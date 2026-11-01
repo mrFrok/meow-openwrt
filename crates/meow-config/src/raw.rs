@@ -33,6 +33,15 @@ pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(St
     pairs
 }
 
+/// mihomo writes some single-value keys as a list (`tun.inet4-address:
+/// [198.18.0.1/30]`); take the first entry (meow-openwrt).
+fn deserialize_string_or_first<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(deserialize_string_or_seq(deserializer)?.and_then(|v| v.into_iter().next()))
+}
+
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -366,6 +375,8 @@ pub struct RawTun {
     pub mtu: Option<u16>,
     /// CIDR assigned to the device. Default: the first /30 of
     /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
+    /// A string, or mihomo's list form (the first entry is used).
+    #[serde(default, deserialize_with = "deserialize_string_or_first")]
     pub inet4_address: Option<String>,
     /// Route installation on startup. Accepts the mihomo boolean
     /// (`true` = capture all traffic where supported, `false` = off) plus

@@ -223,20 +223,55 @@ const WRITE_STASH_CAP: usize = 64 * 1024;
 
 /// After this long without a new stream, a reused connection is PINGed
 /// first (a NAT or the server may have dropped it silently).
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 const REUSE_IDLE_PING: Duration = Duration::from_secs(30);
 /// How long a reused connection may take to accept one more stream (its
 /// concurrent-stream limit) before a fresh connection is dialed instead.
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 const REUSE_READY_TIMEOUT: Duration = Duration::from_secs(2);
 /// New streams stop going to a connection this old (Xray's xmux rotates
 /// connections after 30-50 min); streams already on it run to completion.
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 const REUSE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// The h2 connection driver task, shared by a [`SharedH2`] and the streams
 /// opened on it. The conn owns the inner stream's fd: once every send/recv
 /// ref is gone the driver self-terminates, but only if its closing flush
 /// can make progress — so the last owner bounds that wait (issue #669).
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 pub(crate) struct ConnDriver(Option<tokio::task::JoinHandle<()>>);
 
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 impl ConnDriver {
     fn is_finished(&self) -> bool {
         self.0
@@ -269,6 +304,13 @@ impl Drop for ConnDriver {
 /// One client h2 connection that a multiplexing layer (gRPC, XHTTP) opens
 /// every tunnel of a proxy on, as mihomo/Xray clients do — instead of a new
 /// TCP + TLS/REALITY session per tunnel.
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 #[derive(Clone)]
 pub(crate) struct SharedH2 {
     h2: h2::client::SendRequest<Bytes>,
@@ -278,6 +320,13 @@ pub(crate) struct SharedH2 {
     born: Instant,
 }
 
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 impl SharedH2 {
     /// Spawn the driver for a fresh connection.
     pub(crate) fn spawn<T>(
@@ -357,9 +406,23 @@ impl SharedH2 {
 }
 
 /// The connection a layer currently shares (the last one it opened).
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 #[derive(Default)]
 pub(crate) struct SharedH2Slot(std::sync::Mutex<Option<SharedH2>>);
 
+#[cfg_attr(
+    not(any(feature = "grpc", feature = "xhttp")),
+    allow(
+        dead_code,
+        reason = "connection sharing serves only the grpc and xhttp layers"
+    )
+)]
 impl SharedH2Slot {
     /// The shared connection if it is still usable; a dead one is dropped.
     pub(crate) async fn live(&self) -> Option<SharedH2> {
@@ -434,6 +497,13 @@ impl H2Stream {
     /// Keep a shared connection alive while this stream lives; on drop the
     /// response is drained (bounded) so its flow-control window returns to
     /// the connection the other streams keep using.
+    #[cfg_attr(
+        not(any(feature = "grpc", feature = "xhttp")),
+        allow(
+            dead_code,
+            reason = "connection sharing serves only the grpc and xhttp layers"
+        )
+    )]
     pub(crate) fn with_shared_driver(mut self, driver: Arc<ConnDriver>) -> Self {
         self.shared_driver = Some(driver);
         self

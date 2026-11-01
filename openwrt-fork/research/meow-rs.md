@@ -172,3 +172,25 @@ Reality — ClientHello собран вручную (`src/proto/tls/reality.c`),
 - Hysteria2: quinn 0.11, `clash-lib/src/proxy/hysteria2/` ~2300 строк: codec, Brutal (`congestion.rs` на
   `quinn_proto::congestion::Controller`), Salamander, port hopping (`udp_hop.rs`). — лучший кандидат для BE-бэкенда meow.
 - Reality у meow лучше (свой TLS 1.3 + отпечатки), брать у clash-rs не нужно.
+
+## UDP через TUN и Hysteria2 на BPI-R4 (2026-11-02, `bench/tunbench.sh`)
+
+Стенд целиком в двух netns на роутере (хост и боевой mihomo не затронуты): iperf3 в `mwc` → TUN ядра
+(`routing-mark` 0x99 уводит исходящие сокеты ядра в veth) → `mwb` (iperf3 -s, сервер Hysteria2 — mihomo
+listener на CPU 3). 1200-байтовые датаграммы, ядро на CPU 0,1. Потолок hy2 — сервер на одном ядре.
+
+| сценарий | meow | mihomo |
+|---|---|---|
+| DIRECT ↑ 1G | 451 Мбит/с | 423 |
+| DIRECT ↓ 1G | 623 | 439 |
+| DIRECT ↓ 300M, %/Мбит | 0.45 | 0.29 |
+| hy2 ↑ 300M (до правки) | 0.4 | 95 |
+| hy2 ↑ 300M / 1G (после) | 135 / 132, 1.31 %/Мбит | 95 / 96, 1.55 |
+| hy2 ↓ 300M | 72, 1.14 %/Мбит | 67, 1.31 |
+
+Правки: `UdpSession::send` при полной очереди драйвера отбрасывает датаграмму вместо `Closed` (иначе
+TUN-поток пересоздавал hy2-сессию → новый сокет/порт на сервере → подключённые UDP-приложения теряли
+поток — главная причина); BBRv2 (`Bbr2Gcongestion`, как у клиентов Hysteria) вместо CUBIC; QUIC-пакеты до
+1452 Б с PMTUD (у quiche по умолчанию 1200 — датаграмма 1200 Б резалась на 2 фрагмента).
+Не сделано: offload/GSO-GRO в TUN (tun-rs `offload`, `recv_multiple`/`send_multiple`), пакетная
+отправка/GSO в драйвере hy2, лишние копии на пути датаграммы (oneshot + 3 аллокации на пакет).

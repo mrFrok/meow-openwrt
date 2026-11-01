@@ -620,3 +620,12 @@ fn t18b_unusable_fake_ip_ranges_fall_back_to_the_default_range() {
         );
     }
 }
+
+/// mihomo's list form of `tun.inet4-address` (meow-openwrt): first entry.
+#[tokio::test]
+async fn inet4_address_accepts_mihomos_list_form() {
+    let cfg = load_config_from_str("tun:\n  enable: true\n  inet4-address: [172.31.0.1/30]\n")
+        .await
+        .expect("list form parses");
+    assert_eq!(cfg.tun.inet4_address.to_string(), "172.31.0.1/30");
+}
