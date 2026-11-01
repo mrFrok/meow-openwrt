@@ -1,0 +1,498 @@
+{
+  "agent": "mihomo_architecture",
+  "model": "Claude Sonnet 5.5",
+  "effort": "Medium",
+  "research_date": "2026-11-01",
+  "scope": [
+    "TCP/UDP connection path listener->tunnel->rules->outbound->relay",
+    "DNS / Fake-IP / sniffer / nameserver-policy",
+    "TUN stacks (mips/system/gvisor/mixed), auto-redirect, route-address-set, TPROXY",
+    "Rule engine and rule-provider memory model; startup memory spike",
+    "Existing build tags, protocol registration, per-protocol tag strategy, dependency weight",
+    "Other RAM/CPU consumers (statistics, log, cache.db, geodata, UI, pprof, NTP, process lookup)",
+    "Per-profile exclusions and no-touch zones"
+  ],
+  "summary": "Read of fork v1.19.33 source. A TCP connection costs 3 goroutines in the common case (inbound handler, 200ms peek helper, one relay copy goroutine + handler as the other direction) and DIRECT TCP can be handed to splice(2) by sing bufio.Copy; a UDP session costs 2 goroutines (dial/process + handleUDPToLocal) plus a shared pool of max(4,GOMAXPROCS) workers. Fake-IP is an in-memory LRU of only 1000 entries by default (or cache.db when store-fake-ip). Default TUN stack in this fork is the pure-Go 'mips' stack (metacubex/mipstack), not gvisor; route-address-set/route-exclude-address-set are implemented only through sing-tun nftables interval sets (no iptables fallback) and are fed from rule-providers of behavior ipcidr. The most probable cause of the ~42 MB startup spike is that on arm64/amd64 hub/executor/concurrent_load_unlimit.go sets concurrentCount=MaxInt, so ALL rule providers are read+zstd-decoded+parsed in parallel; per-element binary.Read allocations in the .mrs readers add garbage (hypothesis, not measured). Existing tags: with_gvisor, with_low_memory, no_tailscale, no_zerotier, no_easytier, no_fake_tcp, cmfa. No per-protocol tags exist for the heavy families (quic-go, utls, restls, ssh, openvpn, mieru, sudoku, kcp, wireguard, masque); protocol registration is a plain switch in adapter/parser.go and listener/parse.go, so stub-file build tags (the pattern already used for tailscale/zerotier/easytier) are the rebase-friendly route. easytier embeds a 6.85 MB WASM core plus wazero.",
+  "findings": [
+    {
+      "id": "F001",
+      "topic": "TCP connection path and goroutines",
+      "description": "Inbound listener accepts and spawns a goroutine per connection; the protocol is detected by Peek(1) in the mixed listener; the connection is handed to tunnel.HandleTCPConn which runs handleTCPConn synchronously in the listener goroutine. Rule matching runs under configMux.RLock. Dial goes through retry(); relay is N.Relay with one extra goroutine.",
+      "technical_details": "mixed: Accept loop goroutine (listener/mixed/mixed.go:122-139) -> `go handleConn` per socket (mixed.go:134,148) -> N.NewBufferedConn (bufio.Reader 4096 B, common/net/bufconn.go:18-22) -> socks/http handler -> tunnel.Tunnel.HandleTCPConn (tunnel/tunnel.go:80) -> handleTCPConn (tunnel.go:502): fixMetadata (275), preHandleMetadata (289: fake-ip/redir-host reverse lookup by IP), optional snifferDispatcher.TCPSniff (tunnel.go:~527), peek helper goroutine `go func(){ Peek(1) with 200ms deadline }` only if not yet peeked (tunnel.go:543-552), resolveMetadata (317) -> match (654) iterating getRules(), proxy.DialContext inside retry() with C.DefaultTCPTimeout, statistic.NewTCPTracker (615), handleSocket -> N.Relay (common/net/sing.go:69-92). Relay starts exactly one goroutine (sing.go:76) for the remote->local direction; the calling goroutine does local->remote. Redir/tproxy listeners: `go rl.handleTProxy` per conn (listener/tproxy/tproxy.go:~83); the legacy TCPIn() queue (chan cap 64) also does `go handleTCPConn` (tunnel.go:165-175) but is deprecated. Net per TCP connection: 2 long-lived goroutines (handler+relay copy) + 1 short-lived peek goroutine + the tracker object; outbound adapters (mux, ws, quic streams) add their own goroutines.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "80,275-315,502-625" },
+        { "url": "", "file_path": "fork:common/net/sing.go", "line_reference": "69-92" },
+        { "url": "", "file_path": "fork:listener/mixed/mixed.go", "line_reference": "122-148" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F002",
+      "topic": "UDP session path and goroutines",
+      "description": "UDP packets are hashed by NAT key onto a fixed pool of worker goroutines; each new NAT key creates a packetSender and two goroutines.",
+      "technical_details": "Tunnel.HandleUDPPacket (tunnel.go:99-113) -> initUDP once: numUDPWorkers = max(4, GOMAXPROCS) queues of cap 64 (tunnel.go:85-97,36) -> processUDP -> handleUDPConn (414-500). Packet dropped if queue full. natTable.GetOrCreate(key) (441) creates newPacketSender (tunnel/connection.go:27-39: chan cap 128 = senderCapacity, two maps for destination-NAT mapping, a context). For a new key: `go func(){ dial(); sender.Process(pc, proxy) }` (tunnel.go:489) and inside dial `go handleUDPToLocal(...)` (485) = 2 goroutines per session; handleUDPToLocal loops pc.WaitReadFrom with SetReadDeadline(udpTimeout=60s) (tunnel/connection.go:~150-200, tunnel.go:62). UDP buffers come from common/pool (UDPBufferSize 16 KiB standard / 8 KiB with_low_memory) at the listener (e.g. tproxy/udp.go:69, tproxy/packet.go:102). For tproxy each (remote,local) pair also creates a dedicated transparent UDP socket + reader goroutine (tproxy/packet.go:94-117, nat.GetForLocalConn). Packets queued in a sender hold their pool buffer until processed or dropped.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "36-37,85-113,414-500" },
+        { "url": "", "file_path": "fork:tunnel/connection.go", "line_reference": "15-45,150-200" },
+        { "url": "", "file_path": "fork:listener/tproxy/packet.go", "line_reference": "55-117" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F003",
+      "topic": "Per-connection buffers",
+      "description": "Relay buffer sizes are 32 KiB (TCP) / 16 KiB (UDP) by default and halved by the with_low_memory tag; sing has its own copy of the same constants. DIRECT TCP can bypass user-space buffers via splice.",
+      "technical_details": "common/pool/buffer_standard.go: RelayBufferSize 32 KiB, UDPBufferSize 16 KiB; buffer_low_memory.go (tag with_low_memory): 16 KiB / 8 KiB. sing v0.5.8 common/buf/buffer_standard.go|buffer_low_memory.go: BufferSize 32/16 KiB, UDPBufferSize 16/8 KiB (the sing buf.Buffer is what bufio.Copy -> CopyExtended actually allocates per direction, bufio/copy.go:100-190). Per TCP connection: bufio.Reader 4096 B on the inbound side + up to 2 relay buffers (one per direction, taken from sing buf pool, returned to pool afterwards; pool holds them so steady RSS ~ peak concurrent connections x 2 x BufferSize) + outbound protocol buffers (TLS records, etc.). bufio.Copy first drains BufferedConn.ReadCached, then if both ends unwrap (via UnwrapReader/Upstream: tcpTracker tracker.go:72, BufferedConn bufconn.go:93-100, adapter conn base.go:261) to syscall.Conn it calls copyDirect -> splice(2) with a pipe resized to 1 MiB (sing bufio/splice_linux.go:12-70). Hypothesis: splice applies to DIRECT TCP (raw *net.TCPConn both sides) but not to encrypted outbounds; not exercised here. gVisor/mips stack per-socket TCP buffers: gvisor 20 KiB recv + 20 KiB send (sing-tun stack_gvisor.go:~160-170).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:common/pool/buffer_standard.go", "line_reference": "1-14" },
+        { "url": "", "file_path": "fork:common/pool/buffer_low_memory.go", "line_reference": "1-14" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go", "line_reference": "20-100,159-192" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/splice_linux.go", "line_reference": "12-70" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F004",
+      "topic": "Fake-IP pool: storage and reverse mapping",
+      "description": "The fake-ip pool is two LRU caches in memory (host->IP and IP->host) with a hard cap of 1000 entries per family, or a bbolt-backed store when profile.store-fake-ip is true. A fake IP is mapped back to a domain in tunnel.preHandleMetadata via resolver.FindHostByIP.",
+      "technical_details": "component/fakeip/pool.go: Pool{gateway,first,last,offset,cycle,mux,store}; Lookup(host) lowercases, uses store.GetByHost else get() which increments offset, wraps at last (cycle=true) evicting the old IP (pool.go:43-63,105-118). New() (169-196) picks cachefileStore (cache.db) if Persistence else newMemoryStore(options.Size). config.go passes Size: 1000 (config/config.go ~1543-1560). memory.go: lru.LruCache[string,netip.Addr] + lru.LruCache[netip.Addr,string] (memory.go:9-12). Consequence: with more than 1000 distinct domains resolved, the oldest mappings are evicted and any connection to an evicted fake IP fails with 'fake DNS record missing' (tunnel.go:310-311) unless the sniffer recovers a domain (tunnel.go:526-535). Reverse lookup: dns/enhancer.go FindHostByIP (pool.LookBack -> pool6 -> mapping LRU of 4096 for redir-host, enhancer.go:188) called from tunnel.preHandleMetadata (tunnel.go:289-315) which sets metadata.Host, clears DstIP when IsFakeIP (confirmed fake), DNSMode=FakeIP. Pool is cloned on reload (Pool.CloneFrom, pool.go:89-103). RAM is tiny (1000 entries x2 maps); range default 198.18.0.1/16 (config.go).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:component/fakeip/pool.go", "line_reference": "30-64,89-118,169-198" },
+        { "url": "", "file_path": "fork:component/fakeip/memory.go", "line_reference": "9-48" },
+        { "url": "", "file_path": "fork:dns/enhancer.go", "line_reference": "56-82,188" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "289-315" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F005",
+      "topic": "fake-ip-filter modes and what breaks when DNS answers real IPs",
+      "description": "Three filter modes decide per query name whether to answer with a fake IP or pass to the real resolver; domains that get real IPs lose domain info in the tunnel unless the sniffer or redir-host mapping restores it.",
+      "technical_details": "Skipper (component/fakeip/skipper.go:20-48): blacklist mode (default FilterBlackList, config.go:536): names matching the filter list get real IPs, everything else fake; whitelist: only matching names get fake IPs; rule mode (fake-ip-filter-mode: rule): ordered rules with action 'fake-ip'/'real-ip' (config.go:1625-1655; rule-sets with behavior domain/classical allowed, only domain rules honoured). Applied in dns/middleware.go:149-190 withFakeIP; also HTTPS/SVCB queries get empty answers under fake-ip (middleware.go:~176). Fallback nameserver hostnames are auto-added to the skip set unless rule mode (config.go:1508-1521). If DNS gives real IPs for a domain: (1) metadata.Host is empty at tunnel entry, so DOMAIN/DOMAIN-SUFFIX/GEOSITE/rule-set(domain) rules cannot match unless the sniffer extracts SNI/Host or MappingEnabled redir-host mapping (enhancer InsertHostByIP, 10s TTL entries, middleware.go:55-75) knows the IP; (2) rules then fall to IP rules after ResolveIP, i.e. policy changes silently (a PROXY domain may match IP-CIDR/GEOIP DIRECT, or MATCH); (3) the real IP in a hosts-less path means the proxy node gets an IP instead of a domain (remote DNS no longer used: DNS leak/geo-mismatch for CDN); (4) shared CDN IPs mean IP->policy is ambiguous. Typical required real-ip set: NTP, STUN, captive portals, LAN domains, game/VoIP domains, proxy-server hostnames (DNS dialer), domains in a kernel bypass set. This is the core constraint for an IP-level safe bypass: a bypass keyed only by destination IP cannot represent domain-specific policy.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:component/fakeip/skipper.go", "line_reference": "9-48" },
+        { "url": "", "file_path": "fork:dns/middleware.go", "line_reference": "55-75,149-190" },
+        { "url": "", "file_path": "fork:config/config.go", "line_reference": "531-536,1508-1565,1625-1655" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F006",
+      "topic": "Sniffer interaction and nameserver-policy",
+      "description": "Sniffer runs inside handleTCPConn before rule matching and can rescue a failed fake-IP lookup; nameserver-policy is a per-domain resolver selection implemented as DomainTrie/rule policies inside the DNS Resolver.",
+      "technical_details": "tunnel.go:522-540: if sniffing enabled, TCPSniff (component/sniffer/dispatcher.go:122-167) is tried after the lookup; success clears preHandleFailed. replaceDomain (dispatcher.go:169-181) sets metadata.Host and optionally overrides DstIP (override-destination). Sniffers: TLS, HTTP, QUIC (quic_sniffer.go is 19.7 KB, large table) with sniff failure cache (dispatcher.go:301-320, 'bitmap' structure). For UDP: DoSniff happens inside the dial closure (tunnel.go:446-452) via UDPSniff (dispatcher.go:85-120). Sniffer delays the first byte (wait for ClientHello) which is also why the peek helper exists. nameserver-policy: dns/resolver.go dnsPolicy list built by makePolicy (resolver.go:568-600) from a trie (domainTriePolicy) / geosite / rule-set matchers; matchPolicy (resolver.go:261-275) is consulted at the start of ExchangeContext (215, 300) before main/fallback; DirectFollowPolicy and ProxyServerPolicy are separate policy sets (resolver.go:465-483). A policy hit routes the query to its own nameserver list (possibly via a proxy group), bypassing fallback logic.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:component/sniffer/dispatcher.go", "line_reference": "85-181,301-320" },
+        { "url": "", "file_path": "fork:dns/resolver.go", "line_reference": "215,261-275,465-483,568-600" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "522-552" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F007",
+      "topic": "TUN stacks and their cost",
+      "description": "Four TUN stacks: mips (pure-Go mipstack, the fork's config default), system (kernel TCP via local listener + packet NAT), gvisor (gVisor netstack, needs with_gvisor), mixed (system TCP + gvisor UDP, needs with_gvisor).",
+      "technical_details": "Selection: sing-tun stack.go:41-63 (\"\"|mips -> NewMipstack; gvisor -> NewGVisor; mixed -> NewMixed; system -> NewSystem). Default in mihomo config: Stack: C.TunMips (config/config.go:548); enum constant/tun.go:16-19. System: stack_system.go (996 lines): reads TUN with tunLoop/batchLoopLinux (batchSize buffers each mtu+headroom, stack_system.go:190-260), rewrites addresses (NAT tables stack_system_nat.go) so the kernel TCP stack terminates the flow on a local TCPListener (tcp4/tcp6, lines 136-176, acceptLoop per family); UDP handled in userspace with own NAT. Cheapest RAM and best TCP throughput (kernel TCP, no user TCP state machine), no extra dependency. gVisor: stack_gvisor.go sets TCP buffers 20 KiB recv/send per connection (line ~160), full user-space TCP -> highest CPU/RAM per flow, pulls github.com/metacubex/gvisor (324 files in go list -deps) and is also required by tailscale, wireguard device (mipstack used in wireguard.go), and with_gvisor tag. Mixed: embeds *System and replaces only UDP forwarder with gvisor (stack_mixed.go:17-46). Mipstack: 41,202 lines pure Go (incl. BBR/CUBIC/Reno, fragment, IPv6) with no with_gvisor requirement; per-conn buffers unverified. Costs are qualitative here; no throughput numbers were measured (hypothesis for ranking: system < mixed < mips ~ gvisor in CPU per byte for TCP).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack.go", "line_reference": "41-63" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack_system.go", "line_reference": "117,136-260" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack_gvisor.go", "line_reference": "160-176" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack_mixed.go", "line_reference": "17-46" },
+        { "url": "", "file_path": "fork:config/config.go", "line_reference": "548" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F008",
+      "topic": "auto-route, auto-redirect and route(-exclude)-address-set implementation",
+      "description": "auto-redirect creates an nftables table 'mihomo' (inet) with REDIRECT/mark rules and a local redirect server; route-address-set and route-exclude-address-set are rule-providers (behavior ipcidr) converted to netipx.IPSet and loaded into nftables interval sets. Only the nftables backend supports them.",
+      "technical_details": "listener/sing_tun/server.go:431-476: auto-redirect requires auto-route; tun.NewAutoRedirect(TableName 'mihomo', DisableNFTables from env DISABLE_NFTABLES, RouteAddressSet/RouteExcludeAddressSet pointers); each name in route-address-set / route-exclude-address-set must be an existing rule-provider (error otherwise), loaded by updateRule (server.go:574-603) that requires the strategy to implement ToIpCidr() (ipcidr_strategy.go:~108 ToIpCidr -> *netipx.IPSet). Any set sets AutoRedirectMarkMode (route marks/ output mark 'AutoRedirectOutputMark', also forces a global dialer routing-mark, server.go:~519-530). On provider update, updateRule(..., update=true) calls autoRedirect.UpdateRouteAddressSet() (server.go:600) -> nftablesUpdateRouteAddressSet (sing-tun redirect_nftables.go:316-331) which re-creates sets inet4/6_route_address_set and inet4/6_route_exclude_address_set (redirect_nftables_rules.go:32-62) via nftablesCreateIPSet (redirect_nftables_exprs.go:130-180) as interval sets (From + IntervalEnd elements) through github.com/metacubex/nftables netlink. Chains: output mangle priority, prerouting at NATDest+1/+2 (redirect_nftables.go:59-149). iptables backend: UpdateRouteAddressSet is a no-op (redirect_linux.go:157-165 checks useNFTables) and redirect_iptables.go has no set support. On OpenWrt with fw4 the library writes /etc/nftables.d/0-mihomo-auto-redirect.nft accepting tun traffic in input/forward and runs `fw4 reload` (redirect_nftables_rules_openwrt.go:15-52). Memory: IPSet is kept in mihomo (ranges slice) plus the kernel set. This is the existing, in-tree template for dynamic nft set maintenance, but it is a static provider->set mapping, not a per-connection decision cache.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:listener/sing_tun/server.go", "line_reference": "431-476,519-530,574-603" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_nftables.go", "line_reference": "59-149,316-331" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_nftables_rules.go", "line_reference": "32-62" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_nftables_exprs.go", "line_reference": "130-180" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_nftables_rules_openwrt.go", "line_reference": "15-52" },
+        { "url": "", "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_linux.go", "line_reference": "157-165" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F009",
+      "topic": "TPROXY listener (TCP and UDP) and redir",
+      "description": "TPROXY is a plain transparent TCP listener plus an IP_TRANSPARENT UDP socket with per-flow reply sockets; mihomo does not by default install firewall rules for it (helper for iptables exists).",
+      "technical_details": "TCP: listener/tproxy/tproxy.go New(): net.ListenConfig with MPTCP forced off (tproxy.go ~60-65), setsockopt IP_TRANSPARENT (setsockopt_linux.go), accept loop -> go handleTProxy: the original destination is just conn.LocalAddr() (tproxy.go:~36-44) then tunnel.HandleTCPConn(inbound.NewSocket(target, conn, C.TPROXY)). UDP: tproxy/udp.go:~60-90: one IP_TRANSPARENT UDP socket, a single reader goroutine allocating pool.Get(UDPBufferSize)(16 KiB) per datagram and a 1024-byte OOB buffer, ReadMsgUDPAddrPort + getOrigDst/getDSCP from cmsg (udp_linux.go:99-165); replies: createOrGetLocalConn/listenLocalConn (packet.go:55-117) dial a transparent socket bound to the original destination (udp_linux.go dialUDP :23-70) and spawn one reader goroutine per (src,dst) pair, closed via natTable.RangeForLocalConn when the session ends (connection.go closeAllLocalCoon). Redir TCP (listener/redir/tcp_linux.go) gets original dst by SO_ORIGINAL_DST (conntrack). tproxy_iptables.go has SetTProxyIPTables (uses `iptables` CLI via common/cmd, mark 0x2d0 / table 0x2d0, with a bypass list) - legacy helper, not nftables. In clashwrt the rules are set up externally, so none of this is needed.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:listener/tproxy/tproxy.go", "line_reference": "36-90" },
+        { "url": "", "file_path": "fork:listener/tproxy/udp.go", "line_reference": "60-109" },
+        { "url": "", "file_path": "fork:listener/tproxy/packet.go", "line_reference": "55-117" },
+        { "url": "", "file_path": "fork:listener/tproxy/udp_linux.go", "line_reference": "23-70,99-165" },
+        { "url": "", "file_path": "fork:listener/tproxy/tproxy_iptables.go", "line_reference": "1-40" },
+        { "url": "", "file_path": "fork:listener/redir/tcp_linux.go", "line_reference": "20-60" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F010",
+      "topic": "Rule engine: types and which metadata each needs",
+      "description": "Rules are evaluated linearly in order under configMux.RLock; helper callbacks lazily resolve DNS and process. Only a subset depends solely on destination IP/port/network.",
+      "technical_details": "Parser: rules/parser.go:12-100 types: DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-REGEX, DOMAIN-WILDCARD, GEOSITE (need metadata.Host / RuleHost()); GEOIP, IP-CIDR(6), IP-SUFFIX, IP-ASN (DstIP; call helper.ResolveIP() unless 'no-resolve', ipcidr.go:38-48, geoip.go:35-48 - resolving fills DstIP via DNS from Host, tunnel.go:333-348); SRC-GEOIP, SRC-IP-CIDR, SRC-IP-SUFFIX, SRC-IP-ASN (SrcIP), SRC-PORT, DST-PORT, IN-PORT, DSCP, NETWORK, UID, IN-TYPE, IN-USER, IN-NAME (inbound/user metadata), PROCESS-NAME/PATH/*-REGEX/*-WILDCARD (helper.FindProcess -> netlink + /proc scan, F021), REMATCH-NAME, SUB-RULE, AND/OR/NOT, RULE-SET (domain/ipcidr/classical providers), MATCH. Also a rule action can be Pass or Rematch (tunnel.go:668-690). A rule-set with behavior ipcidr is pure destination-IP; behavior domain is host-only; classical can contain anything. A connection can be bypassed at IP level safely only when every rule evaluated before the first match is one of: IP-CIDR/GEOIP/IP-ASN/DST-PORT/NETWORK/MATCH/SRC-IP-* (SRC is available at kernel level as source address) and the DstIP is real (not fake-IP); anything depending on Host, process, UID, IN-NAME/IN-USER, DSCP (visible in kernel but not in same form) or logic composites containing them makes the decision connection-specific. Under fake-IP the DstIP is cleared (tunnel.go:296-300) and the decision is domain-based, so the kernel only sees the real IP after mihomo (or the dialer) resolves it.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:rules/parser.go", "line_reference": "12-100" },
+        { "url": "", "file_path": "fork:rules/common/ipcidr.go", "line_reference": "38-48" },
+        { "url": "", "file_path": "fork:rules/common/geoip.go", "line_reference": "35-60" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "317-412,654-711" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F011",
+      "topic": "Rule-provider formats and in-memory structures",
+      "description": "Providers have behavior domain/ipcidr/classical and format yaml/text/mrs. Domain sets are a succinct trie (DomainSet), IP sets are a sorted netipx.IPRange slice; classical keeps one rule object per line.",
+      "technical_details": "Strategies: rules/provider/provider.go:156-172. domainStrategy -> trie.DomainSet (component/trie/domain_set.go:20-24: leaves, labelBitmap []uint64, labels []byte, ranks, selects []int32 built by bitmap.IndexSelect32R64, domain_set.go:312-314; very compact, reversed-key sorted build via DomainSetBuilder.keys []string which holds ALL strings until Build). ipcidrStrategy -> cidr.IpCidrSet{rr []netipx.IPRange} reused as *netipx.IPSet by unsafe cast (component/cidr/ipcidr_set.go:12-76); Merge() goes through netipx.IPSetBuilder (extra copy) for yaml/text; IsContain is a binary search over ranges (O(log n)). classicalStrategy: slice of full C.Rule objects (parsed per line, rules/provider/classical_strategy.go) - heaviest per entry. The fork go.mod also has metacubex/bart (rules/common or ipasn use), but ipcidr rule-sets use the range slice not bart. .mrs = zstd stream: magic 'MRS\\x01', behavior byte, int64 count, int64 extra length, then FromMrs (rules/provider/mrs_reader.go:15-77). Text/yaml parse line by line; yaml parses each line with yaml.Unmarshal into a RulePayload (provider.go:215-250) which is far slower and more garbage-prone than text. Loading: component/resource/fetcher.go Initial() does os.ReadFile of the whole file, MakeHash md5 of whole buffer, then parser (fetcher.go:56-67,129-168); file bytes are retained until the parser returns.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:rules/provider/mrs_reader.go", "line_reference": "15-77" },
+        { "url": "", "file_path": "fork:rules/provider/provider.go", "line_reference": "156-268" },
+        { "url": "", "file_path": "fork:rules/provider/ipcidr_strategy.go", "line_reference": "15-100" },
+        { "url": "", "file_path": "fork:component/trie/domain_set.go", "line_reference": "20-24,312-314" },
+        { "url": "", "file_path": "fork:component/cidr/ipcidr_set.go", "line_reference": "12-76" },
+        { "url": "", "file_path": "fork:component/resource/fetcher.go", "line_reference": "56-168" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F012",
+      "topic": "Likely cause of the ~42 MB transient startup spike",
+      "description": "Candidates ranked by evidence: (1) all rule-providers load concurrently on arm64/amd64; (2) per-element binary.Read allocations plus whole-file ReadFile and zstd decoder buffers; (3) NewDomainStrategy builder / IPSetBuilder copies for non-mrs formats. None measured; the previous gctrace (heap 8-9 MB live, ~42 MB peak for ~0.1 s) is consistent with garbage rather than retained structures.",
+      "technical_details": "(1) hub/executor/concurrent_load_unlimit.go has tag `386 || amd64 || arm64 || arm64be` and sets concurrentCount = math.MaxInt; loadProvider (hub/executor/executor.go:317-353) therefore starts one goroutine per provider with an effectively unlimited semaphore. mips/mipsle use concurrentCount=1; other archs (arm, etc.) 5. The BPI-R4 (arm64) thus parses every provider at the same time, and each holds raw file bytes + zstd decoder + decoded structure simultaneously. (2) rules/provider/mrs_reader.go creates klauspost zstd.NewReader (streaming, default concurrency and window buffers) per provider; trie.ReadDomainSetBin (component/trie/domain_set_bin.go:53-113) and cidr.ReadIpCidrSet (cidr/ipcidr_set_bin.go:38-77) call encoding/binary.Read once per uint64 / twice per range with 16-byte arrays; Go's binary.Read heap-allocates `bs := make([]byte, n)` on every call (go:encoding/binary/binary.go:258-263), i.e. millions of 8-16 B garbage objects for large sets (only collected at the next GC; with GOGC=50 and GOMEMLIMIT=48MiB this shows as the spike). (3) resource.Fetcher keeps the file buffer plus md5 hashing plus parser output alive during parse. Verification plan for the main agent: run with GODEBUG=gctrace=1 and (a) concurrency forced to 1, (b) a build where ReadDomainSetBin/ReadIpCidrSet read the whole slice with one io.ReadFull + binary.BigEndian.Uint64 decode, (c) zstd.NewReader(..., zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(...)). Cheapest fix candidate: make concurrentCount 1 (or 2) under a new tag or for all (isolated file swap), then batch-read in the mrs readers.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:hub/executor/concurrent_load_unlimit.go", "line_reference": "1-8" },
+        { "url": "", "file_path": "fork:hub/executor/concurrent_load_limit.go", "line_reference": "1-5" },
+        { "url": "", "file_path": "fork:hub/executor/executor.go", "line_reference": "317-353" },
+        { "url": "", "file_path": "fork:component/trie/domain_set_bin.go", "line_reference": "53-113" },
+        { "url": "", "file_path": "fork:component/cidr/ipcidr_set_bin.go", "line_reference": "38-77" },
+        { "url": "", "file_path": "go:encoding/binary/binary.go", "line_reference": "258-263" }
+      ],
+      "confidence": "medium",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F013",
+      "topic": "Existing build tags in the repo",
+      "description": "Seven project feature tags exist, all implemented as constant files in constant/features plus stub files; the rest are OS/arch/Go-version constraints.",
+      "technical_details": "Project tags: with_gvisor (adds gvisor/mixed TUN stacks and tailscale; constant/features/with_gvisor.go, sing-tun stack_gvisor.go, stack_mixed.go, tailscale.go requires `with_gvisor && !no_tailscale`, tailscale_stub.go `!with_gvisor || no_tailscale`); no_tailscale (removes github.com/metacubex/tailscale, 602 files in go list -deps); no_zerotier (adapter/outbound/zerotier.go `!no_zerotier`, stub `no_zerotier`; removes zerotier-go); no_easytier (easytier.go `!no_easytier`, stub; removes easytier-go incl. 6.85 MB embedded easytier_core.wasm and metacubex/wazero 216 files); no_fake_tcp (transport/hysteria/conns/faketcp/tcp_linux.go `linux && !no_fake_tcp`, tcp_stub.go `!linux || no_fake_tcp`; removes hysteria fake-TCP raw-socket code and the gopacket dependency); with_low_memory (common/pool buffer sizes halved; sing has same tag; constant/features/low_memory.go); cmfa (Android ClashMeta-for-Android integration; ~7 files such as hub/route/patch_android.go `android && cmfa`, listener/sing_tun/server_android.go `android && !cmfa`). Other constraints: OS (!windows, linux, darwin, android), arch (mips||mipsle: concurrent_load_single.go; 386||amd64||arm64||arm64be: concurrent_load_unlimit.go), Go version (go1.21/!go1.21, go1.22, go1.23, go1.24). Tags are surfaced at runtime via constant/features/tags.go (Tags()). Measured by main project: with_gvisor no_tailscale no_zerotier no_easytier with_low_memory = 38.5 MB; + no_fake_tcp = 37.0 MB (PROJECT_CONTEXT.md). Note: the `mips` TUN stack does not need with_gvisor; with_gvisor is only needed for gvisor/mixed stacks and tailscale (and metacubex/gvisor pulled by wireguard? - wireguard.go imports mipstack and amneziawg-go, not gvisor; unverified).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:constant/features/tags.go", "line_reference": "1-40" },
+        { "url": "", "file_path": "fork:adapter/outbound/tailscale.go", "line_reference": "1" },
+        { "url": "", "file_path": "fork:adapter/outbound/tailscale_stub.go", "line_reference": "1-30" },
+        { "url": "", "file_path": "fork:adapter/outbound/easytier.go", "line_reference": "1" },
+        { "url": "", "file_path": "fork:adapter/outbound/zerotier.go", "line_reference": "1" },
+        { "url": "", "file_path": "fork:transport/hysteria/conns/faketcp/tcp_linux.go", "line_reference": "1" },
+        { "url": "", "file_path": "fork:hub/executor/concurrent_load_single.go", "line_reference": "1" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F014",
+      "topic": "Protocol registration points and rebase-friendly per-protocol tagging",
+      "description": "Outbounds are registered by one switch in adapter/parser.go (ParseProxy), inbounds by one switch in listener/parse.go; adapter constructors live in adapter/outbound/<proto>.go and transports in transport/<proto>. The stub-file pattern already used for tailscale/zerotier/easytier gives minimal-diff tags.",
+      "technical_details": "adapter/parser.go:30-219: case ss, ssr, socks5, http, vmess, vless, snell, trojan, hysteria, hysteria2, wireguard, tuic, shadowquic, gost-relay, direct, dns, reject, rematch, ssh, mieru, anytls, sudoku, masque, trusttunnel, openvpn, tailscale, zerotier, easytier. Each case decodes into outbound.<X>Option then calls outbound.New<X>. listener/parse.go:23-171: socks, http, tproxy, redir, mixed, tunnel, tun, shadowsocks, snell, vmess, vless, trojan, hysteria2, hysteria2-realm, tuic, shadowquic, anytls, mieru, sudoku, trusttunnel. Config-level parsing of proxy-groups, providers and listeners goes through the same constructors. Minimal-diff scheme: for each heavy protocol X add `<x>_stub.go` (`//go:build no_X`) in adapter/outbound defining the Option struct (same fields, needed by the structure decoder) and `NewX` returning an error 'disabled by no_X', and add `//go:build !no_X` to the real file - zero edits to parser.go; same for listener packages (listener/<x>/ stub exporting New returning error, and in listener/inbound/<x>.go constructors which must still compile: each listener has inbound/<x>.go in listener/inbound that imports the real implementation, so that file needs the same stub treatment). Option structs shared with other code (e.g. outbound.<X>Option referenced in listener/config or transport shared structs) are the rebase-risk points; keep stubs a verbatim copy of the Option struct. Transports shared by several protocols (transport/vless, vmess, gun, xhttp, kcptun, mkcp, shadowtls, restls, reality, tlsmirror, jls) require checking VLESS/VMess/Trojan wiring (vless.go imports quic-go for XHTTP/H3; http.go/trojan.go/vmess.go import metacubex/http+tls) - those are compile-time linked and cannot be tagged out cheaply without editing the protocol file itself (invasive).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:adapter/parser.go", "line_reference": "30-219" },
+        { "url": "", "file_path": "fork:listener/parse.go", "line_reference": "23-171" },
+        { "url": "", "file_path": "fork:adapter/outbound/tailscale_stub.go", "line_reference": "1-30" },
+        { "url": "", "file_path": "fork:adapter/outbound/zerotier_stub.go", "line_reference": "1-30" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F015",
+      "topic": "Heaviest dependency per protocol / transport (by package/file count, not bytes)",
+      "description": "Estimated from `go list -deps` non-stdlib Go file counts per top-level module path; this is a proxy for code size, NOT a measured binary size (hypothesis for relative ranking).",
+      "technical_details": "Counts with -tags with_gvisor (full): mihomo 771 files/182 pkgs, metacubex/tailscale 602/195, metacubex/gvisor 324/47, metacubex/wazero 216/33 (only via easytier), quic-go 172/20, sing 152/32, jls-quic-go 151/18 (shadowquic + ssh? no: shadowquic only; separate quic fork), x/net 133, mieru 112/25 (+protobuf), protobuf internal 99, utls 90/15, gopacket 85, klauspost/compress 75, sing-tun 75/7, sagernet/netlink 68, brotli 67 (utls/quic), easytier 67/18, nftables 64/7, amneziawg-go 63, x/text 59, x/crypto 55, go-krypto 46 (Korean ciphers, probably SSR/others), tailscale-wireguard-go 45, metacubex/http 44, chi 42, miekg/dns 42, wireguard-go 41, restls-client-go 36, xz 32, ssh 30, sevenzip 30 (geo/UI zip), bbolt 29, dhcp 29, jls-tls 28, tls 27, godicttls 27 (utls), zerotier 26. After `no_tailscale no_zerotier no_easytier` tailscale (602), tailscale-wireguard-go, wazero (216), easytier (67), zerotier (26) disappear; quic-go (172), jls-quic-go (151), mieru (112), utls (90), gvisor (324 still via with_gvisor) remain. Per protocol: hysteria/hysteria2/tuic/masque/shadowquic/vless-h3 -> quic-go family (quic-go + sing-quic + jls-quic-go + brotli + qpack, congestion code); shadowquic/jls/reality -> jls-tls/jls-quic-go/utls; restls -> restls-client-go + utls; ssh -> metacubex/ssh (30 files, small); openvpn -> transport/openvpn (in-tree, uses go-lzo / x/crypto? lzo import in go.mod); mieru -> enfein/mieru + protobuf; sudoku -> transport/sudoku in-tree + blake3/mlkem/age deps; kcp/mkcp/kcptun -> metacubex/kcp-go + smux + (reedsolomon?); wireguard -> amneziawg-go + wireguard-go + mipstack (+ sing-wireguard); trojan/vmess/vless -> metacubex/http, tls, sing-vmess; shadowsocks -> sing-shadowsocks(2); ssr -> go-krypto. gVisor is used by the with_gvisor TUN stacks and tailscale; the default mips TUN stack needs none of it. Removing them has to be validated by the main agent via real builds.",
+      "source_type": "experiment",
+      "sources": [
+        { "url": "", "file_path": "fork:go.mod", "line_reference": "1-90" },
+        { "url": "", "file_path": "fork:adapter/outbound/hysteria2.go", "line_reference": "1-40" },
+        { "url": "", "file_path": "fork:adapter/outbound/vless.go", "line_reference": "1-40" }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F016",
+      "topic": "easytier embeds a WASM core (6.85 MB) via wazero",
+      "description": "The easytier outbound pulls a precompiled easytier_core.wasm (go:embed) and the wazero runtime; no_easytier removes both. This is already in the main project's measured build set.",
+      "technical_details": "easytier-go/internal/artifact/embed.go:7 `//go:embed easytier_core.wasm`; file size 6,850,909 bytes (module dir). wazero (216 files) imported by easytier internal/engine/hostabi. Only linked when !no_easytier. Also noted: testdata wasm (9.5 MB) is not linked. A no_easytier build is therefore worth ~7 MB of embedded data plus the interpreter/compiler code (Go-linked size not measured here).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "mod:github.com/easytier/easytier/easytier-go@v0.0.0-20260910071355-3d0c9c3ca5e2/internal/artifact/embed.go", "line_reference": "7" },
+        { "url": "", "file_path": "fork:adapter/outbound/easytier.go", "line_reference": "1" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F017",
+      "topic": "Connection tracking / statistics cost",
+      "description": "Every connection and UDP session is registered in a global sync.Map with a UUID and metadata clone; byte counters are atomics; a 1 Hz ticker computes speeds. API reads iterate the whole map.",
+      "technical_details": "statistic.NewTCPTracker (tracker.go:119-152) creates TrackerInfo{UUID, Metadata, atomic counters, Start, Chain, ProviderChain, Rule, RulePayload} (strings built per connection) and manager.Join -> m.connections.Store(c.ID() /*uuid string*/) (manager.go:40-42). Close() leaves; Snapshot() (manager.go:84-97) copies all TrackerInfo pointers for /connections (JSON). Per read/write: two atomic adds (PushUploaded/PushDownloaded + per-conn totals; tracker.go:50-70). A single goroutine ticks every 1 s (manager.go:116-122). Memory read (manager.updateMemory -> memory.GetMemoryInfo) only when the API asks. Costs scale with live connections (every long-lived flow: tens of KB with strings, chain slices, metadata clone); disabling would need a build tag around NewTCPTracker/NewUDPTracker call sites (tunnel.go:479,615), but the traffic API (/traffic, /connections) would then be empty.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:tunnel/statistic/tracker.go", "line_reference": "19-152,211-244" },
+        { "url": "", "file_path": "fork:tunnel/statistic/manager.go", "line_reference": "40-48,84-122" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F018",
+      "topic": "Logging",
+      "description": "Log events go through an unbuffered channel to an observable with per-subscriber goroutines; per-connection INFO log lines (logMetadata) are formatted for every connection.",
+      "technical_details": "log/log.go:13-14 logCh = make(chan Event) feeding observable.NewObservable[Event]; producers at lines 39-57 block until the observable goroutine takes the event. Subscribers: API /logs websockets. tunnel.logMetadata (tunnel.go:635-652) formats every successful connection at info level (string building + Printf even when level filtered? the level check is inside log package; Event is allocated first - hypothesis). Reducing cost: log-level warning/silent in production; or build-time constant. SingLogger bridge: log/sing.go.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:log/log.go", "line_reference": "13-71" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "627-652" }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F019",
+      "topic": "cache.db (bbolt), geodata (GeoSite.dat, GeoIP.dat, mmdb)",
+      "description": "cache.db is a bbolt file opened at startup (selected proxies, fake-ip state, rule/proxy cache); geodata loads whole files unless a memory-conservative loader is selected (default); mmdb opened via maxminddb.",
+      "technical_details": "component/profile/cachefile/cache.go:80-100 bbolt.Open(C.Path.Cache(), options{Timeout 1s, NoStatistics}) with recovery on invalid/checksum errors; bbolt mmaps the file (not verified in this fork) so RSS grows with file size and Batch writes happen on SetSelected / fake-ip store. Fake-ip persistence (store-fake-ip) writes per allocation. geodata: component/geodata/utils.go:15 geoLoaderName = \"memconservative\" (memconservative/cache.go re-encodes protobuf GeoSite/GeoIP into a per-country cache and falls back to os.ReadFile if decode fails, lines 56-57,121-122), alternative 'standard' reads the whole .dat via ReadFile (standard/standard.go:16-29). LoadGeoSiteMatcher/LoadGeoIPMatcher (utils.go:69,158) build per-category matchers on demand when a GEOSITE/GEOIP rule is parsed. mmdb: component/mmdb/mmdb.go opens country mmdb and ASN mmdb via maxminddb.Open (mmap on unix in v1.12 - not verified). google.golang.org/protobuf (99 internal pkgs) is linked for geodata + mieru. If rules use only rule-sets (.mrs), geodata is not loaded, but the code is still linked. Auto-update of geo files (updater package) downloads .dat/.mmdb at runtime and needs sevenzip/zip.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:component/profile/cachefile/cache.go", "line_reference": "30-100" },
+        { "url": "", "file_path": "fork:component/geodata/utils.go", "line_reference": "15-70,158" },
+        { "url": "", "file_path": "fork:component/geodata/memconservative/cache.go", "line_reference": "50-125" },
+        { "url": "", "file_path": "fork:component/mmdb/mmdb.go", "line_reference": "47-80" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F020",
+      "topic": "External UI, pprof, REST API, NTP",
+      "description": "The dashboard is NOT embedded: it is downloaded as a zip (default MetaCubeX/metacubexd gh-pages) and served by http.FileServer from external-ui; pprof is the chi Profiler mounted only when the API runs with log-level debug; NTP is an optional service; none of these cost RAM unless enabled/used.",
+      "technical_details": "config/config.go:600 ExternalUIURL default; hub/executor/executor.go:380-381 updater.NewUiUpdater(...).AutoDownloadUI() (component/updater); hub/route/server.go:148-153 serves /ui via http.FileServer(http.Dir(uiPath)). pprof: hub/route/server.go:108-117 `if isDebug { r.Mount(\"/debug\", ... middleware.Profiler ...)}` (chi) - net/http/pprof is linked in via chi's middleware package regardless of the flag (link cost; hypothesis, mildly increases binary). Route also has /debug/gc -> debug.FreeOSMemory. NTP: ntp.ReCreateNTPService (hub/executor/executor.go:226-234, ntp/ntp/service.go:30) starts a ticker goroutine only when ntp.enable; the package ntp/time.go provides ntp.Now offset used by TLS/time. REST API websockets (/traffic 1 s tick server.go:386-410, /memory 1 s 432-458, /logs, /connections with an interval) create goroutines per client only while the dashboard is open. The updater pulls geo data, GeoIP, UI, and the core itself (/upgrade, hub/route/upgrade.go) - candidate to cut out in router builds.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:hub/route/server.go", "line_reference": "105-153,386-458" },
+        { "url": "", "file_path": "fork:hub/executor/executor.go", "line_reference": "226-234,376-381" },
+        { "url": "", "file_path": "fork:config/config.go", "line_reference": "600" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F021",
+      "topic": "Process matching cost on Linux",
+      "description": "Process lookup runs only when a process rule is evaluated (find-process-mode strict) or when mode=always; it uses sock_diag netlink for uid+inode, then scans /proc/<pid>/fd for the inode.",
+      "technical_details": "tunnel.go:351-375 FindProcess helper (once per connection); FindProcessMode: strict (default; lazily on first process rule), always, off (tunnel.go:395-402; component/process/find_process_mode.go). component/process/process_linux.go:65-92: findProcessName -> resolveSocketByNetlink (93-175, sock_diag by src IP/port), fallback resolveSocketByProcFS (293-352, parses /proc/net/{tcp,udp}[6] text, linear in table size); resolveProcessNameByProcSearch (177-235): os.ReadDir(\"/proc\"), for every numeric pid ReadDir /proc/<pid>/fd and Readlink each fd until socket:[inode] matches: O(processes x open fds) syscalls per new connection; resolveProcessNameByUID (236-272) similar. On a router running dnsmasq/mihomo/uhttpd (tens of pids) this is cheap per lookup, but with process rules on a TUN with thousands of connections/s it burns CPU. Not useful for transparent-proxy traffic from LAN clients (source processes are on other machines): the lookup only finds local-process sockets. For a router profile the whole feature can be turned off with find-process-mode: off, or removed with a tag around the FindProcess callback.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:component/process/process_linux.go", "line_reference": "65-272,293-352" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "351-402" },
+        { "url": "", "file_path": "fork:component/process/find_process_mode.go", "line_reference": "9-30" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F022",
+      "topic": "Runtime parameters: GOMAXPROCS and worker counts",
+      "description": "automaxprocs is applied at start; UDP worker count follows GOMAXPROCS (min 4); channel capacities are fixed.",
+      "technical_details": "main.go imports go.uber.org/automaxprocs/maxprocs (main.go:31) to honor cgroup CPU limits; tunnel.initUDP uses max(4, GOMAXPROCS) workers (tunnel.go:85-97); queueCapacity 64, senderCapacity 128 (tunnel.go:36-37). No GC tuning in main.go (grep of debug./GOGC in main.go and executor found none); clashwrt sets GOGC=50 and GOMEMLIMIT=48MiB externally. Each of the up-to-N UDP worker queues holds C.PacketAdapter pointers that pin 16 KiB pool buffers (queue cap 64 x workers) so worst-case pinned UDP memory is workers x 64 x 16 KiB = 4 MiB at 4 workers (8 KiB halves it) plus 128 x 16 KiB per active sender.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:main.go", "line_reference": "31" },
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "36-37,85-97" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F023",
+      "topic": "DNS server and resolver structure relevant to routers",
+      "description": "The DNS server is an in-process miekg/dns server with middleware chain (hosts, fake-ip, resolver) and an LRU cache; fake-ip responses carry TTL fakeIPTTL; real queries go through resolver with nameserver/fallback/policy and optional DoH/DoT/DoQ clients (quic-go).",
+      "technical_details": "dns/middleware.go:240-241 builds the chain: withHosts -> withMapping (redir-host) or withFakeIP -> withResolver; the fake-ip answer has Authoritative=true, RA=true, TTL = dns.fake-ip-ttl (middleware.go:188-195). Fake-IP TTL influences how long clients cache a mapping vs pool eviction at 1000 entries (F004). DoQ/DoH3 clients link quic-go even if unused. Fallback + nameserver-policy + proxy-server-nameserver exist to avoid proxy-resolution loops (dns/resolver.go:465-483). IPv6: AAAA under fake-ip returns empty unless fake-ip-range6 set (middleware.go:~164-168).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:dns/middleware.go", "line_reference": "149-195,240-241" },
+        { "url": "", "file_path": "fork:dns/resolver.go", "line_reference": "465-483" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F024",
+      "topic": "Candidate exclusions per profile",
+      "description": "Proposed split based on code coupling, to be validated by builds.",
+      "technical_details": "Ultra Lightweight (router, transparent proxy via tproxy/redir/mixed, rule-sets .mrs, small config): exclude via tags (existing) no_tailscale no_zerotier no_easytier no_fake_tcp with_low_memory; no with_gvisor unless tun gvisor/mixed needed (default mips stack is fine) - note tailscale is gated by with_gvisor so dropping with_gvisor also drops tailscale; new tags to add: quic family (hysteria, hysteria2, tuic, masque, shadowquic; keep only if user needs), jls/restls/shadowtls, ssh, openvpn, mieru, sudoku, kcp/mkcp, wireguard/amneziawg, trusttunnel, gost-relay, ssr/snell, geodata (GEOSITE/GEOIP via .dat) with mmdb only, external-ui updater and core self-upgrade, pprof/debug route, sniffer QUIC. Keep: ss/ss2022, vmess/vless(+reality/xtls vision), trojan, socks5/http, direct/reject, anytls (if small), mixed/redir/tproxy listeners, DNS (fake-ip). Lightweight (Router): as Ultra plus quic (hysteria2/tuic), wireguard, ssh; with_low_memory. Performance: with_gvisor optional (TUN mixed/system), full quic family, all transports; keep tailscale/zerotier/easytier off anyway, 128-bit buffer sizes standard, concurrent provider load limited to 1-2. Options not needing code changes: find-process-mode off, log-level warning, external-controller off or unix socket, geodata-mode, profile.store-cache only if needed.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:adapter/parser.go", "line_reference": "30-219" },
+        { "url": "", "file_path": "fork:listener/parse.go", "line_reference": "23-171" },
+        { "url": "", "file_path": "fork:constant/features/tags.go", "line_reference": "1-40" }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F025",
+      "topic": "What not to touch without architecture changes",
+      "description": "Core invariants that make mihomo correct: metadata normalization, fake-IP reverse mapping, rule matching under configMux, retry/dial, tracker/relay pairing, NAT table semantics for UDP, and hot reload cloning of pools.",
+      "technical_details": "Do not alter without redesign: tunnel.preHandleMetadata and resolver.FindHostByIP (domain recovery, tunnel.go:289-315); the rule evaluation order + helper lazy callbacks (tunnel.go:317-412,654-711); rematch/pass semantics (668-690); packetSender / natTable / writeBack pairing for UDP (tunnel/connection.go, tproxy nat); DNS hijack interplay (listener/sing_tun/dns.go) and system DNS blacklist (server.go ~ 'AddSystemDnsBlacklist'); reload path executor.ApplyConfig (Pool.CloneFrom keeps fake-ip range stable, enhancer.PatchFrom); dialer.DefaultRoutingMark/interface binding used with auto-redirect mark mode (server.go:519-530) because direct outbound dials are marked to bypass the redirect rules. Any kernel bypass must be invalidated on rule/proxy/provider update (tunnel.UpdateRules sets rules atomically under configMux) and on fake-ip flush.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:tunnel/tunnel.go", "line_reference": "206-247,289-315,654-711" },
+        { "url": "", "file_path": "fork:listener/sing_tun/server.go", "line_reference": "519-530,605-612" },
+        { "url": "", "file_path": "fork:component/fakeip/pool.go", "line_reference": "89-118" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    }
+  ],
+  "opportunities": [
+    {
+      "name": "Serialize / bound rule-provider loading on 64-bit",
+      "description": "Replace the arch-based concurrentCount (MaxInt on arm64/amd64) with a small constant (1-2) for lightweight profiles, preferably as a tag-selected file mirroring concurrent_load_*.go.",
+      "expected_benefit": "Removes the largest probable contributor to the ~42 MB startup spike; cost is slightly slower startup. Measurable via gctrace on BPI-R4.",
+      "implementation_complexity": "low",
+      "risks": ["Startup time grows with many/large providers", "Hypothesis not yet verified by measurement"],
+      "priority": "critical"
+    },
+    {
+      "name": "Batch reads in .mrs readers and zstd decoder tuning",
+      "description": "Read leaves/labelBitmap/ranges with a single io.ReadFull into a byte slice and decode with binary.BigEndian.Uint64, avoiding millions of per-element binary.Read heap allocations; create the zstd decoder with concurrency 1 and a bounded window.",
+      "expected_benefit": "Lower transient allocation and GC pressure during provider load; fewer goroutines.",
+      "implementation_complexity": "low",
+      "risks": ["Touches upstream files (rebase conflicts), mitigate with small isolated helper functions", "Gain unmeasured"],
+      "priority": "high"
+    },
+    {
+      "name": "Per-protocol stub tags (no_quic, no_ssh, no_openvpn, no_mieru, no_sudoku, no_kcp, no_wireguard, no_restls, no_jls)",
+      "description": "Follow the tailscale/zerotier/easytier stub pattern: add `//go:build !no_X` to the real adapter/listener file and a stub file defining the Option struct and a New* that returns an error. parser.go/listener/parse.go stay untouched.",
+      "expected_benefit": "Binary size reduction (quic family, mieru+protobuf, jls, utls consumers are the top candidates); exact savings must be measured by builds.",
+      "implementation_complexity": "medium",
+      "risks": ["Option structs duplicated in stubs drift on rebase", "Shared transports (vless/vmess/trojan) import quic-go/utls so cannot be removed without touching them", "Inbound listeners need parallel stubs"],
+      "priority": "high"
+    },
+    {
+      "name": "Make the fake-IP cache size configurable or larger when RAM allows",
+      "description": "Size is hardcoded to 1000 entries (config.go ~1545); for routers with many clients, evictions cause 'fake DNS record missing' and failed long-lived connections. Raise via config or tie to fake-ip-ttl.",
+      "expected_benefit": "Stability (priority 1) under many domains; RAM cost negligible (tens of bytes per entry).",
+      "implementation_complexity": "low",
+      "risks": ["Behavioral change vs upstream"],
+      "priority": "high"
+    },
+    {
+      "name": "Dynamic destination-IP bypass set fed from tunnel decisions",
+      "description": "Add a hook after match() in tunnel.go (resolveMetadata result = DIRECT, rule chain purely IP/port based) that adds the real DstIP to an nft set maintained by mihomo, modelled on sing-tun's interval-set code and metacubex/nftables; ties into route-exclude-address-set machinery.",
+      "expected_benefit": "DIRECT flows skip the userspace relay and can be flow-offloaded (kernel conntrack/flowtable).",
+      "implementation_complexity": "high",
+      "risks": ["Shared CDN IPs: an IP learned for a DIRECT domain may also serve a PROXY domain -> leak", "Fake-IP clears DstIP; need the real IP from the dialer", "Must invalidate on rule/provider/config change and fake-ip flush", "IPv6 and per-client (source-based) policy", "First packets (conntrack) before the set entry exists"],
+      "priority": "high"
+    },
+    {
+      "name": "Statistics and connection tracking off switch",
+      "description": "Tag or option to skip NewTCPTracker/NewUDPTracker (tunnel.go:479,615) and the per-second ticker, keeping only global atomics.",
+      "expected_benefit": "Lower per-connection allocation and map contention on busy routers.",
+      "implementation_complexity": "medium",
+      "risks": ["Dashboards show no connections", "RuleUpdate and close semantics rely on tracker Close in some code paths"],
+      "priority": "medium"
+    },
+    {
+      "name": "Remove runtime geodata/UI/self-upgrade downloaders in Ultra profile",
+      "description": "Tag out component/updater (UI zip, geo, core upgrade), sevenzip/zip, and pprof route.",
+      "expected_benefit": "Smaller binary and fewer network-touching code paths on routers where packages are managed by opkg/apk.",
+      "implementation_complexity": "medium",
+      "risks": ["API compatibility with dashboards that call /upgrade", "Touches hub/route and executor wiring"],
+      "priority": "medium"
+    },
+    {
+      "name": "Default TUN stack choice per profile",
+      "description": "Ultra/Lightweight keep mips (no gvisor) or system; Performance may enable with_gvisor+mixed. Possibly drop with_gvisor from router builds entirely (also drops tailscale).",
+      "expected_benefit": "Avoids ~324 gvisor files and tailscale; kernel TCP via system stack for best throughput.",
+      "implementation_complexity": "low",
+      "risks": ["mips/system stack behaviour on MIPS/ARMv7 untested here", "Users selecting gvisor/mixed get error at config load"],
+      "priority": "medium"
+    },
+    {
+      "name": "Process lookup compile-out for router builds",
+      "description": "PROCESS-* rules are meaningless for LAN clients; add a tag making FindProcess a no-op and rejecting PROCESS-* rules at parse time.",
+      "expected_benefit": "Removes /proc scans and netlink diag code; avoids accidental CPU burn from always mode.",
+      "implementation_complexity": "low",
+      "risks": ["Configs from desktop profiles with PROCESS rules fail to load unless downgraded to warnings"],
+      "priority": "low"
+    },
+    {
+      "name": "Cap relay buffer and pool retention for DIRECT splice path",
+      "description": "Confirm copyDirect/splice triggers for DIRECT through the tracker/BufferedConn chain, and measure per-connection RAM/CPU with and without splice; consider a tag to force splice or smaller sing buf.BufferSize.",
+      "expected_benefit": "Lower CPU per DIRECT byte and lower RSS per connection (hypothesis).",
+      "implementation_complexity": "medium",
+      "risks": ["Unverified in this study", "Pipes use kernel memory (1 MiB F_SETPIPE_SZ) per active splice"],
+      "priority": "medium"
+    }
+  ],
+  "limitations": [
+    "No binaries were built or run; all sizes and memory claims are qualitative (go list file counts are a proxy, not bytes).",
+    "Whether sing bufio.Copy actually reaches splice for DIRECT through BufferedConn + tcpTracker + adapter conn was reasoned from Upstream/UnwrapReader plumbing, not executed.",
+    "bbolt/maxminddb mmap behavior and mipstack per-connection buffer sizes were not verified in module source.",
+    "sing-tun nftables priorities/chain layout were read partially (grep level), not fully traced.",
+    "Per-protocol dependency attribution used import lists of adapter/outbound files, not transitive reachability of every transport package.",
+    "Line numbers reference the checked-out tree at commit 3f27ef39; a few ranges are approximate (marked with ~)."
+  ],
+  "risks": [
+    "Concurrent provider load default on arm64 means startup memory spikes are not caused by data size alone; fixing only the readers may not remove the peak.",
+    "Fake-IP size 1000 can cause hard failures of long-lived connections on busy routers.",
+    "Kernel fast-path decisions based on IP only can break domain-specific policy (fake-ip, CDN shared IPs) and leak PROXY traffic.",
+    "Per-protocol stubs duplicate Option structs; rebase drift can cause silent decode differences.",
+    "Option/feature removal via build tags changes user-visible config validity; need explicit error messages."
+  ],
+  "recommendations": [
+    "First measure: gctrace on BPI-R4 with concurrentCount forced to 1, then with batched mrs readers, to attribute the 42 MB spike before patching.",
+    "Prefer stub-file tags over editing parser.go/listener/parse.go; keep tag names consistent (no_<protocol>) and add them to constant/features/tags.go for runtime reporting.",
+    "Treat the default `mips` TUN stack as the router default and evaluate `system` for throughput; reserve with_gvisor for the Performance profile.",
+    "For the DIRECT fast path, design around route-exclude-address-set style nft interval sets plus an invalidation hook on UpdateRules/provider update/fake-ip flush, and only enable when all rules before the match are IP/port/network only.",
+    "Raise fake-IP LRU size or make it configurable for router profiles."
+  ],
+  "open_questions": [
+    "What is the measured contribution of each factor (concurrency, binary.Read garbage, zstd decoder) to the 42 MB spike?",
+    "Does DIRECT TCP actually use splice(2) in the current relay chain, and what is its CPU/throughput effect on BPI-R4?",
+    "What is mipstack per-connection RAM and throughput compared with the system stack on MT7988A and on MIPS/ARMv7?",
+    "Can the real destination IP of a fake-IP DIRECT connection be captured at the dialer (dialer.DialContext) to feed a kernel set safely?",
+    "Which shared transports (vless/vmess/trojan with quic-go, utls, brotli) can realistically be made optional?"
+  ],
+  "conclusion": "mihomo's hot path is small and readable: one handler goroutine, one relay goroutine and a transient peek goroutine per TCP flow, two goroutines per UDP session, 32/16 KiB relay buffers (16/8 KiB with with_low_memory), and global trackers. The biggest controllable RAM items found are provider loading concurrency (MaxInt on 64-bit) with allocation-heavy .mrs readers, and linked-in heavy protocol stacks (tailscale, gvisor, easytier+wazero+6.85 MB wasm, quic-go family, mieru+protobuf, utls). Existing tags already isolate tailscale/zerotier/easytier/fake-tcp; a stub-file pattern can cover the rest with minimal rebase pain. A DIRECT kernel fast path is feasible in principle (sing-tun already maintains nft interval sets from rule-sets) but fake-IP, domain rules and CDN-shared IPs make a per-connection IP bypass unsafe unless restricted to rule chains that depend only on destination IP/port/network."
+}

@@ -1,0 +1,30 @@
+# Client node for bench/reality-server.yaml (public key xg73j5…); injected by baseline-run.sh (PROXY_INJECT).
+  - name: LW Reality
+    type: vless
+    server: 203.0.113.2
+    port: 8443
+    network: tcp
+    udp: true
+    uuid: 6f1d2c3a-8b4e-4f5a-9c7d-1e2f3a4b5c6d
+    packet-encoding: xudp
+    flow: xtls-rprx-vision
+    tls: true
+    servername: bench.test
+    client-fingerprint: chrome
+    reality-opts: {public-key: xg73j5XdvaHyqU6d63nKVlC1i77_cDTbC7os0HAQdHo, short-id: 0123abcd}
+  - name: LW Hysteria2
+    type: hysteria2
+    server: 203.0.113.2
+    port: 8444
+    password: 6f1d2c3a-8b4e-4f5a-9c7d-1e2f3a4b5c6d
+    sni: bench.test
+    skip-cert-verify: true
+  - name: LW Hysteria2 Brutal
+    type: hysteria2
+    server: 203.0.113.2
+    port: 8444
+    password: 6f1d2c3a-8b4e-4f5a-9c7d-1e2f3a4b5c6d
+    sni: bench.test
+    skip-cert-verify: true
+    up: 1000 mbps
+    down: 1000 mbps

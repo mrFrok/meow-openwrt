@@ -1,0 +1,257 @@
+{
+ "date": "2026-11-01",
+ "summary": "16 MB is not reachable for a functional router core; ~22-24 MB (arm64) is the realistic Ultra floor, ~7-8 MB xz on flash. RAM: private (anon) memory is already ~10-13 MB idle on desktop; most RSS is file-backed binary pages, reclaimable when the binary is on flash. A terminated mihomo connection can never be handed to the kernel forward path; the only DIRECT fast path is a pre-interception bypass of NEW connections whose verdict is provably IP-determinable. DIRECT TCP already uses splice(2); eBPF (XDP/TC/sk_lookup) is rejected, sockmap is at most an optional experiment; Rust components are rejected for MIPS profiles.",
+ "measurements": {
+  "host": "desktop x86_64 (CachyOS, Linux 7.3), Go 1.27.3; NOT router hardware",
+  "binary_size_stripped_bytes": {
+   "official(with_gvisor)": {
+    "arm64": 56492156,
+    "armv7": 55967868,
+    "mipsle-softfloat": 62783643,
+    "mips-softfloat": 62783643,
+    "amd64v1": 61255804
+   },
+   "lean(with_gvisor no_tailscale no_zerotier no_easytier with_low_memory no_fake_tcp)": {
+    "arm64": 37027964,
+    "armv7": 37552252,
+    "mipsle-softfloat": 42729627,
+    "mips-softfloat": 42729627,
+    "amd64v1": 40947836
+   },
+   "ultra-trial(switch cases cut, no gvisor; see note)": {
+    "arm64": 28901500,
+    "amd64v1": 32194684,
+    "arm64_gzip9": 10736544,
+    "arm64_xz9": 7290792
+   }
+  },
+  "ultra_trial_note": "Only the switch cases in adapter/parser.go and listener/parse.go were removed (17 outbounds, 13 inbounds) and with_gvisor dropped. Linker DCE still kept mipstack 416 KB (default TUN stack), quic-go 468 KB (vless xhttp-h3, DoH3/DoQ, QUIC sniffer), restls 356 KB, jls-tls 301 KB, protobuf 477 KB (GeoSite.dat), reedsolomon 237 KB (kcptun plugin). File-level build tags are needed for the rest.",
+  "ultra_trial_sections_arm64_KB": {
+   ".text": 12302,
+   ".gopclntab": 10665,
+   ".go.type": 3290,
+   ".rodata": 878,
+   ".noptrdata": 705,
+   ".data": 216
+  },
+  "rss_KB_idle_and_100_slow_DIRECT_downloads(amd64, empty config, GOMAXPROCS=1)": {
+   "official": {
+    "idle": {
+     "rss": 44700,
+     "anon": 12700,
+     "file": 32000
+    },
+    "peak100": {
+     "rss": 48640,
+     "anon": 15060,
+     "file": 33580
+    }
+   },
+   "lean": {
+    "idle": {
+     "rss": 34632,
+     "anon": 10020,
+     "file": 24612
+    },
+    "peak100": {
+     "rss": 38836,
+     "anon": 12900,
+     "file": 25936
+    }
+   },
+   "ultra-trial": {
+    "idle": {
+     "rss": 29964,
+     "anon": 9604,
+     "file": 20360
+    },
+    "peak100": {
+     "rss": 34412,
+     "anon": 12856,
+     "file": 21556
+    }
+   }
+  },
+  "rss_note": "GOMAXPROCS=4 differs by <2 MB. Kernel memory of splice pipes is not in RSS and was not measured. Binary ran from tmpfs here, so file pages were RAM-backed; on a router with the binary on flash they are reclaimable page cache."
+ },
+ "verdicts": {
+  "flow_offload_research:F001": {
+   "verdict": "confirmed",
+   "note": "linux:net/netfilter/nft_flow_offload.c hook_mask = 1<<NF_INET_FORWARD (validate)"
+  },
+  "flow_offload_research:F002": {
+   "verdict": "confirmed",
+   "note": "linux:net/netfilter/nf_flow_table_core.c flow_offload_lookup returns NULL when nf_ct_is_dying"
+  },
+  "flow_offload_research:F005": {
+   "verdict": "confirmed",
+   "note": "consistent with F001: local delivery (TPROXY/REDIRECT) is never in FORWARD"
+  },
+  "ebpf_xdp_research:F002": {
+   "verdict": "confirmed",
+   "note": "openwrt:config-6.12 NET_SOCK_MSG=y, BPF_SYSCALL=y builds sock_map.o (linux:net/core/Makefile:42-43); verdict-only path sk_psock_start_verdict (skmsg.c:1306) is outside the BPF_STREAM_PARSER block (1113-1239). Resolves the conflict with openwrt_kernel F004/F021."
+  },
+  "ebpf_xdp_research:F007": {
+   "verdict": "corrected",
+   "note": "True for Go stdlib, but mihomo's relay uses sing's own splice (mod:sing@v0.5.8/common/bufio/splice_linux.go) via copyDirect, not net.TCPConn.ReadFrom."
+  },
+  "ebpf_xdp_research:F011": {
+   "verdict": "confirmed",
+   "note": "linux:arch/mips/net/bpf_jit_comp32.c and bpf_jit_comp64.c, arch/arm/net/bpf_jit_32.c exist in 6.12.112"
+  },
+  "openwrt_kernel:F003": {
+   "verdict": "confirmed",
+   "note": "openwrt:target/linux/generic/config-6.12 lines 713-719: BPF_JIT=y, BPF_SYSCALL=y, BPF_STREAM_PARSER unset, JIT_ALWAYS_ON unset"
+  },
+  "openwrt_kernel:F004": {
+   "verdict": "corrected",
+   "note": "CGROUPS unset is correct (config-6.12:882), but sockmap sk_skb verdict and sk_msg do NOT need cgroups/stream parser: NET_SOCK_MSG=y (config-6.12:4230)."
+  },
+  "network_performance:F002": {
+   "verdict": "confirmed",
+   "note": "mod:sing@v0.5.8/common/bufio/copy.go: UnwrapCountReader/Writer then copyDirect"
+  },
+  "network_performance:F005": {
+   "verdict": "confirmed",
+   "note": "fact part confirmed: sing splice_linux.go:12,24 sets F_SETPIPE_SZ=1 MiB per pipe (Go stdlib internal/poll/splice_linux.go does the same). Memory impact on routers remains a hypothesis to measure.",
+   "status": "probable"
+  },
+  "mihomo_architecture:F004": {
+   "verdict": "confirmed",
+   "note": "fork:config/config.go:1545 fakeip.Options Size: 1000 (in-memory LRU unless store-fake-ip)"
+  },
+  "mihomo_architecture:F007": {
+   "verdict": "confirmed",
+   "note": "fork:config/config.go:548 default Stack C.TunMips"
+  },
+  "mihomo_architecture:F012": {
+   "verdict": "partially-confirmed",
+   "note": "Concurrency part confirmed: hub/executor/concurrent_load_unlimit.go concurrentCount=MaxInt on 386/amd64/arm64/arm64be; _single.go =1 on mips/mipsle; _limit.go =5 elsewhere. Spike attribution still a hypothesis until gctrace with concurrency 1 on BPI-R4."
+  },
+  "mihomo_architecture:F013": {
+   "verdict": "confirmed",
+   "note": "tags seen in fork: with_gvisor, with_low_memory, no_tailscale, no_zerotier, no_easytier, no_fake_tcp, cmfa"
+  },
+  "go_runtime_memory:F002": {
+   "verdict": "corrected",
+   "note": "Green Tea GC is ON by default in Go 1.27 (go:internal/buildcfg/exp.go:86 GreenTeaGC: true in baseline). 1.26 status not re-checked.",
+   "status": "confirmed"
+  },
+  "go_runtime_memory:F006": {
+   "verdict": "confirmed",
+   "note": "independent run: official amd64 idle RSS 44.7 MB (mem.sh) vs agent 46 MB"
+  },
+  "go_runtime_memory:F010": {
+   "verdict": "confirmed",
+   "note": "bench/size.sh reproduces the per-arch sizes byte-for-byte for official tags"
+  }
+ },
+ "contradictions": [
+  {
+   "topic": "sockmap availability on stock OpenWrt",
+   "between": [
+    "ebpf_xdp_research:F002",
+    "openwrt_kernel:F004/F021"
+   ],
+   "resolution": "ebpf agent is right: verdict-only sockmap works without CGROUPS/BPF_STREAM_PARSER (NET_SOCK_MSG=y)."
+  },
+  {
+   "topic": "hardware offload availability",
+   "between": [
+    "network_performance:F015",
+    "flow_offload_research:F014"
+   ],
+   "resolution": "No conflict: generic kernels have no HW offload; MediaTek mtk_eth_soc/PPE does standard flowtable HW offload. Other vendors software-only or out-of-tree."
+  },
+  {
+   "topic": "where DIRECT TCP is spliced",
+   "between": [
+    "ebpf_xdp_research:F007",
+    "network_performance:F001-F003"
+   ],
+   "resolution": "sing's own splice path (with 1 MiB pipes), confirmed by network agent experiment and by source."
+  }
+ ],
+ "recommendations": [
+  {
+   "id": "D1",
+   "title": "Redefine the size target per profile",
+   "decision": "16 MB is not reachable without dropping utls/REALITY, the QUIC stack and mihomo's HTTP fork. Proposed targets (stripped, arm64): Ultra <=24 MB, Lightweight <=31 MB, Performance = current lean 37 MB; MIPS +15%. Report xz size (flash) next to it: Ultra ~7-8 MB.",
+   "confidence": "medium (Ultra figure is an estimate from the trial build + per-module weights)",
+   "status": "proposed"
+  },
+  {
+   "id": "D2",
+   "title": "Per-protocol build tags via stub files",
+   "decision": "Follow the existing tailscale/zerotier/easytier stub pattern: each protocol file gets //go:build !no_<proto> and a stub returning 'disabled at build time'; switches stay untouched (rebase-friendly). Patches needed beyond stubs: vless xhttp-h3, DoH3/DoQ, QUIC sniffer (for no_quic), shadowsocks plugins restls/kcptun, geodata protobuf (no_geosite_dat).",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D3",
+   "title": "Memory target defined as private memory",
+   "decision": "Measure and report RssAnon + kernel memory attributable to the core (pipes, sockets) as the RAM metric; report RssFile separately. Require the binary on flash (/usr/bin), never /tmp.",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D4",
+   "title": "First memory patches",
+   "decision": "(a) provider load concurrency 1-2 on low-memory profiles (one build-tagged file); (b) .mrs reader without per-element binary.Read allocations; (c) cap splice pipe size (e.g. 64-256 KiB) on low-memory profiles - needs a sing patch or a replace; (d) default GOMEMLIMIT/GOGC from /proc/meminfo when env is unset. Each measured on BPI-R4 before/after.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D5",
+   "title": "DIRECT fast path = pre-interception bypass of NEW connections",
+   "decision": "No hand-back of terminated connections (impossible). The core marks a connection bypass-eligible only if its verdict is IP-determinable: the matched rule and every earlier rule that could match differently depend only on (dst IP, dst port, network[, src IP]); earlier non-determinable rules are allowed only if their outbound is the same DIRECT. Fake-IP connections and sniffed-host decisions are never eligible. Eligible keys go to an nft timeout set checked before interception; invalidation = flush set + conntrack delete by ct mark on every rule/config change and on core start/stop. Glue (clashwrt) owns the nft table; the core only emits verdicts (flow agent option C) behind a build tag.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D6",
+   "title": "eBPF scope",
+   "decision": "Reject XDP, TC-BPF, sk_lookup, cgroup hooks for the core. sockmap verdict redirect for terminated DIRECT TCP: optional experiment only (Performance profile, build tag, raw-syscall loader preferred over cilium/ebpf +1.6 MB), adopted only if BPI-R4 shows a clear CPU win over splice. Fallback = splice (today's path).",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D7",
+   "title": "Rust components",
+   "decision": "Not for stages II-X: cgo breaks the pure-Go static cross-build and needs musl toolchains; Rust MIPS targets are tier 3; crypto on MIPS/ARMv7 is no faster; Go runtime overhead stays. meow-rs is used only as an external comparison baseline.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D8",
+   "title": "CPU levers before code",
+   "decision": "Profile defaults and docs: tproxy/redirect or TUN system stack instead of mips/gvisor userspace stacks; ChaCha20-Poly1305 or VLESS-vision on MIPS/ARMv7 (no AES asm); tun.gso where the kernel allows; PGO only with a real MIPS/ARMv7 profile (4pda volunteers).",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D9",
+   "title": "Toolchain",
+   "decision": "Build with the newest stable Go (1.27.x) unless a benchmark shows a regression vs upstream's 1.26; record Go version in every BENCHMARKS row. CGO_ENABLED=0, non-PIE, -trimpath -s -w -buildid=.",
+   "confidence": "medium",
+   "status": "proposed"
+  }
+ ],
+ "unresolved": [
+  "Real Ultra size with file-level tags (stage II, first task).",
+  "Startup spike cause on BPI-R4: gctrace with provider concurrency forced to 1.",
+  "Kernel memory of 1 MiB splice pipes under 100-500 bulk flows on a 128-256 MB router.",
+  "sockmap vs splice CPU on arm64 (BPI-R4) and MIPS (mt7621).",
+  "Does nft flowtable accept a tun device (relevant for TUN-mode bypass)?",
+  "clashwrt's bypass4_dns (domain -> IP via dnsmasq nftset) has the same shared-CDN-IP hazard as a domain-based dynamic bypass: check how clashwrt limits it (separate task in clashwrt).",
+  "UDP datagrams >8 KiB with with_low_memory (possible truncation).",
+  "Whether Go 1.27 vs 1.26 changes RSS/CPU on arm64 and MIPS."
+ ],
+ "hardware_data_needed": [
+  "BPI-R4: output of bench/hwprobe.sh",
+  "BPI-R4: OpenWrt version, where the core binary lives, whether the core may be stopped for benchmarks",
+  "A LAN PC behind the router for iperf3/wrk; uplink speed",
+  "A proxy server for PROXY scenarios (VPS or own node) and its protocols",
+  "4pda volunteers (mt7621, ath79, ipq40xx, filogic): output of bench/hwprobe.sh (read-only, masks addresses)"
+ ]
+}

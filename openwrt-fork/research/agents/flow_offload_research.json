@@ -1,0 +1,332 @@
+{
+  "agent": "flow_offload_research",
+  "model": "Claude Sonnet 5.5",
+  "effort": "Medium",
+  "research_date": "2026-11-01",
+  "scope": [
+    "nf_flowtable software/hardware offload semantics (linux 6.12.112)",
+    "which data paths (routing, TPROXY, TUN, mihomo DIRECT/PROXY) can be offloaded",
+    "nftables set based pre-interception bypass fed from mihomo (metacubex/nftables API, clashwrt setctl/fw)",
+    "correctness and safety of DIRECT fast path",
+    "per-vendor hardware NAT (MediaTek, Qualcomm, Realtek, Broadcom, Rockchip) and SQM interaction"
+  ],
+  "summary": "A connection already terminated by mihomo cannot be handed back to the kernel forward path: it is two independent TCP sockets with unrelated sequence numbers, and conntrack sees a local-delivery (INPUT/OUTPUT) flow, not a FORWARD flow. The only sound fast path is to decide BEFORE interception, so the first SYN of a connection is plain-routed and nft flow offload picks it up after ESTABLISHED. Offloaded flows skip netfilter prerouting entirely (flowtable hooks at ingress, priority 0), so any bypass entry is a hard commitment: it must be exact (full 4-tuple or at least saddr.daddr.dport with timeout), invalidated on any rule/config change by flushing the set AND deleting conntrack entries (a dying ct makes flow_offload_lookup fail immediately, in software; hardware entries are removed through the gc/teardown path within about 1s). The metacubex/nftables fork already has timeouts, concatenation and element add/delete/flush, so a Go-native updater is feasible but is a new code path (sing-tun uses the same library for its redirect rules). Hardware NAT that works through the standard flowtable 'flags offload' exists mainly on MediaTek (PPE on MT7622/MT7986/MT7981/MT7988, not MT7621); everything else is software flowtable only or vendor-private stacks.",
+  "findings": [
+    {
+      "id": "F001",
+      "topic": "Flowtable eligibility: what qualifies",
+      "description": "nft 'flow offload' is valid only in the FORWARD hook, only for TCP/UDP (GRE without NAT/key too), and only for confirmed conntrack entries. TCP requires nf_conntrack_tcp_established() and the current packet must not carry FIN or RST. Flows with a conntrack helper, IPS_SEQ_ADJUST or IPS_NAT_CLASH are refused.",
+      "technical_details": "nft_flow_offload_eval(): tcph->fin || tcph->rst || !nf_conntrack_tcp_established(ct) -> skip (nft_flow_offload.c:333-338); protonum switch allows only TCP, UDP, GRE (329-352); helper/SEQ_ADJUST/NAT_CLASH -> skip (355-357); !nf_ct_is_confirmed -> skip (360); IPS_OFFLOAD_BIT test_and_set (363). Hook validation: hook_mask = 1<<NF_INET_FORWARD (399-406). UDP has no established check (any confirmed UDP ct qualifies, in practice offloaded after the first reply makes it ASSURED only if the user rule requires 'ct state established'). Consequence: traffic delivered locally (INPUT) or originated locally (OUTPUT), which is every mihomo TPROXY/redirect/TUN connection, can never be offloaded.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "https://docs.kernel.org/networking/nf_flowtable.html", "file_path": "linux:net/netfilter/nft_flow_offload.c", "line_reference": "325-363, 399-406" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F002",
+      "topic": "Flowtable lifecycle, timeouts, FIN/RST, conntrack deletion",
+      "description": "A flow entry is torn down on: FIN/RST seen on the fast path, timeout expiry, or conntrack dying. When the ct is deleted (conntrack -D) the software fast path stops at once because flow_offload_lookup() returns NULL for a dying ct; the entry itself is reaped by the 1 s gc worker; for hardware offload it is first marked HW_DYING and removed from the device, then freed once HW_DEAD is set.",
+      "technical_details": "FIN/RST on the fast path: nf_flow_table_ip.c:31-34 -> flow_offload_teardown() (clears IPS_OFFLOAD, sets NF_FLOW_TEARDOWN, flow_offload_fixup_ct() restores ct timeout so the slow path takes over cleanly). flow_offload_lookup(): TEARDOWN flag -> NULL; nf_ct_is_dying(flow->ct) -> NULL (nf_flow_table_core.c:374-378) so a packet of a killed flow falls back to the normal stack (where, with ct gone, it is a NEW connection hitting prerouting rules again, i.e. TPROXY/redirect would now apply or a RST path). gc: nf_flow_offload_gc_step tears down if expired, ct dying or custom gc (core.c:425-431); gc interval HZ (core.c:458). Idle timeout NF_FLOW_TIMEOUT = 30 s (include/net/netfilter/nf_flow_table.h:189), refreshed on each packet; offload_timeout sysctl tunes ct timeouts while offloaded (core.c:174-199, 263-279). Hardware entries: NF_FLOW_HW_DYING set at nf_flow_table_offload.c:1129, HW_DEAD at 1062. So 'conntrack -D' (or nf_ct_iterate_cleanup via netlink delete) is an immediate invalidation in software and about 1 s in hardware (hypothesis for exact HW latency: depends on driver stats/flow_block callbacks, unmeasured).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:net/netfilter/nf_flow_table_core.c", "line_reference": "174-199, 263-279, 351-357, 366-380, 425-458" },
+        { "url": "", "file_path": "linux:net/netfilter/nf_flow_table_ip.c", "line_reference": "25-40" },
+        { "url": "", "file_path": "linux:net/netfilter/nf_flow_table_offload.c", "line_reference": "1062, 1129" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F003",
+      "topic": "Flowtable hooks at ingress: offloaded flows skip prerouting, firewall and TPROXY",
+      "description": "The fw4 flowtable is declared 'hook ingress priority 0' on the listed devices; the software fast path forwards the packet from there, before inet prerouting/forward chains. Established offloaded flows therefore never see mangle/TPROXY/redirect rules, nor forward-chain rules, nor mihomo's marking. This is why a flow that was classified as PROXY must never be offloaded, and why invalidation must destroy the flow, not just edit rules.",
+      "technical_details": "firewall4 ruleset.uc:20-30 (flowtable ft { hook ingress priority 0; devices=...; flags offload if flow_offloading_hw }), and line 141: 'meta l4proto { tcp, udp } flow offload @ft;' as the FIRST rule of chain forward (before 'ct state established accept'). Only packets that already survived prerouting and reached the forward hook, in ESTABLISHED state, get added. A packet that was TPROXY'd or REDIRECT'd to a local socket never reaches FORWARD, so it is naturally never added. Danger case: a flow that began as plain-routed (bypass hit) and later should be PROXY (rule change) keeps being fast-pathed until torn down.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fw4:root/usr/share/firewall4/templates/ruleset.uc", "line_reference": "20-30, 135-141" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F004",
+      "topic": "Path matrix: which paths can be offloaded",
+      "description": "Plain routed: yes (SW flowtable on all, HW only where a driver implements flow_block). TPROXY / REDIRECT to mihomo: no (local delivery, FORWARD hook never reached). TUN: no (routed into tun device, read in userspace; the reverse path is OUTPUT/local; also device not in the flowtable device list). DIRECT via mihomo: no (mihomo's outbound is a locally originated socket, OUTPUT hook, conntrack entry for the second leg is a local-out flow). PROXY via mihomo: no, and must not be. Only traffic that the kernel routes without ever delivering it to a local socket is offloadable.",
+      "technical_details": "Condition is structural: flow offload expression is validated only for the forward hook (nft_flow_offload.c:399-406). In a mihomo DIRECT connection there are two conntrack entries: client<->router:port (rewritten by redirect/TPROXY, local delivery) and router<->server (local OUT). Neither is a forwarded flow.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:net/netfilter/nft_flow_offload.c", "line_reference": "399-406" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F005",
+      "topic": "Why an already-terminated mihomo connection cannot be handed back",
+      "description": "After mihomo accepts, it holds two unrelated TCP connections (client-to-router with router ISN/window/options/timestamps, router-to-server with different ISN, MSS, window scaling, SACK, ECN, timestamps) plus buffered bytes in socket queues and possibly TLS sniffing state. The forward path would need seq/ack/option translation per direction (the kernel's flowtable does NAT only at L3/L4 port/addr level, no sequence rewriting; flows with IPS_SEQ_ADJUST are explicitly refused). Handing back would also require retiring both sockets silently (no FIN/RST, else peer notified) and recreating a conntrack entry in ESTABLISHED state without having seen the handshake: in-kernel there is no supported path for that (conntrack TCP_REPAIR-like injection exists only for socket state, not for the forwarding conntrack of the gateway).",
+      "technical_details": "Possible only with a splice-to-kernel scheme that does not exist: even TCP_REPAIR (restoring socket state) moves sockets between processes, not into the forwarding path. Equivalent trick (transparent re-injection with seq translation) is a custom eBPF/XDP program with per-flow offset maps; it still cannot be offloaded by flowtable and still runs per packet in the CPU, so it is a different, much larger project. UDP is slightly different: a DIRECT UDP association has no sequence state, but the same two-conntrack-entry structure and NAT mismatch (source port rewritten by mihomo's socket) apply, and QUIC connection migration/ID semantics are preserved only if the real client address stays on the wire. Conclusion: classification-after-the-fact cannot hand off the current connection; only FUTURE connections can be diverted.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:net/netfilter/nft_flow_offload.c", "line_reference": "355-357" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F006",
+      "topic": "Realistic mechanism: pre-interception exact-tuple bypass set",
+      "description": "Mihomo classifies connection N, then installs a set element that the PREROUTING interception rule tests first (return/accept before TPROXY/redirect). Connection N itself continues through userspace; connections N+1.. to the same key are plain routed, then SW/HW flowtable-offloaded. Keys: choose granularity by policy certainty. Concatenation daddr . dport (+ proto) is the minimum; saddr . daddr . dport is safer (per-device policy); full 4-tuple is meaningless for a not-yet-existing connection (ephemeral sport).",
+      "technical_details": "nft set 'type ipv4_addr . ipv4_addr . inet_service; flags timeout; timeout 5m' (+ a v6 twin) with a rule 'ip saddr . ip daddr . tcp dport @direct_fast return' placed before the interception rule in a priority mangle (-150) prerouting chain; the same rule with 'meta l4proto' split for udp. Dynamic (kernel-side) insertion is also possible with 'update @s { ... timeout 5m }' but only for data-plane triggers, not for userspace verdicts, so userspace must add. clashwrt already runs this exact structure: 'ip daddr @bypass4 return' (fw.sh:477-478) with a static interval set (fw.sh:538) and a timeout set bypass4_dns (flags timeout; timeout 1d, fw.sh:539), refilled via nft -f batches by setctl.sh (flush set + add element, setctl.sh:797-799).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/fw.sh", "line_reference": "459, 477-478, 522-543" },
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/setctl.sh", "line_reference": "797-799, 948-949" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F007",
+      "topic": "Go APIs: metacubex/nftables and google/nftables set updates",
+      "description": "The fork's indirect dependency github.com/metacubex/nftables@v0.0.0-20260426003805-208c2c1ba2cb (a google/nftables derivative; module path used by sing-tun@v0.4.28 redirect_nftables_*.go) supports everything needed: sets with HasTimeout/Timeout/Dynamic/Concatenation/Interval, SetAddElements, SetDeleteElements, FlushSet, GetSetElements, and flowtables (flowtable.go). Elements carry a per-element Timeout and Expires. Updates are sent over a netlink batch; the Conn buffers messages until Flush().",
+      "technical_details": "set.go: type SetElement{Key, Val, KeyEnd, IntervalEnd, Timeout, Expires, Counter...} (277-296); (cc *Conn) SetAddElements (376), AddSet (496, flags incl. Concatenation 537, Timeout 559-561), SetDeleteElements (704), FlushSet (727), GetSetElements (972). Per-element timeout is written only when the set has HasTimeout (422-424). Concatenated keys must be hand-packed as padded 4-byte-aligned fields (v4 addr 4B, port 2B padded to 4B on the wire: hypothesis, check against nft's own encoding before use) since the library does not build the concat key for you. Note: the module is currently an indirect dep, so enabling this in the fork adds sing-tun's already-linked package to the build; a direct dep would be only a go.mod change. Cost per update: one netlink sendmsg per Flush (batch many adds per Flush); about tens of microseconds of syscall plus kernel set insertion (hash set, O(1)); not benchmarked here.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "https://pkg.go.dev/github.com/google/nftables", "file_path": "mod:github.com/metacubex/nftables@v0.0.0-20260426003805-208c2c1ba2cb/set.go", "line_reference": "253-296, 376-430, 496-562, 704-727, 972" },
+        { "url": "", "file_path": "fork:go.mod", "line_reference": "117" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F008",
+      "topic": "Mihomo's existing route-exclude-address-set and why it is not enough",
+      "description": "Mihomo/sing-tun already has RouteExcludeAddressSet (tun config) which feeds an nft set checked by sing-tun's auto-redirect rules, but it is a STATIC address-set mechanism (CIDR lists) and only exists when mihomo owns the firewall (auto-route + auto-redirect). It does not provide per-connection verdict-driven insertion or invalidation.",
+      "technical_details": "fork config/config.go:298 (RouteExcludeAddressSet) and :1719. clashwrt's own comment in setctl.sh header states route-exclude-address-set requires auto-route and auto-redirect and is incompatible with routing-mark, hence clashwrt keeps its own set. A dynamic exact-tuple bypass module would be a separate component in the core (e.g. a `fastpath` package) wired to the rule matcher result.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fork:config/config.go", "line_reference": "298, 1719" },
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/setctl.sh", "line_reference": "4-15" }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F009",
+      "topic": "Shared CDN IP hazard",
+      "description": "A domain-based DIRECT verdict must not become an IP-level exemption unless that exact IP is provably only reachable under that verdict. On a shared CDN IP, domain A (DIRECT) and domain B (PROXY) hit the same address; bypassing by daddr would send B's traffic direct (leak and policy violation). The bypass key therefore needs either (a) per-connection proof that the whole IP . port is policy-uniform, or (b) a poison rule that blocks insertion.",
+      "technical_details": "Safe insertion criteria (proposal): insert only when (1) the verdict came from a rule whose result is independent of the domain (GEOIP/IP-CIDR/DST-PORT/PROCESS-NAME-by-source-IP) OR (2) the DNS answer cache maps this IP to only domains with the same verdict (mihomo already keeps ip->domain mapping for fake-ip and for sniffing), AND no rule in the config could yield a different outcome for any domain (a global check at config load: if any DOMAIN/ RULE-SET-domain rule routes to a non-DIRECT outcome, mark domain-derived inserts 'tainted' and only allow IP-derived verdicts). Reverse hazard: a DNS answer that later returns a PROXY domain on an IP already in the set must delete the element (mihomo sees every resolution through its DNS server; hook there). With ECH/HTTP3 the SNI is invisible, so sniffer-based domain verdicts cannot support (b).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "", "line_reference": "" }
+      ],
+      "confidence": "medium",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F010",
+      "topic": "fake-ip incompatibility",
+      "description": "In fake-ip mode clients connect to fake addresses; the kernel cannot route those to the real server, and a bypass keyed on a fake IP would just black-hole. A DIRECT fast path needs the client to hold the real IP, so the DNS server must hand out real-IP answers for domains whose verdict is DIRECT (fake-ip-filter semantics, reverse of the usual direction), accepting that the domain->verdict mapping must be known at DNS time (rule-based on domain; GEOIP-derived DIRECT is unknown at DNS time).",
+      "technical_details": "Design consequence: only domain-decidable DIRECT (DOMAIN/ DOMAIN-SUFFIX/ RULE-SET domain) can be real-ip answered. IP-based DIRECT (GEOIP,RU) needs resolution first; with real-ip mode the client already has the real IP and the kernel-level set can cover it by CIDR (static, like clashwrt's bypass4 interval set). Also, DNS leak: real-ip answers for DIRECT domains must come from a DNS upstream consistent with policy (direct nameservers), and PROXY domains stay fake-ip so no real-IP leaks occur. Hypothesis: mixed mode adds complexity and is the fragile part, so a profile may restrict the fast path to real-IP mode.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "", "line_reference": "" }
+      ],
+      "confidence": "medium",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F011",
+      "topic": "IPv6, UDP/QUIC, and sniffer interactions",
+      "description": "IPv6: needs a parallel ipv6_addr set and the same ordering; the flowtable handles IPv6 forward (nft_flow_offload.c:250-251) and MediaTek PPE supports IPv6 5-tuple (mtk_foe_entry_set_ipv6_tuple). Without NAT, IPv6 clients have globally routable source addresses, so a bypass key of saddr . daddr is natural. UDP/QUIC: a UDP flow is offload-eligible once confirmed; QUIC to a DIRECT destination is safe to bypass once the verdict is known, but a PROXY-policy QUIC flow must be dropped/blocked first (or the first Initial must be intercepted) since the bypass set is consulted per packet, not per connection: the first packet of a flow decides the conntrack path. Sniffer: the sniffer needs the first bytes through userspace to learn the SNI, so SNI-based decisions are possible only from connection N onward; the first connection per (src,dst,dport) always goes through mihomo.",
+      "technical_details": "nft_flow_offload.c:242-251 set fl.u.ip4/ip6 tuple per family. Race: between mihomo's decision on connection N and the set insertion, the kernel may route a retransmitted SYN or a second parallel connection (browsers open several) to mihomo, which is harmless (consistent verdict). The unsafe race is the reverse: PROXY verdict follows a DIRECT insertion on the same key (policy changed, DNS answer remapped). That is covered by F013 invalidation.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:net/netfilter/nft_flow_offload.c", "line_reference": "242-251" },
+        { "url": "", "file_path": "linux:drivers/net/ethernet/mediatek/mtk_ppe_offload.c", "line_reference": "66-70, 354" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F012",
+      "topic": "Set update vs first packet race",
+      "description": "Netlink set insertion becomes visible to the data plane at transaction commit (nf_tables uses a generation counter; a batch is atomic). A connection's first SYN either sees the old or the new set content, never a partial one. Exposure: insertion latency (Go goroutine + syscall + commit) means the first few connections still go through mihomo; this is a performance, not a safety, race. Safety race is the opposite direction (stale DIRECT element kept after policy flips).",
+      "technical_details": "Mitigation set: (a) short element timeout (for example 30-120 s, refreshed only on a new classification) bounds staleness even if mihomo dies; (b) element add runs in a batched, non-blocking worker so dial latency is unaffected; (c) config reload runs 'flush set; conntrack delete for bypassed tuples' before the new rule table goes live. The kernel set timeout is evaluated lazily on lookup: expired elements are not matched.",
+      "source_type": "official_docs",
+      "sources": [
+        { "url": "https://wiki.nftables.org/wiki-nftables/index.php/Sets", "file_path": "", "line_reference": "timeouts section" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F013",
+      "topic": "Invalidation on rule change and mihomo crash",
+      "description": "On config/rule/proxy-group change or when policy cannot be guaranteed: flush the bypass sets, then delete conntrack entries that were offloaded through the bypass (a flushed set only stops NEW flows; established offloaded flows keep forwarding past all rules). Deletion via NFNL_SUBSYS_CTNETLINK delete (conntrack -D with a source/dest filter) makes the ct dying and flow_offload_lookup stop matching immediately (software). Mihomo crash: bypass entries remain in the kernel; with kernel-side timeouts the DIRECT shortcut persists until expiry, and offloaded established flows continue to work. This is a fail-open for destinations that were classified DIRECT only, which is acceptable when classifications were DIRECT; the dangerous part is the INTERCEPTION rules (TPROXY/redirect) pointing at a dead listener, which is an existing clashwrt watchdog problem ('autobypass' flag, fw.sh:47-52), not new.",
+      "technical_details": "Because a flow-offload entry is created from a ct and the ct holds the policy state, the clean invalidation primitive is ct deletion (by tuple). Mark-based selective deletion: tag bypass-accepted packets with a ct mark (e.g. 'ct mark set 0x...' in the bypass rule) and delete all ct with that mark via ctnetlink (conntrack -D -m <mark>); this is O(conntrack table) once per rule change and avoids tracking per-flow tuples in Go. SW flowtable also honours NF_FLOW_TEARDOWN set when the ct is killed (core.c:429). Kill-switch semantics (hypothesis, design choice): on crash with strict mode, the supervisor must flush the bypass set AND the ct entries, otherwise 'kill switch' leaves a DIRECT shortcut open for up to the element timeout.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:net/netfilter/nf_flow_table_core.c", "line_reference": "374-380, 425-431" },
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/fw.sh", "line_reference": "47-52, 80" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F014",
+      "topic": "MediaTek PPE (standard flowtable hardware offload)",
+      "description": "MediaTek is the one family where upstream nf_flowtable 'flags offload' maps to hardware: the mtk_eth_soc driver implements ndo_setup_tc for flow blocks and mtk_ppe_offload.c programs FOE entries (IPv4 and IPv6 tuples, NAT, VLAN/PPPoE, DSA tags). Enabled in OpenWrt for mediatek targets (NET_MEDIATEK_SOC with WED def_bool). WED (Wireless Ethernet Dispatch) is a separate hardware path for MT7915/MT7916/MT7615 Wi-Fi which lets PPE-forwarded flows skip the CPU to wireless; it requires CONFIG_NET_MEDIATEK_SOC_WED and PPE.",
+      "technical_details": "mtk_eth_soc.c:4643 .ndo_setup_tc = mtk_eth_setup_tc; mtk_ppe_offload.c:267 mtk_flow_offload_replace (parses flow_rule: meta, control, basic, ipv4/ipv6 addrs, ports); mtk_ppe_offload.c:101-295 handles WED only if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED). OpenWrt: generic/config-6.12:4390 '# CONFIG_NF_FLOW_TABLE is not set' (generic default), enabled via kmod-nf-flow (netfilter.mk:199-210 CONFIG_NF_FLOW_TABLE and NF_FLOW_TABLE_HW); mediatek filogic/mt7622/mt7629/mt7623 config set NET_MEDIATEK_SOC=y (mt7621 and other ramips use ramips ethernet and are SOFTWARE-only: hypothesis, check target config). SoC coverage: which have a working PPE: MT7622 (PPE v1), MT7623 (hypothesis), MT7981/MT7986/MT7988 (NETSYS v2/v3, the filogic target). Rate: wire speed forwarding, on filogic 2.5G/10G ports. HW NAT PPE has a flow-table size limit (order of 16k entries per PPE; unverified), hardware flows beyond the table fall back to software flowtable.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "linux:drivers/net/ethernet/mediatek/mtk_eth_soc.c", "line_reference": "4643" },
+        { "url": "", "file_path": "linux:drivers/net/ethernet/mediatek/mtk_ppe_offload.c", "line_reference": "101, 267-318" },
+        { "url": "", "file_path": "openwrt:package/kernel/linux/modules/netfilter.mk", "line_reference": "199-210" },
+        { "url": "", "file_path": "openwrt:target/linux/mediatek/filogic/config-6.12", "line_reference": "326-327" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F015",
+      "topic": "Qualcomm: ipq40xx and ipq807x/qualcommax",
+      "description": "ipq40xx (IPQ4018/4019) has no hardware NAT in OpenWrt; software flowtable only. ipq807x/ipq60xx (qualcommax) have NSS/PPE offload only through vendor out-of-tree stacks (qca-nss-drv/ECM from the NSS-OpenWrt forks, e.g. the 'NSS builds'), not the standard nf_flowtable hw offload, and these stacks are not in OpenWrt mainline. ECM takes over conntrack-based flow acceleration with its own sysctls and does not honour nft sets in the same way.",
+      "technical_details": "In openwrt v25.12.6 sparse: no NSS packages in target/linux/qualcommax tree (grep for NSS/OFFLOAD in qualcommax/ipq40xx configs returned nothing relevant). Recommendation for a fast path: treat Qualcomm as software-flowtable only unless the user installs an NSS build, and detect it (presence of /sys/kernel/debug/ecm or kmod qca-nss-ecm) to DISABLE the bypass design since ECM can accelerate flows created before the bypass set was edited and has its own invalidation (hypothesis).",
+      "source_type": "secondary_source",
+      "sources": [
+        { "url": "https://openwrt.org/docs/guide-user/firewall/fw3_configurations/fw3_nat#flow_offloading", "file_path": "", "line_reference": "" },
+        { "url": "", "file_path": "openwrt:target/linux/qualcommax", "line_reference": "" }
+      ],
+      "confidence": "medium",
+      "status": "unverified"
+    },
+    {
+      "id": "F016",
+      "topic": "Realtek, Broadcom, Rockchip, ramips/ath79",
+      "description": "Realtek rtl838x/rtl93xx: the switch ASIC can route L3 but OpenWrt's DSA driver (rtl838x) exposes switching only for the router CPU path; L3 hardware offload is not exposed to nf_flowtable (hypothesis, not confirmed in sparse tree). Broadcom: proprietary CTF/Runner/Flow Cache (in vendor SDK firmware), not in OpenWrt; a Broadcom router running OpenWrt uses the kernel only (software). Rockchip (RK3328/RK3399/RK3568/RK3588): software flowtable only; high CPU throughput makes it adequate. ramips mt7621 (the most common cheap OpenWrt SoC) has no PPE in mainline: software flowtable only. ath79: software.",
+      "technical_details": "Standard flowtable HW offload requires an ndo_setup_tc/TC_SETUP_FT or flow_block callback in the NIC/switch driver; the sparse tree has this only for mediatek. Vendor stacks (Qualcomm ECM/NSS, Broadcom FlowCache/CTF, Realtek SDK L3) are independent from nf_flowtable and each needs its own invalidation, which a fast-path safety design cannot assume.",
+      "source_type": "secondary_source",
+      "sources": [
+        { "url": "https://docs.kernel.org/networking/nf_flowtable.html", "file_path": "", "line_reference": "hardware offload section" }
+      ],
+      "confidence": "low",
+      "status": "unverified"
+    },
+    {
+      "id": "F017",
+      "topic": "SQM/cake interaction",
+      "description": "SW flowtable keeps traffic on the CPU, so an egress cake qdisc on the WAN device still shapes fast-pathed packets, and ingress shaping through ifb/tc mirred runs at tc-ingress which is before netfilter ingress in the receive path (so flowtable does not hide packets from it: hypothesis from netdev receive ordering, verify on device). HW offload (PPE) forwards without the CPU; qdiscs and tc filters on those flows are bypassed, so cake no longer shapes them (OpenWrt guidance: SQM and hardware flow offloading conflict). clashwrt already notes that a DIRECT rule in mihomo collapses all hosts behind one address (the router) so cake cannot tell hosts apart, a reason the bypass design is attractive even in software mode.",
+      "technical_details": "clashwrt setctl.sh header: 'a DIRECT rule inside mihomo is not a fast path... collapses every device behind one address, so a shaper like cake can no longer tell hosts apart. Traffic excluded here never reaches mihomo at all.' Per-host fairness for DIRECT traffic is regained for both SW flowtable and plain routing. With HW flow offload and SQM enabled, the safe default is software flowtable and warn when 'flags offload' is on with an active sqm instance.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/setctl.sh", "line_reference": "11-17" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F018",
+      "topic": "DNS leak and policy consistency of the bypass",
+      "description": "A bypass entry stops the kernel from sending packets to mihomo, but DNS resolution itself continues to go through mihomo's DNS server (or dnsmasq). The leak risks are: (1) DNS queries of bypassed clients still reach upstreams via the proxy or direct per DNS policy, so policy for DNS must be explicit and not be shortcut by the bypass set (port 53/853/443-DoH must never be in the key space); (2) a bypassed destination discovered through a proxied DNS answer (PROXY resolver, geo-DNS) may be a different IP than the DIRECT resolver returns, so cache-poisoned or geo-mismatched CDN addresses can be bypassed: key insertion should require that the answer came from the policy-matching resolver (hypothesis).",
+      "technical_details": "Implementation constraint: exclude dport 53/853 and DoH IPs from insertion (clashwrt already keeps doh4 reject set, fw.sh:459). Insert on dial success of a DIRECT outbound, not on rule match alone, so unreachable addresses are never promoted.",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/fw.sh", "line_reference": "459" }
+      ],
+      "confidence": "medium",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F019",
+      "topic": "Cost model: what the fast path saves",
+      "description": "A DIRECT connection through mihomo costs two sockets, user-space copy (splice is not used by mihomo's relay; it uses copy buffers), and conntrack twice. Offloaded flows cost one conntrack entry and a hash lookup in the flowtable per packet. No measured numbers collected here; claims of throughput gain are unverified.",
+      "technical_details": "No benchmark was run (no root, no NIC). Needed experiment: iperf3 through a DIRECT rule in mihomo vs plain routing vs SW flowtable on the target SoC (mt7621, mt7981, ipq40xx, rk3568). Treat as hypothesis until measured.",
+      "source_type": "secondary_source",
+      "sources": [
+        { "url": "", "file_path": "", "line_reference": "" }
+      ],
+      "confidence": "low",
+      "status": "unverified"
+    },
+    {
+      "id": "F020",
+      "topic": "Insertion point and flowtable device list",
+      "description": "A bypass hit makes the packet fall out of the clashwrt mangle chain and into the normal path; to be offloaded it must reach the fw4 forward chain 'flow offload @ft' rule and the devices must be in the flowtable device list. The bypass set must therefore live in a chain that runs BEFORE interception (prerouting mangle/ raw) and must not terminate with 'accept' in a way that skips fw4's forward evaluation (a 'return' in the clashwrt chain is correct; a verdict in the prerouting base chain does not affect the later forward base chain).",
+      "technical_details": "fw4 chain forward flow offload rule at ruleset.uc:141 runs at 'hook forward priority filter'; clashwrt's own table is separate ('inet clashwrt', fw.sh:477), so fw4 offload and the clashwrt bypass cooperate by construction. Check: fw4 only adds flow offload when flow_offloading is enabled in /etc/config/firewall defaults (fw4.resolve_offload_devices, ruleset.uc:2).",
+      "source_type": "source_code",
+      "sources": [
+        { "url": "", "file_path": "fw4:root/usr/share/firewall4/templates/ruleset.uc", "line_reference": "2, 141" },
+        { "url": "", "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/fw.sh", "line_reference": "477" }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    }
+  ],
+  "opportunities": [
+    {
+      "name": "Static CIDR bypass set (extend what clashwrt does) as an optional core module",
+      "description": "Move/mirror clashwrt's static interval-set bypass (RU CIDR, private ranges) into the core so mihomo can emit it itself, loading it with metacubex/nftables, without per-connection logic.",
+      "expected_benefit": "Large share of DIRECT traffic (RU/LAN) offloadable with zero per-connection overhead and no safety risk from shared CDN IPs, because the key is the policy-defining IP range, not a domain verdict.",
+      "implementation_complexity": "low",
+      "risks": ["Only helps IP-defined DIRECT policies", "Requires nft/fw4 present; must auto-disable on non-OpenWrt hosts", "Static list staleness"],
+      "priority": "high"
+    },
+    {
+      "name": "Dynamic exact-key bypass with timeout (saddr . daddr . dport)",
+      "description": "On successful DIRECT dial where the rule is IP/port based or the IP is policy-uniform, add an element with a short timeout via a batched Go worker; remove on DNS remap or config reload.",
+      "expected_benefit": "Subsequent connections (parallel browser connections, keep-alive reconnects) are routed in kernel and offloaded; frees mihomo from bulk transfers (downloads, video).",
+      "implementation_complexity": "high",
+      "risks": ["Shared-CDN IP poisoning (F009)", "fake-ip incompatibility (F010)", "Stale elements after policy change", "QUIC/UDP first packet decisions"],
+      "priority": "medium"
+    },
+    {
+      "name": "Conntrack-mark based invalidation helper",
+      "description": "Mark bypass-accepted flows with a dedicated ct mark and implement a Go ctnetlink delete-by-mark routine run on config reload/crash recovery.",
+      "expected_benefit": "Deterministic flush of offloaded DIRECT flows without per-flow tuple tracking; required for any dynamic mode.",
+      "implementation_complexity": "medium",
+      "risks": ["Needs ctnetlink access (CAP_NET_ADMIN) and a netlink library for conntrack (vishvananda/netlink or hand-rolled)", "Brief connection resets for long flows after a reload"],
+      "priority": "high"
+    },
+    {
+      "name": "Capability detection with auto-disable",
+      "description": "At start-up probe nft, flowtable presence, NSS/ECM or vendor offload, SQM instance, and refuse to activate dynamic fast path when policy cannot be guaranteed.",
+      "expected_benefit": "Prevents silent unsafe configurations; matches the project requirement of auto-disable.",
+      "implementation_complexity": "medium",
+      "risks": ["Detection heuristics for vendor stacks are fragile"],
+      "priority": "high"
+    }
+  ],
+  "limitations": [
+    "No benchmark or hardware test was run; all performance statements are unverified.",
+    "Vendor hardware statements for Qualcomm NSS, Realtek, Broadcom are from background knowledge, not from the sparse trees; only MediaTek was checked in kernel source.",
+    "Concatenated-key wire encoding for metacubex/nftables was not tested; nft's own encoding needs to be compared (padding of inet_service to 4 bytes).",
+    "Hardware flow teardown latency after conntrack deletion was not measured.",
+    "The sparse OpenWrt tree has only the listed targets; NF_FLOW_TABLE kconfig default is 'not set' in generic and gets enabled by the kmod, so per-target availability of HW offload must be read from each target config."
+  ],
+  "risks": [
+    "Offloaded flows skip prerouting; a stale bypass is an uncatchable leak until the flow ends or is torn down.",
+    "Shared CDN IPs and domain-based verdicts can leak PROXY traffic.",
+    "fake-ip clients cannot use a kernel bypass at all for fake-ip answered domains.",
+    "Mihomo crash leaves bypass entries and established offloaded flows active.",
+    "HW offload bypasses SQM/cake shaping."
+  ],
+  "recommendations": [
+    "Candidate A (static only): clashwrt-style interval set of policy CIDRs (and fake-ip excluded), loaded from the core at start-up with the metacubex/nftables library; no per-connection insertion. Lowest risk, benefit limited to IP-defined DIRECT.",
+    "Candidate B (static + dynamic exact-key): A plus a Go worker adding saddr . daddr . dport elements with a 1-5 min timeout only for IP-based verdicts or policy-uniform IPs, flush + ct-mark delete on reload, auto-disable on fake-ip/ECM/crash. Medium risk, most benefit.",
+    "Candidate C (none in core): keep the core agnostic; expose a hook/API (e.g. verdict event stream) so the OpenWrt integration layer (clashwrt shell) owns sets, flush and ct deletion. Lowest core complexity, benefit depends on integration quality; the core must still guarantee correct DNS (real-ip answers for DIRECT domains).",
+    "In every candidate: default element timeout short, flush sets and delete conntrack by mark on config change, and keep PROXY flows structurally unable to enter FORWARD (they are always TPROXY/redirect/TUN)."
+  ],
+  "open_questions": [
+    "Exact wire encoding of concatenated keys (ipv4_addr . ipv4_addr . inet_service) in metacubex/nftables vs nft userspace.",
+    "Does the Go side need conntrack deletion by mark (ctnetlink) and which library is acceptable under the binary-size budget?",
+    "Measured throughput/CPU gain of SW flowtable vs mihomo DIRECT on mt7621, mt7981, ipq40xx, rk3568.",
+    "Hardware flow teardown time after ct delete on MediaTek PPE.",
+    "Can a verdict be made domain-independent for shared CDN IPs, or must dynamic mode be restricted to IP/port-based rules?",
+    "Is RealIP-for-DIRECT-domains acceptable for the fake-ip default profile?",
+    "Which OpenWrt targets in scope really enable HW flowtable (per-target config verification beyond mediatek)."
+  ],
+  "conclusion": "Handing a live mihomo-terminated connection back to the kernel forward path is not possible; only future connections can be fast-pathed, by a pre-interception nft set that mihomo (or the OpenWrt glue) maintains. The kernel mechanics (flowtable at ingress, ct-dying invalidation, 30 s idle timeout, FIN/RST teardown) make this safe only if bypass entries are exact, short-lived and invalidated together with conntrack. The static CIDR variant is low-risk and already proven in clashwrt; the dynamic variant is the main source of gain and the main source of leak risk. Hardware NAT is realistic only on MediaTek via standard flowtable offload; elsewhere it is software flowtable or vendor stacks that must be detected and excluded."
+}

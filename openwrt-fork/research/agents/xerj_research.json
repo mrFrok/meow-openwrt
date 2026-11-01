@@ -1,0 +1,133 @@
+{
+ "agent": "xerj_research",
+ "model": "Claude Opus 5.5 (main agent, by user decision instead of a separate Sonnet agent)",
+ "effort": "XHigh",
+ "research_date": "2026-11-01",
+ "scope": [
+  "Xerj engine (local node)",
+  "Xerj Indexer (autoindex)",
+  "Xerj Corpus Hub",
+  "usage plan for the project"
+ ],
+ "summary": "Xerj rc.100 runs locally (127.0.0.1:9200). The local indexer is the useful part: 8 mlw-* indices cover the fork, key deps, Go runtime, the Linux 6.12 networking/BPF subset, OpenWrt 25.12.6, fw4, cilium/ebpf and sing-box (~373k records, 8.3k code files, ~1 min total). The Corpus Hub has no corpus for mihomo, Linux kernel networking, eBPF, OpenWrt, nftables or the Go runtime; only adjacent ones exist.",
+ "findings": [
+  {
+   "id": "F001",
+   "topic": "Xerj availability",
+   "description": "Xerj node rc.100 is running with API-key auth; MCP tools (xerj_search, xerj_map, xerj_hub_find, xerj_hub_ask, xerj_code_search, memory/brain tools) are available.",
+   "technical_details": "Process /usr/bin/xerj --data-dir ~/xerj-data; listeners 9200 (ES API), 8080/8081; key in ~/xerj-data/admin.key. CLI: xerj autoindex/search/code/hub/brain/feedback.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "host:~/xerj-data",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F002",
+   "topic": "Corpus Hub coverage",
+   "description": "No hub corpus covers the project's core topics. hub_find for mihomo/clash, kernel networking/nf_flowtable/conntrack, eBPF/XDP/cilium, Go runtime GC, OpenWrt, sing-tun/gvisor, nftables/TPROXY returned no_coverage or unrelated corpora.",
+   "technical_details": "Catalogue 7 days old at test time, no packs cached. Adjacent corpora only: golang-x-crypto (BSD-3), coroot (eBPF observability, Apache-2.0), boringtun (WireGuard data plane, BSD-3), coredns, dnscrypt-proxy (ISC), aioquic.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "xerj hub find (2026-11-01)",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F003",
+   "topic": "Local indices",
+   "description": "Autoindex built 8 searchable indices quickly; definition-first search returns the defining file and line (e.g. ParseProxy -> fork:adapter/parser.go:11).",
+   "technical_details": "mlw-fork: fork (mihomo v1.19.33) (981 code files, 12133 records); mlw-deps: sing-tun, sing, gvisor, quic-go, sing-*, nftables, utls, bart (1920 code files, 76247 records); mlw-goruntime: Go 1.27.3 runtime, net, internal/poll, syscall (1721 code files, 92131 records); mlw-kernel: Linux 6.12.112 net/bpf/arch-jit/mediatek subset (1952 code files, 166826 records); mlw-openwrt: OpenWrt v25.12.6 sparse (generic config, kmods, targets) (6 code files, 870 records); mlw-fw4: firewall4 (1 code files, 473 records); mlw-ebpf: cilium/ebpf (473 code files, 6966 records); mlw-singbox: sing-box (kTLS, auto-redirect reference) (1254 code files, 17016 records). Flags used: --no-semantic --code-analyzer code; deps/goruntime via symlink farms need --follow-symlinks --follow-symlinks-outside-root (without --follow-symlinks the run exits 2).",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "bench/../research (index run log)",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F004",
+   "topic": "Stale index",
+   "description": "The pre-existing mihomo-docs index (2026-10-31) points at a deleted scratch checkout; it should be retired after the user agrees (not deleted by the agent).",
+   "technical_details": "xerj_map shows mihomo-docs 12119 records from run-20261031T175017Z; source folder gone.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "xerj_map mihomo-*",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F005",
+   "topic": "Indexer limits",
+   "description": "Lexical (BM25) code search is strong for identifiers; there is no semantic understanding with the default lexical embeddings, so conceptual questions still need grep + reading. OpenWrt Makefile/config files index as few 'code' files (6 of 116).",
+   "technical_details": "Default --embed-mode lexical; neural mode would need a restart of the node with a 90 MB model.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "xerj --help",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  }
+ ],
+ "opportunities": [
+  {
+   "name": "Re-index the fork after each optimization stage",
+   "description": "Run xerj autoindex on the fork (prefix mlw-fork, --fresh) after every merged stage, so impact analysis and regression search see current code.",
+   "expected_benefit": "Fast definition/usage lookup across fork + deps during refactors (build-tag splits touch many files).",
+   "implementation_complexity": "low",
+   "risks": [
+    "stale hits if forgotten (search reports index_stale hint)"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "Xerj memory namespace for decisions",
+   "description": "Store ADR summaries and measured numbers in a xerj memory namespace (e.g. mlw) for recall across sessions, mirroring DECISIONS.md/BENCHMARKS.md.",
+   "expected_benefit": "Cross-session recall by meaning; complements Claude project memory.",
+   "implementation_complexity": "low",
+   "risks": [
+    "duplication with repo docs; repo docs remain the source of truth"
+   ],
+   "priority": "low"
+  }
+ ],
+ "limitations": [
+  "Hub has no relevant corpora; primary sources and local indices are used instead.",
+  "No corpus feedback was sent: no hub corpus was actually queried for answers."
+ ],
+ "risks": [
+  "Index staleness after code changes."
+ ],
+ "recommendations": [
+  "Use xerj_search with prefixes mlw-fork / mlw-deps / mlw-kernel for every code question before grep.",
+  "Re-index mlw-fork after each stage; add new reference trees as their own mlw-* prefix.",
+  "Ask the user before removing the stale mihomo-docs index."
+ ],
+ "open_questions": [
+  "Is a neural embedding mode worth enabling for conceptual search over kernel docs?"
+ ],
+ "conclusion": "Xerj Indexer is in active use for the project; the Corpus Hub is not useful for this domain today."
+}

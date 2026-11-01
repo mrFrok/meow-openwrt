@@ -1,0 +1,701 @@
+{
+  "agent": "go_runtime_memory",
+  "model": "Claude Sonnet 5.5",
+  "effort": "Medium",
+  "research_date": "2026-11-01",
+  "scope": [
+    "Go GC/GOGC/GOMEMLIMIT/GOMAXPROCS/scavenger on small devices (Go 1.25-1.27)",
+    "fixed runtime overhead and per-connection cost",
+    "mihomo/sing memory machinery (pool, with_low_memory)",
+    "binary size and dead-code elimination",
+    "per-arch crypto assembly (arm64/arm/mips/riscv64)",
+    "PGO",
+    "small amd64 experiments and cross-builds of the fork"
+  ],
+  "summary": "The fork as built today (tags: with_gvisor) is 56-63 MB stripped on arm64/arm/mipsle (61 MB amd64): the 16 MB target is unreachable by linker flags alone and needs feature pruning (tailscale, wazero, easytier, gopacket, mieru, protobuf, gvisor, pprof tables); pclntab alone is ~20 MB. Idle RSS of a default amd64 build with an empty config is ~46 MB with 14 threads; 453 package init() calls allocate ~1.76 MB on the heap, the rest is the mapped/touched binary and runtime. mihomo sets no GOGC/GOMEMLIMIT and only calls uber automaxprocs; with go.mod 'go 1.20' the Go 1.25 container-aware GOMAXPROCS is OFF by default. Go 1.26+ uses Green Tea GC by default. with_low_memory in the fork/sing only halves two buffer constants (32K->16K relay, 16K->8K UDP) and forces the wait-then-read (pooled buffer) copy path; it does not change sing-tun or gvisor. 32-bit ARM and all MIPS have NO assembly for AES, GHASH, SHA-2 or ChaCha20/Poly1305 in Go 1.27, so VMess/SS/Trojan AEAD on those cores run pure-Go code; arm64 has AES-GCM/SHA/NEON-ChaCha20 but no Poly1305 asm. Recommended knobs: GOMAXPROCS = real core count (cap 2-4), GOMEMLIMIT as a soft ceiling at ~60-70% of RAM available to mihomo, GOGC 50-100, with_low_memory on <=256 MB, build with -trimpath -s -w -buildid=, no PGO until a representative profile exists.",
+  "findings": [
+    {
+      "id": "F001",
+      "topic": "Container-aware GOMAXPROCS is off for this module",
+      "description": "Go 1.25 added cgroup-CPU-limit-aware default GOMAXPROCS and periodic updates (containermaxprocs, updatemaxprocs). Both are GODEBUG settings whose defaults depend on the main module's go.mod 'go' line; the fork has 'go 1.20' and no godebug block, so both are 0 (old behaviour).",
+      "technical_details": "internal/godebugs/table.go lists containermaxprocs/updatemaxprocs/decoratemappings with Changed:25, Old:\"0\"; with go.mod go<1.25 Old applies. godebug.md documents the semantics. runtime/cgroup_linux.go reads /proc/self/cgroup + mountinfo once and polls the limit file. On a plain OpenWrt router (no cpu cgroup quota) the new feature changes nothing anyway: GOMAXPROCS = CPU count/affinity. mihomo main.go:99 uses uber automaxprocs v1.6.0 (go.mod:62) that does the cgroup quota rounding itself (also a no-op on bare routers; it pulls code and a cgroup parse at startup). Also decoratemappings=0 under go 1.20 (no [anon: Go:] names in /proc/maps).",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "https://go.dev/doc/godebug",
+          "file_path": "go:internal/godebugs/table.go",
+          "line_reference": "30,33,72"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/cgroup_linux.go",
+          "line_reference": "1-40"
+        },
+        {
+          "url": "",
+          "file_path": "fork:main.go",
+          "line_reference": "31,99"
+        },
+        {
+          "url": "",
+          "file_path": "fork:go.mod",
+          "line_reference": "3,62"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F002",
+      "topic": "Green Tea GC status in 1.25-1.27",
+      "description": "Green Tea GC was an opt-in experiment in Go 1.25 (GOEXPERIMENT=greenteagc), became the default in Go 1.26 (from release notes, not re-verified locally), and in the local Go 1.27.3 tree it is in the baseline experiment set (still switchable at build time with GOEXPERIMENT=nogreenteagc). Also baseline in 1.27: SizeSpecializedMalloc, RandomizedHeapBase64, JSONv2.",
+      "technical_details": "internal/buildcfg/exp.go:80-88 baseline {GreenTeaGC:true, JSONv2:true, SizeSpecializedMalloc:true, RandomizedHeapBase64:true}. Green Tea scans spans (8 KiB) rather than individual objects, improving memory locality; the advertised gain is 10-40% less GC CPU on GC-heavy programs, with the main benefit for many-core machines and small-object heaps; effect on a 10-30 MB heap on 1-2 cores is expected to be small. Upstream CI builds mihomo with Go 1.26 (build.yml:167,181) so it already gets Green Tea. JSONv2 baseline means encoding/json v1 is implemented on top of json/v2 in 1.27: possible binary size/init change (unmeasured). Experiment: my hello server with GOEXPERIMENT=nogreenteagc gave identical RSS (30584 vs 30616 kB), i.e. no visible RSS effect at this scale.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "https://go.dev/doc/go1.26",
+          "file_path": "go:internal/buildcfg/exp.go",
+          "line_reference": "80-88"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/mgcmark_greenteagc.go",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "fork:.github/workflows/build.yml",
+          "line_reference": "167,181"
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F003",
+      "topic": "GC pacing: GOGC, heap minimum, GOMEMLIMIT semantics",
+      "description": "Default GOGC=100 with a 4 MiB minimum heap goal: a small program GCs when live heap doubles but never below 4 MiB total heap. An opt-in experiment HeapMinimum512KiB (Go 1.27 tree) lowers this to 512 KiB; it is NOT in the baseline. GOMEMLIMIT is a soft limit on total Go-runtime-mapped memory (heap+stacks+runtime structures, not binary text, not kernel buffers); as the limit nears, GC frequency rises and the scavenger returns memory; a GC CPU limiter (50% cap, leaky bucket) prevents a death spiral where the program thrashes in GC, after which the limit is exceeded rather than the program stalling.",
+      "technical_details": "runtime/mgcpacer.go:58-60 defaultHeapMinimum = 4<<20 unless GOEXPERIMENT=heapminimum512kib (internal/goexperiment/flags.go:79-84). runtime/mgclimit.go:13-16 'very conservative limit of 50%'. runtime/mgcscavenge.go:54-62 background scavenger targets (100-reduceExtraPercent)/100*memoryLimit when a limit is set. Consequence for routers: GOMEMLIMIT must be set well above the live set or GC runs continuously until the limiter cuts it off; set it relative to expected peak (live heap + stacks + ~25% slack), not to total RAM. Process-kill (OOM) is not prevented; the limit is a throttle. Experiment: hello net server at GOMAXPROCS=1, 500 conns, GOGC=50 and GOMEMLIMIT=16MiB gave 30620/30356 kB RSS vs 30616 kB default - dominated by my own 32 KiB client buffers, so inconclusive for GOGC.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "https://go.dev/doc/gc-guide",
+          "file_path": "go:runtime/mgcpacer.go",
+          "line_reference": "58-60"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/mgclimit.go",
+          "line_reference": "13-30"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/mgcscavenge.go",
+          "line_reference": "15-70"
+        },
+        {
+          "url": "",
+          "file_path": "go:internal/goexperiment/flags.go",
+          "line_reference": "79-84"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F004",
+      "topic": "Scavenger and returning memory to the OS",
+      "description": "Linux default release advice is MADV_DONTNEED (debug.madvdontneed=1 default since 1.16), so RSS falls when the scavenger releases pages, unlike MADV_FREE. The background scavenger paces itself to ~1% of mutator CPU and releases down to roughly retain = (1+retainExtraPercent)*heapGoal-ish, so RSS lags heap by minutes after a spike; debug.FreeOSMemory() forces a GC plus full scavenge. mihomo only exposes FreeOSMemory on the debug-mode API route /debug/gc.",
+      "technical_details": "runtime/runtime1.go:407 'default to MADV_DONTNEED' sets debug.madvdontneed=1; runtime/mem_linux.go:38-64 sysUnusedOS chooses MADV_FREE (if madvdontneed==0) else MADV_DONTNEED. runtime/mgcscavenge.go:15 scavengePercent soft cap of mutator time; :74-79 releases in huge-page-aware chunks. fork:hub/route/server.go:109-113 PUT /debug/gc calls debug.FreeOSMemory() only when log level is debug. A periodic low-priority FreeOSMemory (e.g. after connections drop below a threshold, or every N minutes while idle) is an easy RSS reduction on routers; cost = one full GC + page-faults on regrowth. Combining GOMEMLIMIT also makes the background scavenger more aggressive.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "https://pkg.go.dev/runtime/debug#FreeOSMemory",
+          "file_path": "go:runtime/runtime1.go",
+          "line_reference": "400-408"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/mem_linux.go",
+          "line_reference": "38-64"
+        },
+        {
+          "url": "",
+          "file_path": "fork:hub/route/server.go",
+          "line_reference": "109-113"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F005",
+      "topic": "Experiment: hello net server RSS vs GOMAXPROCS",
+      "description": "Static amd64 hello server (2.3 MB binary): idle RSS 4.7 MB at GOMAXPROCS=1, 6.8 MB at 2 (noisy), 4.8 MB at 4; threads 3/4/6. So P count barely matters for RSS (per-P mcache is small); the cost of more Ps is threads and scheduler spinning, not memory. With 500 loopback connections (1000 sockets, 500 goroutines with 32 KiB client buffers) RSS was 30.6 MB for every P count.",
+      "technical_details": "Built CGO_ENABLED=0 go build -buildvcs=false -ldflags '-s -w', Go 1.27.3, /proc/self/status after a forced GC. The 500-conn run is polluted by my 500x32 KiB client buffers (16 MB) so the net per-connection-pair cost (2 goroutines + conn structs + netpoll) is about (30.6-4.7-16)/500 ~ 20 KB -- upper bound, rough, hypothesis. Single run each, no repetition. Files: scratchpad/go_runtime_memory/hello/main.go.",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "scratchpad/go_runtime_memory/hello/main.go",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "low",
+      "status": "probable"
+    },
+    {
+      "id": "F006",
+      "topic": "Experiment: idle RSS of the full fork (amd64) and init() cost",
+      "description": "Fork built with -tags with_gvisor, started with an empty config dir (no network wait), had VmRSS ~46 MB and 14 threads about 1.5 s after start. GODEBUG=inittrace=1 shows 453 package inits allocating 1.76 MB of heap in total; the top: metacubex/gopacket/layers 466 KB (+ 2.6 MB .bss tables EthernetTypeMetadata/PPPTypeMetadata), google/pprof/profile 154 KB, easytier api/instance 82 KB, mieru appctlpb 56 KB, goupnp/soap 55 KB, gobwas/ws 54 KB, easytier peer_rpc 53 KB, tailscale varz 34 KB, regexp2/syntax 29 KB.",
+      "technical_details": "Method: GODEBUG=inittrace=1 ./mihomo -v (init lines on stderr: 'init pkg @t ms, X ms clock, N bytes, M allocs'). Individual init costs are small (<0.4 ms), so init heap is ~4% of 46 MB; the bulk of RSS is touched binary pages, runtime/GC structures, and later config/rule/geodata load. crypto/internal/fips140/drbg.memory is a 32 MiB .noptrbss symbol (nm: 33554432 B) - bss is virtual and not resident unless touched, but inflates VSZ. NOTE: measured with an empty config; real RSS depends on geosite/mmdb/rule-sets. Not a router measurement.",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "scratchpad/go_runtime_memory/mihomo_strip",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F007",
+      "topic": "Fixed runtime overhead: stacks, mcache, GC workers",
+      "description": "Goroutine minimum stack is 2 KiB (grows by copying, doubling; shrunk by GC if under 1/4 used). Each P has an mcache (small, in non-GC memory). Background GC worker goroutines (one per P, dedicated or fractional/idle) and sysmon/scavenger/bgsweep goroutines exist regardless of load. Idle process: ~3 threads at GOMAXPROCS=1 in my hello test.",
+      "technical_details": "runtime/stack.go:78 stackMin = 2048; runtime/mcache.go:20 type mcache (per-P, allocated by procresize). Real TLS/proxy relay goroutines usually grow to 8-16 KiB stacks (crypto, bufio.Copy frames). Per relayed TCP connection mihomo.Relay starts 1 extra goroutine (the calling one is the second) (fork:common/net/sing.go:69-92), plus listener/proxy goroutines for the outbound (e.g. TLS read loop, mux), 2 net.Conn structs, netpoll entries, pooled buffers only while a Read is blocked. Estimated 20-40 KB heap per proxied connection (hypothesis, unmeasured with real mihomo).",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "go:runtime/stack.go",
+          "line_reference": "78-83"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/mcache.go",
+          "line_reference": "20-45"
+        },
+        {
+          "url": "",
+          "file_path": "fork:common/net/sing.go",
+          "line_reference": "66-92"
+        }
+      ],
+      "confidence": "medium",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F008",
+      "topic": "with_low_memory: exactly what it changes",
+      "description": "The tag (which the fork exposes in feature tags) changes only: (1) pool.RelayBufferSize 32K->16K and pool.UDPBufferSize 16K->8K (fork common/pool/buffer_low_memory.go vs buffer_standard.go); (2) sing buf.BufferSize 32K->16K and buf.UDPBufferSize 16K->8K; (3) sing common.LowMemory=true makes bufio.Copy / CopyExtended / CopyOnce always take the copyWaitWithPool path (wait for readability, then take a buffer) instead of preallocating. Nothing in sing-tun, sing-mux, gvisor or quic-go references the tag (grep found none).",
+      "technical_details": "sing@v0.5.8 common/low_memory.go, common/buf/buffer_low_memory.go; bufio/copy.go:110 and :269 and copy_once.go:16 use '!needCopy || common.LowMemory'; fork constant/features/low_memory.go + tags.go:7. Users of the fork constants: UDP read paths (common/net/packet/packet.go:67, listener/tproxy/*, listener/tunnel/udp.go:62, component/resolver/relay.go:30, adapter/outbound/masque.go:379, transport/snell, trojan.go:195) and RelayBufferSize in simple-obfs/ssr/vmess chunk/aead. Tradeoff: smaller buffers = more syscalls per MB (higher CPU, lower peak), not applicable to large TUN MTU 9000 packets > 8 KiB UDP buffer (possible truncation risk of UDP > 8 KiB; unverified). sizes of arm64 binaries with/without the tag are identical (56492156 bytes).",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "fork:common/pool/buffer_low_memory.go",
+          "line_reference": "1-14"
+        },
+        {
+          "url": "",
+          "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go",
+          "line_reference": "110,269"
+        },
+        {
+          "url": "",
+          "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/buf/buffer_low_memory.go",
+          "line_reference": "1-9"
+        },
+        {
+          "url": "",
+          "file_path": "fork:constant/features/tags.go",
+          "line_reference": "7"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F009",
+      "topic": "Allocator design and hot-path allocations",
+      "description": "common/pool is a power-of-two sync.Pool allocator (64 B..64 KiB, 11 classes, pointer-to-array so no allocation on Put) installed as sing's buf.DefaultAllocator; >64 KiB falls back to make(). sync.Pool is cleared across two GC cycles, so a burst of connections returns buffers to the GC and RSS depends on GC cadence (another reason to keep GOGC moderate). Hot paths with per-op make(): transport/socks5/socks5.go (lines 111,132,137,214,319,388-400,439-445: handshake/address buffers, per UDP packet at 388-445), pool.GetBuffer returns bytes.Buffer pooled objects.",
+      "technical_details": "fork:common/pool/alloc.go:20-60; alloc.go Get returns nil for size 0; sing.go:3-6 init sets buf.DefaultAllocator. The relay path itself is allocation-light in non-LowMemory mode only when the source implements ReadWaiter; otherwise CopyExtendedWithPool allocates a 32 KiB buffer per read cycle and each blocked Read holds one (sing bufio/copy.go:159-190), so N idle non-ReadWaiter (e.g. TLS-wrapped) conns hold N x 32 KiB: an important RSS driver at 1000+ connections; with_low_memory halves this and uses wait-then-read where available. A cheaper fix is a first-read small buffer (e.g. 2-4 KiB, grow on full read) for idle connections (opportunity, hypothesis).",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "fork:common/pool/alloc.go",
+          "line_reference": "20-60"
+        },
+        {
+          "url": "",
+          "file_path": "fork:transport/socks5/socks5.go",
+          "line_reference": "111,214,388-445"
+        },
+        {
+          "url": "",
+          "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go",
+          "line_reference": "159-190"
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F010",
+      "topic": "Binary size today: far above 16 MB",
+      "description": "Stripped (-s -w -buildid=) fork with only with_gvisor: amd64 61 MB, arm64 56.5 MB, arm GOARM=7 56.0 MB, mipsle softfloat 62.8 MB, riscv64 53.1 MB. arm64 -buildmode=pie: 63.4 MB (+12%). Section split (amd64): .text 25.2 MB, .gopclntab 20.1 MB, .noptrdata 7.6 MB (6.85 MB is easytier artifact blob), .rodata 1.7 MB. By-package symbol sizes (amd64 nm): easytier artifact 6.85 MB data, gopacket/layers 6.8 MB (tables), text of tailscale 2.26 MB, wazero 1.08 MB, gvisor 0.81 MB, protobuf impl 0.37 MB.",
+      "technical_details": "Method: go build -tags with_gvisor -trimpath -ldflags '-s -w -buildid=' per GOARCH; readelf -S -W; go tool nm -size -sort size | grouped by import path. Fork contains tailscale, easytier, zerotier, mieru, wazero (wasm engine), reedsolomon, jls/restls etc. (go.mod). pclntab (function table + file/line tables) is ~1/3 of the file and is NOT removed by -s -w (only DWARF/symtab are). Reaching <=16 MB needs build-tag pruning of whole protocol families (~30-40 MB), and likely also removing geodata/embedded blobs. Absolute gc-compiled sizes here are for the whole feature set, not an optimized profile.",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "scratchpad/go_runtime_memory/mh_arm64",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "fork:go.mod",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "fork:Makefile",
+          "line_reference": "14-18"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F011",
+      "topic": "Build flags and what each does",
+      "description": "-s strips symtab, -w strips DWARF, -buildid= makes builds reproducible (tiny size), -trimpath removes local paths (slightly smaller, reproducible; pclntab still stores file names). CGO_ENABLED=0 gives static, no libc (fork Makefile already does this). Default linux/arm64 and mips executables are non-PIE static; -buildmode=pie adds relocations/dynamic sections (measured +12% on arm64) and is not needed on OpenWrt routers for size/speed. GOAMD64 matters for x86 only. -checklinkname=0 only needed if a dependency uses go:linkname into restricted runtime symbols; I did not test it on this fork (unverified).",
+      "technical_details": "Fork Makefile:14-18 uses -tags with_gvisor -trimpath -ldflags '-w -s -buildid=' and CGO_ENABLED=0. Go linker has no LTO. Size levers beyond flags: build tags per feature (biggest), UPX-style compression (external; runtime decompress cost is RAM-expensive on routers because the whole binary is resident after decompress; hypothesis), moving rule/geo data out of the binary, -gcflags='-l' (disable inlining; may shrink a few %, costs CPU; untested). GOEXPERIMENT can drop features only rarely. No LTO exists for gc; gccgo/TinyGo are not viable: gccgo lags the language (no current-Go support and uncertain generics/runtime parity) and TinyGo lacks parts of reflect/net/crypto-tls/unsafe patterns heavily used by mihomo, sing, quic-go and gvisor (probable; not tested).",
+      "source_type": "official_docs",
+      "sources": [
+        {
+          "url": "https://pkg.go.dev/cmd/link",
+          "file_path": "fork:Makefile",
+          "line_reference": "14-18"
+        },
+        {
+          "url": "https://tinygo.org/docs/reference/lang-support/",
+          "file_path": "",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F012",
+      "topic": "What dead-code elimination cannot remove here",
+      "description": "text/template and html/template are absent from the binary (0 symbols), so the method-reachability pessimization from them is not present; reflect.Value.Method is present (2 symbols) - any reflect Method/MethodByName with a non-constant name makes the linker keep all exported methods of reachable types, which blunts DCE for e.g. protobuf, yaml, JSON codecs. Interface method calls keep method sets of every type converted to an interface; package-level var initializers and init() with side effects (registries in tailscale, protobuf descriptors, gopacket layer tables) are always retained once a package is imported.",
+      "technical_details": "Measured with go tool nm on mihomo_sym: text/template 0, html/template 0, net/http/pprof 0 matches, reflect.Value.Method 2, tailscale 7345 symbols, protobuf 2220, gvisor 3677, wazero 2060, easytier 1504, mieru 1083. The proven way to cut size is not importing packages (build tags + stubs), since one import drags in package-level registrations. Find size per package: go tool nm -size -sort size | aggregate by import path, or go-size-analyzer (gsa) / go tool nm; use go build -ldflags=-dumpdep to see who pulls a package (I did not run gsa; not installed).",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "https://github.com/Zxilly/go-size-analyzer",
+          "file_path": "scratchpad/go_runtime_memory/mihomo_sym",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F013",
+      "topic": "Crypto assembly per architecture in Go 1.27 stdlib",
+      "description": "crypto/internal/fips140 AES, AES-GCM (GHASH), SHA-256, SHA-512, SHA-3 have assembly on arm64 (and amd64, s390x, ppc64x for some; riscv64 has only SHA-256/512 + subtle xor; loong64 xor). There is NO assembly for 32-bit ARM (GOARM=5/6/7), mips, mipsle, mips64 in AES/GCM/SHA/xor/chacha8rand/nistec paths: they use pure-Go generic code (aes_noasm.go, gcm_noasm.go, sha256block_noasm.go).",
+      "technical_details": "go:crypto/internal/fips140/aes/aes_arm64.s, ctr_arm64.s, aes/gcm/gcm_arm64.s (build tag '(amd64||arm64)&&!purego', aes/gcm/gcm_asm.go:1); sha256/sha256block_arm64.s + sha256block_riscv64.s; sha512 same; sha3/sha3_arm64.s; subtle/xor_arm64.s,xor_riscv64.s; internal/chacha8rand has amd64/arm64/loong64/riscv64 only. nistec p256 asm: amd64, arm64, ppc64le, s390x (no arm/mips/riscv64) so TLS/QUIC ECDHE P-256 handshakes are slow in pure Go on MIPS/ARMv7. Consequence: AES-128/256-GCM (SS aes-gcm, VMess aes-128-gcm, Trojan/TLS 1.3 AES) on MIPS/ARMv7 runs generic table-less Go AES+GHASH; hardware-accelerated only on arm64 (when CPU has AES/PMULL extensions - not all cheap SoCs, e.g. some Cortex-A53 have crypto ext, others do not).",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "go:crypto/internal/fips140/aes/gcm/gcm_asm.go",
+          "line_reference": "1"
+        },
+        {
+          "url": "",
+          "file_path": "go:crypto/internal/fips140/sha256/sha256block_arm64.s",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "go:crypto/internal/fips140/nistec/p256_asm_arm64.s",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F014",
+      "topic": "ChaCha20-Poly1305 assembly in the fork's dependencies",
+      "description": "x/crypto v0.33.0 (in the fork) has chacha20 NEON assembly for arm64 (also ppc64x, s390x) and poly1305 assembly only for amd64, ppc64x, s390x - so on arm64 ChaCha20 is vectorized but Poly1305 is pure Go; chacha20poly1305 combined AVX2 assembly is amd64-only. On ARMv7 and MIPS both are pure Go. The fork also imports github.com/metacubex/chacha (chacha.go only, pure Go; its poly1305 dir is separate); which code path each protocol uses (SS chacha20-ietf-poly1305 vs VLESS/VMess) was not traced.",
+      "technical_details": "x/crypto@v0.33.0: chacha20/chacha_arm64.s, chacha_ppc64x.s, chacha_s390x.s; internal/poly1305/sum_amd64.s, sum_ppc64x.s, sum_s390x.s; chacha20poly1305/chacha20poly1305_amd64.s. Hence a MIPS/ARMv7 router will generally be faster with AES-128-GCM only if arm64 AES ext exist, otherwise ChaCha20 (designed for CPUs without AES instructions) is the better default on ARMv7/MIPS - but both are slow in Go without SIMD; 'none'/plain TLS-over-TCP-passthrough is far cheaper. Quantitative MB/s on target hardware: unmeasured.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "mod:golang.org/x/crypto@v0.33.0/chacha20/chacha_arm64.s",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "mod:golang.org/x/crypto@v0.33.0/internal/poly1305/sum_amd64.s",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "fork:go.mod",
+          "line_reference": "19,74"
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F015",
+      "topic": "GOARM / GOMIPS / GOMIPS64 / GORISCV64 settings",
+      "description": "GOARM=5 uses software floating point and kernel helpers for some atomics; GOARM=6 adds VFP; GOARM=7 uses VFPv3 and native LDREX/STREX atomics. The fork Makefile builds v5/v6/v7. GOMIPS=softfloat is the safe choice for OpenWrt MIPS targets (OpenWrt mips_24kc/mipsel_24kc packages are soft-float ABI; a hardfloat binary on an FPU-less core dies with SIGILL, softfloat on an FPU core only costs float speed). mihomo is integer-heavy so softfloat is the proposed default (hypothesis). GORISCV64 picks rva20u64 (default) or rva22u64 baseline; GOMIPS64 has the same softfloat/hardfloat switch.",
+      "technical_details": "Fork Makefile:113-131 builds arm v5/v6/v7 and mips/mipsle softfloat+hardfloat. Binary size from my cross-build: arm7 56.0 MB, mipsle softfloat 62.8 MB (MIPS code is larger, no compressed instructions). Details of cmd/go env vars from go.dev/cmd/go and internal/buildcfg; exact instruction-selection differences were not verified in the compiler source.",
+      "source_type": "official_docs",
+      "sources": [
+        {
+          "url": "https://go.dev/wiki/GoArm",
+          "file_path": "go:internal/buildcfg/cfg.go",
+          "line_reference": ""
+        },
+        {
+          "url": "",
+          "file_path": "fork:Makefile",
+          "line_reference": "112-131"
+        }
+      ],
+      "confidence": "low",
+      "status": "unverified"
+    },
+    {
+      "id": "F016",
+      "topic": "PGO",
+      "description": "Profile-guided optimization: place a CPU pprof as default.pgo in the main package dir (go build -pgo=auto is default since Go 1.21 for main packages); the compiler uses hot call sites for inlining and (1.22+) interface devirtualization, plus block layout. Official numbers: ~2-14% CPU improvement for typical server workloads, with build time overhead and a modest binary size increase. The profile must represent the real workload (relay + crypto + DNS + rule matching on router traffic); a profile collected on amd64 desktop helps cross-arch builds only approximately (profile is by function/line, so it is architecture-independent in principle). Not yet applied to mihomo; needs a representative profile (pprof endpoint exists in debug mode: /debug/pprof).",
+      "technical_details": "go.dev/doc/pgo; mihomo exposes net/http middleware.Profiler under /debug when log level is debug (fork:hub/route/server.go:104-115). PGO does not shrink memory; it may enlarge text through inlining (binary +few %). Expected benefit on a router is limited because hot code is in non-PGO'd assembly or crypto/syscalls. Recommend: low priority; only after throughput benchmarks.",
+      "source_type": "official_docs",
+      "sources": [
+        {
+          "url": "https://go.dev/doc/pgo",
+          "file_path": "fork:hub/route/server.go",
+          "line_reference": "104-115"
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F017",
+      "topic": "Per-connection cost model for mihomo relay",
+      "description": "A relayed TCP flow in mihomo costs: 2 goroutines (Relay spawns one, caller is the other), 2 sockets (client + upstream), plus protocol goroutines in the outbound (TLS/WebSocket/mux readers), plus a pooled buffer per read in flight (16-32 KiB), plus tunnel metadata, DNS mapping, statistics tracker. The default stats tracker and per-connection context are in tunnel/ (not examined in detail).",
+      "technical_details": "fork:common/net/sing.go:69-92 Relay; sing bufio.Copy with readWaiter. Goroutine stack growth means TLS-wrapped relays settle at 8-16 KiB stack per goroutine (probable). Order-of-magnitude (hypothesis, not measured on mihomo): 30-60 KB heap per active connection plus kernel socket buffers (not counted in Go RSS), so 1000 conns ~ 30-60 MB; limiting max connections or lowering idle timeouts is a stronger memory knob than GC tuning.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "fork:common/net/sing.go",
+          "line_reference": "66-92"
+        },
+        {
+          "url": "",
+          "file_path": "fork:tunnel/connection.go",
+          "line_reference": "220-222"
+        }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F018",
+      "topic": "Recommended runtime defaults by RAM class (hypothesis)",
+      "description": "Table of proposed starting points, all to be validated on real hardware: 64 MB RAM: GOMAXPROCS=1-2 (actual cores), GOGC=50, GOMEMLIMIT=24MiB, build tag with_low_memory, FreeOSMemory every ~5 min when idle, max concurrent conns ~300; 128 MB: GOMAXPROCS=2, GOGC=50-75, GOMEMLIMIT=48MiB, with_low_memory, FreeOSMemory on idle; 256 MB: GOMAXPROCS=min(cores,4), GOGC=100, GOMEMLIMIT=96-128MiB, with_low_memory optional; 512 MB: GOMAXPROCS=cores, GOGC=100, GOMEMLIMIT=192-256MiB (or unset), standard buffers.",
+      "technical_details": "Rationale: GOMEMLIMIT should leave headroom for kernel (conntrack, nftables, socket buffers) and other daemons (dnsmasq, uhttpd, luci); the ceiling is ~35-45% of RAM for mihomo on low-memory routers. GOGC=50 reduces peak heap by up to ~25% at ~1.3-1.5x GC CPU. These numbers are NOT measured; they derive from the GC guide formulas and the observed amd64 idle RSS (46 MB full build), which implies 64 MB devices cannot run the unpruned build at all. The limit must exceed live heap or the 50% GC CPU limiter engages and performance degrades.",
+      "source_type": "secondary_source",
+      "sources": [
+        {
+          "url": "https://go.dev/doc/gc-guide",
+          "file_path": "",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F019",
+      "topic": "How to set runtime knobs without code changes",
+      "description": "Runtime tuning can be applied by env vars in the procd init script (GOGC, GOMEMLIMIT, GOMAXPROCS, GODEBUG) or in code with debug.SetGCPercent / debug.SetMemoryLimit / runtime.GOMAXPROCS in main(); mihomo today sets none (main.go only calls maxprocs.Set). GODEBUG can also be embedded at build time via //go:debug directives or go.mod godebug lines (e.g. //go:debug madvdontneed=1, updatemaxprocs=0).",
+      "technical_details": "runtime GODEBUG options of interest: gctrace=1 (diagnose), madvdontneed, inittrace=1 (init cost), gcshrinkstackoff (disable stack shrinking, runtime/runtime1.go:314), scavtrace. A config-file-driven approach (mihomo YAML key like runtime: {gogc, memory-limit, gomaxprocs}) lets the LuCI/clashwrt wizard pick by detected RAM; hot reload would use debug.SetMemoryLimit(), which is safe at runtime.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "https://pkg.go.dev/runtime/debug",
+          "file_path": "go:runtime/runtime1.go",
+          "line_reference": "300-420"
+        },
+        {
+          "url": "",
+          "file_path": "fork:main.go",
+          "line_reference": "99"
+        }
+      ],
+      "confidence": "high",
+      "status": "confirmed"
+    },
+    {
+      "id": "F020",
+      "topic": "GOMAXPROCS on 1-4 core routers",
+      "description": "Go uses all logical CPUs by default; routers are 1-4 cores (MT7621 2c/4t SMT counts as 4 logical CPUs). On SMT cores GOMAXPROCS=4 may add scheduling overhead without proportional throughput. More Ps = more idle spinning threads, per-P mcache and per-P GC worker goroutines, but my experiment shows RSS difference is negligible (4.7 vs 4.8 MB); the real effect is CPU contention with the kernel's softirq/nft work on the same cores.",
+      "technical_details": "Experiment F005 plus runtime/proc.go GOMAXPROCS logic. A GC cycle uses 25% of GOMAXPROCS as dedicated workers: with P=1 the GC runs fractional/idle workers and steals mutator time; with P=2 half a core. Setting GOMAXPROCS=1 on a 1-core CPU is the default anyway; on 2-4 core routers leaving GOMAXPROCS < cores to keep 1 core for kernel networking is an option (hypothesis).",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "go:runtime/proc.go",
+          "line_reference": "7117"
+        },
+        {
+          "url": "",
+          "file_path": "scratchpad/go_runtime_memory/hello/main.go",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    },
+    {
+      "id": "F021",
+      "topic": "GOEXPERIMENT and toolchain pinning in CI",
+      "description": "Upstream CI builds with Go 1.26 for the release matrix (go-version '1.26', and 1.26.0 for another job) while go.mod says 'go 1.20'; runtime GODEBUG defaults therefore follow Go 1.20 semantics (see F001) even on the newest toolchain, so new-version runtime behaviours need explicit //go:debug or go.mod godebug entries. For own builds pin the toolchain (1.26.x or 1.27.x) and record it, since inlining/heap/codegen/size change between versions.",
+      "technical_details": "fork:.github/workflows/build.yml:167,174,181; the local Go is 1.27.3-X:nodwarf5 (distro build with the nodwarf5 experiment). Newer toolchains tend to grow pclntab and binary slightly. Release process (git tags, SHA-256) in project memory is not affected.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "fork:.github/workflows/build.yml",
+          "line_reference": "167,174,181"
+        },
+        {
+          "url": "",
+          "file_path": "fork:go.mod",
+          "line_reference": "3"
+        }
+      ],
+      "confidence": "medium",
+      "status": "confirmed"
+    },
+    {
+      "id": "F022",
+      "topic": "gopacket and other large tables inflate bss/VSZ",
+      "description": "gopacket/layers allocates 466 KB of heap during init and holds 2.6 MB .bss maps (EthernetTypeMetadata, PPPTypeMetadata), plus errorDecodersForPPPType 0.5 MB; crypto/internal/fips140/drbg.memory is a 32 MiB bss. Bss is not resident until touched, but the init allocations (maps filled in init) are resident. google/pprof/profile adds 154 KB init allocations and exists only for the debug profiler.",
+      "technical_details": "go tool nm -size -sort size: drbg.memory 33554432 B; gopacket/layers.EthernetTypeMetadata 2621440 B; PPPTypeMetadata 2621440 B. inittrace: gopacket/layers 466192 B, pprof/profile 153840 B. Removing gopacket (used for packet parsing in some listener/outbound like tun/easytier) and pprof behind build tags saves ~0.6 MB init heap and several MB binary; individually small, collectively they define the idle floor.",
+      "source_type": "experiment",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "scratchpad/go_runtime_memory/mihomo_sym",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "medium",
+      "status": "confirmed"
+    },
+    {
+      "id": "F023",
+      "topic": "Linker/compiler facts: no LTO, pclntab, alternatives",
+      "description": "The gc toolchain has no whole-program/link-time optimization beyond linker deadcode and function-level DCE; pclntab (~1/3 of this binary) is required for stack traces, GC stack maps and panics and cannot be stripped. gccgo is effectively abandoned for current Go versions (stuck far behind the language) and TinyGo targets embedded/WASM with incomplete reflect/net/crypto support; neither can build mihomo (quic-go, gvisor, tailscale, utls). Thus size reduction means removing code, not compiler tricks.",
+      "technical_details": "Measured .gopclntab = 0x130b815 = 20.1 MB of 61 MB stripped amd64. Statements about gccgo/TinyGo are from project documentation knowledge and were not re-verified by building; classify as probable.",
+      "source_type": "secondary_source",
+      "sources": [
+        {
+          "url": "https://tinygo.org/docs/reference/lang-support/",
+          "file_path": "",
+          "line_reference": ""
+        },
+        {
+          "url": "https://go.dev/doc/install/gccgo",
+          "file_path": "",
+          "line_reference": ""
+        }
+      ],
+      "confidence": "medium",
+      "status": "probable"
+    },
+    {
+      "id": "F024",
+      "topic": "Stack shrinking / per-goroutine stack and TLS cost",
+      "description": "GC shrinks goroutine stacks that use less than 1/4 of their size (disabled by GODEBUG gcshrinkstackoff); idle goroutines blocked in TLS reads typically keep a 4-8 KiB stack. On busy relays the stack can grow to 16-32 KiB through crypto/tls handshake frames; shrinking happens only at GC, which for a small heap with GOGC=100/4 MiB minimum may be infrequent, so stacks can linger.",
+      "technical_details": "runtime/runtime1.go:314 gcshrinkstackoff; runtime/stack.go:78 stackMin. A lower GOGC or periodic runtime.GC()/FreeOSMemory (F004) therefore also reclaims stack memory. Magnitude on mihomo not measured.",
+      "source_type": "source_code",
+      "sources": [
+        {
+          "url": "",
+          "file_path": "go:runtime/stack.go",
+          "line_reference": "78"
+        },
+        {
+          "url": "",
+          "file_path": "go:runtime/runtime1.go",
+          "line_reference": "314"
+        }
+      ],
+      "confidence": "low",
+      "status": "hypothesis"
+    }
+  ],
+  "opportunities": [
+    {
+      "name": "Runtime memory profile from config/wizard",
+      "description": "Add a runtime section (gogc, memory-limit, gomaxprocs) applied at startup and on reload via debug.SetGCPercent/SetMemoryLimit, with presets chosen by detected RAM (64/128/256/512 MB).",
+      "expected_benefit": "Cuts peak RSS (est. 15-30% on small heaps; unmeasured) and prevents unbounded growth; zero binary cost.",
+      "implementation_complexity": "low",
+      "risks": [
+        "limit below live set causes GC thrash (50% CPU limiter)",
+        "needs on-device validation",
+        "does not prevent OOM"
+      ],
+      "priority": "high"
+    },
+    {
+      "name": "Idle FreeOSMemory / scavenger tuning",
+      "description": "After connection count drops below a threshold or on a long idle timer, call debug.FreeOSMemory (currently only on debug API) and keep madvdontneed=1.",
+      "expected_benefit": "Lower observed RSS after bursts (returning freed spans and shrunk stacks).",
+      "implementation_complexity": "low",
+      "risks": [
+        "one full GC pause/CPU burst per call",
+        "page-fault cost on regrowth"
+      ],
+      "priority": "medium"
+    },
+    {
+      "name": "Prune features by build tags",
+      "description": "Introduce build tags to exclude tailscale, easytier, zerotier, mieru, wazero, reedsolomon, gopacket, pprof, rarely used protocols; keep pclntab proportional.",
+      "expected_benefit": "Binary from ~56 MB toward the 16 MB goal (tailscale+wazero+easytier+... are tens of MB of the 56); lower init allocations and idle RSS floor.",
+      "implementation_complexity": "high",
+      "risks": [
+        "touching upstream-merged code increases merge conflicts",
+        "feature regressions",
+        "needs stub files per feature"
+      ],
+      "priority": "critical"
+    },
+    {
+      "name": "Drop uber automaxprocs / set GOMAXPROCS explicitly",
+      "description": "Remove automaxprocs (redundant with Go 1.25+ container-aware logic if go.mod go>=1.25, or pointless on bare routers) and set GOMAXPROCS from config.",
+      "expected_benefit": "Small code/init reduction; deterministic CPU usage.",
+      "implementation_complexity": "low",
+      "risks": [
+        "behaviour change in containerized deployments"
+      ],
+      "priority": "low"
+    },
+    {
+      "name": "Smaller initial read buffer for idle connections",
+      "description": "In the relay path, avoid pinning 16-32 KiB per blocked Read for non-ReadWaiter conns: start with 2-4 KiB or use wait-then-read where possible; grow adaptively.",
+      "expected_benefit": "Saves ~16-32 KB per idle connection (e.g. 16-32 MB at 1000 conns), large for 128 MB devices.",
+      "implementation_complexity": "medium",
+      "risks": [
+        "extra syscalls for bulk transfers",
+        "touching sing internals (module fork)"
+      ],
+      "priority": "high"
+    },
+    {
+      "name": "Per-arch crypto defaults and cipher advice",
+      "description": "On ARMv7/MIPS prefer ChaCha20-Poly1305 or no-crypto-over-TLS paths; on arm64 with AES ext prefer AES-GCM; expose in wizard based on /proc/cpuinfo features.",
+      "expected_benefit": "Potentially large CPU/throughput difference on MIPS/ARMv7 where no asm exists (unmeasured).",
+      "implementation_complexity": "medium",
+      "risks": [
+        "benchmarks needed on real MT7621/IPQ40xx/ath79 devices",
+        "server-side cipher must match"
+      ],
+      "priority": "high"
+    },
+    {
+      "name": "Pure-Go to assembly crypto swap for MIPS/ARMv7",
+      "description": "Evaluate third-party assembly implementations (e.g. ChaCha20/Poly1305 for ARMv7 NEON) or cgo-free Go assembly; likely too costly to maintain.",
+      "expected_benefit": "Several-fold on ChaCha20/Poly1305 on ARMv7 NEON (hypothesis).",
+      "implementation_complexity": "high",
+      "risks": [
+        "maintenance, security audit, FIPS-like module boundaries",
+        "MIPS has no SIMD target on most routers"
+      ],
+      "priority": "low"
+    },
+    {
+      "name": "PGO with a router-representative profile",
+      "description": "Collect CPU profiles from a real router run (relay + DNS + rules) and commit default.pgo for release builds.",
+      "expected_benefit": "2-14% CPU per Go docs (generic), likely less here.",
+      "implementation_complexity": "medium",
+      "risks": [
+        "stale profiles",
+        "build time and slight size growth",
+        "profile from non-router hardware"
+      ],
+      "priority": "low"
+    },
+    {
+      "name": "Use with_low_memory for small-RAM profiles and measure the UDP-8K limit",
+      "description": "Enable the tag for Ultra Lightweight/Lightweight and validate UDP datagrams >8 KiB (TUN MTU up to 9000) are not truncated.",
+      "expected_benefit": "Halves relay/UDP buffer sizes; fewer bytes in flight per connection.",
+      "implementation_complexity": "low",
+      "risks": [
+        "UDP truncation if read buffers < datagram",
+        "more syscalls, higher CPU"
+      ],
+      "priority": "medium"
+    },
+    {
+      "name": "Trim init-time allocations",
+      "description": "Lazily initialize large package-level tables (gopacket layer maps, pprof, regexp2 tables, protobuf registries) or drop the packages.",
+      "expected_benefit": "Up to ~1.76 MB heap at startup saved at most (inittrace total), ~0.6 MB from the top few.",
+      "implementation_complexity": "medium",
+      "risks": [
+        "vendor patching of third-party packages"
+      ],
+      "priority": "low"
+    }
+  ],
+  "limitations": [
+    "All measurements were done on amd64 (and cross-compiled binary sizes for arm64/arm/mipsle/riscv64); no code was run on a router, so RSS numbers do not carry over (different page size, SMT, kernel).",
+    "Fork run for RSS used an empty config dir for ~1.5 s, with no rules or geodata; steady-state RSS is higher.",
+    "Hello-server connection experiment was polluted by my own 32 KiB client buffers and was run once per setting.",
+    "Go 1.26 release notes and go.dev docs on Green Tea/PGO were not fetched; those points rely on the local 1.27 tree and prior knowledge.",
+    "go-size-analyzer, -checklinkname=0, UPX, -gcflags=-l effects were not measured.",
+    "Crypto paths used by each protocol in the fork (which package serves VMess/SS/Trojan AEAD) were not fully traced."
+  ],
+  "risks": [
+    "A too-low GOMEMLIMIT causes continuous GC until the 50% limiter engages, harming latency and throughput.",
+    "with_low_memory halves UDP buffers; UDP above 8 KiB (TUN MTU 9000) may be truncated if any read path relies on UDPBufferSize.",
+    "go.mod 'go 1.20' keeps old GODEBUG defaults; raising it silently enables containermaxprocs/updatemaxprocs and other behavioural changes.",
+    "Pruning features diverges the fork from upstream and raises merge cost."
+  ],
+  "recommendations": [
+    "Treat size and idle RSS as feature-pruning problems first (tailscale, easytier, wazero, zerotier, mieru, gopacket, pprof) - flags give only a few percent.",
+    "Ship GOMEMLIMIT/GOGC/GOMAXPROCS as config with presets by RAM and expose an idle FreeOSMemory; validate on real 64/128/256/512 MB devices.",
+    "Use with_low_memory for the Ultra Lightweight and Lightweight profiles after checking UDP buffer sizes; keep the standard buffers in Performance.",
+    "Build with CGO_ENABLED=0 -trimpath -ldflags '-s -w -buildid=', non-PIE; do not use PGO or UPX initially; pin Go 1.26/1.27 and set GOMIPS=softfloat for FPU-less MIPS.",
+    "Advise ChaCha20-Poly1305 on ARMv7/MIPS and AES-GCM only on arm64 with crypto extensions; benchmark on hardware before claims.",
+    "Build a reproducible measurement harness (RSS after N idle conns, inittrace, nm -size by package) and run on target hardware."
+  ],
+  "open_questions": [
+    "Real idle and loaded RSS of the pruned fork on arm64/mipsle/armv7 devices (and with real geodata/rule sets).",
+    "Does MT7621 (4 logical CPUs) benefit from GOMAXPROCS=2 vs 4 with firewall/softirq load?",
+    "Exact per-connection heap and stack cost of a mihomo relay (VLESS+TLS, SS, Trojan) measured with heap profiles.",
+    "Which UDP read paths would truncate >8 KiB datagrams under with_low_memory?",
+    "How much of the 56 MB is removable per feature tag (measure each module: tailscale, easytier, mieru, wazero)?",
+    "Do the metacubex/chacha and sing-vmess/shadowsocks2 code paths use x/crypto asm or their own pure-Go ciphers?"
+  ],
+  "conclusion": "Go runtime tuning (GOMEMLIMIT/GOGC/GOMAXPROCS, idle FreeOSMemory, with_low_memory) can trim peak memory modestly and cheaply, but the dominant levers for the 16 MB / 10 MB RSS targets are removing code (the current build is 53-63 MB per arch with pclntab ~20 MB) and choosing ciphers that suit the architecture (no stdlib crypto assembly on ARMv7/MIPS). The 64 MB class is infeasible without heavy pruning; 128 MB is plausible with the Lightweight profile; 256/512 MB can run a richer build with standard buffers. All runtime defaults listed are hypotheses pending on-device measurement."
+}

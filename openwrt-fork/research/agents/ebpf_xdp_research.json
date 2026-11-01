@@ -1,0 +1,682 @@
+{
+ "agent": "ebpf_xdp_research",
+ "model": "Claude Sonnet 5.5",
+ "effort": "Medium",
+ "research_date": "2026-11-01",
+ "scope": [
+  "XDP/TC-BPF/sockmap/sk_lookup/cgroup hooks fit for mihomo on OpenWrt",
+  "sockmap vs splice for DIRECT connections",
+  "eBPF vs nftables sets/flowtable for bypass",
+  "JIT/BTF per architecture",
+  "cilium/ebpf integration cost"
+ ],
+ "summary": "On the OpenWrt 25.12 6.12 kernel only sockmap/sockhash (sk_skb stream_verdict + redirect) is available without extra kmods and composes with firewall policy; XDP/TC-BPF/sk_lookup/cgroup hooks are either unavailable by default, bypass fw4/conntrack, or cannot capture forwarded traffic. Go's stdlib already splices TCPConn->TCPConn (go:net/splice_linux.go), the zero-dependency baseline. nft set + flowtable remains the safest classified-flow bypass. cilium/ebpf costs ~1.6-2.0 MB stripped standalone (measured) so a raw-syscall loader or helper binary is preferable if eBPF is ever added. No device benchmarks exist; throughput gains are hypotheses.",
+ "findings": [
+  {
+   "id": "F001",
+   "topic": "OpenWrt 25.12 kernel BPF baseline",
+   "description": "Generic OpenWrt 6.12 config has eBPF syscall and JIT enabled but NOT the networking pieces needed for TC/XDP-socket use; everything else is a kmod or build option.",
+   "technical_details": "CONFIG_BPF=y, BPF_JIT=y, BPF_JIT_DEFAULT_ON=y, BPF_SYSCALL=y, BPF_UNPRIV_DEFAULT_OFF=y (root only), BPF_JIT_ALWAYS_ON not set, BPF_STREAM_PARSER not set, DEBUG_INFO_BTF not set, NET_CLS_ACT/NET_SCH_INGRESS/NET_CLS_BPF/NET_ACT_BPF not set (kmod-sched-bpf, kmod-sched-core provide them as modules via KCONFIG in netsupport.mk), XDP_SOCKETS not set, NET_SOCK_MSG=y, CGROUPS not set at generic level, NF_FLOW_TABLE not set (kmod), NF_TPROXY/NFT_TPROXY/NFT_SOCKET not set (kmods). Per-target configs may change CGROUPS (procd option), unverified for per-target.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "712-720, 1318, 4082-4109, 4214, 4230, 4390, 7721"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:package/kernel/linux/modules/netsupport.mk",
+     "line_reference": "799-802 (kmod-sched-bpf), 719-724"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F002",
+   "topic": "Which BPF program types need which config",
+   "description": "sockmap/sockhash + sk_skb stream_verdict + sk_msg only need BPF_SYSCALL (which selects NET_SOCK_MSG); BPF_STREAM_PARSER (stream_parser, needs CGROUP_BPF) is NOT needed for stream_verdict. sk_lookup needs BPF_SYSCALL only. TC-BPF needs NET_CLS_BPF/NET_ACT_BPF/NET_SCH_INGRESS/NET_SCH_CLSACT modules. cgroup/connect4/6 needs CGROUPS+CGROUP_BPF and cgroup2 mount (not guaranteed on OpenWrt). XDP generic needs only BPF_SYSCALL; native needs driver ndo_bpf.",
+   "technical_details": "So sockmap is the one eBPF feature that works on the stock OpenWrt kernel without extra kmods. cgroup hooks are the most config-fragile (mihomo already runs outside any special cgroup; connect hooks could not distinguish mihomo's own sockets without cgroup membership).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:kernel/bpf/Kconfig",
+     "line_reference": "34 (select NET_SOCK_MSG if NET)"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/Kconfig",
+     "line_reference": "354-360 (BPF_STREAM_PARSER depends on CGROUP_BPF), 474"
+    },
+    {
+     "url": "",
+     "file_path": "linux:kernel/bpf/syscall.c",
+     "line_reference": "3932-3975 attach-type mapping (BPF_CGROUP_INET4_CONNECT, BPF_SK_SKB_STREAM_VERDICT, BPF_SK_LOOKUP)"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F003",
+   "topic": "XDP: driver support on router SoCs",
+   "description": "XDP is a poor fit: it sees only raw frames before the stack, cannot terminate or redirect to a local userspace socket, and cannot skip mihomo for classified traffic better than flowtable does. mtk_eth_soc exposes native XDP (BASIC|REDIRECT|NDO_XMIT) but only when page_pool is enabled; ndo_bpf=mtk_xdp. mt7621 (ramips) PAGE_POOL is set in config. Many wifi/switch ports (DSA user ports, mt76 WLAN) have no native XDP, generic XDP (skb-mode) runs after skb alloc with little gain.",
+   "technical_details": "mtk_eth_soc xdp_features set at 4820-4823 only if mtk_page_pool_enabled(). XDP and the hardware flow offload (PPE) of Filogic overlap: PPE offload (via flowtable HW offload) already bypasses the CPU entirely, which XDP cannot match. XDP cannot be used on bridged WLAN clients. XDP is IPv4/IPv6 and TCP/UDP capable but sees no conntrack state unless it uses bpf_skb/xdp conntrack kfuncs (bpf_xdp_ct_lookup, needs NF_CONNTRACK + kfunc support, hypothesis for 6.12 config on OpenWrt).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://docs.kernel.org/networking/xdp-rx-metadata.html",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "linux:drivers/net/ethernet/mediatek/mtk_eth_soc.c",
+     "line_reference": "4644 (.ndo_bpf), 4820-4823 (xdp_features), 1980-1988 (XDP_REDIRECT/XDP_TX)"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F004",
+   "topic": "TC-BPF (clsact) fit",
+   "description": "TC-BPF at ingress/egress can run on any netdev (incl. bridge ports, WLAN) with skb context, can read ct state via bpf_skb_ct_lookup kfunc (hypothesis re: availability) and can do bpf_sk_assign (TPROXY-like steering) and mark/redirect. But it only needs to exist if nftables sets can't express the policy; nftables already handles IP/CIDR set lookups natively and fw4 owns the ruleset.",
+   "technical_details": "Needs kmod-sched-core + kmod-sched-bpf (NET_CLS_ACT, NET_SCH_INGRESS, NET_CLS_BPF, NET_ACT_BPF) which are NOT built-in in the generic config (+~100-200 KB modules, size unverified). cilium/ebpf supports TCX (kernel >=6.6, link/tcx.go) which fits 6.12; older kernels need netlink clsact qdisc setup. bpf_sk_assign and bpf_skb_set_tunnel_key exist in filter.c.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/filter.c",
+     "line_reference": "7610-7632 (bpf_sk_assign)"
+    },
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:link/tcx.go",
+     "line_reference": "TCX attach"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F005",
+   "topic": "sockmap redirect for terminated DIRECT connections: mechanism",
+   "description": "A sockhash holding the client socket and upstream socket, with an sk_skb stream_verdict program doing bpf_sk_redirect_hash(skb,&map,&key,0) (egress) on each, moves payload between two ESTABLISHED TCP sockets in-kernel without userspace copying. Constraints are strict: only ESTABLISHED sockets for redirect, listen sockets excluded for redirect.",
+   "technical_details": "sock_map_redirect_allowed: TCP requires state != TCP_LISTEN; sock_map_sk_state_allowed: ESTABLISHED or LISTEN for TCP, hashed UDP, unix stream, vsock. TCP data path: sk_psock_verdict_data_ready calls ops->read_skb (tcp_read_skb) which unlinks skbs from sk_receive_queue and passes each to sk_psock_verdict_recv -> BPF verdict -> sk_psock_skb_redirect to peer's egress queue, sent by a workqueue (sk_psock_backlog), not in softirq context. IPv6 sockets are supported (tcpv6 prot rebuilt, tcp_bpf.c:622-654). UDP only via skb_verdict, not meaningful for QUIC/ DIRECT UDP proxies.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/sock_map.c",
+     "line_reference": "529-552, 657-690"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/ipv4/tcp_bpf.c",
+     "line_reference": "164-178, 221, 610-654, 711"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/core/skmsg.c",
+     "line_reference": "958-1083, 1241-1300"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/ipv4/tcp.c",
+     "line_reference": "1664-1692 tcp_read_skb"
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/map_sockmap.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F006",
+   "topic": "sockmap limitations for a proxy (half-close, RST, accounting, ordering)",
+   "description": "Proxy semantics are not fully preserved: (a) FIN/RST are not translated into shutdown/close on the peer; tcp_read_skb stops at an skb with FIN and the verdict program only sees a zero-length skb, so userspace must detect EOF out of band (e.g. poll for EPOLLRDHUP on the sockmap'd socket, still delivered via data_ready? hypothesis) and then call shutdown(peer, SHUT_WR); (b) bytes already sitting in sk_receive_queue before insertion (e.g. data mihomo peeked for TLS SNI sniffing and the unread remainder) stay in the receive queue of the old socket and are not redirected, so userspace must drain/forward them first and only then insert into the map (ordering race with new arrivals); (c) socket buffer accounting: redirected skbs are charged to the receiving psock and the egress socket's sndbuf; slow peers can cause backlog growth bounded by sk_psock ingress queue / sk_rcvbuf; (d) after insertion userspace read() on the fd goes through tcp_bpf_recvmsg_parser/ tcp_bpf_recvmsg - not for proxies reading bytes, so Go's netpoll semantics change; (e) errors on peer produce sk_err on the other socket asynchronously.",
+   "technical_details": "Hence a robust design needs a userspace supervisor goroutine per connection (or a conn-level epoll) anyway, which weakens the memory benefit: Go goroutine stack per connection (~2-8 KB) remains plus fds. Idle-timeout, traffic accounting (up/down bytes for the dashboard), and rate limiting / connection statistics are lost unless read from tcp_info (TCP_INFO bytes_received/bytes_acked are available) or sockmap-side counters in a BPF map. This breaks mihomo's per-connection statistics hooks unless re-implemented through tcp_info polling.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/ipv4/tcp.c",
+     "line_reference": "1664-1692"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/core/skmsg.c",
+     "line_reference": "1031-1083, 1241-1300"
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/map_sockmap.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F007",
+   "topic": "Go TCPConn.ReadFrom already uses splice(2) between two TCP sockets",
+   "description": "Go (1.27.3 stdlib here) io.Copy(dstTCP, srcTCP) takes TCPConn.readFrom -> spliceFrom: if the reader is a *TCPConn (or tcpConnWithoutWriteTo) or a unix stream conn, it splices kernel-side through a pipe (socket->pipe->socket), no userspace copy. Optionally LimitedReader supported. spliceTo (WriteTo path) is only enabled when dst is a stream UnixConn. This works only if mihomo's relay passes the bare *net.TCPConn objects (not wrapped by statistic tracker, buffered reader, or TLS), which is true for the DIRECT/TPROXY path only when no wrapper intervenes.",
+   "technical_details": "This is the baseline non-BPF alternative: kernel does the copy, but two syscalls-per-chunk wake-ups (splice in + splice out, up to pipe size 64 KB default) per direction occur in userspace and each readiness wake-up goes through the Go netpoller; CPU cost on MT7621-class cores is dominated by the Go scheduler wake-ups plus kernel copy via the pipe (page refs, not memcpy for TCP->pipe on splice from socket: it does copy from skb frags into pipe pages for many drivers). mihomo's tunnel/relay in the fork still needs checking whether it uses the bare TCPConn (see opportunities).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:net/splice_linux.go",
+     "line_reference": "20-60 (spliceFrom accepts *TCPConn), 56-62 (spliceTo only unix)"
+    },
+    {
+     "url": "",
+     "file_path": "go:net/tcpsock_posix.go",
+     "line_reference": "47-60 readFrom: splice -> sendfile -> generic"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F008",
+   "topic": "sockmap vs splice: expected gain",
+   "description": "No measured numbers exist for these hardware targets in this study. Hypothesis: sockmap redirect removes the userspace wake-ups and syscalls entirely (data_ready -> BPF -> backlog worker), so it would cut CPU per byte versus splice mostly by removing per-chunk syscalls and context switches, but both still traverse the full TCP stack twice (rx + tx), so the gain over splice is bounded (guess: tens of percent CPU at best), while the gain over a plain userspace io.Copy with 16-32 KB buffers (two memcpys + 2 syscalls/chunk) is larger. Hardware flowtable/PPE offload on a pure forwarding path beats both.",
+   "technical_details": "Known public data points (secondary): Cloudflare/Cilium sockmap-accelerated proxying reports gains on x86 servers; no MIPS/ARMv7 data. Treat as hypothesis. Recommended measurement: iperf3 through a TPROXY'd DIRECT flow on a MT7621 / filogic device comparing (a) io.Copy w/ buffer, (b) splice (Go default), (c) sockmap, measuring CPU idle% and throughput.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://ebpf.io/applications/",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/map_sockmap.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F009",
+   "topic": "sk_lookup as TPROXY replacement",
+   "description": "sk_lookup (BPF_SK_LOOKUP, netns-attached link) lets a BPF program choose the listening socket for incoming connections/datagrams (bpf_sk_assign) based on dest IP/port, but it only acts on traffic destined to local addresses; it cannot capture forwarded LAN traffic (dst not local) the way TPROXY with policy routing / local route does. For a router intercepting forwarded flows you still need nft tproxy / REDIRECT or a TUN. A tc-bpf program using bpf_sk_assign can capture non-local dst, like TPROXY, replacing nft tproxy but not simpler.",
+   "technical_details": "So sk_lookup is useful for steering many ports to one listener (e.g. 'all ports' without a port range DNAT) after traffic is already delivered locally (e.g. via ip rule local route). Not a net win vs nft tproxy which fw4 already supports. Supported TCP and UDP, IPv4/IPv6 (kernel >=5.9). Config: BPF_SYSCALL only; attach via link (cilium/ebpf link.AttachNetNs).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/filter.c",
+     "line_reference": "11594-11620 (bpf_sk_lookup_assign), 7610 (bpf_sk_assign)"
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/prog_sk_lookup.html",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:link/netns.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F010",
+   "topic": "Bypass of not-yet-intercepted traffic: eBPF map vs nft set + flowtable",
+   "description": "For forwarded traffic the existing mechanism (nft set of classified DIRECT destinations consulted before the tproxy rule, plus flowtable software/hardware offload for established flows) gives the same bypass with kernel-supported, fw4-integrated pieces. An XDP/TC program with a hash map filled by mihomo could bypass the tproxy decision earlier but still needs a way to also skip nft hooks/conntrack, which XDP_PASS does not do; only XDP_REDIRECT-style forwarding does and it bypasses the firewall (safety problem). nft set+flowtable is simpler and safer: atomic transactions, timeouts per element, interval sets for CIDR, fw4 reload keeps ruleset consistent, auto-flush on mihomo exit via the set living in fw4/tables.",
+   "technical_details": "eBPF map advantages: LRU eviction, per-element stats, wide key types (5-tuple instead of dst-only). Disadvantages: needs kmod-sched-bpf, no FW4 awareness, map lifetime must be pinned, leak risk if mihomo crashes while program stays attached (stale 'bypass' = traffic leaking around the proxy), verifier/JIT variance across the 5 architectures. The clashwrt setctl.sh/fw.sh already implements an nft bypass set; see consumer project.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/setctl.sh",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "clashwrt:clashwrt/files/usr/libexec/clashwrt/fw.sh",
+     "line_reference": ""
+    },
+    {
+     "url": "https://docs.kernel.org/networking/nf_flowtable.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F011",
+   "topic": "BPF JIT availability per architecture (OpenWrt targets)",
+   "description": "eBPF JIT exists for all OpenWrt arches in v6.12: arm64 (HAVE_EBPF_JIT), arm 32-bit ARMv7 (HAVE_EBPF_JIT if !CPU_ENDIAN_BE32 && !CPU_32v3), MIPS (32 and 64: bpf_jit_comp32.c / comp64.c, except microMIPS), riscv (MMU only). MIPS eBPF JIT (32-bit variant by Johan Almbladh) merged around Linux 5.16 (from memory; unverified).",
+   "technical_details": "Without JIT, eBPF is interpreted; OpenWrt sets BPF_JIT_DEFAULT_ON=y and not ALWAYS_ON, so the interpreter fallback is enabled if the JIT is disabled via sysctl net.core.bpf_jit_enable=0. Interpreter is several times slower; for sockmap verdict programs per-skb cost is small anyway, but for per-packet TC/XDP on MT7621 it matters. big-endian ARM (CPU_ENDIAN_BE32) has no JIT; ath79/ramips big-endian MIPS is covered. MIPS 32-bit with 64-bit atomics/bpf_loop etc. has restricted insns support.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:arch/arm64/Kconfig",
+     "line_reference": "196"
+    },
+    {
+     "url": "",
+     "file_path": "linux:arch/arm/Kconfig",
+     "line_reference": "96"
+    },
+    {
+     "url": "",
+     "file_path": "linux:arch/mips/Kconfig",
+     "line_reference": "70"
+    },
+    {
+     "url": "",
+     "file_path": "linux:arch/riscv/Kconfig",
+     "line_reference": "149"
+    },
+    {
+     "url": "",
+     "file_path": "linux:arch/mips/net/Makefile",
+     "line_reference": "4-9 (comp32/comp64)"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F012",
+   "topic": "BTF/CO-RE not available on OpenWrt kernels",
+   "description": "CONFIG_DEBUG_INFO_BTF is unset, so /sys/kernel/btf/vmlinux does not exist; CO-RE relocations and fentry/kprobe-with-struct-access programs cannot be portably loaded. Network-type programs (sk_skb, sk_msg, sk_lookup, xdp, tc) that only use their stable UAPI contexts (__sk_buff, sk_msg_md, bpf_sk_lookup, xdp_md) need no BTF and no CO-RE, so they can be built once per arch with clang -target bpf and embedded as ELF via bpf2go.",
+   "technical_details": "bpf2go needs clang at dev time only. Maps declared in legacy or BTF-style: BTF-defined maps (.maps section) require the program ELF's own BTF (compiler-generated, fine) but the loader also strips/does not need vmlinux BTF; cilium/ebpf handles missing kernel BTF unless CO-RE relocations or typed kfunc calls are present. Verifier limits on 6.12: 1M insn complexity, bounded loops allowed; older kernels (<5.2) no bounded loops; irrelevant for 6.12 but matters for OpenWrt 23.05 (5.15) and 22.03 (5.10) — sockmap stream_verdict first appears in 5.13, sk_lookup 5.9, TCX 6.6.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "1318"
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/btf.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F013",
+   "topic": "cilium/ebpf: pure Go, no libbpf; supports sockmap, XDP, TCX, netns/sk_lookup, cgroup",
+   "description": "cilium/ebpf (go 1.26.0, repo at commit 7963e20, 2026-10-29) is pure Go with no cgo; supports map types incl. SockMap/SockHash, program types SkSKB/SkMsg/SkLookup/XDP/SchedCLS, links for XDP, TCX, netns, cgroup, and pinning of maps/programs/links in bpffs. Requires golang.org/x/sys (already a mihomo dependency) and uses the kernel's BPF syscall directly.",
+   "technical_details": "Package list pulled by a minimal sockmap program: github.com/cilium/ebpf, /asm, /btf, /internal/{sys,unix,linux,platform,kallsyms,kconfig,tracefs,mountinfo,sysenc} and golang.org/x/sys/unix, plus std reflect, encoding/binary, os (the others, crypto etc., come from fmt/os in the test program). Link pinning: RawLink.Pin / Unpin in link/link.go:164-173; program/map pinning via pin package. ",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:go.mod",
+     "line_reference": "1-10"
+    },
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:link/link.go",
+     "line_reference": "164-173"
+    },
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:link/xdp.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F014",
+   "topic": "Experiment: binary size cost of importing cilium/ebpf (stripped, -ldflags -s -w -trimpath, CGO off, Go 1.27.3)",
+   "description": "A minimal program that creates a SockHash map and loads an SkSKB program with cilium/ebpf adds about 1.64 MB on arm64 (1,573,024 -> 3,211,424 bytes; hello-world baseline), 1.70 MB on arm32 (same ending size, ~3.2 MB, baseline 1,507,488), and 1.97 MB on mipsle softfloat (1,704,127 -> 3,670,207). This is a standalone overstatement: mihomo already links reflect, encoding/binary, os, golang.org/x/sys/unix and fmt-era runtime, so the real delta inside mihomo is estimated at ~0.8-1.3 MB (hypothesis, not measured).",
+   "technical_details": "The big contributors are cilium/ebpf/btf (BTF parser/marshaler, kconfig and kallsyms) which cannot be eliminated by build tags; using only the sys package (github.com/cilium/ebpf/internal/sys is internal, not importable) isn't possible, so a leaner alternative is a tiny hand-written wrapper over golang.org/x/sys/unix.Syscall(SYS_BPF,...) for BPF_MAP_CREATE/BPF_PROG_LOAD/BPF_MAP_UPDATE_ELEM/BPF_PROG_ATTACH with a hand-assembled static program (~300 lines) that adds <50 KB. Source: /tmp/claude-1000/-home-mrfrok-Projects-clashwrt/0712caf5-593b-4903-aa33-590a1010ee6c/scratchpad/ebpf_xdp_research/ebpf/main.go and empty/main.go. Not run on a device: the host runtime test of loading wasn't executed to avoid touching host state; kernel-loaded behaviour unverified.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "experiment:ebpf_xdp_research/ebpf/main.go",
+     "line_reference": "built for arm64, arm, mipsle"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F015",
+   "topic": "Capabilities, pinning, cleanup on crash",
+   "description": "BPF map/program creation needs CAP_BPF (kernel>=5.8) plus CAP_NET_ADMIN for network program types, and CAP_PERFMON for some; on OpenWrt mihomo already runs as root. Resources are fd-refcounted: if programs/maps are only held by mihomo's fds, they are freed when the process dies (safe: no stale bypass). Pinned objects in bpffs (needs mount -t bpf, CONFIG_BPF_SYSCALL; OpenWrt does not mount bpffs by default, unverified) or link-attached objects (XDP/TCX/cgroup/netns links are destroyed with the last fd unless pinned) outlive the process. Legacy netlink attach (TC clsact filters, XDP via netlink without link) always outlives the process.",
+   "technical_details": "Safety rule for the bypass use-case: use non-pinned links so that crash/exit auto-detaches (fail-closed); never pin. Sockmaps: sockets removed from the map when closed; psock detaches on socket close; crash closes all sockets so connections die with the process (same as today).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:kernel/bpf/syscall.c",
+     "line_reference": "3932-4122 (attach-type checks)"
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/bpf_design_QA.html",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "cilium-ebpf:link/link.go",
+     "line_reference": "164-173"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F016",
+   "topic": "Interaction with conntrack and nftables",
+   "description": "XDP runs before nf hooks and conntrack: packets handled in XDP never create conntrack entries and bypass fw4 rules entirely (firewall bypass risk). TC-BPF runs after ingress qdisc and before nf PREROUTING (ingress) / after POSTROUTING hooks on egress (clsact egress runs before netfilter egress hooks), also outside nft policy unless the program calls bpf_skb_ct_lookup. sockmap runs on socket layer, after nf and conntrack, so it composes with firewall policy and conntrack safely. Software flowtable (nf_flow_table) is the standard in-kernel fast path after conntrack and respects fw4 offload settings.",
+   "technical_details": "Hence of the eBPF options only sockmap composes with the existing firewall without bypass risk. For TPROXY traffic, mihomo's sockets are local (conntrack entry exists, tproxy assigned), which flowtable can never offload since it is locally terminated.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://docs.kernel.org/networking/nf_flowtable.html",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "https://docs.kernel.org/bpf/prog_flow_dissector.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F017",
+   "topic": "UDP and QUIC",
+   "description": "sockmap handles UDP only as skb_verdict between hashed UDP sockets (sock_map_sk_state_allowed: sk_is_udp -> sk_hashed), without connection semantics; QUIC DIRECT flows in mihomo's UDP NAT proxy cannot be redirected between 'client' and 'upstream' as a stream; each UDP packet needs source address rewriting (userspace does that today). So UDP is not accelerated by sockmap in any useful way.",
+   "technical_details": "The only in-kernel UDP fast path is flowtable for forwarded (non-intercepted) flows, i.e. DIRECT UDP traffic that is NOT sent to mihomo at all (bypass by IP/port sets), which requires classification without domain data in practice.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/sock_map.c",
+     "line_reference": "542-552"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F018",
+   "topic": "TLS sniffing and DIRECT first bytes",
+   "description": "For a TPROXY'd DIRECT connection mihomo reads the first bytes (TLS ClientHello SNI) to classify, then dials upstream. After sniff, those bytes are already consumed by userspace and written to the upstream socket by write(); only the *rest* of the stream could be sockmap-offloaded. This makes the handoff point after the first request exactly once per connection: userspace sets the upstream socket and client socket into a sockhash (fd insert via BPF_MAP_UPDATE_ELEM) when both ESTABLISHED and both receive queues are drained; there is an inherent race for data arriving during the switch.",
+   "technical_details": "Quantitative scope: this only helps long-lived bulk DIRECT flows (downloads/video). Short HTTP flows pay the map-insert syscalls and psock allocation for no gain. A size threshold trigger (e.g. after N KB moved) is hypothesis for a hybrid policy.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/skmsg.c",
+     "line_reference": "1031-1083"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/ipv4/tcp.c",
+     "line_reference": "1664-1692"
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F019",
+   "topic": "Custom kernel module / TUN stack comparison",
+   "description": "A custom kernel module (e.g. a netfilter hook with a classified-flow table, or an ipt/nft expr) could do the same bypass as nft sets with fewer constraints but must be built per kernel version/arch ABI with every OpenWrt snapshot (vermagic, kmod packaging), and is a stability and security burden; nft sets/flowtable (in-tree, maintained by firewall4 and kmod-nft-offload) already cover the semantic. TC u32/flower can match prefix sets but have no dynamic set semantics, no per-element timeouts and need kmod-sched-core + kmod-cls-*; they bypass nftables like TC-BPF.",
+   "technical_details": "Verdict ordering by risk: nft set (in-tree, atomic) < flowtable < sockmap < TC-BPF < XDP < out-of-tree kmod. Fallbacks for kernels lacking support: sockmap -> Go splice (stdlib) -> io.Copy w/ pooled buffer; TC/XDP -> nft set; flowtable -> plain forward.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fw4:",
+     "line_reference": ""
+    },
+    {
+     "url": "https://docs.kernel.org/networking/nf_flowtable.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F020",
+   "topic": "cgroup/connect4/6 hooks",
+   "description": "cgroup/connect hooks (BPF_CGROUP_INET4_CONNECT / INET6_CONNECT) rewrite destinations of locally originated connects per-cgroup: useful to redirect an app's connections transparently on a host, but this project is a router where traffic is forwarded and not generated by local processes, so connect hooks are irrelevant to forwarded LAN traffic; they could replace the 'mihomo's own packets must not loop' fwmark/uid exemption but that already works.",
+   "technical_details": "Needs CGROUPS + CGROUP_BPF + mounted cgroup2, absent in generic OpenWrt config. Not worth it.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:kernel/bpf/syscall.c",
+     "line_reference": "3932, 4248"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "882"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F021",
+   "topic": "Other considerations: RAM, kmods and size on small devices",
+   "description": "eBPF adds kernel memory (JIT image pages, map memory charged to memlock/kernel; small) and, for TC/XDP, kmods. A sockmap psock allocates struct sk_psock (~ few hundred bytes) plus queues per socket plus a work item; with 1000s of long flows this is KBs not MBs. On 64-128 MB devices not a problem. On 16-32 MB devices (the Ultra profile) everything beyond sockmap is too costly (kmods), and the cilium/ebpf import cost (~1-2 MB) matters relative to a 16 MB binary target.",
+   "technical_details": "The hand-rolled raw-syscall loader (see F014) is the right path for an optional sockmap module if ever done; otherwise a separate helper binary (e.g. loaded by procd) keeps the core small and crash-isolated.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "experiment:ebpf_xdp_research/ebpf/main.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F022",
+   "topic": "XDP generic and driver notes for the target SoCs",
+   "description": "Targets: mediatek filogic/mt7622/mt7623/mt7629 use mtk_eth_soc (XDP native only with page_pool), ramips mt7621 also uses mtk_eth_soc and has PAGE_POOL set in its config, so native XDP is plausible (unverified at runtime); ath79/qca955x etc. (ag71xx), qualcommax (ipq807x: edma / dp_soc, ppe offload via NSS), rockchip (stmmac/r8169/dwmac: stmmac supports XDP natively), ipq40xx (ipqess no XDP). Generic XDP works anywhere but is slower than native and does not skip skb allocation.",
+   "technical_details": "Only the mediatek and rockchip families plausibly support native XDP; qualcommax prefers its own HW offload (nss/ppe). Honest conclusion: XDP is not generally available on OpenWrt routers; do not depend on it.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:drivers/net/ethernet/mediatek/mtk_eth_soc.c",
+     "line_reference": "4820-4823"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/mediatek/filogic/config-6.12",
+     "line_reference": "355-356"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/ramips/mt7621/config-6.12",
+     "line_reference": "215-216"
+    }
+   ],
+   "confidence": "low",
+   "status": "probable"
+  },
+  {
+   "id": "F023",
+   "topic": "Go integration cost: netpoller and fds",
+   "description": "Passing the raw fd to the BPF syscall requires syscall.RawConn.Control to get the socket fd without breaking the netpoller; after the sockets enter the sockmap, Go's netpoll would still be registered on those fds (epoll), and sockmap redirect intercepts data at tcp_read_skb in sk_data_ready, so epoll readability signals for the socket stop firing for payload but still fire for EOF? (unverified). Meaning net.Conn.Read must not be used afterwards, and the goroutine should only be waiting on Close/timeouts. A per-flow supervisor can use a pidfd-less approach: poll tcp_info state via getsockopt(TCP_INFO) on a timer for CLOSE_WAIT/ESTABLISHED, which costs a syscall per flow per tick.",
+   "technical_details": "This is the key engineering uncertainty for sockmap; requires an on-device prototype to resolve (see open questions).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "linux:net/core/skmsg.c",
+     "line_reference": "1273-1315"
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F024",
+   "topic": "Overall verdict matrix",
+   "description": "Per use: XDP: not worth it (bypasses firewall, driver-limited, no benefit over flowtable/PPE); TC-BPF classified-flow bypass: not worth it vs nft set + flowtable (needs kmods, bypasses fw4); sk_lookup as TPROXY replacement: not worth it (does not capture forwarded traffic); cgroup/connect: not worth it (router); sockmap splice of DIRECT proxied connections: optional module, only after an on-device benchmark shows gain over Go splice; Go splice already used by stdlib: baseline, ensure the relay passes bare *net.TCPConn.",
+   "technical_details": "Fallback chain: sockmap -> splice (io.Copy with TCPConn pairs) -> buffered copy. Gate sockmap by capability probing (BPF_MAP_CREATE SockHash + BPF_PROG_LOAD SkSKB) at startup and by kernel>=5.13 (stream_verdict) and self-test.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:net/splice_linux.go",
+     "line_reference": "20-60"
+    },
+    {
+     "url": "",
+     "file_path": "linux:net/core/sock_map.c",
+     "line_reference": "529-552"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F025",
+   "topic": "Documentation entry points",
+   "description": "Official docs consulted/relevant: docs.kernel.org/bpf/map_sockmap.html (sockmap/sockhash semantics), docs.kernel.org/bpf/prog_sk_lookup.html, docs.kernel.org/networking/nf_flowtable.html, docs.kernel.org/bpf/btf.html, ebpf.io/applications. I could not fetch these live in this session; claims referencing them are from the local kernel source and prior knowledge and are marked accordingly.",
+   "technical_details": "",
+   "source_type": "official_docs",
+   "sources": [
+    {
+     "url": "https://docs.kernel.org/bpf/map_sockmap.html",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "https://ebpf.io/what-is-ebpf/",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "unverified"
+  }
+ ],
+ "opportunities": [
+  {
+   "name": "Ensure Go splice path is actually used for DIRECT relay",
+   "description": "Audit the fork's tunnel relay (statistic wrappers, buffered conns) so that for DIRECT TCP the bare *net.TCPConn pair reaches io.Copy and Go's splice(2) kicks in; add a tracker that counts bytes via TCP_INFO instead of wrapping Read/Write.",
+   "expected_benefit": "Less userspace copy CPU on DIRECT TCP with zero kernel feature dependency (high on weak CPUs, hypothesis).",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Per-connection stats/limits need alternative accounting",
+    "Splice is skipped if any wrapper type appears"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "Optional sockmap offload module for long DIRECT TCP flows",
+   "description": "After N KB of DIRECT traffic, switch the flow to sockhash redirect with an sk_skb verdict program; supervisor handles FIN/RST/timeouts.",
+   "expected_benefit": "Removes remaining per-chunk wake-ups; gain over splice unknown (hypothesis).",
+   "implementation_complexity": "high",
+   "risks": [
+    "FIN/RST/half-close semantics",
+    "Queued data race on switch",
+    "Loses per-connection stats",
+    "Needs on-device validation per arch"
+   ],
+   "priority": "low"
+  },
+  {
+   "name": "Capability probe for BPF features at startup",
+   "description": "Probe BPF_MAP_CREATE(SockHash)+BPF_PROG_LOAD(SkSKB) and log availability; expose in diagnostics only, no behavior change.",
+   "expected_benefit": "Gives data to decide whether any eBPF path is viable across the five targets.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Needs root"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Raw-syscall minimal BPF loader instead of cilium/ebpf",
+   "description": "Hand-written loader on x/sys/unix for just map create/update, prog load, prog attach, with pre-assembled instructions.",
+   "expected_benefit": "Saves ~1-2 MB binary (measured standalone delta of cilium/ebpf) and avoids btf code.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Per-kernel ABI quirks",
+    "Maintenance of hand-assembled bytecode"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Prefer nft set + flowtable for classified DIRECT bypass (not eBPF)",
+   "description": "Keep classified-flow bypass in nftables sets with timeouts and rely on flowtable; eBPF map approach is not recommended.",
+   "expected_benefit": "Safe, fw4-compatible, auto-cleanup, no kmod-sched-bpf.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Set element churn costs CPU on weak routers",
+    "kmod-nft-offload size"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "On-device benchmark: splice vs sockmap vs buffered copy",
+   "description": "Prototype a small C/Go test sockmap relay and measure on MT7621 (MIPS32), MT7981/7986 (arm64), IPQ40xx (ARMv7).",
+   "expected_benefit": "Turns hypotheses F008/F023 into data to make the module decision.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Needs hardware and time"
+   ],
+   "priority": "medium"
+  }
+ ],
+ "limitations": [
+  "No on-device runs; no benchmarks of sockmap vs splice",
+  "Official docs not fetched live; kernel source (v6.12.112) is primary",
+  "MIPS JIT introduction kernel version from memory",
+  "Per-target CGROUPS/BPF kmod configs not exhaustively checked",
+  "Did not verify mihomo relay passes bare TCPConn"
+ ],
+ "risks": [
+  "eBPF/TC/XDP programs bypass nftables/conntrack policy: stale attached programs after a crash can cause proxy leaks",
+  "sockmap loses FIN/RST/half-close fidelity and per-connection stats",
+  "Verifier/JIT differences across arch/kernel versions (OpenWrt 23.05=5.15, 24.10=6.6)",
+  "Big-endian ARM has no JIT"
+ ],
+ "recommendations": [
+  "Do not use XDP, TC-BPF, sk_lookup or cgroup hooks in any profile",
+  "Keep classified DIRECT bypass in nft sets + flowtable",
+  "Verify and guarantee Go splice usage for DIRECT TCP relay",
+  "If sockmap is explored, do it as an Optional module for the Performance profile, gated by a capability probe, with a raw-syscall loader or separate helper binary, and an on-device benchmark first",
+  "Never pin links/maps so a crash fails closed"
+ ],
+ "open_questions": [
+  "Does epoll still signal EOF/RDHUP on a socket inside a sockhash with a stream_verdict program (6.12)?",
+  "What is the actual MT7621/filogic CPU gain of sockmap versus Go splice?",
+  "Does mihomo's relay hand bare *net.TCPConn pairs to io.Copy for TPROXY DIRECT?",
+  "Which OpenWrt targets build CGROUPS and bpffs mount by default?",
+  "Is bpf_skb_ct_lookup/kfunc usable in the OpenWrt 6.12 config?"
+ ],
+ "conclusion": "eBPF is not worth adopting for fast path classification on OpenWrt; sockmap is the only plausible optional module, pending measurement against Go's built-in splice and the nft set/flowtable approach."
+}

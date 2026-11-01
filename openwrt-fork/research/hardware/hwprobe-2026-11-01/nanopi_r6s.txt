@@ -1,0 +1,253 @@
+
+=== board
+        "kernel": "6.12.112",
+        "system": "ARMv8 Processor rev 0",
+        "model": "FriendlyElec NanoPi R6S",
+        "board_name": "friendlyarm,nanopi-r6s",
+        "release": {
+                "distribution": "OpenWrt",
+                "version": "25.12.6",
+                "revision": "r33311-981c978eff",
+                "target": "rockchip/armv8",
+                "description": "OpenWrt 25.12.6 r33311-981c978eff",
+6.12.112 #0 SMP Sat Oct 17 21:45:38 2026 aarch64
+
+=== cpu
+      8 BogoMIPS        : 48.00
+      8 CPU implementer : 0x41
+      4 CPU part        : 0xd05
+      4 CPU part        : 0xd0b
+      8 Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp
+cores: 8
+max_freq_khz 1800000
+fpu-flags: present
+
+=== memory
+MemTotal:        8143088 kB
+MemFree:         7964640 kB
+MemAvailable:    7962676 kB
+Buffers:            2292 kB
+Cached:            61904 kB
+SwapTotal:             0 kB
+Shmem:               268 kB
+Slab:              48700 kB
+SUnreclaim:        32320 kB
+KernelStack:        3196 kB
+PageTables:          796 kB
+CommitLimit:     4071544 kB
+Committed_AS:      18832 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+overcommit_memory 0
+
+=== storage
+Filesystem                Size      Used Available Use% Mounted on
+/dev/root               309.8M    104.6M    198.7M  34% /
+/dev/root               309.8M    104.6M    198.7M  34% /
+tmpfs                     3.9G    268.0K      3.9G   0% /tmp
+/dev/root / ext4
+tmpfs /tmp tmpfs
+
+=== packages
+pm: apk
+dnsmasq-full-2.93-r2
+firewall4-2025.03.17~b6e51575-r2
+ip-full-6.18.0-r2
+kmod-amneziawg-6.12.112.3.1.20260906-r1
+kmod-asn1-decoder-6.12.112-r1
+kmod-atm-6.12.112-r1
+kmod-br-netfilter-6.12.112-r1
+kmod-cdrom-6.12.112-r1
+kmod-crypto-acompress-6.12.112-r1
+kmod-crypto-aead-6.12.112-r1
+kmod-crypto-arc4-6.12.112-r1
+kmod-crypto-authenc-6.12.112-r1
+kmod-crypto-blake2b-6.12.112-r1
+kmod-crypto-cbc-6.12.112-r1
+kmod-crypto-ccm-6.12.112-r1
+kmod-crypto-chacha20poly1305-6.12.112-r1
+kmod-crypto-cmac-6.12.112-r1
+kmod-crypto-crc32-6.12.112-r1
+kmod-crypto-crc32c-6.12.112-r1
+kmod-crypto-ctr-6.12.112-r1
+kmod-crypto-cts-6.12.112-r1
+kmod-crypto-deflate-6.12.112-r1
+kmod-crypto-des-6.12.112-r1
+kmod-crypto-ecb-6.12.112-r1
+kmod-crypto-ecdh-6.12.112-r1
+kmod-crypto-echainiv-6.12.112-r1
+kmod-crypto-essiv-6.12.112-r1
+kmod-crypto-gcm-6.12.112-r1
+kmod-crypto-geniv-6.12.112-r1
+kmod-crypto-gf128-6.12.112-r1
+kmod-crypto-ghash-6.12.112-r1
+kmod-crypto-hash-6.12.112-r1
+kmod-crypto-hmac-6.12.112-r1
+kmod-crypto-kpp-6.12.112-r1
+kmod-crypto-lib-chacha20-6.12.112-r1
+kmod-crypto-lib-chacha20poly1305-6.12.112-r1
+kmod-crypto-lib-curve25519-6.12.112-r1
+kmod-crypto-lib-poly1305-6.12.112-r1
+kmod-crypto-manager-6.12.112-r1
+kmod-crypto-md4-6.12.112-r1
+kmod-crypto-md5-6.12.112-r1
+kmod-crypto-michael-mic-6.12.112-r1
+kmod-crypto-misc-6.12.112-r1
+kmod-crypto-null-6.12.112-r1
+kmod-crypto-pcbc-6.12.112-r1
+kmod-crypto-rmd160-6.12.112-r1
+kmod-crypto-rng-6.12.112-r1
+kmod-crypto-seqiv-6.12.112-r1
+kmod-crypto-sha1-6.12.112-r1
+kmod-crypto-sha256-6.12.112-r1
+kmod-crypto-sha3-6.12.112-r1
+kmod-crypto-sha512-6.12.112-r1
+kmod-crypto-test-6.12.112-r1
+kmod-crypto-user-6.12.112-r1
+kmod-crypto-xcbc-6.12.112-r1
+kmod-crypto-xts-6.12.112-r1
+kmod-crypto-xxhash-6.12.112-r1
+kmod-cryptodev-6.12.112.1.14-r1
+kmod-dnsresolver-6.12.112-r1
+kmod-fs-btrfs-6.12.112-r1
+kmod-fs-exfat-6.12.112-r1
+kmod-fs-ext4-6.12.112-r1
+kmod-fs-f2fs-6.12.112-r1
+kmod-fs-hfs-6.12.112-r1
+kmod-fs-hfsplus-6.12.112-r1
+kmod-fs-jfs-6.12.112-r1
+kmod-fs-ntfs3-6.12.112-r1
+kmod-fs-vfat-6.12.112-r1
+kmod-gpio-button-hotplug-6.12.112-r5
+kmod-gre-6.12.112-r1
+kmod-gre6-6.12.112-r1
+kmod-hwmon-core-6.12.112-r1
+kmod-i2c-core-6.12.112-r1
+kmod-inet-diag-6.12.112-r1
+kmod-ip6-tunnel-6.12.112-r1
+kmod-ipt-core-6.12.112-r1
+kmod-ipt-ipopt-6.12.112-r1
+kmod-iptunnel-6.12.112-r1
+kmod-iptunnel6-6.12.112-r1
+kmod-l2tp-6.12.112-r1
+kmod-lib-crc-ccitt-6.12.112-r1
+kmod-lib-crc16-6.12.112-r1
+kmod-lib-crc32c-6.12.112-r1
+kmod-lib-lzo-6.12.112-r1
+kmod-lib-raid6-6.12.112-r1
+kmod-lib-textsearch-6.12.112-r1
+kmod-lib-xor-6.12.112-r1
+kmod-lib-xxhash-6.12.112-r1
+kmod-lib-zlib-deflate-6.12.112-r1
+kmod-lib-zlib-inflate-6.12.112-r1
+kmod-lib-zstd-6.12.112-r1
+kmod-libphy-6.12.112-r1
+kmod-mdio-devres-6.12.112-r1
+kmod-mii-6.12.112-r1
+kmod-mppe-6.12.112-r1
+kmod-nf-conntrack-6.12.112-r1
+kmod-nf-conntrack-netlink-6.12.112-r1
+kmod-nf-conntrack6-6.12.112-r1
+kmod-nf-flow-6.12.112-r1
+kmod-nf-ipt-6.12.112-r1
+kmod-nf-log-6.12.112-r1
+kmod-nf-log6-6.12.112-r1
+kmod-nf-nat-6.12.112-r1
+kmod-nf-nathelper-6.12.112-r1
+kmod-nf-nathelper-amanda-6.12.112-r1
+kmod-nf-nathelper-broadcast-6.12.112-r1
+kmod-nf-nathelper-extra-6.12.112-r1
+kmod-nf-nathelper-h323-6.12.112-r1
+kmod-nf-nathelper-irc-6.12.112-r1
+kmod-nf-nathelper-netbios-6.12.112-r1
+kmod-nf-nathelper-pptp-6.12.112-r1
+kmod-nf-nathelper-sane-6.12.112-r1
+kmod-nf-nathelper-sip-6.12.112-r1
+kmod-nf-nathelper-snmp-6.12.112-r1
+kmod-nf-nathelper-tftp-6.12.112-r1
+kmod-nf-reject-6.12.112-r1
+kmod-nf-reject6-6.12.112-r1
+kmod-nf-socket-6.12.112-r1
+kmod-nf-tproxy-6.12.112-r1
+kmod-nfnetlink-6.12.112-r1
+kmod-nfnetlink-queue-6.12.112-r1
+kmod-nft-core-6.12.112-r1
+kmod-nft-fib-6.12.112-r1
+kmod-nft-nat-6.12.112-r1
+kmod-nft-offload-6.12.112-r1
+kmod-nft-queue-6.12.112-r1
+kmod-nft-socket-6.12.112-r1
+kmod-nft-tproxy-6.12.112-r1
+kmod-nls-base-6.12.112-r1
+kmod-nls-cp1250-6.12.112-r1
+kmod-nls-cp437-6.12.112-r1
+kmod-nls-cp850-6.12.112-r1
+kmod-nls-iso8859-1-6.12.112-r1
+kmod-nls-iso8859-15-6.12.112-r1
+kmod-nls-ucs2-utils-6.12.112-r1
+kmod-nls-utf8-6.12.112-r1
+kmod-oid-registry-6.12.112-r1
+kmod-phy-realtek-6.12.112-r1
+kmod-ppp-6.12.112-r1
+kmod-pppoa-6.12.112-r1
+kmod-pppoe-6.12.112-r1
+kmod-pppol2tp-6.12.112-r1
+kmod-pppox-6.12.112-r1
+kmod-pptp-6.12.112-r1
+kmod-r8169-6.12.112-r1
+kmod-scsi-core-6.12.112-r1
+kmod-slhc-6.12.112-r1
+kmod-thermal-6.12.112-r1
+kmod-tls-6.12.112-r1
+kmod-tun-6.12.112-r1
+kmod-udptunnel4-6.12.112-r1
+kmod-udptunnel6-6.12.112-r1
+kmod-usb-common-6.12.112-r1
+kmod-usb-core-6.12.112-r1
+kmod-usb-ehci-6.12.112-r1
+kmod-usb-net-6.12.112-r1
+kmod-usb-net-cdc-eem-6.12.112-r1
+kmod-usb-net-cdc-ether-6.12.112-r1
+kmod-usb-net-cdc-mbim-6.12.112-r1
+kmod-usb-net-cdc-ncm-6.12.112-r1
+kmod-usb-net-cdc-subset-6.12.112-r1
+kmod-usb-net-huawei-cdc-ncm-6.12.112-r1
+kmod-usb-net-qmi-wwan-6.12.112-r1
+kmod-usb-net-rndis-6.12.112-r1
+kmod-usb-storage-6.12.112-r1
+kmod-usb-wdm-6.12.112-r1
+kmod-usb-xhci-hcd-6.12.112-r1
+kmod-usb2-6.12.112-r1
+kmod-usb3-6.12.112-r1
+kmod-veth-6.12.112-r1
+kmod-wireguard-6.12.112-r1
+nftables-json-1.1.6-r2
+
+=== kernel-config
+no /proc/config.gz (normal on OpenWrt); see modules below
+bpf_jit_enable=1
+unprivileged_bpf_disabled=2
+bpffs dir present: 1 mounted
+cgroup fs: cgroup2 
+
+=== modules
+iptable_filter iptable_mangle nf_conntrack nf_conntrack_amanda nf_conntrack_broadcast nf_conntrack_ftp nf_conntrack_h323 nf_conntrack_irc nf_conntrack_netbios_ns nf_conntrack_netlink nf_conntrack_pptp nf_conntrack_sane nf_conntrack_sip nf_conntrack_snmp nf_conntrack_tftp nf_defrag_ipv4 nf_defrag_ipv6 nf_flow_table nf_flow_table_inet nf_log_syslog nf_nat nf_nat_amanda nf_nat_ftp nf_nat_h323 nf_nat_irc nf_nat_pptp nf_nat_sip nf_nat_snmp_basic nf_nat_tftp nf_reject_ipv4 nf_reject_ipv6 nf_socket_ipv4 nf_socket_ipv6 nf_tables nf_tproxy_ipv4 nf_tproxy_ipv6 nfnetlink nfnetlink_queue nft_chain_nat nft_ct nft_fib nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_flow_offload nft_hash nft_limit nft_log nft_masq nft_nat nft_numgen nft_queue nft_quota nft_redir nft_reject nft_reject_inet nft_reject_ipv4 nft_reject_ipv6 nft_socket nft_tproxy tls tun tunnel6 xt_CLASSIFY xt_DSCP xt_HL xt_LOG xt_TCPMSS xt_comment xt_dscp xt_ecn xt_hl xt_length xt_limit xt_mac xt_mark xt_multiport xt_statistic xt_tcpmss xt_tcpudp xt_time 
+
+=== firewall
+table inet fw4
+
+=== network
+br-lan driver=- mtu=1500  speed=1000
+erspan0 driver=- mtu=1450  speed=-
+eth0 driver=rk_gmac-dwmac mtu=1500  speed=1000
+eth1 driver=r8169 mtu=1500  speed=-1
+eth2 driver=r8169 mtu=1500  speed=-1
+gre0 driver=- mtu=1476  speed=-
+gretap0 driver=- mtu=1462  speed=-
+ip6gre0 driver=- mtu=1448  speed=-
+ip6tnl0 driver=- mtu=1452  speed=-
+no ethtool
+
+=== proxy-core
+
+=== end

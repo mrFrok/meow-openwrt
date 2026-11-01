@@ -1,0 +1,613 @@
+{
+ "agent": "network_performance",
+ "model": "Claude Sonnet 5.5",
+ "effort": "Medium",
+ "research_date": "2026-11-01",
+ "scope": [
+  "TCP relay hot path and splice",
+  "UDP relay syscalls",
+  "TUN stacks and offloads",
+  "io_uring/zerocopy/XDP/kTLS",
+  "buffers and goroutine cost",
+  "control/data plane split"
+ ],
+ "summary": "Mihomo relays TCP with sing bufio.Copy, which already uses splice(2) when both ends unwrap to raw TCP sockets (confirmed by gdb syscall counting for DIRECT CONNECT); traffic counters do not break it. Every encrypted/wrapped outbound and every gVisor/mipstack TUN inbound falls to userspace copies with 16/32 KiB pooled buffers. UDP is one recvfrom/sendto per packet with channel handoff (batching exists only inside quic-go). sing-tun 0.4.28 supports IFF_VNET_HDR TSO/GRO/USO behind tun.gso. io_uring, XDP sockets, kTLS and flow tables are disabled in OpenWrt generic 6.12 config, so exotic zero-copy options are not viable. Best gain per complexity: use real-socket inbounds (redirect/tproxy/system stack), tune buffers/GC per profile, keep splice healthy; a process-level data-plane split is not worth it.",
+ "findings": [
+  {
+   "id": "F001",
+   "topic": "TCP relay structure",
+   "description": "Both directions are copied by two goroutines calling sing bufio.Copy; the fork's Relay is a lighter bufio.CopyConn (no task.Group/context). One goroutine pair per connection.",
+   "technical_details": "tunnel handleSocket -> N.Relay (fork:common/net/sing.go:69-92): spawns one goroutine for dst->src, runs src->dst in the caller, closeWrite on EOF. Called from fork:tunnel/connection.go:220.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:common/net/sing.go",
+     "line_reference": "69-92"
+    },
+    {
+     "url": "",
+     "file_path": "fork:tunnel/connection.go",
+     "line_reference": "220-222"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F002",
+   "topic": "Splice decision logic in sing Copy",
+   "description": "bufio.Copy unwraps wrappers (UnwrapCountReader/Writer follow Upstream/UnwrapReader and turn the statistics tracker into CountFuncs), drains N.CachedReader (BufferedConn bufio buffer) first, then if BOTH ends are syscall.Conn calls copyDirect -> splice(2) via a pipe. Otherwise falls to CopyExtended: ReadWaiter (WaitReadBuffer, zero extra copy) if available, else pooled ReadBuffer/WriteBuffer loop.",
+   "technical_details": "Loop at sing copy.go:28-81 (max 10 CopyExtendedOnce replaceable-unwrap rounds); syscall.Conn check copy.go:68-77; ReadWaiter path copy.go:~96-115; pool fallback CopyExtendedWithPool copy.go:159-190. splice implementation: 1 MiB F_SETPIPE_SZ pipe per direction per connection (pipe2 + 2 splice per chunk, SPLICE_F_NONBLOCK|MOVE), counters invoked per chunk. Counting is therefore kept even on the splice path (traffic statistics do NOT force a userspace copy).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go",
+     "line_reference": "28-81,159-190"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/splice_linux.go",
+     "line_reference": "12-77"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/network/counter.go",
+     "line_reference": "29-47"
+    },
+    {
+     "url": "",
+     "file_path": "fork:tunnel/statistic/tracker.go",
+     "line_reference": "72-108"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F003",
+   "topic": "EXPERIMENT: DIRECT CONNECT tunnel uses splice",
+   "description": "Built fork (go 1.27.3, amd64) with config mixed-port + MATCH,DIRECT on loopback, ran under gdb with catch syscall counting (strace is absent), 20 MB transfer via curl -p (HTTP CONNECT tunnel). Result: splice entered/returned 94 stops (~47 calls, ~0.4 MB/call), pipe2 4 stops (1 per direction), only ~30 write stops -> data path is splice, zero-copy in userspace.",
+   "technical_details": "Counts are catchpoint hits (entry+exit each). Same 20 MB transferred as plain HTTP proxy request (no CONNECT, curl without -p): splice 0, pipe2 0, ~1360 write stops (~680 write calls) and ~1384 read calls -> userspace copy, because the HTTP listener handles each plain-HTTP request itself (HTTP transport + io.Copy), not the tunnel relay. Not measured: throughput/CPU, arm/mips behaviour, TLS destinations (CONNECT to :443 is same path), tun inbound.",
+   "source_type": "experiment",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "scratchpad:network_performance/gdb2.out",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "scratchpad:network_performance/gdb1.out",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "fork:listener/http/proxy.go",
+     "line_reference": "43"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F004",
+   "topic": "Conditions that defeat splice (fallback to userspace)",
+   "description": "(1) Either side not a raw *net.TCPConn after unwrapping: any outbound protocol with its own framing/crypto (ss, vmess, vless, trojan, TLS, REALITY, ws, grpc, h2) -> never splice, uses ReadWaiter/pool path with encryption in userspace; only DIRECT and plain tunnels (and maybe http/socks5 upstream without TLS) qualify. (2) Inbound from TUN: gvisor/mipstack TCPConn are not syscall.Conn (adapter/outbound/base.go:286-289 even special-cases ipstackConn) -> userspace copy through the netstack. system stack gives real kernel sockets (loopback to its own listener) and can splice. (3) Pending cached bytes in BufferedConn/sniffer peek are written first (copy.go:36-52), then splice continues (ReaderReplaceable false only while buffered>0). (4) NewDeadlineConn wrapping of non-syscall conns in outbound.NewConn (base.go:284-296) is a userspace wrapper. (5) Plain HTTP proxy requests (non-CONNECT) never reach the relay.",
+   "technical_details": "The sniffer path writes the peeked bytes to remoteConn then calls handleSocket (fork:tunnel/tunnel.go:~595-623), so sniffing does not disable splice for DIRECT after the first bytes (inferred from code and the experiment, sniffer was off in the test; not experimentally verified with sniffer on).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:adapter/outbound/base.go",
+     "line_reference": "284-296"
+    },
+    {
+     "url": "",
+     "file_path": "fork:common/net/bufconn.go",
+     "line_reference": "79-101"
+    },
+    {
+     "url": "",
+     "file_path": "fork:tunnel/tunnel.go",
+     "line_reference": "590-623"
+    },
+    {
+     "url": "",
+     "file_path": "fork:adapter/outbound/direct.go",
+     "line_reference": "30-34"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F005",
+   "topic": "Splice memory/CPU trade on weak routers",
+   "description": "Splice removes two copies per chunk and Go-heap buffers (no 16/32 KiB pool buffers per direction) but costs per-connection pipe2 and up to 1 MiB pipe capacity per direction (pages allocated lazily by kernel, charged to the user pipe-user-pages-soft limit 16384 pages by default) and 3 syscalls per chunk (splice-in, splice-out, plus epoll wake) vs 2 (read+write) for the copy path.",
+   "technical_details": "Page-lazy allocation means idle connections cost little, but 1 MiB F_SETPIPE_SZ lets one hot flow queue 1 MiB kernel memory; on 64-128 MB routers with many bulk flows this is a RAM risk. Whether splice is a net CPU win on MIPS (memcpy-bound at ~100-300 MB/s) is plausible but not measured here.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/splice_linux.go",
+     "line_reference": "12-26"
+    },
+    {
+     "url": "",
+     "file_path": "go:internal/poll/splice_linux.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F006",
+   "topic": "Buffer sizes in sing",
+   "description": "Relay buffers are pooled: 32 KiB TCP / 16 KiB UDP by default; with build tag with_low_memory 16 KiB / 8 KiB and common.LowMemory=true makes Copy prefer the copyWaitWithPool path even when needCopy. Fork go.mod pins sing v0.5.8; the tag is a free profile knob for Ultra/Lightweight.",
+   "technical_details": "buffer_standard.go:6-7, buffer_low_memory.go:6-7 (//go:build with_low_memory), low_memory.go:5 / low_memory_stub.go:5, copy.go:96-110. Socket buffers: mihomo does not set SO_RCVBUF/SO_SNDBUF on relay sockets by default (grep of component/dialer found nothing) -> kernel autotuning (tcp_rmem/wmem) applies.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/buf/buffer_standard.go",
+     "line_reference": "6-7"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/buf/buffer_low_memory.go",
+     "line_reference": "1-8"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/low_memory.go",
+     "line_reference": "1-5"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go",
+     "line_reference": "96-115"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F007",
+   "topic": "Go runtime GC knobs not set",
+   "description": "Fork main.go sets no GOGC/GOMEMLIMIT/SetGCPercent (grep empty); memory behaviour is entirely left to env. For a 10-20 MB RSS target a default GOGC=100 can double heap; setting GOMEMLIMIT/GOGC=50 or debug.SetGCPercent at start is the cheapest runtime lever.",
+   "technical_details": "Trade-off: lower GOGC raises GC CPU on weak cores. Needs measurement on target; belongs partly to the memory agent.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:main.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "go:runtime/mgcpacer.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F008",
+   "topic": "UDP relay path",
+   "description": "Per-packet cost: inbound socks/mixed/tproxy UDP listener reads one datagram per syscall (WaitReadFrom), pushes through a channel into one of max(4,GOMAXPROCS) hash-sharded worker queues (cap 64), then pc.WriteTo (sendto) to the upstream; reverse direction in a goroutine per NAT entry doing WaitReadFrom + WriteBack. Roughly 1 recvfrom + 1 sendto + channel handoff + 2 goroutine switches per packet. No recvmmsg/sendmmsg anywhere in the fork or sing paths for plain UDP (grep for ReadBatch/WriteBatch in fork returned nothing).",
+   "technical_details": "fork:tunnel/tunnel.go:86-111 (udpQueues), fork:tunnel/connection.go:154-193, fork:listener/socks/udp.go:65. Cost estimate is hypothesis; weak CPUs are dominated by syscall + goroutine wake per packet at small-packet rates (DNS/QUIC/games).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:tunnel/tunnel.go",
+     "line_reference": "86-111"
+    },
+    {
+     "url": "",
+     "file_path": "fork:tunnel/connection.go",
+     "line_reference": "154-193"
+    },
+    {
+     "url": "",
+     "file_path": "fork:listener/socks/udp.go",
+     "line_reference": "65"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F009",
+   "topic": "quic-go GSO/GRO and batching",
+   "description": "quic-go fork (v0.61.1) uses ipv4.PacketConn/ipv6 ReadBatch (recvmmsg) in sys_conn_oob.go and UDP GSO (UDP_SEGMENT) when kernel supports it; GSO can be switched off via env QUIC_GO_DISABLE_GSO and the fork has a QUICGoDisableGSO config. This only affects QUIC-based outbounds (hysteria/hysteria2/tuic/masque), not the generic UDP relay. x/net v0.35.0 (go.mod) provides ipv4.PacketConn.ReadBatch/WriteBatch on Linux (recvmmsg/sendmmsg).",
+   "technical_details": "sys_conn_oob.go:36,149,173,249-252; sys_conn_helper_linux.go:63-69. GSO may need UDP_SEGMENT-capable NIC path; software GSO in 6.12 is OK for loopback/veth but gains on MIPS Ethernet with no HW offload are mostly fewer syscalls, not fewer packets.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/quic-go@v0.61.1-0.20260727080200-2548683b76f4/sys_conn_oob.go",
+     "line_reference": "36,149,173,249-252"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/quic-go@v0.61.1-0.20260727080200-2548683b76f4/sys_conn_helper_linux.go",
+     "line_reference": "63-97"
+    },
+    {
+     "url": "",
+     "file_path": "fork:config/config.go",
+     "line_reference": "123"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F010",
+   "topic": "TUN stacks and offload",
+   "description": "sing-tun v0.4.28 stacks: mipstack (default when stack empty), gvisor, system, mixed. Linux TUN supports IFF_VNET_HDR + TSO/GRO/USO (GSO option) with batch read/write (BatchRead, up to idealBatchSize 128), GRO tables for TCP and UDP, checksum offload toggles; mihomo exposes tun.gso and tun.gso-max-size (default 65536). Stack System reads batches and rewrites packets in-place to NAT TCP to a local listener (kernel TCP does the rest, splice-capable); Mixed = system for TCP, gvisor for UDP; mipstack/gvisor terminate TCP in a userspace netstack (copy per packet, userspace TCP state, more RAM).",
+   "technical_details": "tun_linux.go:52,121-145,173-240,290,334,422-440; tun_offload.go:12-16; tun_offload_linux.go:44 (GSOUDPL4); stack_system.go:189,251 (BatchRead); stack.go:41-63; fork listener/config/tun.go:22-23, listener/sing_tun/server.go:145,396. Kernel: IFF_VNET_HDR/TSO since ~2.6.x, TUN UDP GSO (USO) needs >=6.2, OpenWrt 25.12 kernel 6.12 qualifies; TUN GRO requires TUNSETOFFLOAD ioctl. With GSO the userspace sees up to 64 KiB super-packets: fewer syscalls and fewer per-packet stack traversals (the dominant TUN cost), but needs enough RAM for 64 KiB * batch buffers (hypothesis: raises RSS by a few MB) and kmod-tun.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/tun_linux.go",
+     "line_reference": "52,121-145,173-240,290,334,422-440"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/tun_offload.go",
+     "line_reference": "12-16"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack.go",
+     "line_reference": "41-63"
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/stack_system.go",
+     "line_reference": "189,251"
+    },
+    {
+     "url": "",
+     "file_path": "fork:listener/sing_tun/server.go",
+     "line_reference": "145-146,396"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F011",
+   "topic": "TUN vs transparent proxy (redirect/tproxy) on routers",
+   "description": "For a router, TUN (any stack) is structurally more expensive than REDIRECT/TPROXY because every forwarded packet crosses userspace twice; redirect/tproxy hand mihomo real TCP sockets (splice-capable) and skip the TUN packet path entirely. sing-tun also ships auto-redirect (nftables) code.",
+   "technical_details": "redirect_nftables*.go, redirect_linux.go in sing-tun. This is the dominant architecture lever for throughput on weak routers, bigger than any micro-optimisation. Not measured here.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_nftables.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing-tun@v0.4.28/redirect_linux.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F012",
+   "topic": "io_uring is not viable",
+   "description": "OpenWrt 6.12 generic config has CONFIG_IO_URING disabled; Go stdlib has no io_uring netpoll; third-party Go io_uring libs need cgo-free raw syscalls, per-ring memory, and are blocked on seccomp/old kernels. Gains over epoll are modest for 1-socket-per-goroutine workloads, and 32-bit MIPS/ARMv7 io_uring support is weak.",
+   "technical_details": "openwrt:target/linux/generic/config-6.12:2851 '# CONFIG_IO_URING is not set'. Enabling needs a custom kernel (not user-installable as a kmod).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "2851"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F013",
+   "topic": "AF_XDP / MSG_ZEROCOPY / sendfile",
+   "description": "AF_XDP: CONFIG_XDP_SOCKETS not set in OpenWrt generic config; also needs driver XDP support and bypasses netfilter/routing, useless for a terminating proxy that must maintain real TCP sockets. MSG_ZEROCOPY: helps only for large (>~10 KB) sends and adds completion handling via the error queue; Go net does not expose it; loses on loopback and small chunks. sendfile: irrelevant (no file source); splice already covers socket-to-socket.",
+   "technical_details": "openwrt config-6.12:7721 '# CONFIG_XDP_SOCKETS is not set'. kernel doc: Documentation/networking/msg_zerocopy.rst.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "7721"
+    },
+    {
+     "url": "",
+     "file_path": "linux:Documentation/networking/msg_zerocopy.rst",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F014",
+   "topic": "kTLS in sing-box",
+   "description": "sing-box common/ktls implements Linux kernel TLS (TCP_ULP 'tls', TLS_TX/TLS_RX) for TLS 1.3 only, AES-GCM and ChaCha20-Poly1305, by hooking crypto/tls internals via //go:linkname (build tag linux && go1.25 && badlinkname, needs -checklinkname=0-style flags). With RX offload it can splice from the TLS socket. Requires kernel with CONFIG_TLS and TLS1.3 support.",
+   "technical_details": "ktls.go:1 (build tag), ktls_linux.go:114-139 (Load/setupKernel: support.TLS && TLS_Version13 required), ktls_cipher_suites_linux.go:40-45 (chacha), ktls_read.go splice RX pending. OpenWrt: CONFIG_TLS is '# not set' in generic config-6.12:6769; available only as kmod-tls (netsupport.mk:1077). Applicability: only to stacks using stdlib crypto/tls with TLS1.3 (trojan, vless-tls, plain tls); mihomo mostly uses metacubex/utls and REALITY which do not go through stdlib state. On MIPS/ARMv7 without crypto engine kernel AES/ChaCha is not cheaper than Go's; benefit is only the removed copies and ability to splice plaintext<->kTLS socket (inbound TCP -> outbound TLS), which could allow TLS-proxy relay zero-copy. Treated as low value for the target, high fragility.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "sing-box:common/ktls/ktls.go",
+     "line_reference": "1-30"
+    },
+    {
+     "url": "",
+     "file_path": "sing-box:common/ktls/ktls_linux.go",
+     "line_reference": "114-139"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "6769"
+    },
+    {
+     "url": "",
+     "file_path": "openwrt:package/kernel/linux/modules/netsupport.mk",
+     "line_reference": "1077-1090"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F015",
+   "topic": "Hardware flow offload not available generically",
+   "description": "CONFIG_NF_FLOW_TABLE is not set in OpenWrt generic config (enabled per-target / kmod-nf-flow); BBR also not set. Fast path for DIRECT traffic therefore competes with (and the project can reuse) kernel flow offload rather than mihomo user-space splice, which relates to the project key question (out of this agent's scope).",
+   "technical_details": "openwrt config-6.12:4390, 6626.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "openwrt:target/linux/generic/config-6.12",
+     "line_reference": "4390,6626"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F016",
+   "topic": "Goroutine-per-connection cost",
+   "description": "Each relayed TCP connection costs 2 goroutines (relay pair) + handler goroutine; Go starts goroutines at 2-8 KiB stacks (grows to 32 KiB+ in TLS/crypto paths), pooled 16-32 KiB buffers per active direction on the non-splice path, kernel socket buffers on top. At hundreds of idle connections the goroutine overhead (~tens of KB each incl. buffers) is small vs socket buffers; epoll wakeups per read/write dominate CPU under bulk load. Not measured here.",
+   "technical_details": "Splice path avoids pooled buffers; copyWaitWithPool (ReadWaiter) avoids pre-allocating buffer until data is ready which matters for idle connections.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:runtime/proc.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "mod:github.com/metacubex/sing@v0.5.8/common/bufio/copy.go",
+     "line_reference": "96-115"
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F017",
+   "topic": "Control plane / data plane split (spec section 14)",
+   "description": "Mihomo already separates (a) rule/DNS decision (tunnel.handleTCPConn/handleUDPConn, hot only at connection setup) from (b) data copy (N.Relay). A true split (separate data-plane process or kernel fast path for classified DIRECT flows) is not present. For DIRECT TCP the data plane is already kernel-side via splice but still pays 2-3 syscalls + wakeups per ~0.4 MB chunk in the proxy process; handing the established flow to nftables flow offload/eBPF removes even that, but needs a safe classification contract (sets keyed by dst/src, invalidation), i.e. complexity is in the policy layer, not in Go networking.",
+   "technical_details": "Key control-plane output points: tunnel.go:590-623 after rule match and DIRECT dial; metadata (src, dst, rule, proxy chain) available there. Process split (control plane process + tiny dataplane helper) offers no measurable gain for TCP over splice and only memory duplication (two Go runtimes) -> not recommended.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:tunnel/tunnel.go",
+     "line_reference": "590-623"
+    },
+    {
+     "url": "",
+     "file_path": "fork:common/net/sing.go",
+     "line_reference": "69-92"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F018",
+   "topic": "UDP relay lacks pooled batch/NAT alloc reduction opportunities",
+   "description": "packetSender + per-NAT goroutine + queue copies mean each inbound UDP packet is allocated/pooled and handed through chan; replacing the generic socks/tproxy UDP read path with recvmmsg would need a new ReadBatch listener loop and per-packet metadata (tproxy needs IP_RECVORIGDSTADDR control messages, which ipv4.PacketConn.ReadBatch can return via OOB buffers).",
+   "technical_details": "Feasible with x/net ipv4.PacketConn.ReadBatch (already a dependency, v0.35.0), but only pays at >~20-50 kpps, above what typical routers push through a userspace proxy; DNS/QUIC-direct bursts are the realistic target (hypothesis).",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "mod:golang.org/x/net@v0.35.0/ipv4/batch.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F019",
+   "topic": "Go net stdlib splice scope",
+   "description": "Go stdlib net.TCPConn.ReadFrom/WriteTo splice only when the peer is *TCPConn/*UnixConn directly (poll.Splice); mihomo wraps conns, so it does not rely on stdlib splice; sing implements its own splice with raw syscalls. Also stdlib has fallback to copy_file_range/sendfile, irrelevant here.",
+   "technical_details": "go:net/splice_linux.go, go:internal/poll/splice_linux.go.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:net/splice_linux.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "go:internal/poll/splice_linux.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  }
+ ],
+ "opportunities": [
+  {
+   "name": "Keep sing splice path healthy for DIRECT + REDIRECT/TPROXY inbound",
+   "description": "Already present; add regression test/CI check that DIRECT CONNECT tunnel still hits splice (gdb/strace counters as in F003) and prefer redirect/tproxy or system stack over mipstack/gvisor for router profiles so inbound conns are real sockets.",
+   "expected_benefit": "Hypothesis: highest gain per complexity; zero-copy relay for direct/unwrapped flows, lower CPU and no pool buffers.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Stack choice changes TUN semantics",
+    "Pipe 1 MiB cap RAM on many bulk flows"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "Cap splice pipe size (e.g. 64-128 KiB) in low-memory profiles",
+   "description": "Patch sing splice maxSpliceSize/F_SETPIPE_SZ via fork replace or vendored copy, tunable per profile.",
+   "expected_benefit": "Hypothesis: lower kernel memory under many bulk flows; slightly more syscalls per MB.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Needs measurement of syscall/CPU trade-off on target"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Build tag with_low_memory + GC tuning (GOGC/GOMEMLIMIT) per profile",
+   "description": "Smaller 16/8 KiB buffers and a memory limit in Ultra/Lightweight profiles.",
+   "expected_benefit": "Hypothesis: several MB RSS saved under load; small CPU increase from GC.",
+   "implementation_complexity": "low",
+   "risks": [
+    "More GC cycles on weak CPUs",
+    "throughput drop with 16 KiB chunks on non-splice paths"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "Enable TUN GSO/GRO (tun.gso) when TUN is used",
+   "description": "Turn on IFF_VNET_HDR offload and batch read/write in sing-tun with kernel 6.12; verify stack system/mixed.",
+   "expected_benefit": "Hypothesis: fewer syscalls and per-packet stack traversals for TCP-heavy TUN traffic; main TUN throughput lever.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Extra buffer RAM",
+    "driver/kernel quirks; sing-tun needs checksum handling bugs-free",
+    "does not help if TUN avoided in favour of redirect"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Prefer transparent redirect/tproxy over TUN on routers",
+   "description": "Make redirect/tproxy the documented fast mode so inbound conns are kernel sockets and avoid userspace TCP stack and double packet crossing.",
+   "expected_benefit": "Hypothesis: largest throughput and RAM gain vs mipstack/gvisor.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Feature gap for non-TCP/UDP protocols (ICMP), UDP needs TPROXY"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "UDP batching with recvmmsg/sendmmsg",
+   "description": "Use ipv4/ipv6 PacketConn ReadBatch/WriteBatch in the generic UDP listener and DIRECT UDP socket.",
+   "expected_benefit": "Hypothesis: fewer syscalls for high-pps UDP; negligible below ~20 kpps.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Larger buffers per socket",
+    "Per-packet metadata/OOB (tproxy) complexity",
+    "Conflicts with deadline/NAT handling"
+   ],
+   "priority": "low"
+  },
+  {
+   "name": "Hand classified DIRECT TCP flows to kernel (nftables flow offload / set bypass)",
+   "description": "After rule match -> DIRECT, install the flow into a kernel fast path (see project key question); mihomo's own splice remains the safe fallback.",
+   "expected_benefit": "Hypothesis: removes proxy CPU for bulk direct flows entirely; best gain for DIRECT-heavy home traffic.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Leaks if policy changes",
+    "DNS/IPv6 correctness",
+    "CONFIG_NF_FLOW_TABLE not in generic config"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "kTLS TX/RX for trojan/vless-tls",
+   "description": "Port sing-box common/ktls to enable splice between plain socket and TLS socket.",
+   "expected_benefit": "Hypothesis: small on CPUs without crypto offload; saves copies only.",
+   "implementation_complexity": "high",
+   "risks": [
+    "linkname hacks and build flags per Go version",
+    "kmod-tls not in default kernel",
+    "TLS1.3 only; REALITY/utls incompatible"
+   ],
+   "priority": "low"
+  },
+  {
+   "name": "io_uring / AF_XDP / MSG_ZEROCOPY",
+   "description": "Not recommended.",
+   "expected_benefit": "Negligible or unavailable on OpenWrt 6.12 default config.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Disabled in kernel config",
+    "MIPS/ARMv7 immature",
+    "no Go runtime support"
+   ],
+   "priority": "low"
+  },
+  {
+   "name": "Process-level control/data plane split",
+   "description": "Separate helper process for relaying.",
+   "expected_benefit": "None measurable over splice; duplicated Go runtime RAM.",
+   "implementation_complexity": "high",
+   "risks": [
+    "+RAM",
+    "IPC latency",
+    "stability"
+   ],
+   "priority": "low"
+  }
+ ],
+ "limitations": [
+  "No strace/perf available: used gdb catchpoint counts, so numbers are syscall hit counts not timings.",
+  "Tested on x86_64 loopback only; no MIPS/ARMv7 hardware, no throughput or CPU measurement, no TLS/sniffer-on/tun-inbound run.",
+  "Gain figures are hypotheses; no benchmarks measured.",
+  "Did not read gVisor/mipstack TCP internals in depth."
+ ],
+ "risks": [
+  "Splice pipe 1 MiB per direction may pressure RAM/pipe-user-pages on small routers with many flows.",
+  "Enabling TUN GSO depends on kernel/driver behaviour on each target.",
+  "Forking sing for buffer/pipe tuning adds maintenance burden."
+ ],
+ "recommendations": [
+  "Add a CI/smoke check that DIRECT CONNECT still splices (syscall count) so refactors of conn wrappers do not silently disable it.",
+  "Make redirect/tproxy (or sing-tun system stack) the performance path for routers; document mipstack/gvisor as heavier.",
+  "Provide per-profile with_low_memory build tag and GOGC/GOMEMLIMIT defaults; measure RSS and CPU on a real MIPS/ARMv7 device.",
+  "Evaluate a smaller splice pipe size and tun.gso on target hardware before adopting.",
+  "Do not invest in io_uring, AF_XDP, MSG_ZEROCOPY, process-split; defer kTLS."
+ ],
+ "open_questions": [
+  "Is splice a net CPU win vs 16 KiB copy on MIPS 24Kc/74Kc and ARMv7 (measure with perf/ strace -c on device)?",
+  "Does the sniffer (tls/http sniff enabled) keep the splice path after the peek, with real traffic?",
+  "Which outbounds with plain TCP (http/socks5 upstream, ss with none cipher) actually unwrap to *net.TCPConn?",
+  "How much RAM does 1 MiB F_SETPIPE_SZ really cost under 200+ concurrent bulk flows?",
+  "Do OpenWrt kernels enable CONFIG_NF_FLOW_TABLE per-target for the project's target list?"
+ ],
+ "conclusion": "The TCP data plane is already close to optimal for DIRECT flows because of sing's splice; the real losses are for wrapped/encrypted outbounds (unavoidable userspace copy) and for TUN userspace stacks. Cheap wins are configuration and profile level (stack choice, buffer tag, GC limits, tun.gso), while kernel-bypass/io_uring/kTLS options are blocked by OpenWrt kernel config or fragile, and a control/data process split offers no benefit over splice."
+}

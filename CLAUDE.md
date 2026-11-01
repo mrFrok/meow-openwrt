@@ -1,5 +1,14 @@
 # CLAUDE.md
 
+> **meow-openwrt fork (branch `openwrt`).** Unofficial GPLv3 fork of meow-rs for OpenWrt routers
+> (see `NOTICE-FORK.md`). Fork work lives in `openwrt-fork/`: **`PLAN.md` (stages 0–7, start here)**,
+> `research/meow-rs.md` (recon, findings with file:line), `research/go-fork/` (TODO/BENCHMARKS of the
+> abandoned Go fork mihomo-lightweight — behaviour reference), `bench/` (router bench scripts).
+> Remotes: `upstream` = meow-rs. Generic fixes without GPL-derived code go upstream as MIT PRs.
+> Code search: xerj prefixes `mlw-mo` (this fork), `mlw-meow` (pristine upstream), `mlw-clashrs`, `mlw-steer`,
+> `mlw-meowdeps-*`, `mlw-fork` (Go fork); reindex after edits: `xerj autoindex . --prefix mlw-mo --fresh`.
+> Users talk Russian; keep replies short.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview

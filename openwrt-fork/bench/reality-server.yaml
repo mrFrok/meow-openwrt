@@ -1,0 +1,26 @@
+# Mihomo Lightweight — bench-only VLESS+Reality server for the router netns (bench/netns-iperf.sh).
+# Throwaway keys for TEST-NET-3 203.0.113.2; never use them anywhere else.
+# Reality dest = this mihomo's own TLS controller (TLS 1.3, self-signed bench.test), so no Internet is needed.
+mode: direct
+log-level: warning
+ipv6: false
+external-controller-tls: 127.0.0.1:9443
+tls: {certificate: /tmp/lwsrv/cert.pem, private-key: /tmp/lwsrv/key.pem}
+listeners:
+  - name: vr
+    type: vless
+    listen: 0.0.0.0
+    port: 8443
+    users: [{username: bench, uuid: 6f1d2c3a-8b4e-4f5a-9c7d-1e2f3a4b5c6d, flow: xtls-rprx-vision}]
+    reality-config:
+      dest: 127.0.0.1:9443
+      private-key: -M5y-GkeSMWhOYKMfSjBOwung5wvu88F7DukrACPc08
+      short-id: ["0123abcd"]
+      server-names: [bench.test]
+  - name: hy2
+    type: hysteria2
+    listen: 0.0.0.0
+    port: 8444
+    users: {bench: 6f1d2c3a-8b4e-4f5a-9c7d-1e2f3a4b5c6d}
+    certificate: /tmp/lwsrv/cert.pem
+    private-key: /tmp/lwsrv/key.pem

@@ -1,0 +1,133 @@
+
+=== board
+	"kernel": "6.6.144",
+	"system": "MediaTek MT7628AN ver:1 eco:2",
+	"model": "Zyxel Keenetic Extra II",
+	"board_name": "zyxel,keenetic-extra-ii",
+	"release": {
+		"distribution": "OpenWrt",
+		"version": "24.10.8",
+		"revision": "r29233-443ec4032a",
+		"target": "ramips/mt76x8",
+		"description": "OpenWrt 24.10.8 r29233-443ec4032a",
+6.6.144 #0 Fri Jul 24 07:21:50 2026 mips
+
+=== cpu
+      1 ASEs implemented	: mips16 dsp
+      1 BogoMIPS		: 385.84
+      1 cpu model		: MIPS 24KEc V5.5
+      1 isa			: mips1 mips2 mips32r1 mips32r2
+      1 system type		: MediaTek MT7628AN ver:1 eco:2
+cores: 1
+fpu-flags: none listed
+
+=== memory
+MemTotal:          58252 kB
+MemFree:           18916 kB
+MemAvailable:      14840 kB
+Buffers:               0 kB
+Cached:            15000 kB
+SwapTotal:             0 kB
+Shmem:               240 kB
+Slab:               9944 kB
+SUnreclaim:         8284 kB
+KernelStack:         464 kB
+PageTables:          484 kB
+CommitLimit:       29124 kB
+Committed_AS:       8104 kB
+overcommit_memory 0
+
+=== storage
+Filesystem                Size      Used Available Use% Mounted on
+overlayfs:/overlay        9.0M      2.8M      6.2M  32% /
+/dev/mtdblock15           9.0M      2.8M      6.2M  32% /overlay
+tmpfs                    28.4M    240.0K     28.2M   1% /tmp
+/dev/root /rom squashfs
+tmpfs /tmp tmpfs
+/dev/mtdblock15 /overlay jffs2
+overlayfs:/overlay / overlay
+
+=== packages
+pm: opkg
+dnsmasq 2.93-r1
+firewall4 2024.12.18~18fc0ead-r1
+kmod-cfg80211 6.6.144.6.12.96-r1
+kmod-crypto-acompress 6.6.144-r1
+kmod-crypto-aead 6.6.144-r1
+kmod-crypto-ccm 6.6.144-r1
+kmod-crypto-cmac 6.6.144-r1
+kmod-crypto-crc32c 6.6.144-r1
+kmod-crypto-ctr 6.6.144-r1
+kmod-crypto-gcm 6.6.144-r1
+kmod-crypto-geniv 6.6.144-r1
+kmod-crypto-gf128 6.6.144-r1
+kmod-crypto-ghash 6.6.144-r1
+kmod-crypto-hash 6.6.144-r1
+kmod-crypto-hmac 6.6.144-r1
+kmod-crypto-manager 6.6.144-r1
+kmod-crypto-null 6.6.144-r1
+kmod-crypto-rng 6.6.144-r1
+kmod-crypto-seqiv 6.6.144-r1
+kmod-crypto-sha3 6.6.144-r1
+kmod-crypto-sha512 6.6.144-r1
+kmod-gpio-button-hotplug 6.6.144-r5
+kmod-leds-gpio 6.6.144-r1
+kmod-lib-crc-ccitt 6.6.144-r1
+kmod-lib-crc32c 6.6.144-r1
+kmod-lib-lzo 6.6.144-r1
+kmod-mac80211 6.6.144.6.12.96-r1
+kmod-mt76-core 6.6.144.2025.11.06~eb567bc7-r1
+kmod-mt7603 6.6.144.2025.11.06~eb567bc7-r1
+kmod-mt76x02-common 6.6.144.2025.11.06~eb567bc7-r1
+kmod-mt76x2 6.6.144.2025.11.06~eb567bc7-r1
+kmod-mt76x2-common 6.6.144.2025.11.06~eb567bc7-r1
+kmod-nf-conntrack 6.6.144-r1
+kmod-nf-conntrack6 6.6.144-r1
+kmod-nf-flow 6.6.144-r1
+kmod-nf-log 6.6.144-r1
+kmod-nf-log6 6.6.144-r1
+kmod-nf-nat 6.6.144-r1
+kmod-nf-reject 6.6.144-r1
+kmod-nf-reject6 6.6.144-r1
+kmod-nfnetlink 6.6.144-r1
+kmod-nfnetlink-queue 6.6.144-r1
+kmod-nft-core 6.6.144-r1
+kmod-nft-fib 6.6.144-r1
+kmod-nft-nat 6.6.144-r1
+kmod-nft-offload 6.6.144-r1
+kmod-nft-queue 6.6.144-r1
+kmod-nls-base 6.6.144-r1
+kmod-ppp 6.6.144-r1
+kmod-pppoe 6.6.144-r1
+kmod-pppox 6.6.144-r1
+kmod-slhc 6.6.144-r1
+kmod-usb-core 6.6.144-r1
+kmod-usb-ehci 6.6.144-r1
+kmod-usb-ledtrig-usbport 6.6.144-r1
+kmod-usb-ohci 6.6.144-r1
+kmod-usb2 6.6.144-r1
+nftables-json 1.1.1-r1
+
+=== kernel-config
+no /proc/config.gz (normal on OpenWrt); see modules below
+bpf_jit_enable=1
+unprivileged_bpf_disabled=2
+bpffs dir present: 1 mounted
+
+=== modules
+nf_conntrack nf_defrag_ipv4 nf_defrag_ipv6 nf_flow_table nf_flow_table_inet nf_log_syslog nf_nat nf_reject_ipv4 nf_reject_ipv6 nf_tables nfnetlink nfnetlink_queue nft_chain_nat nft_ct nft_fib nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_flow_offload nft_hash nft_limit nft_log nft_masq nft_nat nft_numgen nft_queue nft_quota nft_redir nft_reject nft_reject_inet nft_reject_ipv4 nft_reject_ipv6 
+
+=== firewall
+table inet fw4
+table inet zapret
+
+=== network
+br-lan driver=- mtu=1500  speed=-1
+eth0 driver=mtk_soc_eth mtu=1500  speed=-
+eth0.1 driver=- mtu=1500  speed=-
+eth0.2 driver=- mtu=1500  speed=-
+no ethtool
+
+=== proxy-core
+
+=== end

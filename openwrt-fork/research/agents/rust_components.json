@@ -1,0 +1,428 @@
+{
+ "agent": "rust_components",
+ "model": "Claude Sonnet 5.5",
+ "effort": "Medium",
+ "research_date": "2026-11-01",
+ "scope": [
+  "Rust integration options (cgo, helper, full core)",
+  "Rust target tiers for OpenWrt arches",
+  "Crypto asm on MIPS/ARMv7",
+  "Which mihomo components could benefit",
+  "Prior art: meow-rs, clash-rs, shadowsocks-rust, leaf"
+ ],
+ "summary": "Rust does not meaningfully help the stated goals on MIPS/ARMv7 routers. MIPS targets are Tier 3 (nightly build-std or full OpenWrt buildroot rustc), Rust crypto has no MIPS/ARMv7 SIMD in RustCrypto so the main CPU cost is in the same position as Go, and the DIRECT TCP data plane already uses splice. cgo loses the pure-Go cross-compile and does not remove Go runtime overhead; a helper process adds RSS and complexity; a full Rust core (meow-rs) gives large RAM savings (secondary-source numbers, Apple M4) but lacks MIPS/ARM32 packages and full parity, and breaks the rebase-friendly fork model.",
+ "findings": [
+  {
+   "id": "F001",
+   "topic": "Rust platform tiers for router targets",
+   "description": "As of 2026-11-01 mips-unknown-linux-musl and mipsel-unknown-linux-musl are Tier 3. armv7-unknown-linux-musleabihf is Tier 2 without host tools; aarch64, riscv64gc and x86_64 linux-musl are Tier 2 with host tools.",
+   "technical_details": "Tier 3 = no official prebuilt std and no CI guarantee; needs nightly -Zbuild-std (or rust-src) to build std for the target. Tier 2 without host tools = rust-std is shipped, but rustc/cargo do not run on that target (cross-compile only, which is all we need). The page lists musl 1.2.5 for these targets.",
+   "source_type": "official_docs",
+   "sources": [
+    {
+     "url": "https://doc.rust-lang.org/rustc/platform-support.html",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F002",
+   "topic": "OpenWrt builds Rust itself",
+   "description": "OpenWrt packages feeds lang/rust (rustc 1.96.0 at master) builds the compiler from source on the build host and supports aarch64, arm, i386, loongarch64, mips, mips64, mips64el, mipsel, powerpc, riscv64, x86_64; ARM v7 maps to armv7 target, v5/v6 fall back to armv5te; mips64 uses a dedicated openwrt target.",
+   "technical_details": "This means Rust-in-package for MIPS is possible inside an OpenWrt buildroot (x.py dist rustc rust-std). It is the only supported MIPS path and makes the build long and heavy; it is not a prebuilt-toolchain flow. Building standalone via cargo needs nightly -Zbuild-std for mips musl.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://raw.githubusercontent.com/openwrt/packages/master/lang/rust/Makefile",
+     "file_path": "",
+     "line_reference": "PKG_VERSION, RUST_ARCH_DEPENDS"
+    },
+    {
+     "url": "https://raw.githubusercontent.com/openwrt/packages/master/lang/rust/rust-values.mk",
+     "file_path": "",
+     "line_reference": "ARM/mips64 logic"
+    }
+   ],
+   "confidence": "medium",
+   "status": "confirmed"
+  },
+  {
+   "id": "F003",
+   "topic": "cgo staticlib integration costs",
+   "description": "Linking a Rust staticlib into the Go binary needs CGO_ENABLED=1, a musl cross C toolchain per target (OpenWrt SDK) and a Rust target per arch; the fork's Makefile builds with CGO_ENABLED=0 so the pure-Go static cross-compile matrix would be lost for any profile using it.",
+   "technical_details": "Fork Makefile:15 uses CGO_ENABLED=0; build.yml only sets CGO_ENABLED=1 in one special job (line ~217). Each cgo call goes through runtime.cgocall -> entersyscall -> asmcgocall on the g0 stack (go:runtime/cgocall.go header comment) and pins the goroutine to an OS thread for the call duration; blocking Rust calls consume extra Ms. Go GC headroom, goroutine stacks and the scheduler remain unchanged for all remaining Go code, so the RSS floor is not lowered, only the Rust part's own allocations differ.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:Makefile",
+     "line_reference": "15"
+    },
+    {
+     "url": "",
+     "file_path": "fork:.github/workflows/build.yml",
+     "line_reference": "202,217"
+    },
+    {
+     "url": "",
+     "file_path": "go:runtime/cgocall.go",
+     "line_reference": "1-20"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F004",
+   "topic": "cgo call overhead numbers",
+   "description": "I did not obtain a primary-source cgo benchmark. Commonly quoted figures are roughly tens to ~200 ns per call on x86; weaker MIPS/ARM cores are expected several times slower.",
+   "technical_details": "No number is cited as fact. Per-call cost matters only for fine-grained calls (per-packet rule match); batch APIs (match a whole list, or a single long-running Rust loop) amortise it. Would need a microbenchmark on real MIPS/ARM (qemu-user is not representative).",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://pkg.go.dev/cmd/cgo",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "unverified"
+  },
+  {
+   "id": "F005",
+   "topic": "Separate Rust helper process (option b)",
+   "description": "A helper process costs its own RSS plus IPC; Rust static musl binaries are small but a tokio-based process realistically adds several MB RSS.",
+   "technical_details": "meow-rs, a full Rust core with REALITY/Hysteria2, reports 9.7 MB idle RSS and 7.8 MB stripped (aarch64 Apple M4, macOS, loopback), i.e. an upper-bound for a sizeable helper; a tiny non-async splice/DNS helper could be 1-2 MB (hypothesis). IPC (unix socket) per connection decision adds latency of a syscall round trip; failure handling needs a supervisor, fallback to Go path, and state sync (rules, fake-ip table) on every reload. The relay hot path cannot be handed over without passing fds (SCM_RIGHTS), which is feasible for splice-style DIRECT relay.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://github.com/madeye/meow-rs",
+     "file_path": "",
+     "line_reference": "README Benchmarks"
+    }
+   ],
+   "confidence": "medium",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F006",
+   "topic": "Fast DIRECT relay already in Go stdlib",
+   "description": "Go's net package already uses splice(2)/sendfile for TCP-to-TCP io.Copy (net/splice_linux.go), so the DIRECT TCP data plane that a Rust helper would replace is already zero-copy in kernel when both ends are *net.TCPConn.",
+   "technical_details": "Rust would gain nothing on bytes moved; gains only in goroutine/stack overhead per connection (about 2-8 KB stacks per goroutine, 2 goroutines per conn - hypothesis) and GC scanning.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:net/splice_linux.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F007",
+   "topic": "Crypto asm coverage in Go on router arches",
+   "description": "Go stdlib has hardware-assisted AES-GCM only for arm64 (and amd64/s390x/ppc64) in crypto/internal/fips140/aes; chacha20 asm exists for arm64/ppc64x/s390x only. ARMv7 and MIPS fall back to generic Go code.",
+   "technical_details": "Directory listing of go:crypto/internal/fips140/aes shows aes_arm64.s, gcm_arm64.s, ctr_arm64.s; x/crypto chacha20 has chacha_arm64.s, ppc64x, s390x, no arm32 or mips. So on MIPS/ARMv7 Go is already in software-only mode.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "go:crypto/internal/fips140/aes/",
+     "line_reference": "aes_arm64.s, gcm_arm64.s"
+    },
+    {
+     "url": "",
+     "file_path": "go:vendor/golang.org/x/crypto/chacha20/",
+     "line_reference": "chacha_arm64.s ..."
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F008",
+   "topic": "Rust crypto crates on MIPS/ARMv7",
+   "description": "RustCrypto chacha20 has SIMD backends only for x86 (SSE2/AVX2/AVX512) and aarch64 NEON; everything else (MIPS, ARMv7) uses the soft backend. aes-gcm uses hardware instructions (AES-NI/CLMUL, ARMv8 crypto) or constant-time soft code elsewhere. ring/aws-lc-rs ship asm for x86_64, aarch64 and ARMv7 NEON, but I could not confirm MIPS asm; ring README warns about unusual targets.",
+   "technical_details": "Conclusion hypothesis: on MIPS the best Rust crypto is a portable scalar implementation, comparable to Go's generic code (rustc/LLVM may schedule a bit better; no source of benchmark). On ARMv7 ring/aws-lc may beat Go (NEON asm vs Go generic) - unmeasured. Therefore 'Rust for speed' does not fix the main CPU cost (encryption) on MIPS.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://raw.githubusercontent.com/RustCrypto/stream-ciphers/master/chacha20/src/backends.rs",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "https://github.com/briansmith/ring#toolchains--targets",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "https://github.com/aws/aws-lc-rs",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F009",
+   "topic": "Rule matching already succinct in the fork",
+   "description": "mihomo domain/IP matching uses compact structures: component/trie (domain.go, domain_set.go succinct set, domain_map, ipcidr_trie) and binary .mrs loaders (domain_set_bin.go, ipcidr_set_bin.go). A Rust rewrite would give a small constant gain at best.",
+   "technical_details": "Memory of rule sets is dominated by data size (number of domains/CIDRs), which is the same in any language; gains would come from layout (already succinct) not language. CPU per lookup is microseconds; not the bottleneck at router connection rates.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:component/trie/domain_set.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "fork:component/trie/domain_set_bin.go",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "fork:component/cidr/ipcidr_set.go",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F010",
+   "topic": "TUN stack alternatives",
+   "description": "sing-tun system stack passes packets via the kernel TCP (system) or gVisor netstack (with_gvisor tag, heavy in RAM and binary size: Makefile builds with -tags with_gvisor). A Rust smoltcp/lwIP-like userspace stack would reduce RAM versus gVisor but the 'system' stack already has near-zero stack memory.",
+   "technical_details": "Replacing gVisor with a Rust userspace stack means cgo+FFI per packet or a helper process owning the TUN fd; high effort, still needs full parity (IPv6, UDP, ICMP). On routers the better option is nft redirect/tproxy and avoiding TUN at all. Hypothesis, no benchmark.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "fork:Makefile",
+     "line_reference": "15"
+    }
+   ],
+   "confidence": "low",
+   "status": "hypothesis"
+  },
+  {
+   "id": "F011",
+   "topic": "meow-rs maturity and feature parity",
+   "description": "meow-rs (madeye) is an active Rust reimplementation of mihomo: v0.28.0 on 2026-10-30, pushed 2026-10-30, 612 stars. Supports VLESS with REALITY and XTLS Vision, Trojan, Shadowsocks, Hysteria2 (QUIC via quiche), fake-ip DNS, rule providers; no VMess, TUIC, Hysteria v1, WireGuard, SSH, SOCKS5/HTTP outbound in its own 2026-04 gap analysis (archived, partly outdated); no in-process TUN on Linux (tproxy only), Wintun on Windows.",
+   "technical_details": "Own docs state TUN excluded as non-goal. .mrs rule-provider support not confirmed. Single maintainer-style project; version below 1.0.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://github.com/madeye/meow-rs",
+     "file_path": "",
+     "line_reference": ""
+    },
+    {
+     "url": "",
+     "file_path": "/tmp/claude-1000/-home-mrfrok-Projects-clashwrt/d08673a6-0d18-497c-b8fd-f64825016b7f/scratchpad/meow/gap-analysis.md",
+     "line_reference": "Proxy table"
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F012",
+   "topic": "meow-rs OpenWrt architectures",
+   "description": "Official OpenWrt ipk/apk packages are published only for aarch64 (generic, cortex-a53/a72/a76) and x86_64; 32-bit arm and MIPS packages are NOT published because boring-sys (BoringSSL) does not build there. A --no-default-features --features full build exists for them, self-built.",
+   "technical_details": "This excludes the MIPS/ARMv7 routers that are this project's core audience.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://raw.githubusercontent.com/madeye/meow-rs/main/docs/openwrt.md",
+     "file_path": "",
+     "line_reference": "lines 4-52"
+    }
+   ],
+   "confidence": "high",
+   "status": "confirmed"
+  },
+  {
+   "id": "F013",
+   "topic": "meow-rs published RAM/size",
+   "description": "meow-rs v0.21.2 vs Go mihomo v1.19.31: stripped 7.8 MB vs 54.0 MB, RSS idle 9.7 MB vs 31.3 MB, peak 12.2 vs 42.4 MB, DNS QPS +43%, TCP throughput about equal.",
+   "technical_details": "Measured by the project on an Apple M4 Pro arm64 macOS, loopback, direct mode: not an OpenWrt router; the Go binary is a 54 MB desktop build (not a stripped/tuned fork build with GOGC/memory limit tuning). Throughput parity suggests the data plane is kernel-bound, as expected.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://github.com/madeye/meow-rs#benchmarks",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "unverified"
+  },
+  {
+   "id": "F014",
+   "topic": "clash-rs",
+   "description": "Watfaq/clash-rs: release tag 'latest' on 2026-10-29, active but only 5 stars (displayed); Clash-compatible Rust core. Feature parity with mihomo (REALITY, .mrs, fake-ip, TUN) not verified here.",
+   "technical_details": "Its TUN uses a Rust userspace stack (smoltcp-style) in the upstream code, not confirmed this session. Rolling 'latest' tag, no semver.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://github.com/Watfaq/clash-rs",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "unverified"
+  },
+  {
+   "id": "F015",
+   "topic": "shadowsocks-rust",
+   "description": "shadowsocks-rust v1.25.0 (2026-08-26), 10.9k stars, pushes in Oct 2026: very mature SS/AEAD-2022 implementation with local/redir/tun/dns modes; it is a proxy, not a Clash-config core (no rules engine like mihomo, no VLESS/Reality).",
+   "technical_details": "Could serve as an alternative SS data plane or reference for splice/zero-copy, but cannot replace mihomo's multi-protocol core.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://github.com/shadowsocks/shadowsocks-rust",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F016",
+   "topic": "leaf",
+   "description": "eycorsican/leaf v0.14.2 (2026-02-25), 2.8k stars, last push 2026-09-30: lightweight Rust proxy framework (SS, Trojan, VMess, VLESS?, TUN via netstack-lwip). Slower release cadence; feature parity with mihomo rules/providers is partial.",
+   "technical_details": "Uses lwIP via FFI for TUN, i.e. C code inside the Rust process. MIPS builds of leaf are reported in the community (unverified).",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "https://github.com/eycorsican/leaf",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "low",
+   "status": "unverified"
+  },
+  {
+   "id": "F017",
+   "topic": "Cost of a full Rust core for a fork",
+   "description": "Option c abandons the rebase-friendly fork model: all mihomo protocol, rule, provider, API semantics would be re-implemented and tracked against upstream indefinitely.",
+   "technical_details": "The Go fork gets upstream protocol fixes by rebase. A Rust core must chase ~30 protocols/transports; even meow-rs, a funded active project, lacks several after seven months.",
+   "source_type": "secondary_source",
+   "sources": [
+    {
+     "url": "",
+     "file_path": "/tmp/claude-1000/-home-mrfrok-Projects-clashwrt/d08673a6-0d18-497c-b8fd-f64825016b7f/scratchpad/meow/gap-analysis.md",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  },
+  {
+   "id": "F018",
+   "topic": "Where Rust RAM saving actually comes from",
+   "description": "The large RAM delta in meow-rs numbers (31 MB -> 9.7 MB idle) comes mostly from no GC heap headroom, no goroutine stacks and smaller binaries, i.e. things achievable only by replacing the whole runtime, not by swapping one component.",
+   "technical_details": "A component in cgo/helper form leaves the Go runtime (GC, ~hundreds of KB per runtime thread structures, goroutine stacks) as is. Go-side tuning (GOGC, GOMEMLIMIT, fewer goroutines, build tags) is the cheaper way to get a share of this. Other agents' areas.",
+   "source_type": "source_code",
+   "sources": [
+    {
+     "url": "https://github.com/madeye/meow-rs#benchmarks",
+     "file_path": "",
+     "line_reference": ""
+    }
+   ],
+   "confidence": "medium",
+   "status": "probable"
+  }
+ ],
+ "opportunities": [
+  {
+   "name": "Do not adopt Rust; spend effort on Go-side tuning",
+   "description": "Keep the pure-Go CGO_ENABLED=0 matrix and use build tags, GOGC/GOMEMLIMIT, kernel fast path for DIRECT.",
+   "expected_benefit": "Keeps MIPS support and rebase-ability; most RAM/CPU wins are available without Rust.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Go runtime floor of several MB remains"
+   ],
+   "priority": "high"
+  },
+  {
+   "name": "Optional aarch64/x86_64 Rust helper for bulk workloads",
+   "description": "A separate tiny Rust process (splice relay, DNS cache) enabled only on aarch64/x86_64 Performance profile, with Go fallback.",
+   "expected_benefit": "Hypothesis: small RSS and CPU gain on aarch64 only; none on MIPS.",
+   "implementation_complexity": "high",
+   "risks": [
+    "two code paths",
+    "IPC failure modes",
+    "fd passing complexity",
+    "audit surface"
+   ],
+   "priority": "low"
+  },
+  {
+   "name": "Benchmark crypto on real MIPS/ARMv7 before any decision",
+   "description": "Compare Go generic ChaCha20-Poly1305 vs Rust (RustCrypto soft, ring, aws-lc-rs) on an actual mipsel/ARMv7 router.",
+   "expected_benefit": "Settles whether Rust crypto helps the main CPU cost.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "needs Tier 3 mips build via -Zbuild-std or OpenWrt buildroot"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Use meow-rs / shadowsocks-rust as comparison baseline only",
+   "description": "Run meow-rs on a real aarch64 router to get honest RAM/CPU numbers versus the tuned fork.",
+   "expected_benefit": "Gives data point for the Go ceiling vs Rust ceiling.",
+   "implementation_complexity": "low",
+   "risks": [
+    "its published numbers are from a Mac"
+   ],
+   "priority": "medium"
+  },
+  {
+   "name": "Replace gVisor TUN stack with Rust userspace stack",
+   "description": "Only if TUN mode must stay in the Performance profile.",
+   "expected_benefit": "Hypothesis: lower RAM than gVisor.",
+   "implementation_complexity": "high",
+   "risks": [
+    "packet-level FFI cost",
+    "parity bugs",
+    "leaks"
+   ],
+   "priority": "low"
+  }
+ ],
+ "limitations": [
+  "No cgo microbenchmark obtained; no on-device measurements",
+  "ring MIPS asm status not confirmed",
+  "clash-rs and leaf feature parity not verified in code",
+  "meow-rs benchmarks are from its own README on macOS"
+ ],
+ "risks": [
+  "Tier 3 MIPS toolchain can break on any rustc release",
+  "cgo adds C toolchain supply-chain and build-matrix risk"
+ ],
+ "recommendations": [
+  "Option a (cgo): reject for MIPS profiles; at most aarch64/x86_64 Performance profile, and only for a measured hotspot.",
+  "Option b (helper): defer; revisit only if a kernel fast path proves insufficient on aarch64.",
+  "Option c (full Rust core): not compatible with a rebase-friendly fork; use meow-rs only as a reference/baseline.",
+  "Get RAM wins from Go tuning and build tags first (other agents)."
+ ],
+ "open_questions": [
+  "Real cgo call cost on MIPS 24Kc/74Kc and ARMv7 Cortex-A7/A9",
+  "Does aws-lc-rs/ring outperform Go generic ChaCha20-Poly1305 on ARMv7 NEON, and by how much?",
+  "Idle RSS of meow-rs on an actual aarch64 router vs the tuned Go fork"
+ ],
+ "conclusion": "Assessed honestly, Rust gives no safe speed or RAM win for the MIPS/ARM32 routers the project targets, and the integration costs (toolchain tier, cgo build matrix, IPC, parity) outweigh gains. Keep Go; revisit Rust only as an optional aarch64 helper after measurement."
+}

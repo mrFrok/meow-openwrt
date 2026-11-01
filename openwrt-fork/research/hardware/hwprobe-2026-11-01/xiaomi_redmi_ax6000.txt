@@ -1,0 +1,146 @@
+=== board
+	"kernel": "6.12.94",
+	"system": "ARMv8 Processor rev 4",
+	"model": "Xiaomi Redmi Router AX6000 (OpenWrt U-Boot layout)",
+	"board_name": "xiaomi,redmi-router-ax6000-ubootmod",
+	"release": {
+		"distribution": "OpenWrt",
+		"version": "25.12.5",
+		"revision": "r33051-f5dae5ece4",
+		"target": "mediatek/filogic",
+		"description": "OpenWrt 25.12.5 r33051-f5dae5ece4",
+6.12.94 #0 SMP Mon Jun 29 12:59:20 2026 aarch64
+
+=== cpu
+      4 BogoMIPS	: 26.00
+      4 CPU implementer	: 0x41
+      4 CPU part	: 0xd03
+      4 Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid
+cores: 4
+fpu-flags: present
+
+=== memory
+MemTotal:         495732 kB
+MemFree:          387380 kB
+MemAvailable:     376488 kB
+Buffers:               4 kB
+Cached:            21992 kB
+SwapTotal:             0 kB
+Shmem:               444 kB
+Slab:              27848 kB
+SUnreclaim:        22036 kB
+KernelStack:        2184 kB
+PageTables:          772 kB
+CommitLimit:      247864 kB
+Committed_AS:      13196 kB
+overcommit_memory 0
+
+=== storage
+Filesystem                Size      Used Available Use% Mounted on
+overlayfs:/overlay       84.3M     52.0K     79.9M   0% /
+/dev/ubi0_4              84.3M     52.0K     79.9M   0% /overlay
+tmpfs                   242.1M    448.0K    241.6M   0% /tmp
+/dev/root /rom squashfs
+tmpfs /tmp tmpfs
+/dev/ubi0_4 /overlay ubifs
+overlayfs:/overlay / overlay
+
+=== packages
+pm: apk
+dnsmasq-2.93-r1
+firewall4-2025.03.17~b6e51575-r2
+kmod-cfg80211-6.12.94.6.18.26-r1
+kmod-crypto-aead-6.12.94-r1
+kmod-crypto-authenc-6.12.94-r1
+kmod-crypto-ccm-6.12.94-r1
+kmod-crypto-cmac-6.12.94-r1
+kmod-crypto-crc32c-6.12.94-r1
+kmod-crypto-ctr-6.12.94-r1
+kmod-crypto-des-6.12.94-r1
+kmod-crypto-gcm-6.12.94-r1
+kmod-crypto-geniv-6.12.94-r1
+kmod-crypto-gf128-6.12.94-r1
+kmod-crypto-ghash-6.12.94-r1
+kmod-crypto-hash-6.12.94-r1
+kmod-crypto-hmac-6.12.94-r1
+kmod-crypto-hw-safexcel-6.12.94-r1
+kmod-crypto-manager-6.12.94-r1
+kmod-crypto-md5-6.12.94-r1
+kmod-crypto-null-6.12.94-r1
+kmod-crypto-rng-6.12.94-r1
+kmod-crypto-seqiv-6.12.94-r1
+kmod-crypto-sha1-6.12.94-r1
+kmod-crypto-sha256-6.12.94-r1
+kmod-crypto-sha3-6.12.94-r1
+kmod-crypto-sha512-6.12.94-r1
+kmod-gpio-button-hotplug-6.12.94-r5
+kmod-hwmon-core-6.12.94-r1
+kmod-i2c-core-6.12.94-r1
+kmod-leds-gpio-6.12.94-r1
+kmod-leds-ws2812b-6.12.94-r1
+kmod-lib-crc-ccitt-6.12.94-r1
+kmod-lib-crc-itu-t-6.12.94-r1
+kmod-lib-crc32c-6.12.94-r1
+kmod-libphy-6.12.94-r1
+kmod-mac80211-6.12.94.6.18.26-r1
+kmod-mt76-connac-6.12.94.2026.03.19~39c960c3-r2
+kmod-mt76-core-6.12.94.2026.03.19~39c960c3-r2
+kmod-mt7915e-6.12.94.2026.03.19~39c960c3-r2
+kmod-mt7986-firmware-6.12.94.2026.03.19~39c960c3-r2
+kmod-nf-conntrack-6.12.94-r1
+kmod-nf-conntrack6-6.12.94-r1
+kmod-nf-flow-6.12.94-r1
+kmod-nf-log-6.12.94-r1
+kmod-nf-log6-6.12.94-r1
+kmod-nf-nat-6.12.94-r1
+kmod-nf-reject-6.12.94-r1
+kmod-nf-reject6-6.12.94-r1
+kmod-nfnetlink-6.12.94-r1
+kmod-nft-core-6.12.94-r1
+kmod-nft-fib-6.12.94-r1
+kmod-nft-nat-6.12.94-r1
+kmod-nft-offload-6.12.94-r1
+kmod-phy-aquantia-6.12.94-r1
+kmod-ppp-6.12.94-r1
+kmod-pppoe-6.12.94-r1
+kmod-pppox-6.12.94-r1
+kmod-slhc-6.12.94-r1
+kmod-thermal-6.12.94-r1
+kmod-tls-6.12.94-r1
+nftables-json-1.1.6-r2
+
+=== kernel-config
+no /proc/config.gz (normal on OpenWrt); see modules below
+bpf_jit_enable=1
+unprivileged_bpf_disabled=2
+bpffs dir present: 1 mounted
+cgroup fs: cgroup2 
+
+=== modules
+nf_conntrack nf_defrag_ipv4 nf_defrag_ipv6 nf_flow_table nf_flow_table_inet nf_log_syslog nf_nat nf_reject_ipv4 nf_reject_ipv6 nf_tables nfnetlink nft_chain_nat nft_ct nft_fib nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_flow_offload nft_hash nft_limit nft_log nft_masq nft_nat nft_numgen nft_quota nft_redir nft_reject nft_reject_inet nft_reject_ipv4 nft_reject_ipv6 tls 
+
+=== firewall
+table inet fw4
+
+=== network
+br-lan driver=- mtu=1500  speed=1000
+eth0 driver=mtk_soc_eth mtu=1504 dsa speed=2500
+lan2 driver=mt7530-mdio mtu=1500  speed=-1
+lan3 driver=mt7530-mdio mtu=1500  speed=1000
+lan4 driver=mt7530-mdio mtu=1500  speed=-1
+wan driver=mt7530-mdio mtu=1500  speed=-1
+-- ethtool -k eth0
+rx-checksumming: on
+tx-checksumming: on
+scatter-gather: on
+tcp-segmentation-offload: on
+generic-segmentation-offload: on
+generic-receive-offload: on
+hw-tc-offload: on
+rx-gro-list: on
+rx-udp-gro-forwarding: off
+
+=== proxy-core
+
+=== end
+

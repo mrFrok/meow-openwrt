@@ -1,0 +1,249 @@
+--- a/connection.go
++++ b/connection.go
+@@ -123,6 +123,7 @@
+ //   - [StatelessResetError]: when we receive a stateless reset
+ //   - [VersionNegotiationError]: returned by the client, when there's no version overlap between the peers
+ type Conn struct {
++	pendingLW pendingPacketLW // lightweight: see sendPacketsWithGSO
+ 	// Destination connection ID used during the handshake.
+ 	// Used to check source connection ID on incoming packets.
+ 	handshakeDestConnID protocol.ConnectionID
+@@ -2500,6 +2501,9 @@
+ }
+ 
+ func (c *Conn) sendPackets(now monotime.Time) error {
++	if !c.flushPendingLW() { // lightweight: see sendPacketsWithGSO
++		return nil
++	}
+ 	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
+ 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
+ 			connID, frame, tr, ok := pm.NextPathToProbe()
+@@ -2609,10 +2613,18 @@
+ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
+ 	buf := getLargePacketBuffer()
+ 	maxSize := c.maxPacketSize()
++	// lightweight: the GSO segment size is the size of the first packet in the batch,
++	// not maxSize. Upstream ends a batch at the first packet smaller than maxSize, and
++	// a DATAGRAM packet (Hysteria2, TUIC, MASQUE) is almost always smaller — every
++	// datagram then cost one sendmsg (BPI-R4: ~27 µs, the cap of Hysteria2 upload).
++	// Packets are still packed with maxSize (the packer drops a DATAGRAM that does not
++	// fit); one bigger than the segment size starts a new batch.
++	segSize := maxSize
+ 
+ 	ecn := c.sentPacketHandler.ECNMode(true)
+ 	for {
+ 		var dontSendMore bool
++		prevLen := buf.Len()
+ 		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
+ 		if err != nil {
+ 			if err != errNothingToPack {
+@@ -2623,6 +2635,21 @@
+ 				return nil
+ 			}
+ 			dontSendMore = true
++		} else if prevLen == 0 {
++			if size > 0 {
++				segSize = size
++			}
++		} else if size > segSize {
++			// lightweight: send the batch without this packet, which starts the next one.
++			next := getLargePacketBuffer()
++			next.Data = append(next.Data, buf.Data[prevLen:]...)
++			buf.Data = buf.Data[:prevLen]
++			c.sendQueue.Send(buf, gsoSizeLW(buf, segSize, maxSize), ecn)
++			buf, segSize = next, size
++			if c.sendQueue.WouldBlock() {
++				c.pendingLW = pendingPacketLW{buf: buf, ecn: ecn}
++				return nil
++			}
+ 		}
+ 
+ 		if !dontSendMore {
+@@ -2640,14 +2667,15 @@
+ 
+ 		// Append another packet if
+ 		// 1. The congestion controller and pacer allow sending more
+-		// 2. The last packet appended was a full-size packet
++		// 2. The last packet appended was a full-size packet (lightweight: of the segment size)
+ 		// 3. The next packet will have the same ECN marking
+ 		// 4. We still have enough space for another full-size packet in the buffer
+-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
++		if !dontSendMore && size == segSize && nextECN == ecn && buf.Len()+segSize <= buf.Cap() &&
++			buf.Len()/segSize < maxGSOSegmentsLW {
+ 			continue
+ 		}
+ 
+-		c.sendQueue.Send(buf, uint16(maxSize), ecn)
++		c.sendQueue.Send(buf, gsoSizeLW(buf, segSize, maxSize), ecn)
+ 
+ 		if dontSendMore {
+ 			return nil
+@@ -2667,7 +2695,38 @@
+ 
+ 		ecn = nextECN
+ 		buf = getLargePacketBuffer()
++		segSize = maxSize
++	}
++}
++
++// maxGSOSegmentsLW is UDP_MAX_SEGMENTS of older kernels (64); with small packets
++// the 20 KiB buffer could otherwise hold more segments than the kernel accepts.
++const maxGSOSegmentsLW = 64
++
++// gsoSizeLW keeps upstream's gsoSize (maxSize) for a single-packet batch.
++func gsoSizeLW(buf *packetBuffer, segSize, maxSize protocol.ByteCount) uint16 {
++	if buf.Len() <= segSize {
++		return uint16(maxSize)
++	}
++	return uint16(segSize)
++}
++
++// pendingPacketLW is a packed packet that split a GSO batch when the send queue
++// filled up; sendPackets sends it first (the run loop calls it with a free slot).
++type pendingPacketLW struct {
++	buf *packetBuffer
++	ecn protocol.ECN
++}
++
++// flushPendingLW reports whether the send queue is still free afterwards.
++func (c *Conn) flushPendingLW() bool {
++	if c.pendingLW.buf == nil {
++		return true
+ 	}
++	p := c.pendingLW
++	c.pendingLW = pendingPacketLW{}
++	c.sendQueue.Send(p.buf, uint16(c.maxPacketSize()), p.ecn)
++	return !c.sendQueue.WouldBlock()
+ }
+ 
+ func (c *Conn) resetPacingDeadline() {
+--- a/connection_test.go
++++ b/connection_test.go
+@@ -3484,3 +3484,127 @@
+ 	require.NoError(t, err)
+ 	require.Equal(t, []byte("bar"), d)
+ }
++
++// lightweight: DATAGRAM-sized packets (smaller than maxPacketSize) are batched
++// with the first packet's size as the GSO segment size.
++func TestConnectionGSOBatchSmallPacketsLW(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		mockCtrl := gomock.NewController(t)
++		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
++		tc := newServerTestConnection(t, mockCtrl, nil, true,
++			connectionOptHandshakeConfirmed(),
++			connectionOptSentPacketHandler(sph),
++		)
++		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
++		sph.EXPECT().TimeUntilSend().AnyTimes()
++		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
++		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
++		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
++
++		const seg = 1000
++		maxPacketSize := tc.conn.maxPacketSize()
++		require.Greater(t, int(maxPacketSize), seg)
++		var expectedData []byte
++		var calls []any
++		sizes := []int{seg, seg, seg, 700} // the smaller one ends the batch
++		for i, n := range sizes {
++			data := bytes.Repeat([]byte{byte(i)}, n)
++			expectedData = append(expectedData, data...)
++			first := i == 0
++			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
++				func(buffer *packetBuffer, maxSize protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
++					require.Equal(t, maxPacketSize, maxSize) // never reduced: the packer drops DATAGRAMs that do not fit
++					_ = first
++					buffer.Data = append(buffer.Data, data...)
++					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(10 + i)}, nil
++				},
++			))
++		}
++		calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack))
++		gomock.InOrder(calls...)
++		done := make(chan struct{})
++		tc.sendConn.EXPECT().Write(expectedData, uint16(seg), protocol.ECT1).DoAndReturn(func([]byte, uint16, protocol.ECN) error { close(done); return nil })
++		tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
++
++		errChan := make(chan error, 1)
++		go func() { errChan <- tc.conn.run() }()
++		tc.conn.scheduleSending()
++		synctest.Wait()
++		select {
++		case <-done:
++		default:
++			t.Fatal("should have sent the batch")
++		}
++		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
++		tc.conn.destroy(nil)
++		synctest.Wait()
++		select {
++		case err := <-errChan:
++			require.NoError(t, err)
++		default:
++			t.Fatal("should have timed out")
++		}
++	})
++}
++
++func TestConnectionGSOBatchSplitLW(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		mockCtrl := gomock.NewController(t)
++		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
++		tc := newServerTestConnection(t, mockCtrl, nil, true,
++			connectionOptHandshakeConfirmed(),
++			connectionOptSentPacketHandler(sph),
++		)
++		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
++		sph.EXPECT().TimeUntilSend().AnyTimes()
++		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
++		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
++		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
++
++		const seg = 1000
++		maxPacketSize := tc.conn.maxPacketSize()
++		require.Greater(t, int(maxPacketSize), seg)
++		var expectedData []byte
++		var calls []any
++		sizes := []int{seg, seg, seg + 100, seg + 100} // the bigger one starts a new batch
++		for i, n := range sizes {
++			data := bytes.Repeat([]byte{byte(i)}, n)
++			expectedData = append(expectedData, data...)
++			first := i == 0
++			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
++				func(buffer *packetBuffer, maxSize protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
++					require.Equal(t, maxPacketSize, maxSize) // never reduced: the packer drops DATAGRAMs that do not fit
++					_ = first
++					buffer.Data = append(buffer.Data, data...)
++					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(10 + i)}, nil
++				},
++			))
++		}
++		calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack))
++		gomock.InOrder(calls...)
++		done := make(chan struct{})
++		gomock.InOrder(
++			tc.sendConn.EXPECT().Write(expectedData[:2*seg], uint16(seg), protocol.ECT1),
++			tc.sendConn.EXPECT().Write(expectedData[2*seg:], uint16(seg+100), protocol.ECT1).DoAndReturn(func([]byte, uint16, protocol.ECN) error { close(done); return nil }),
++		)
++
++		errChan := make(chan error, 1)
++		go func() { errChan <- tc.conn.run() }()
++		tc.conn.scheduleSending()
++		synctest.Wait()
++		select {
++		case <-done:
++		default:
++			t.Fatal("should have sent the batch")
++		}
++		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
++		tc.conn.destroy(nil)
++		synctest.Wait()
++		select {
++		case err := <-errChan:
++			require.NoError(t, err)
++		default:
++			t.Fatal("should have timed out")
++		}
++	})
++}

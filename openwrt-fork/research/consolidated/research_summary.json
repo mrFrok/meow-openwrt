@@ -1,0 +1,163 @@
+{
+ "project": "Mihomo Lightweight",
+ "date": "2026-11-01",
+ "base": "upstream mihomo v1.19.33 (3f27ef39)",
+ "summary": "16 MB is not reachable for a functional router core; ~22-24 MB (arm64) is the realistic Ultra floor, ~7-8 MB xz on flash. RAM: private (anon) memory is already ~10-13 MB idle on desktop; most RSS is file-backed binary pages, reclaimable when the binary is on flash. A terminated mihomo connection can never be handed to the kernel forward path; the only DIRECT fast path is a pre-interception bypass of NEW connections whose verdict is provably IP-determinable. DIRECT TCP already uses splice(2); eBPF (XDP/TC/sk_lookup) is rejected, sockmap is at most an optional experiment; Rust components are rejected for MIPS profiles.",
+ "measurements": {
+  "host": "desktop x86_64 (CachyOS, Linux 7.3), Go 1.27.3; NOT router hardware",
+  "binary_size_stripped_bytes": {
+   "official(with_gvisor)": {
+    "arm64": 56492156,
+    "armv7": 55967868,
+    "mipsle-softfloat": 62783643,
+    "mips-softfloat": 62783643,
+    "amd64v1": 61255804
+   },
+   "lean(with_gvisor no_tailscale no_zerotier no_easytier with_low_memory no_fake_tcp)": {
+    "arm64": 37027964,
+    "armv7": 37552252,
+    "mipsle-softfloat": 42729627,
+    "mips-softfloat": 42729627,
+    "amd64v1": 40947836
+   },
+   "ultra-trial(switch cases cut, no gvisor; see note)": {
+    "arm64": 28901500,
+    "amd64v1": 32194684,
+    "arm64_gzip9": 10736544,
+    "arm64_xz9": 7290792
+   }
+  },
+  "ultra_trial_note": "Only the switch cases in adapter/parser.go and listener/parse.go were removed (17 outbounds, 13 inbounds) and with_gvisor dropped. Linker DCE still kept mipstack 416 KB (default TUN stack), quic-go 468 KB (vless xhttp-h3, DoH3/DoQ, QUIC sniffer), restls 356 KB, jls-tls 301 KB, protobuf 477 KB (GeoSite.dat), reedsolomon 237 KB (kcptun plugin). File-level build tags are needed for the rest.",
+  "ultra_trial_sections_arm64_KB": {
+   ".text": 12302,
+   ".gopclntab": 10665,
+   ".go.type": 3290,
+   ".rodata": 878,
+   ".noptrdata": 705,
+   ".data": 216
+  },
+  "rss_KB_idle_and_100_slow_DIRECT_downloads(amd64, empty config, GOMAXPROCS=1)": {
+   "official": {
+    "idle": {
+     "rss": 44700,
+     "anon": 12700,
+     "file": 32000
+    },
+    "peak100": {
+     "rss": 48640,
+     "anon": 15060,
+     "file": 33580
+    }
+   },
+   "lean": {
+    "idle": {
+     "rss": 34632,
+     "anon": 10020,
+     "file": 24612
+    },
+    "peak100": {
+     "rss": 38836,
+     "anon": 12900,
+     "file": 25936
+    }
+   },
+   "ultra-trial": {
+    "idle": {
+     "rss": 29964,
+     "anon": 9604,
+     "file": 20360
+    },
+    "peak100": {
+     "rss": 34412,
+     "anon": 12856,
+     "file": 21556
+    }
+   }
+  },
+  "rss_note": "GOMAXPROCS=4 differs by <2 MB. Kernel memory of splice pipes is not in RSS and was not measured. Binary ran from tmpfs here, so file pages were RAM-backed; on a router with the binary on flash they are reclaimable page cache."
+ },
+ "contradictions": [
+  {
+   "topic": "sockmap availability on stock OpenWrt",
+   "between": [
+    "ebpf_xdp_research:F002",
+    "openwrt_kernel:F004/F021"
+   ],
+   "resolution": "ebpf agent is right: verdict-only sockmap works without CGROUPS/BPF_STREAM_PARSER (NET_SOCK_MSG=y)."
+  },
+  {
+   "topic": "hardware offload availability",
+   "between": [
+    "network_performance:F015",
+    "flow_offload_research:F014"
+   ],
+   "resolution": "No conflict: generic kernels have no HW offload; MediaTek mtk_eth_soc/PPE does standard flowtable HW offload. Other vendors software-only or out-of-tree."
+  },
+  {
+   "topic": "where DIRECT TCP is spliced",
+   "between": [
+    "ebpf_xdp_research:F007",
+    "network_performance:F001-F003"
+   ],
+   "resolution": "sing's own splice path (with 1 MiB pipes), confirmed by network agent experiment and by source."
+  }
+ ],
+ "agents": [
+  {
+   "agent": "ebpf_xdp_research",
+   "findings": 25,
+   "opportunities": 6,
+   "summary": "On the OpenWrt 25.12 6.12 kernel only sockmap/sockhash (sk_skb stream_verdict + redirect) is available without extra kmods and composes with firewall policy; XDP/TC-BPF/sk_lookup/cgroup hooks are either unavailable by default, bypass fw4/conntrack, or cannot capture forwarded traffic. Go's stdlib already splices TCPConn->TCPConn (go:net/splice_linux.go), the zero-dependency baseline. nft set + flowtable remains the safest classified-flow bypass. cilium/ebpf costs ~1.6-2.0 MB stripped standalone (measured) so a raw-syscall loader or helper binary is preferable if eBPF is ever added. No device benchmarks exist; throughput gains are hypotheses.",
+   "conclusion": "eBPF is not worth adopting for fast path classification on OpenWrt; sockmap is the only plausible optional module, pending measurement against Go's built-in splice and the nft set/flowtable approach."
+  },
+  {
+   "agent": "flow_offload_research",
+   "findings": 20,
+   "opportunities": 4,
+   "summary": "A connection already terminated by mihomo cannot be handed back to the kernel forward path: it is two independent TCP sockets with unrelated sequence numbers, and conntrack sees a local-delivery (INPUT/OUTPUT) flow, not a FORWARD flow. The only sound fast path is to decide BEFORE interception, so the first SYN of a connection is plain-routed and nft flow offload picks it up after ESTABLISHED. Offloaded flows skip netfilter prerouting entirely (flowtable hooks at ingress, priority 0), so any bypass entry is a hard commitment: it must be exact (full 4-tuple or at least saddr.daddr.dport with timeout), invalidated on any rule/config change by flushing the set AND deleting conntrack entries (a dying ct makes flow_offload_lookup fail immediately, in software; hardware entries are removed through the gc/teardown path within about 1s). The metacubex/nftables fork already has timeouts, concatenation and element add/delete/flush, so a Go-native updater is feasible but is a new code path (sing-tun uses the same library for its redirect rules). Hardware NAT that works through the standard flowtable 'flags offload' exists mainly on MediaTek (PPE on MT7622/MT7986/MT7981/MT7988, not MT7621); everything else is software flowtable only or vendor-private stacks.",
+   "conclusion": "Handing a live mihomo-terminated connection back to the kernel forward path is not possible; only future connections can be fast-pathed, by a pre-interception nft set that mihomo (or the OpenWrt glue) maintains. The kernel mechanics (flowtable at ingress, ct-dying invalidation, 30 s idle timeout, FIN/RST teardown) make this safe only if bypass entries are exact, short-lived and invalidated together with conntrack. The static CIDR variant is low-risk and already proven in clashwrt; the dynamic variant is the main source of gain and the main source of leak risk. Hardware NAT is realistic only on MediaTek via standard flowtable offload; elsewhere it is software flowtable or vendor stacks that must be detected and excluded."
+  },
+  {
+   "agent": "go_runtime_memory",
+   "findings": 24,
+   "opportunities": 10,
+   "summary": "The fork as built today (tags: with_gvisor) is 56-63 MB stripped on arm64/arm/mipsle (61 MB amd64): the 16 MB target is unreachable by linker flags alone and needs feature pruning (tailscale, wazero, easytier, gopacket, mieru, protobuf, gvisor, pprof tables); pclntab alone is ~20 MB. Idle RSS of a default amd64 build with an empty config is ~46 MB with 14 threads; 453 package init() calls allocate ~1.76 MB on the heap, the rest is the mapped/touched binary and runtime. mihomo sets no GOGC/GOMEMLIMIT and only calls uber automaxprocs; with go.mod 'go 1.20' the Go 1.25 container-aware GOMAXPROCS is OFF by default. Go 1.26+ uses Green Tea GC by default. with_low_memory in the fork/sing only halves two buffer constants (32K->16K relay, 16K->8K UDP) and forces the wait-then-read (pooled buffer) copy path; it does not change sing-tun or gvisor. 32-bit ARM and all MIPS have NO assembly for AES, GHASH, SHA-2 or ChaCha20/Poly1305 in Go 1.27, so VMess/SS/Trojan AEAD on those cores run pure-Go code; arm64 has AES-GCM/SHA/NEON-ChaCha20 but no Poly1305 asm. Recommended knobs: GOMAXPROCS = real core count (cap 2-4), GOMEMLIMIT as a soft ceiling at ~60-70% of RAM available to mihomo, GOGC 50-100, with_low_memory on <=256 MB, build with -trimpath -s -w -buildid=, no PGO until a representative profile exists.",
+   "conclusion": "Go runtime tuning (GOMEMLIMIT/GOGC/GOMAXPROCS, idle FreeOSMemory, with_low_memory) can trim peak memory modestly and cheaply, but the dominant levers for the 16 MB / 10 MB RSS targets are removing code (the current build is 53-63 MB per arch with pclntab ~20 MB) and choosing ciphers that suit the architecture (no stdlib crypto assembly on ARMv7/MIPS). The 64 MB class is infeasible without heavy pruning; 128 MB is plausible with the Lightweight profile; 256/512 MB can run a richer build with standard buffers. All runtime defaults listed are hypotheses pending on-device measurement."
+  },
+  {
+   "agent": "mihomo_architecture",
+   "findings": 25,
+   "opportunities": 10,
+   "summary": "Read of fork v1.19.33 source. A TCP connection costs 3 goroutines in the common case (inbound handler, 200ms peek helper, one relay copy goroutine + handler as the other direction) and DIRECT TCP can be handed to splice(2) by sing bufio.Copy; a UDP session costs 2 goroutines (dial/process + handleUDPToLocal) plus a shared pool of max(4,GOMAXPROCS) workers. Fake-IP is an in-memory LRU of only 1000 entries by default (or cache.db when store-fake-ip). Default TUN stack in this fork is the pure-Go 'mips' stack (metacubex/mipstack), not gvisor; route-address-set/route-exclude-address-set are implemented only through sing-tun nftables interval sets (no iptables fallback) and are fed from rule-providers of behavior ipcidr. The most probable cause of the ~42 MB startup spike is that on arm64/amd64 hub/executor/concurrent_load_unlimit.go sets concurrentCount=MaxInt, so ALL rule providers are read+zstd-decoded+parsed in parallel; per-element binary.Read allocations in the .mrs readers add garbage (hypothesis, not measured). Existing tags: with_gvisor, with_low_memory, no_tailscale, no_zerotier, no_easytier, no_fake_tcp, cmfa. No per-protocol tags exist for the heavy families (quic-go, utls, restls, ssh, openvpn, mieru, sudoku, kcp, wireguard, masque); protocol registration is a plain switch in adapter/parser.go and listener/parse.go, so stub-file build tags (the pattern already used for tailscale/zerotier/easytier) are the rebase-friendly route. easytier embeds a 6.85 MB WASM core plus wazero.",
+   "conclusion": "mihomo's hot path is small and readable: one handler goroutine, one relay goroutine and a transient peek goroutine per TCP flow, two goroutines per UDP session, 32/16 KiB relay buffers (16/8 KiB with with_low_memory), and global trackers. The biggest controllable RAM items found are provider loading concurrency (MaxInt on 64-bit) with allocation-heavy .mrs readers, and linked-in heavy protocol stacks (tailscale, gvisor, easytier+wazero+6.85 MB wasm, quic-go family, mieru+protobuf, utls). Existing tags already isolate tailscale/zerotier/easytier/fake-tcp; a stub-file pattern can cover the rest with minimal rebase pain. A DIRECT kernel fast path is feasible in principle (sing-tun already maintains nft interval sets from rule-sets) but fake-IP, domain rules and CDN-shared IPs make a per-connection IP bypass unsafe unless restricted to rule chains that depend only on destination IP/port/network."
+  },
+  {
+   "agent": "network_performance",
+   "findings": 19,
+   "opportunities": 10,
+   "summary": "Mihomo relays TCP with sing bufio.Copy, which already uses splice(2) when both ends unwrap to raw TCP sockets (confirmed by gdb syscall counting for DIRECT CONNECT); traffic counters do not break it. Every encrypted/wrapped outbound and every gVisor/mipstack TUN inbound falls to userspace copies with 16/32 KiB pooled buffers. UDP is one recvfrom/sendto per packet with channel handoff (batching exists only inside quic-go). sing-tun 0.4.28 supports IFF_VNET_HDR TSO/GRO/USO behind tun.gso. io_uring, XDP sockets, kTLS and flow tables are disabled in OpenWrt generic 6.12 config, so exotic zero-copy options are not viable. Best gain per complexity: use real-socket inbounds (redirect/tproxy/system stack), tune buffers/GC per profile, keep splice healthy; a process-level data-plane split is not worth it.",
+   "conclusion": "The TCP data plane is already close to optimal for DIRECT flows because of sing's splice; the real losses are for wrapped/encrypted outbounds (unavoidable userspace copy) and for TUN userspace stacks. Cheap wins are configuration and profile level (stack choice, buffer tag, GC limits, tun.gso), while kernel-bypass/io_uring/kTLS options are blocked by OpenWrt kernel config or fragile, and a control/data process split offers no benefit over splice."
+  },
+  {
+   "agent": "openwrt_kernel",
+   "findings": 21,
+   "opportunities": 4,
+   "summary": "On OpenWrt 25.12 (kernel 6.12) generic config has BPF_SYSCALL=y, BPF_JIT=y (default on, not always-on), NET_SOCK_MSG=y, but no BTF, no CGROUPS (so no CGROUP_BPF/STREAM_PARSER), no KPROBES/FTRACE/PERF_EVENTS (no BPF_EVENTS), no XDP_SOCKETS. Everything netfilter-side (nf_tables, flowtable, nft_flow_offload, nft_tproxy, conntrack netlink, TUN, cls_bpf/act_bpf) is a loadable kmod-* package that a given image may or may not contain. So a stock-kernel eBPF fast path is limited to tc-bpf (needs kmod-sched-bpf+sched-core) and the syscall/map layer; an nft-set / flowtable fast path is the portable choice. Flowtable 'ft' is declared by fw4, used only from the forward chain for TCP/UDP of established conntrack entries, and offloaded flows skip prerouting/forward/postrouting hooks, so a third-party table must not rely on seeing offloaded packets. TPROXY and REDIRECT end in local delivery (never offloadable); TUN goes through forward and is theoretically offloadable but unverified.",
+   "conclusion": "Stock OpenWrt 25.12 gives a usable bpf() syscall plus JIT but no BTF/cgroup/tracing BPF, and puts every netfilter feature in kmods. The robust DIRECT fast path is nft sets feeding the existing fw4 flowtable (forward-only, TCP/UDP), with explicit invalidation because offloaded flows skip all later hooks; TPROXY/REDIRECT are inherently local-delivery and non-offloadable, TUN is forwarded but offload is unverified."
+  },
+  {
+   "agent": "rust_components",
+   "findings": 18,
+   "opportunities": 5,
+   "summary": "Rust does not meaningfully help the stated goals on MIPS/ARMv7 routers. MIPS targets are Tier 3 (nightly build-std or full OpenWrt buildroot rustc), Rust crypto has no MIPS/ARMv7 SIMD in RustCrypto so the main CPU cost is in the same position as Go, and the DIRECT TCP data plane already uses splice. cgo loses the pure-Go cross-compile and does not remove Go runtime overhead; a helper process adds RSS and complexity; a full Rust core (meow-rs) gives large RAM savings (secondary-source numbers, Apple M4) but lacks MIPS/ARM32 packages and full parity, and breaks the rebase-friendly fork model.",
+   "conclusion": "Assessed honestly, Rust gives no safe speed or RAM win for the MIPS/ARM32 routers the project targets, and the integration costs (toolchain tier, cgo build matrix, IPC, parity) outweigh gains. Keep Go; revisit Rust only as an optional aarch64 helper after measurement."
+  },
+  {
+   "agent": "xerj_research",
+   "findings": 5,
+   "opportunities": 2,
+   "summary": "Xerj rc.100 runs locally (127.0.0.1:9200). The local indexer is the useful part: 8 mlw-* indices cover the fork, key deps, Go runtime, the Linux 6.12 networking/BPF subset, OpenWrt 25.12.6, fw4, cilium/ebpf and sing-box (~373k records, 8.3k code files, ~1 min total). The Corpus Hub has no corpus for mihomo, Linux kernel networking, eBPF, OpenWrt, nftables or the Go runtime; only adjacent ones exist.",
+   "conclusion": "Xerj Indexer is in active use for the project; the Corpus Hub is not useful for this domain today."
+  }
+ ]
+}

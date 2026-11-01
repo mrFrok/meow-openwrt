@@ -1,0 +1,691 @@
+{
+ "project": "Mihomo Lightweight",
+ "date": "2026-11-01",
+ "base": "upstream mihomo v1.19.33 (3f27ef39)",
+ "decisions_proposed": [
+  {
+   "id": "D1",
+   "title": "Redefine the size target per profile",
+   "decision": "16 MB is not reachable without dropping utls/REALITY, the QUIC stack and mihomo's HTTP fork. Proposed targets (stripped, arm64): Ultra <=24 MB, Lightweight <=31 MB, Performance = current lean 37 MB; MIPS +15%. Report xz size (flash) next to it: Ultra ~7-8 MB.",
+   "confidence": "medium (Ultra figure is an estimate from the trial build + per-module weights)",
+   "status": "proposed"
+  },
+  {
+   "id": "D2",
+   "title": "Per-protocol build tags via stub files",
+   "decision": "Follow the existing tailscale/zerotier/easytier stub pattern: each protocol file gets //go:build !no_<proto> and a stub returning 'disabled at build time'; switches stay untouched (rebase-friendly). Patches needed beyond stubs: vless xhttp-h3, DoH3/DoQ, QUIC sniffer (for no_quic), shadowsocks plugins restls/kcptun, geodata protobuf (no_geosite_dat).",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D3",
+   "title": "Memory target defined as private memory",
+   "decision": "Measure and report RssAnon + kernel memory attributable to the core (pipes, sockets) as the RAM metric; report RssFile separately. Require the binary on flash (/usr/bin), never /tmp.",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D4",
+   "title": "First memory patches",
+   "decision": "(a) provider load concurrency 1-2 on low-memory profiles (one build-tagged file); (b) .mrs reader without per-element binary.Read allocations; (c) cap splice pipe size (e.g. 64-256 KiB) on low-memory profiles - needs a sing patch or a replace; (d) default GOMEMLIMIT/GOGC from /proc/meminfo when env is unset. Each measured on BPI-R4 before/after.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D5",
+   "title": "DIRECT fast path = pre-interception bypass of NEW connections",
+   "decision": "No hand-back of terminated connections (impossible). The core marks a connection bypass-eligible only if its verdict is IP-determinable: the matched rule and every earlier rule that could match differently depend only on (dst IP, dst port, network[, src IP]); earlier non-determinable rules are allowed only if their outbound is the same DIRECT. Fake-IP connections and sniffed-host decisions are never eligible. Eligible keys go to an nft timeout set checked before interception; invalidation = flush set + conntrack delete by ct mark on every rule/config change and on core start/stop. Glue (clashwrt) owns the nft table; the core only emits verdicts (flow agent option C) behind a build tag.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D6",
+   "title": "eBPF scope",
+   "decision": "Reject XDP, TC-BPF, sk_lookup, cgroup hooks for the core. sockmap verdict redirect for terminated DIRECT TCP: optional experiment only (Performance profile, build tag, raw-syscall loader preferred over cilium/ebpf +1.6 MB), adopted only if BPI-R4 shows a clear CPU win over splice. Fallback = splice (today's path).",
+   "confidence": "high",
+   "status": "proposed"
+  },
+  {
+   "id": "D7",
+   "title": "Rust components",
+   "decision": "Not for stages II-X: cgo breaks the pure-Go static cross-build and needs musl toolchains; Rust MIPS targets are tier 3; crypto on MIPS/ARMv7 is no faster; Go runtime overhead stays. meow-rs is used only as an external comparison baseline.",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D8",
+   "title": "CPU levers before code",
+   "decision": "Profile defaults and docs: tproxy/redirect or TUN system stack instead of mips/gvisor userspace stacks; ChaCha20-Poly1305 or VLESS-vision on MIPS/ARMv7 (no AES asm); tun.gso where the kernel allows; PGO only with a real MIPS/ARMv7 profile (4pda volunteers).",
+   "confidence": "medium",
+   "status": "proposed"
+  },
+  {
+   "id": "D9",
+   "title": "Toolchain",
+   "decision": "Build with the newest stable Go (1.27.x) unless a benchmark shows a regression vs upstream's 1.26; record Go version in every BENCHMARKS row. CGO_ENABLED=0, non-PIE, -trimpath -s -w -buildid=.",
+   "confidence": "medium",
+   "status": "proposed"
+  }
+ ],
+ "agent_opportunities": [
+  {
+   "name": "Prune features by build tags",
+   "description": "Introduce build tags to exclude tailscale, easytier, zerotier, mieru, wazero, reedsolomon, gopacket, pprof, rarely used protocols; keep pclntab proportional.",
+   "expected_benefit": "Binary from ~56 MB toward the 16 MB goal (tailscale+wazero+easytier+... are tens of MB of the 56); lower init allocations and idle RSS floor.",
+   "implementation_complexity": "high",
+   "risks": [
+    "touching upstream-merged code increases merge conflicts",
+    "feature regressions",
+    "needs stub files per feature"
+   ],
+   "priority": "critical",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Serialize / bound rule-provider loading on 64-bit",
+   "description": "Replace the arch-based concurrentCount (MaxInt on arm64/amd64) with a small constant (1-2) for lightweight profiles, preferably as a tag-selected file mirroring concurrent_load_*.go.",
+   "expected_benefit": "Removes the largest probable contributor to the ~42 MB startup spike; cost is slightly slower startup. Measurable via gctrace on BPI-R4.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Startup time grows with many/large providers",
+    "Hypothesis not yet verified by measurement"
+   ],
+   "priority": "critical",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Ensure Go splice path is actually used for DIRECT relay",
+   "description": "Audit the fork's tunnel relay (statistic wrappers, buffered conns) so that for DIRECT TCP the bare *net.TCPConn pair reaches io.Copy and Go's splice(2) kicks in; add a tracker that counts bytes via TCP_INFO instead of wrapping Read/Write.",
+   "expected_benefit": "Less userspace copy CPU on DIRECT TCP with zero kernel feature dependency (high on weak CPUs, hypothesis).",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Per-connection stats/limits need alternative accounting",
+    "Splice is skipped if any wrapper type appears"
+   ],
+   "priority": "high",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "Prefer nft set + flowtable for classified DIRECT bypass (not eBPF)",
+   "description": "Keep classified-flow bypass in nftables sets with timeouts and rely on flowtable; eBPF map approach is not recommended.",
+   "expected_benefit": "Safe, fw4-compatible, auto-cleanup, no kmod-sched-bpf.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Set element churn costs CPU on weak routers",
+    "kmod-nft-offload size"
+   ],
+   "priority": "high",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "Static CIDR bypass set (extend what clashwrt does) as an optional core module",
+   "description": "Move/mirror clashwrt's static interval-set bypass (RU CIDR, private ranges) into the core so mihomo can emit it itself, loading it with metacubex/nftables, without per-connection logic.",
+   "expected_benefit": "Large share of DIRECT traffic (RU/LAN) offloadable with zero per-connection overhead and no safety risk from shared CDN IPs, because the key is the policy-defining IP range, not a domain verdict.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Only helps IP-defined DIRECT policies",
+    "Requires nft/fw4 present; must auto-disable on non-OpenWrt hosts",
+    "Static list staleness"
+   ],
+   "priority": "high",
+   "agent": "flow_offload_research"
+  },
+  {
+   "name": "Conntrack-mark based invalidation helper",
+   "description": "Mark bypass-accepted flows with a dedicated ct mark and implement a Go ctnetlink delete-by-mark routine run on config reload/crash recovery.",
+   "expected_benefit": "Deterministic flush of offloaded DIRECT flows without per-flow tuple tracking; required for any dynamic mode.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Needs ctnetlink access (CAP_NET_ADMIN) and a netlink library for conntrack (vishvananda/netlink or hand-rolled)",
+    "Brief connection resets for long flows after a reload"
+   ],
+   "priority": "high",
+   "agent": "flow_offload_research"
+  },
+  {
+   "name": "Capability detection with auto-disable",
+   "description": "At start-up probe nft, flowtable presence, NSS/ECM or vendor offload, SQM instance, and refuse to activate dynamic fast path when policy cannot be guaranteed.",
+   "expected_benefit": "Prevents silent unsafe configurations; matches the project requirement of auto-disable.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Detection heuristics for vendor stacks are fragile"
+   ],
+   "priority": "high",
+   "agent": "flow_offload_research"
+  },
+  {
+   "name": "Runtime memory profile from config/wizard",
+   "description": "Add a runtime section (gogc, memory-limit, gomaxprocs) applied at startup and on reload via debug.SetGCPercent/SetMemoryLimit, with presets chosen by detected RAM (64/128/256/512 MB).",
+   "expected_benefit": "Cuts peak RSS (est. 15-30% on small heaps; unmeasured) and prevents unbounded growth; zero binary cost.",
+   "implementation_complexity": "low",
+   "risks": [
+    "limit below live set causes GC thrash (50% CPU limiter)",
+    "needs on-device validation",
+    "does not prevent OOM"
+   ],
+   "priority": "high",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Smaller initial read buffer for idle connections",
+   "description": "In the relay path, avoid pinning 16-32 KiB per blocked Read for non-ReadWaiter conns: start with 2-4 KiB or use wait-then-read where possible; grow adaptively.",
+   "expected_benefit": "Saves ~16-32 KB per idle connection (e.g. 16-32 MB at 1000 conns), large for 128 MB devices.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "extra syscalls for bulk transfers",
+    "touching sing internals (module fork)"
+   ],
+   "priority": "high",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Per-arch crypto defaults and cipher advice",
+   "description": "On ARMv7/MIPS prefer ChaCha20-Poly1305 or no-crypto-over-TLS paths; on arm64 with AES ext prefer AES-GCM; expose in wizard based on /proc/cpuinfo features.",
+   "expected_benefit": "Potentially large CPU/throughput difference on MIPS/ARMv7 where no asm exists (unmeasured).",
+   "implementation_complexity": "medium",
+   "risks": [
+    "benchmarks needed on real MT7621/IPQ40xx/ath79 devices",
+    "server-side cipher must match"
+   ],
+   "priority": "high",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Batch reads in .mrs readers and zstd decoder tuning",
+   "description": "Read leaves/labelBitmap/ranges with a single io.ReadFull into a byte slice and decode with binary.BigEndian.Uint64, avoiding millions of per-element binary.Read heap allocations; create the zstd decoder with concurrency 1 and a bounded window.",
+   "expected_benefit": "Lower transient allocation and GC pressure during provider load; fewer goroutines.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Touches upstream files (rebase conflicts), mitigate with small isolated helper functions",
+    "Gain unmeasured"
+   ],
+   "priority": "high",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Per-protocol stub tags (no_quic, no_ssh, no_openvpn, no_mieru, no_sudoku, no_kcp, no_wireguard, no_restls, no_jls)",
+   "description": "Follow the tailscale/zerotier/easytier stub pattern: add `//go:build !no_X` to the real adapter/listener file and a stub file defining the Option struct and a New* that returns an error. parser.go/listener/parse.go stay untouched.",
+   "expected_benefit": "Binary size reduction (quic family, mieru+protobuf, jls, utls consumers are the top candidates); exact savings must be measured by builds.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Option structs duplicated in stubs drift on rebase",
+    "Shared transports (vless/vmess/trojan) import quic-go/utls so cannot be removed without touching them",
+    "Inbound listeners need parallel stubs"
+   ],
+   "priority": "high",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Make the fake-IP cache size configurable or larger when RAM allows",
+   "description": "Size is hardcoded to 1000 entries (config.go ~1545); for routers with many clients, evictions cause 'fake DNS record missing' and failed long-lived connections. Raise via config or tie to fake-ip-ttl.",
+   "expected_benefit": "Stability (priority 1) under many domains; RAM cost negligible (tens of bytes per entry).",
+   "implementation_complexity": "low",
+   "risks": [
+    "Behavioral change vs upstream"
+   ],
+   "priority": "high",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Dynamic destination-IP bypass set fed from tunnel decisions",
+   "description": "Add a hook after match() in tunnel.go (resolveMetadata result = DIRECT, rule chain purely IP/port based) that adds the real DstIP to an nft set maintained by mihomo, modelled on sing-tun's interval-set code and metacubex/nftables; ties into route-exclude-address-set machinery.",
+   "expected_benefit": "DIRECT flows skip the userspace relay and can be flow-offloaded (kernel conntrack/flowtable).",
+   "implementation_complexity": "high",
+   "risks": [
+    "Shared CDN IPs: an IP learned for a DIRECT domain may also serve a PROXY domain -> leak",
+    "Fake-IP clears DstIP; need the real IP from the dialer",
+    "Must invalidate on rule/provider/config change and fake-ip flush",
+    "IPv6 and per-client (source-based) policy",
+    "First packets (conntrack) before the set entry exists"
+   ],
+   "priority": "high",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Keep sing splice path healthy for DIRECT + REDIRECT/TPROXY inbound",
+   "description": "Already present; add regression test/CI check that DIRECT CONNECT tunnel still hits splice (gdb/strace counters as in F003) and prefer redirect/tproxy or system stack over mipstack/gvisor for router profiles so inbound conns are real sockets.",
+   "expected_benefit": "Hypothesis: highest gain per complexity; zero-copy relay for direct/unwrapped flows, lower CPU and no pool buffers.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Stack choice changes TUN semantics",
+    "Pipe 1 MiB cap RAM on many bulk flows"
+   ],
+   "priority": "high",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Build tag with_low_memory + GC tuning (GOGC/GOMEMLIMIT) per profile",
+   "description": "Smaller 16/8 KiB buffers and a memory limit in Ultra/Lightweight profiles.",
+   "expected_benefit": "Hypothesis: several MB RSS saved under load; small CPU increase from GC.",
+   "implementation_complexity": "low",
+   "risks": [
+    "More GC cycles on weak CPUs",
+    "throughput drop with 16 KiB chunks on non-splice paths"
+   ],
+   "priority": "high",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Prefer transparent redirect/tproxy over TUN on routers",
+   "description": "Make redirect/tproxy the documented fast mode so inbound conns are kernel sockets and avoid userspace TCP stack and double packet crossing.",
+   "expected_benefit": "Hypothesis: largest throughput and RAM gain vs mipstack/gvisor.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Feature gap for non-TCP/UDP protocols (ICMP), UDP needs TPROXY"
+   ],
+   "priority": "high",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Hand classified DIRECT TCP flows to kernel (nftables flow offload / set bypass)",
+   "description": "After rule match -> DIRECT, install the flow into a kernel fast path (see project key question); mihomo's own splice remains the safe fallback.",
+   "expected_benefit": "Hypothesis: removes proxy CPU for bulk direct flows entirely; best gain for DIRECT-heavy home traffic.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Leaks if policy changes",
+    "DNS/IPv6 correctness",
+    "CONFIG_NF_FLOW_TABLE not in generic config"
+   ],
+   "priority": "high",
+   "agent": "network_performance"
+  },
+  {
+   "name": "nft-set + flowtable fast path for classified DIRECT",
+   "description": "Put IPs classified DIRECT by mihomo into an nft set (timeouts) matched early in a prerouting chain in clashwrt's table to skip tproxy/mark; the connection then stays on the forward path where fw4's flowtable ft offloads it.",
+   "expected_benefit": "Direct traffic runs at software-offload speed (no local socket, no userspace copy), lowest CPU on mt7621/ipq40xx",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Offloaded flows are not re-evaluated after policy change: need flush of flowtable/conntrack on config change",
+    "DNS-based classification races (IP shared by proxied and direct domains)",
+    "IPv6 needs a parallel set",
+    "fw4 flow_offloading must be on and kmod-nft-offload present"
+   ],
+   "priority": "high",
+   "agent": "openwrt_kernel"
+  },
+  {
+   "name": "Runtime capability probe",
+   "description": "At start probe nft table support (sets with timeout, flowtable, tproxy), /sys/kernel/btf, kmod presence and auto-disable fast path if any is missing.",
+   "expected_benefit": "Safe degradation on stripped images",
+   "implementation_complexity": "low",
+   "risks": [
+    "Probing by loading kmods may side-effect firewall state"
+   ],
+   "priority": "high",
+   "agent": "openwrt_kernel"
+  },
+  {
+   "name": "Do not adopt Rust; spend effort on Go-side tuning",
+   "description": "Keep the pure-Go CGO_ENABLED=0 matrix and use build tags, GOGC/GOMEMLIMIT, kernel fast path for DIRECT.",
+   "expected_benefit": "Keeps MIPS support and rebase-ability; most RAM/CPU wins are available without Rust.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Go runtime floor of several MB remains"
+   ],
+   "priority": "high",
+   "agent": "rust_components"
+  },
+  {
+   "name": "Re-index the fork after each optimization stage",
+   "description": "Run xerj autoindex on the fork (prefix mlw-fork, --fresh) after every merged stage, so impact analysis and regression search see current code.",
+   "expected_benefit": "Fast definition/usage lookup across fork + deps during refactors (build-tag splits touch many files).",
+   "implementation_complexity": "low",
+   "risks": [
+    "stale hits if forgotten (search reports index_stale hint)"
+   ],
+   "priority": "high",
+   "agent": "xerj_research"
+  },
+  {
+   "name": "Capability probe for BPF features at startup",
+   "description": "Probe BPF_MAP_CREATE(SockHash)+BPF_PROG_LOAD(SkSKB) and log availability; expose in diagnostics only, no behavior change.",
+   "expected_benefit": "Gives data to decide whether any eBPF path is viable across the five targets.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Needs root"
+   ],
+   "priority": "medium",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "Raw-syscall minimal BPF loader instead of cilium/ebpf",
+   "description": "Hand-written loader on x/sys/unix for just map create/update, prog load, prog attach, with pre-assembled instructions.",
+   "expected_benefit": "Saves ~1-2 MB binary (measured standalone delta of cilium/ebpf) and avoids btf code.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Per-kernel ABI quirks",
+    "Maintenance of hand-assembled bytecode"
+   ],
+   "priority": "medium",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "On-device benchmark: splice vs sockmap vs buffered copy",
+   "description": "Prototype a small C/Go test sockmap relay and measure on MT7621 (MIPS32), MT7981/7986 (arm64), IPQ40xx (ARMv7).",
+   "expected_benefit": "Turns hypotheses F008/F023 into data to make the module decision.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Needs hardware and time"
+   ],
+   "priority": "medium",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "Dynamic exact-key bypass with timeout (saddr . daddr . dport)",
+   "description": "On successful DIRECT dial where the rule is IP/port based or the IP is policy-uniform, add an element with a short timeout via a batched Go worker; remove on DNS remap or config reload.",
+   "expected_benefit": "Subsequent connections (parallel browser connections, keep-alive reconnects) are routed in kernel and offloaded; frees mihomo from bulk transfers (downloads, video).",
+   "implementation_complexity": "high",
+   "risks": [
+    "Shared-CDN IP poisoning (F009)",
+    "fake-ip incompatibility (F010)",
+    "Stale elements after policy change",
+    "QUIC/UDP first packet decisions"
+   ],
+   "priority": "medium",
+   "agent": "flow_offload_research"
+  },
+  {
+   "name": "Idle FreeOSMemory / scavenger tuning",
+   "description": "After connection count drops below a threshold or on a long idle timer, call debug.FreeOSMemory (currently only on debug API) and keep madvdontneed=1.",
+   "expected_benefit": "Lower observed RSS after bursts (returning freed spans and shrunk stacks).",
+   "implementation_complexity": "low",
+   "risks": [
+    "one full GC pause/CPU burst per call",
+    "page-fault cost on regrowth"
+   ],
+   "priority": "medium",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Use with_low_memory for small-RAM profiles and measure the UDP-8K limit",
+   "description": "Enable the tag for Ultra Lightweight/Lightweight and validate UDP datagrams >8 KiB (TUN MTU up to 9000) are not truncated.",
+   "expected_benefit": "Halves relay/UDP buffer sizes; fewer bytes in flight per connection.",
+   "implementation_complexity": "low",
+   "risks": [
+    "UDP truncation if read buffers < datagram",
+    "more syscalls, higher CPU"
+   ],
+   "priority": "medium",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Statistics and connection tracking off switch",
+   "description": "Tag or option to skip NewTCPTracker/NewUDPTracker (tunnel.go:479,615) and the per-second ticker, keeping only global atomics.",
+   "expected_benefit": "Lower per-connection allocation and map contention on busy routers.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Dashboards show no connections",
+    "RuleUpdate and close semantics rely on tracker Close in some code paths"
+   ],
+   "priority": "medium",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Remove runtime geodata/UI/self-upgrade downloaders in Ultra profile",
+   "description": "Tag out component/updater (UI zip, geo, core upgrade), sevenzip/zip, and pprof route.",
+   "expected_benefit": "Smaller binary and fewer network-touching code paths on routers where packages are managed by opkg/apk.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "API compatibility with dashboards that call /upgrade",
+    "Touches hub/route and executor wiring"
+   ],
+   "priority": "medium",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Default TUN stack choice per profile",
+   "description": "Ultra/Lightweight keep mips (no gvisor) or system; Performance may enable with_gvisor+mixed. Possibly drop with_gvisor from router builds entirely (also drops tailscale).",
+   "expected_benefit": "Avoids ~324 gvisor files and tailscale; kernel TCP via system stack for best throughput.",
+   "implementation_complexity": "low",
+   "risks": [
+    "mips/system stack behaviour on MIPS/ARMv7 untested here",
+    "Users selecting gvisor/mixed get error at config load"
+   ],
+   "priority": "medium",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Cap relay buffer and pool retention for DIRECT splice path",
+   "description": "Confirm copyDirect/splice triggers for DIRECT through the tracker/BufferedConn chain, and measure per-connection RAM/CPU with and without splice; consider a tag to force splice or smaller sing buf.BufferSize.",
+   "expected_benefit": "Lower CPU per DIRECT byte and lower RSS per connection (hypothesis).",
+   "implementation_complexity": "medium",
+   "risks": [
+    "Unverified in this study",
+    "Pipes use kernel memory (1 MiB F_SETPIPE_SZ) per active splice"
+   ],
+   "priority": "medium",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "Cap splice pipe size (e.g. 64-128 KiB) in low-memory profiles",
+   "description": "Patch sing splice maxSpliceSize/F_SETPIPE_SZ via fork replace or vendored copy, tunable per profile.",
+   "expected_benefit": "Hypothesis: lower kernel memory under many bulk flows; slightly more syscalls per MB.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Needs measurement of syscall/CPU trade-off on target"
+   ],
+   "priority": "medium",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Enable TUN GSO/GRO (tun.gso) when TUN is used",
+   "description": "Turn on IFF_VNET_HDR offload and batch read/write in sing-tun with kernel 6.12; verify stack system/mixed.",
+   "expected_benefit": "Hypothesis: fewer syscalls and per-packet stack traversals for TCP-heavy TUN traffic; main TUN throughput lever.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Extra buffer RAM",
+    "driver/kernel quirks; sing-tun needs checksum handling bugs-free",
+    "does not help if TUN avoided in favour of redirect"
+   ],
+   "priority": "medium",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Static Go cross builds per ARCH_PACKAGES",
+   "description": "Ship per-arch static binaries: mipsel softfloat, mips softfloat, arm v7, arm64, amd64 with CGO_ENABLED=0.",
+   "expected_benefit": "No libc dependency, simple packaging",
+   "implementation_complexity": "low",
+   "risks": [
+    "softfloat needed on MIPS or SIGILL",
+    "size limits on 16 MB flash devices"
+   ],
+   "priority": "medium",
+   "agent": "openwrt_kernel"
+  },
+  {
+   "name": "Keep binary on flash, avoid tmpfs copy",
+   "description": "Install in /usr/bin, never copy to /tmp; document zram-swap as option on >=256 MB.",
+   "expected_benefit": "Several MB RAM on small devices",
+   "implementation_complexity": "low",
+   "risks": [
+    "First-start latency from flash on slow NAND"
+   ],
+   "priority": "medium",
+   "agent": "openwrt_kernel"
+  },
+  {
+   "name": "Benchmark crypto on real MIPS/ARMv7 before any decision",
+   "description": "Compare Go generic ChaCha20-Poly1305 vs Rust (RustCrypto soft, ring, aws-lc-rs) on an actual mipsel/ARMv7 router.",
+   "expected_benefit": "Settles whether Rust crypto helps the main CPU cost.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "needs Tier 3 mips build via -Zbuild-std or OpenWrt buildroot"
+   ],
+   "priority": "medium",
+   "agent": "rust_components"
+  },
+  {
+   "name": "Use meow-rs / shadowsocks-rust as comparison baseline only",
+   "description": "Run meow-rs on a real aarch64 router to get honest RAM/CPU numbers versus the tuned fork.",
+   "expected_benefit": "Gives data point for the Go ceiling vs Rust ceiling.",
+   "implementation_complexity": "low",
+   "risks": [
+    "its published numbers are from a Mac"
+   ],
+   "priority": "medium",
+   "agent": "rust_components"
+  },
+  {
+   "name": "Optional sockmap offload module for long DIRECT TCP flows",
+   "description": "After N KB of DIRECT traffic, switch the flow to sockhash redirect with an sk_skb verdict program; supervisor handles FIN/RST/timeouts.",
+   "expected_benefit": "Removes remaining per-chunk wake-ups; gain over splice unknown (hypothesis).",
+   "implementation_complexity": "high",
+   "risks": [
+    "FIN/RST/half-close semantics",
+    "Queued data race on switch",
+    "Loses per-connection stats",
+    "Needs on-device validation per arch"
+   ],
+   "priority": "low",
+   "agent": "ebpf_xdp_research"
+  },
+  {
+   "name": "Drop uber automaxprocs / set GOMAXPROCS explicitly",
+   "description": "Remove automaxprocs (redundant with Go 1.25+ container-aware logic if go.mod go>=1.25, or pointless on bare routers) and set GOMAXPROCS from config.",
+   "expected_benefit": "Small code/init reduction; deterministic CPU usage.",
+   "implementation_complexity": "low",
+   "risks": [
+    "behaviour change in containerized deployments"
+   ],
+   "priority": "low",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Pure-Go to assembly crypto swap for MIPS/ARMv7",
+   "description": "Evaluate third-party assembly implementations (e.g. ChaCha20/Poly1305 for ARMv7 NEON) or cgo-free Go assembly; likely too costly to maintain.",
+   "expected_benefit": "Several-fold on ChaCha20/Poly1305 on ARMv7 NEON (hypothesis).",
+   "implementation_complexity": "high",
+   "risks": [
+    "maintenance, security audit, FIPS-like module boundaries",
+    "MIPS has no SIMD target on most routers"
+   ],
+   "priority": "low",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "PGO with a router-representative profile",
+   "description": "Collect CPU profiles from a real router run (relay + DNS + rules) and commit default.pgo for release builds.",
+   "expected_benefit": "2-14% CPU per Go docs (generic), likely less here.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "stale profiles",
+    "build time and slight size growth",
+    "profile from non-router hardware"
+   ],
+   "priority": "low",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Trim init-time allocations",
+   "description": "Lazily initialize large package-level tables (gopacket layer maps, pprof, regexp2 tables, protobuf registries) or drop the packages.",
+   "expected_benefit": "Up to ~1.76 MB heap at startup saved at most (inittrace total), ~0.6 MB from the top few.",
+   "implementation_complexity": "medium",
+   "risks": [
+    "vendor patching of third-party packages"
+   ],
+   "priority": "low",
+   "agent": "go_runtime_memory"
+  },
+  {
+   "name": "Process lookup compile-out for router builds",
+   "description": "PROCESS-* rules are meaningless for LAN clients; add a tag making FindProcess a no-op and rejecting PROCESS-* rules at parse time.",
+   "expected_benefit": "Removes /proc scans and netlink diag code; avoids accidental CPU burn from always mode.",
+   "implementation_complexity": "low",
+   "risks": [
+    "Configs from desktop profiles with PROCESS rules fail to load unless downgraded to warnings"
+   ],
+   "priority": "low",
+   "agent": "mihomo_architecture"
+  },
+  {
+   "name": "UDP batching with recvmmsg/sendmmsg",
+   "description": "Use ipv4/ipv6 PacketConn ReadBatch/WriteBatch in the generic UDP listener and DIRECT UDP socket.",
+   "expected_benefit": "Hypothesis: fewer syscalls for high-pps UDP; negligible below ~20 kpps.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Larger buffers per socket",
+    "Per-packet metadata/OOB (tproxy) complexity",
+    "Conflicts with deadline/NAT handling"
+   ],
+   "priority": "low",
+   "agent": "network_performance"
+  },
+  {
+   "name": "kTLS TX/RX for trojan/vless-tls",
+   "description": "Port sing-box common/ktls to enable splice between plain socket and TLS socket.",
+   "expected_benefit": "Hypothesis: small on CPUs without crypto offload; saves copies only.",
+   "implementation_complexity": "high",
+   "risks": [
+    "linkname hacks and build flags per Go version",
+    "kmod-tls not in default kernel",
+    "TLS1.3 only; REALITY/utls incompatible"
+   ],
+   "priority": "low",
+   "agent": "network_performance"
+  },
+  {
+   "name": "io_uring / AF_XDP / MSG_ZEROCOPY",
+   "description": "Not recommended.",
+   "expected_benefit": "Negligible or unavailable on OpenWrt 6.12 default config.",
+   "implementation_complexity": "high",
+   "risks": [
+    "Disabled in kernel config",
+    "MIPS/ARMv7 immature",
+    "no Go runtime support"
+   ],
+   "priority": "low",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Process-level control/data plane split",
+   "description": "Separate helper process for relaying.",
+   "expected_benefit": "None measurable over splice; duplicated Go runtime RAM.",
+   "implementation_complexity": "high",
+   "risks": [
+    "+RAM",
+    "IPC latency",
+    "stability"
+   ],
+   "priority": "low",
+   "agent": "network_performance"
+  },
+  {
+   "name": "Optional aarch64/x86_64 Rust helper for bulk workloads",
+   "description": "A separate tiny Rust process (splice relay, DNS cache) enabled only on aarch64/x86_64 Performance profile, with Go fallback.",
+   "expected_benefit": "Hypothesis: small RSS and CPU gain on aarch64 only; none on MIPS.",
+   "implementation_complexity": "high",
+   "risks": [
+    "two code paths",
+    "IPC failure modes",
+    "fd passing complexity",
+    "audit surface"
+   ],
+   "priority": "low",
+   "agent": "rust_components"
+  },
+  {
+   "name": "Replace gVisor TUN stack with Rust userspace stack",
+   "description": "Only if TUN mode must stay in the Performance profile.",
+   "expected_benefit": "Hypothesis: lower RAM than gVisor.",
+   "implementation_complexity": "high",
+   "risks": [
+    "packet-level FFI cost",
+    "parity bugs",
+    "leaks"
+   ],
+   "priority": "low",
+   "agent": "rust_components"
+  },
+  {
+   "name": "Xerj memory namespace for decisions",
+   "description": "Store ADR summaries and measured numbers in a xerj memory namespace (e.g. mlw) for recall across sessions, mirroring DECISIONS.md/BENCHMARKS.md.",
+   "expected_benefit": "Cross-session recall by meaning; complements Claude project memory.",
+   "implementation_complexity": "low",
+   "risks": [
+    "duplication with repo docs; repo docs remain the source of truth"
+   ],
+   "priority": "low",
+   "agent": "xerj_research"
+  }
+ ]
+}

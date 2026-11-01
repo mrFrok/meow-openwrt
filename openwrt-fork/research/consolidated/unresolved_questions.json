@@ -1,0 +1,172 @@
+{
+ "project": "Mihomo Lightweight",
+ "date": "2026-11-01",
+ "base": "upstream mihomo v1.19.33 (3f27ef39)",
+ "from_opus": [
+  "Real Ultra size with file-level tags (stage II, first task).",
+  "Startup spike cause on BPI-R4: gctrace with provider concurrency forced to 1.",
+  "Kernel memory of 1 MiB splice pipes under 100-500 bulk flows on a 128-256 MB router.",
+  "sockmap vs splice CPU on arm64 (BPI-R4) and MIPS (mt7621).",
+  "Does nft flowtable accept a tun device (relevant for TUN-mode bypass)?",
+  "clashwrt's bypass4_dns (domain -> IP via dnsmasq nftset) has the same shared-CDN-IP hazard as a domain-based dynamic bypass: check how clashwrt limits it (separate task in clashwrt).",
+  "UDP datagrams >8 KiB with with_low_memory (possible truncation).",
+  "Whether Go 1.27 vs 1.26 changes RSS/CPU on arm64 and MIPS."
+ ],
+ "from_agents": [
+  {
+   "agent": "ebpf_xdp_research",
+   "question": "Does epoll still signal EOF/RDHUP on a socket inside a sockhash with a stream_verdict program (6.12)?"
+  },
+  {
+   "agent": "ebpf_xdp_research",
+   "question": "What is the actual MT7621/filogic CPU gain of sockmap versus Go splice?"
+  },
+  {
+   "agent": "ebpf_xdp_research",
+   "question": "Does mihomo's relay hand bare *net.TCPConn pairs to io.Copy for TPROXY DIRECT?"
+  },
+  {
+   "agent": "ebpf_xdp_research",
+   "question": "Which OpenWrt targets build CGROUPS and bpffs mount by default?"
+  },
+  {
+   "agent": "ebpf_xdp_research",
+   "question": "Is bpf_skb_ct_lookup/kfunc usable in the OpenWrt 6.12 config?"
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Exact wire encoding of concatenated keys (ipv4_addr . ipv4_addr . inet_service) in metacubex/nftables vs nft userspace."
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Does the Go side need conntrack deletion by mark (ctnetlink) and which library is acceptable under the binary-size budget?"
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Measured throughput/CPU gain of SW flowtable vs mihomo DIRECT on mt7621, mt7981, ipq40xx, rk3568."
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Hardware flow teardown time after ct delete on MediaTek PPE."
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Can a verdict be made domain-independent for shared CDN IPs, or must dynamic mode be restricted to IP/port-based rules?"
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Is RealIP-for-DIRECT-domains acceptable for the fake-ip default profile?"
+  },
+  {
+   "agent": "flow_offload_research",
+   "question": "Which OpenWrt targets in scope really enable HW flowtable (per-target config verification beyond mediatek)."
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "Real idle and loaded RSS of the pruned fork on arm64/mipsle/armv7 devices (and with real geodata/rule sets)."
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "Does MT7621 (4 logical CPUs) benefit from GOMAXPROCS=2 vs 4 with firewall/softirq load?"
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "Exact per-connection heap and stack cost of a mihomo relay (VLESS+TLS, SS, Trojan) measured with heap profiles."
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "Which UDP read paths would truncate >8 KiB datagrams under with_low_memory?"
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "How much of the 56 MB is removable per feature tag (measure each module: tailscale, easytier, mieru, wazero)?"
+  },
+  {
+   "agent": "go_runtime_memory",
+   "question": "Do the metacubex/chacha and sing-vmess/shadowsocks2 code paths use x/crypto asm or their own pure-Go ciphers?"
+  },
+  {
+   "agent": "mihomo_architecture",
+   "question": "What is the measured contribution of each factor (concurrency, binary.Read garbage, zstd decoder) to the 42 MB spike?"
+  },
+  {
+   "agent": "mihomo_architecture",
+   "question": "Does DIRECT TCP actually use splice(2) in the current relay chain, and what is its CPU/throughput effect on BPI-R4?"
+  },
+  {
+   "agent": "mihomo_architecture",
+   "question": "What is mipstack per-connection RAM and throughput compared with the system stack on MT7988A and on MIPS/ARMv7?"
+  },
+  {
+   "agent": "mihomo_architecture",
+   "question": "Can the real destination IP of a fake-IP DIRECT connection be captured at the dialer (dialer.DialContext) to feed a kernel set safely?"
+  },
+  {
+   "agent": "mihomo_architecture",
+   "question": "Which shared transports (vless/vmess/trojan with quic-go, utls, brotli) can realistically be made optional?"
+  },
+  {
+   "agent": "network_performance",
+   "question": "Is splice a net CPU win vs 16 KiB copy on MIPS 24Kc/74Kc and ARMv7 (measure with perf/ strace -c on device)?"
+  },
+  {
+   "agent": "network_performance",
+   "question": "Does the sniffer (tls/http sniff enabled) keep the splice path after the peek, with real traffic?"
+  },
+  {
+   "agent": "network_performance",
+   "question": "Which outbounds with plain TCP (http/socks5 upstream, ss with none cipher) actually unwrap to *net.TCPConn?"
+  },
+  {
+   "agent": "network_performance",
+   "question": "How much RAM does 1 MiB F_SETPIPE_SZ really cost under 200+ concurrent bulk flows?"
+  },
+  {
+   "agent": "network_performance",
+   "question": "Do OpenWrt kernels enable CONFIG_NF_FLOW_TABLE per-target for the project's target list?"
+  },
+  {
+   "agent": "openwrt_kernel",
+   "question": "Does nft_flow_route accept a tun (NOARP) output device?"
+  },
+  {
+   "agent": "openwrt_kernel",
+   "question": "Which kmods are in default official images for each target?"
+  },
+  {
+   "agent": "openwrt_kernel",
+   "question": "Does an official 25.12 image enable USE_APK on all targets (expected yes)?"
+  },
+  {
+   "agent": "openwrt_kernel",
+   "question": "Measured mt7621 forward vs local-socket throughput"
+  },
+  {
+   "agent": "openwrt_kernel",
+   "question": "Does fw4 flow_offloading cover IPv6 flows from clashwrt-marked paths?"
+  },
+  {
+   "agent": "rust_components",
+   "question": "Real cgo call cost on MIPS 24Kc/74Kc and ARMv7 Cortex-A7/A9"
+  },
+  {
+   "agent": "rust_components",
+   "question": "Does aws-lc-rs/ring outperform Go generic ChaCha20-Poly1305 on ARMv7 NEON, and by how much?"
+  },
+  {
+   "agent": "rust_components",
+   "question": "Idle RSS of meow-rs on an actual aarch64 router vs the tuned Go fork"
+  },
+  {
+   "agent": "xerj_research",
+   "question": "Is a neural embedding mode worth enabling for conceptual search over kernel docs?"
+  }
+ ],
+ "hardware_data_needed": [
+  "BPI-R4: output of bench/hwprobe.sh",
+  "BPI-R4: OpenWrt version, where the core binary lives, whether the core may be stopped for benchmarks",
+  "A LAN PC behind the router for iperf3/wrk; uplink speed",
+  "A proxy server for PROXY scenarios (VPS or own node) and its protocols",
+  "4pda volunteers (mt7621, ath79, ipq40xx, filogic): output of bench/hwprobe.sh (read-only, masks addresses)"
+ ]
+}
