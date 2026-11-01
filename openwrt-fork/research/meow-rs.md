@@ -194,3 +194,15 @@ TUN-поток пересоздавал hy2-сессию → новый соке
 1452 Б с PMTUD (у quiche по умолчанию 1200 — датаграмма 1200 Б резалась на 2 фрагмента).
 Не сделано: offload/GSO-GRO в TUN (tun-rs `offload`, `recv_multiple`/`send_multiple`), пакетная
 отправка/GSO в драйвере hy2, лишние копии на пути датаграммы (oneshot + 3 аллокации на пакет).
+
+## Дашборды (2026-11-02, `bench/dashcheck.mjs`)
+
+zashboard и metacubexd — отдельные пакеты (`external-ui`), в ядро не встраиваются. Прогон обоих в headless
+Firefox против meow и mihomo на одном конфиге. Было: zashboard `GET /storage/zashboard` → 404 (синхронизация
+настроек); `/rules` с типами `RULE-SET`/`DOMAIN-SUFFIX`, payload логики `udp AND x`, без `extra` (нет
+тумблеров и счётчиков); нет `unified-delay` в `/configs`; HTTP-прокси не считал заголовок запроса в upload.
+Сделано как в mihomo: `/storage/{key}` (GET/PUT/DELETE, ≤1 MB, `ui-storage.json` в home), имена типов
+`RuleType::mihomo_name` (в `/rules`, `rule` соединений и логах), payload `((Network,udp) && (…))`,
+`extra` + `PATCH /rules/disable` (отключённое правило пропускается как PASS-цель; `RuleStats` в `RouteTable`).
+Остаётся: `missCount` всегда 0 (IR не обходит все правила); порядок GLOBAL (основной исходящий первым —
+решение upstream); `lazy: false` по умолчанию (ADR-0002) — mihomo проверяет группы лениво.
