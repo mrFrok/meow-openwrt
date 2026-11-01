@@ -215,4 +215,5 @@ in-place, RFC 1624), ядерный `TcpListener` на адресе TUN, peek-sn
 Итог: 2110/1680 Мбит/с, 0.07 %/Мбит. Затем offload (`IFF_VNET_HDR`, `tun/vnet.rs`): NAT переписывает
 TSO/GRO-агрегаты до 64 КБ целиком (partial csum — правка только адресов), lwIP получает сегменты через
 `gso_split`. Итог: **6090/5810 Мбит/с, 0.02–0.03 %/Мбит** (mihomo 2490/2180). UDP DIRECT 300M: meow 0.44–0.46
-%/Мбит, mihomo 0.29 — дальше UDP мимо lwIP (свой разбор IP/UDP в помпе).
+%/Мбит, mihomo 0.29. Затем UDP мимо lwIP (`tun/direct_udp.rs`: помпа разбирает IP/UDP и строит ответы,
+v6/v4 csum через NEEDS_CSUM): 300M **0.31/0.33 %/Мбит**; 900M ul 537 / dl 877 Мбит/с (mihomo 427 / 475).
