@@ -17,7 +17,10 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+// Entry ids are SQLite row ids (u64); `portable_atomic` is native on
+// 64-bit targets and lock-based on mips32, which has no 64-bit atomics.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;

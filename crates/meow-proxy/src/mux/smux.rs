@@ -10,12 +10,13 @@
 //! the kcptun path overrides frame size, buffers, and keepalive.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use meow_common::atomic::{AtomicU, Uint};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -262,16 +263,22 @@ struct SessionState {
     /// Millis-since-epoch of the last inbound frame — the smux
     /// `KeepAliveTimeout` input. Only written when a session is built
     /// with keepalive; the epoch in [`now_ms`] is process-wide.
-    last_recv_ms: AtomicU64,
+    last_recv_ms: AtomicU,
 }
 
 /// Milliseconds on a process-wide monotonic epoch for keepalive timestamps.
-fn now_ms() -> u64 {
+/// `u32` (wrapping every ~49.7 days) on targets without 64-bit atomics, so
+/// stamps are only compared via `wrapping_sub`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "u32 stamps on mips32 wrap by design; compared via wrapping_sub"
+)]
+fn now_ms() -> Uint {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     EPOCH
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_millis() as u64
+        .as_millis() as Uint
 }
 
 /// smux session over one physical connection (client role).
@@ -390,7 +397,7 @@ impl Session {
             dead: AtomicBool::new(false),
             // Seed at session start: a peer that sends nothing yet still
             // gets the full first timeout window before being declared dead.
-            last_recv_ms: AtomicU64::new(now_ms()),
+            last_recv_ms: AtomicU::new(now_ms()),
         });
         let receive_budget = Arc::new(Semaphore::new(receive_budget_size.max(1)));
         let cancel = CancellationToken::new();
@@ -725,9 +732,13 @@ impl Session {
                         _ = ka_cancel.cancelled() => break,
                         _ = ticker.tick() => {}
                     }
-                    let silence = Duration::from_millis(
-                        now_ms().saturating_sub(ka_state.last_recv_ms.load(Ordering::Relaxed)),
-                    );
+                    // The reader may stamp after `now_ms()` was read: clamp
+                    // that "negative" age to zero rather than wrapping it.
+                    let last = ka_state.last_recv_ms.load(Ordering::Relaxed);
+                    let age = now_ms().wrapping_sub(last);
+                    let age = if age > Uint::MAX / 2 { 0 } else { age };
+                    #[allow(clippy::useless_conversion, reason = "u32→u64 on mips32")]
+                    let silence = Duration::from_millis(u64::from(age));
                     if silence > timeout {
                         debug!("smux: no inbound frame for {silence:?}; declaring session dead");
                         break;

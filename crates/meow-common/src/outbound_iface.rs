@@ -67,17 +67,18 @@
 //! on platforms where the binding syscall is not implemented, which lets
 //! the TUN listener fail closed instead of starting a looping configuration.
 
+use crate::atomic::{AtomicU, Uint};
 use crate::logbook;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
 /// One live owner of the binding.
 struct Owner {
-    id: u64,
+    id: Uint,
     iface: Arc<str>,
     /// OS interface index, resolved when the owner installed. What the
     /// index-keyed platforms bind to; Linux binds by name.
@@ -102,7 +103,7 @@ static OWNERS: RwLock<Vec<Owner>> = RwLock::new(Vec::new());
 
 /// Owner identity source. Interface names cannot identify owners: two
 /// overlapping owners routinely bind the same interface.
-static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_OWNER_ID: AtomicU = AtomicU::new(1);
 
 /// The binding the logbook last recorded as in effect. Taken while
 /// [`OWNERS`] is held, so changes record in the order they happened.
@@ -115,7 +116,7 @@ static RECORDED: Mutex<Option<Arc<str>>> = Mutex::new(None);
 #[must_use = "dropping the guard gives the binding up immediately"]
 #[derive(Debug)]
 pub struct OutboundIfaceGuard {
-    id: u64,
+    id: Uint,
     iface: Arc<str>,
 }
 
@@ -615,7 +616,7 @@ mod tests {
 
     /// Id of the owner in effect — distinguishes owners that bind the same
     /// interface.
-    fn current_owner() -> Option<u64> {
+    fn current_owner() -> Option<Uint> {
         OWNERS.read().last().map(|o| o.id)
     }
 

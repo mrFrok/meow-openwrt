@@ -37,7 +37,7 @@ impl std::error::Error for AuthenticationFailed {}
 use std::{
     io,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -155,7 +155,7 @@ struct Inner {
     options: Options,
     sessions: Mutex<Vec<Arc<Session>>>,
     creating: AsyncMutex<()>,
-    generation: AtomicU64,
+    generation: meow_common::atomic::AtomicU,
     network_cancel: Mutex<CancellationToken>,
 }
 
@@ -338,7 +338,7 @@ impl Client {
             options,
             sessions: Mutex::new(Vec::new()),
             creating: AsyncMutex::new(()),
-            generation: AtomicU64::new(1),
+            generation: meow_common::atomic::AtomicU::new(1),
             network_cancel: Mutex::new(CancellationToken::new()),
         })))
     }

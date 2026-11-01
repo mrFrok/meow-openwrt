@@ -99,7 +99,7 @@ impl DnsServer {
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         })
     }
 
@@ -871,7 +871,7 @@ pub struct BoundDnsServer {
     socket: Arc<UdpSocket>,
     /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
     /// already running. Exposed for stats/observability (issue #515).
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    dropped: Arc<meow_common::atomic::AtomicU>,
 }
 
 impl BoundDnsServer {
@@ -889,7 +889,7 @@ impl BoundDnsServer {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             socket: Arc::new(socket),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         }
     }
 
@@ -899,7 +899,7 @@ impl BoundDnsServer {
         Self {
             resolver,
             socket: Arc::new(socket),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         }
     }
 
@@ -908,13 +908,14 @@ impl BoundDnsServer {
     /// drop was previously invisible). A query lost mid-task (e.g. a panic)
     /// is not counted here.
     pub fn dropped_queries(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        #[allow(clippy::useless_conversion, reason = "u32→u64 on mips32")]
+        u64::from(self.dropped.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Shared handle to the drop counter. [`Self::run`] consumes the
     /// server, so embedders that want live observability must clone this
     /// `Arc` beforehand.
-    pub fn dropped_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+    pub fn dropped_counter(&self) -> Arc<meow_common::atomic::AtomicU> {
         Arc::clone(&self.dropped)
     }
 

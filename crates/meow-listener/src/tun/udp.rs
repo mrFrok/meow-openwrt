@@ -15,10 +15,11 @@
 //! inside the routed range); without it the flow follows ordinary routing
 //! rules, including REJECT and proxy selection.
 
+use meow_common::atomic::{AtomicU, Uint};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,12 +66,18 @@ type FlowKey = (SocketAddr, SocketAddr);
 /// Epoch for flow activity stamps. `Instant` cannot be shared atomically
 /// between the reader loop and flow tasks, so activity is recorded as
 /// elapsed milliseconds since this base — monotonic for the process
-/// lifetime and comparable across entries.
+/// lifetime and comparable across entries. On targets without 64-bit
+/// atomics the stamp is truncated to `u32` and wraps every ~49.7 days, so
+/// stamps are only ever compared as ages (`now.wrapping_sub(stamp)`).
 static ACTIVITY_EPOCH: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
 
-fn activity_ms() -> u64 {
-    ACTIVITY_EPOCH.elapsed().as_millis() as u64
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "u32 stamps on mips32 wrap by design; compared as wrapping ages"
+)]
+fn activity_ms() -> Uint {
+    ACTIVITY_EPOCH.elapsed().as_millis() as Uint
 }
 
 /// Live flow-table entry. `last_activity` is stamped by the reader loop on
@@ -79,7 +86,7 @@ fn activity_ms() -> u64 {
 /// idle to the LRU eviction at `MAX_FLOWS`.
 struct FlowEntry {
     tx: mpsc::Sender<Vec<u8>>,
-    last_activity: Arc<AtomicU64>,
+    last_activity: Arc<AtomicU>,
 }
 
 pub(super) async fn run_udp(
@@ -114,7 +121,7 @@ pub(super) async fn run_udp(
     let mut flows: HashMap<FlowKey, FlowEntry> = HashMap::new();
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
-    let hijack_dropped = AtomicU64::new(0);
+    let hijack_dropped = AtomicU::new(0);
 
     while let Some((data, src, dst)) = read_half.next().await {
         if dns_hijack && dst.port() == 53 {
@@ -235,7 +242,7 @@ pub(super) async fn run_udp(
 
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         tx.try_send(data).expect("fresh flow queue has capacity");
-        let last_activity = Arc::new(AtomicU64::new(activity_ms()));
+        let last_activity = Arc::new(AtomicU::new(activity_ms()));
         flows.insert(
             key,
             FlowEntry {
@@ -267,14 +274,14 @@ struct FlowSpec {
     key: FlowKey,
     udp_timeout: Duration,
     in_name: String,
-    last_activity: Arc<AtomicU64>,
+    last_activity: Arc<AtomicU>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
 /// sustained floods stay visible without a log storm (issue #515). Covers
 /// both drop shapes: in-flight cap saturation and a full reply queue.
-fn note_hijack_drop(counter: &AtomicU64) {
-    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+fn note_hijack_drop(counter: &AtomicU) {
+    let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if n.is_power_of_two() {
         warn!(
             "tun dns-hijack saturated: {n} responses dropped \
@@ -292,9 +299,11 @@ fn note_hijack_drop(counter: &AtomicU64) {
 fn evict_for_admission(flows: &mut HashMap<FlowKey, FlowEntry>) {
     flows.retain(|_, e| !e.tx.is_closed());
     if flows.len() >= MAX_FLOWS {
+        // Oldest = largest age; ages stay correct across a u32 stamp wrap.
+        let now = activity_ms();
         if let Some(victim) = flows
             .iter()
-            .min_by_key(|(_, e)| e.last_activity.load(Ordering::Relaxed))
+            .max_by_key(|(_, e)| now.wrapping_sub(e.last_activity.load(Ordering::Relaxed)))
             .map(|(k, _)| *k)
         {
             debug!("tun UDP flow table full: evicting LRU flow {victim:?}");
@@ -490,7 +499,8 @@ mod tests {
 
     /// Build a flow table holding `live` live entries plus `dead` entries
     /// whose receiver was dropped (channel closed). Live entries are kept
-    /// alive via `keepers`. Activity stamps increase with the loop index —
+    /// alive via `keepers`. Activity stamps increase with the loop index (all
+    /// in the past, so ages are well-defined) —
     /// index 0 is the least recently active.
     fn seeded_table(
         live: usize,
@@ -501,7 +511,9 @@ mod tests {
     ) {
         let mut flows = HashMap::new();
         let mut keepers = Vec::new();
-        for i in 0..(live + dead) {
+        let total = live + dead;
+        let now = super::activity_ms();
+        for i in 0..total {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             if i < live {
                 keepers.push(rx);
@@ -512,7 +524,9 @@ mod tests {
                 (src, dst),
                 FlowEntry {
                     tx,
-                    last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(i as u64)),
+                    last_activity: std::sync::Arc::new(meow_common::atomic::AtomicU::new(
+                        now.wrapping_sub((total - i) as meow_common::atomic::Uint),
+                    )),
                 },
             );
         }
@@ -548,7 +562,7 @@ mod tests {
             .get(&oldest_key)
             .unwrap()
             .last_activity
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            .store(super::activity_ms(), std::sync::atomic::Ordering::Relaxed);
         evict_for_admission(&mut flows);
         assert!(flows.contains_key(&oldest_key), "refreshed flow survives");
         assert!(
@@ -593,7 +607,7 @@ mod tests {
                     ),
                     udp_timeout: std::time::Duration::from_millis(100),
                     in_name: "tun".to_string(),
-                    last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    last_activity: std::sync::Arc::new(meow_common::atomic::AtomicU::new(0)),
                 },
             )
             .await;

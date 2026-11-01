@@ -664,9 +664,10 @@ pub fn is_offline_validate() -> bool {
 
 /// Upper bound, in milliseconds, on how long a config load waits for the
 /// remote proxy- and rule-provider fetches that have no usable on-disk
-/// cache. `u64::MAX` = wait for every fetch to finish (the default).
-static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
+/// cache. `Uint::MAX` = wait for every fetch to finish (the default).
+/// `u32` ms (~49 days max) on targets without 64-bit atomics.
+static PROVIDER_FETCH_DEADLINE_MS: meow_common::atomic::AtomicU =
+    meow_common::atomic::AtomicU::new(meow_common::atomic::Uint::MAX);
 
 /// Bound how long a config load waits for provider downloads that have no
 /// cache to fall back on. `None` (the default) waits for every fetch, as
@@ -693,8 +694,9 @@ static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
 /// whether it lands before or after the deadline — only local (`file:` /
 /// `inline:`) payloads and document content keep the fatal verdict.
 pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
-    let ms = deadline.map_or(u64::MAX, |d| {
-        u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1)
+    use meow_common::atomic::Uint;
+    let ms = deadline.map_or(Uint::MAX, |d| {
+        Uint::try_from(d.as_millis()).unwrap_or(Uint::MAX - 1)
     });
     PROVIDER_FETCH_DEADLINE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
@@ -702,8 +704,9 @@ pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
 /// The deadline set by [`set_provider_fetch_deadline`].
 pub fn provider_fetch_deadline() -> Option<std::time::Duration> {
     match PROVIDER_FETCH_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        u64::MAX => None,
-        ms => Some(std::time::Duration::from_millis(ms)),
+        meow_common::atomic::Uint::MAX => None,
+        #[allow(clippy::useless_conversion, reason = "u32→u64 on mips32")]
+        ms => Some(std::time::Duration::from_millis(u64::from(ms))),
     }
 }
 

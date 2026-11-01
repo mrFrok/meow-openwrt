@@ -29,11 +29,14 @@ subtle = { workspace = true }
 rusqlite = { version = "0.40", default-features = false, features = [
     "fallible_uint",
 ], optional = true }
+# The logbook's u64 entry-id watermark: native AtomicU64 on 64-bit targets,
+# a lock-based fallback on mips32 (no 64-bit atomics).
+portable-atomic = { version = "1", features = ["fallback"], optional = true }
 
 [features]
 # Persistent logbook (`meow_common::logbook`, ADR-0014). Off, the logbook
 # API stays and records nothing.
-logbook = ["dep:rusqlite"]
+logbook = ["dep:rusqlite", "dep:portable-atomic"]
 
 [target.'cfg(not(any(target_os = "ios", target_os = "tvos")))'.dependencies]
 rusqlite = { version = "0.40", default-features = false, features = [
