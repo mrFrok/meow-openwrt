@@ -42,6 +42,10 @@ pub struct TProxyListener {
     udp: bool,
     /// Per-flow UDP idle timeout (both directions refresh it).
     udp_timeout: std::time::Duration,
+    /// TCP arrives by real TPROXY (mihomo `tproxy-port`), not REDIRECT: the
+    /// accepted socket's local address is the original destination. The
+    /// listening socket must be bound by [`bind_tcp`] with `transparent`.
+    transparent: bool,
     /// Fallible setup performed by [`Self::prepare`] — carried so `run_on`
     /// spawns nothing that can fail inside a detached task (issue #641).
     prepared: Option<Prepared>,
@@ -97,6 +101,7 @@ impl TProxyListener {
             firewall: true,
             udp: false,
             udp_timeout: std::time::Duration::from_secs(60),
+            transparent: false,
             prepared: None,
         }
     }
@@ -132,6 +137,13 @@ impl TProxyListener {
     /// and external-firewall-only in this release — both are enforced at
     /// config-parse and again at [`Self::prepare`]. Call before `prepare`
     /// — mutating after prepare discards the prepared artifacts.
+    /// Take TCP by real TPROXY instead of REDIRECT (see `transparent`).
+    #[must_use]
+    pub fn with_transparent(mut self, enabled: bool) -> Self {
+        self.transparent = enabled;
+        self
+    }
+
     pub fn with_udp(mut self, enabled: bool, udp_timeout: std::time::Duration) -> Self {
         self.udp = enabled;
         self.udp_timeout = udp_timeout;
@@ -147,7 +159,7 @@ impl TProxyListener {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind first so a port-0 listen can resolve to the OS-assigned port
         // before firewall rules are installed against it.
-        let listener = TcpListener::bind(self.listen_addr).await?;
+        let listener = bind_tcp(self.listen_addr, self.transparent)?;
         self.run_on(listener).await
     }
 
@@ -180,6 +192,13 @@ impl TProxyListener {
 
         // Validate the UDP opt-in BEFORE any firewall work — an invalid
         // combination must not install-then-remove rules on the way out.
+        if self.transparent && self.firewall {
+            return Err(
+                "tproxy transparent (TPROXY) tcp requires `firewall: false` — \
+                 meow's managed rules are REDIRECT"
+                    .into(),
+            );
+        }
         if self.udp && self.firewall {
             return Err(
                 "tproxy `udp: true` requires `firewall: false` — meow does not \
@@ -351,15 +370,23 @@ impl TProxyListener {
         let sniffer = self.sniffer;
         let name = self.name;
         let max_connections = self.max_connections;
+        let transparent = self.transparent;
         bounded_accept_loop(listener, max_connections, name.clone(), {
             move |stream, src_addr| {
                 let tunnel = tunnel.clone();
                 let sniffer = sniffer.clone();
                 let name = name.clone();
                 async move {
-                    if let Err(e) =
-                        handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
-                            .await
+                    if let Err(e) = handle_tproxy_conn(
+                        tunnel,
+                        stream,
+                        src_addr,
+                        bound_addr,
+                        transparent,
+                        sniffer,
+                        name,
+                    )
+                    .await
                     {
                         debug!("TProxy connection error from {src_addr}: {e}");
                     }
@@ -496,16 +523,68 @@ fn collect_proxy_server_ips(tunnel: &Tunnel) -> Vec<IpAddr> {
     result
 }
 
+/// Bind the TCP socket of a tproxy listener. `transparent` sets
+/// `IP_TRANSPARENT` (`IPV6_TRANSPARENT`) so the socket accepts connections
+/// steered to it by an nftables/iptables `TPROXY` rule (Linux, needs
+/// `CAP_NET_ADMIN`); otherwise a plain listener for REDIRECT'd traffic.
+pub fn bind_tcp(addr: SocketAddr, transparent: bool) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    if transparent {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let (level, name) = if addr.is_ipv4() {
+                (libc::SOL_IP, libc::IP_TRANSPARENT)
+            } else {
+                (libc::SOL_IPV6, libc::IPV6_TRANSPARENT)
+            };
+            let one: libc::c_int = 1;
+            // SAFETY: valid fd owned by `socket`; `one` outlives the call.
+            let ret = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    name,
+                    std::ptr::from_ref(&one).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "transparent (TPROXY) tcp is Linux-only",
+        ));
+    }
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
 async fn handle_tproxy_conn(
     tunnel: Tunnel,
     stream: tokio::net::TcpStream,
     src_addr: SocketAddr,
     listen_addr: SocketAddr,
+    transparent: bool,
     sniffer: Option<Arc<SnifferRuntime>>,
     name: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Recover the original destination address
-    let orig_dst = orig_dest::get_original_dst(&stream, listen_addr)?;
+    // Recover the original destination address: under TPROXY the kernel
+    // hands over the connection with its original destination as the local
+    // address; under REDIRECT conntrack keeps it.
+    let orig_dst = if transparent {
+        stream.local_addr()?
+    } else {
+        orig_dest::get_original_dst(&stream, listen_addr)?
+    };
 
     // Skip connections where original dest equals listen addr (self-connection)
     if orig_dst == listen_addr {

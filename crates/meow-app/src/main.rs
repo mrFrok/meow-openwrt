@@ -586,6 +586,10 @@ fn run_application_inner(
         // recorded; the run is marked started once it is up.
         meow_common::logbook::apply(meow_config::raw::RawLogbook::enabled(raw.logbook.as_ref()));
 
+        // mihomo's `routing-mark` marks every outbound socket, from the first
+        // provider fetch on (meow-openwrt; the deployer's rules exempt it).
+        meow_common::set_routing_mark(raw.routing_mark);
+
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
             let config = meow_config::build_config(raw, None)
@@ -1375,10 +1379,11 @@ async fn run(
                 firewall,
                 udp,
                 udp_timeout,
+                transparent,
             } => {
                 #[cfg(feature = "listener-tproxy")]
                 {
-                    let socket = match tokio::net::TcpListener::bind(addr).await {
+                    let socket = match meow_listener::tproxy::bind_tcp(addr, *transparent) {
                         Ok(s) => s,
                         Err(e) => {
                             listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
@@ -1397,7 +1402,8 @@ async fn run(
                     .with_sniffer(Arc::clone(&sniffer_runtime))
                     .with_max_connections(nl.max_connections)
                     .with_firewall(*firewall)
-                    .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout));
+                    .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
+                    .with_transparent(*transparent);
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1420,7 +1426,7 @@ async fn run(
                     // the `listener-tproxy` build above; mark them used so the
                     // bindings don't trip `-D warnings` on tproxy-less feature
                     // sets.
-                    let _ = (sni, firewall, udp, udp_timeout);
+                    let _ = (sni, firewall, udp, udp_timeout, transparent);
                     tracing::warn!(
                         "listener '{}': TProxy requires feature 'listener-tproxy'",
                         nl.name
@@ -1875,6 +1881,7 @@ mod tests {
                 firewall: true,
                 udp: false,
                 udp_timeout: 60,
+                transparent: false,
             }),
             (!cfg!(feature = "listener-tproxy")).then_some("listener-tproxy")
         );
