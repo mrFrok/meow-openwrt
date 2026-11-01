@@ -29,6 +29,11 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 3. Атомики: 6 файлов с прямым `AtomicU64` → `meow_common::atomic::AtomicU` (meow-listener tun/{udp,policy_route}.rs,
    meow-dns/server.rs, meow-common/outbound_iface.rs, meow-proxy/mux/smux.rs, meow-config/lib.rs).
 4. Результат: размер mipsel `minimal`/`full`, `qemu-mipsel meow -v/-t`. Это решает судьбу профилей и этапа 7.
+   **Итог 2026-11-01** (SDK snapshot mt7621, rust 1.96, opt z/LTO/panic=abort, stripped):
+   `minimal` 10.2 МБ (xz 2.8, apk 4.1), `full` 18.3 МБ (xz 4.8, apk 7.3); оба `-v`/`-t` под qemu-mipsel ок.
+   NEEDED: libstdc++ (BoringSSL C++) + libgcc_s → ещё ~1+ МБ на флеше. Сборка: bindgen boring-sys нужен
+   `--sysroot` тулчейна; 32-бит musl 1.2 → `--cfg=libc_unstable_musl_v1_2` (time_t 64). Пакет: `openwrt/package/meow`.
+   Вывод: для 16 МБ флеша нужен профиль `tiny` (этап 2) и, вероятно, статическая libstdc++ / UPX-подобное.
 
 ## Этап 1 — паритет с mihomo (из research; поведение сверять с mihomo/`mlw-fork`)
 1. Симлинки провайдеров — `meow-config/src/safe_path.rs:52`: лексическая проверка как `C.Path.IsSafePath`.

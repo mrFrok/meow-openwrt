@@ -53,7 +53,6 @@ smol_str = { workspace = true }
 tun-rs = { workspace = true, optional = true }
 lwip = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-route_manager = { workspace = true, optional = true }
 meow-dns = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
 # listener-shadowsocks
@@ -75,6 +74,13 @@ smol_str = { workspace = true }
 
 # listener-tun: the Wintun adapter's addresses are assigned through IP
 # Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
+# Off Linux tun-rs needs `address-management` for the builder's addresses,
+# and routes go through route_manager (Linux uses `tun/policy_route.rs`'s
+# own rtnetlink socket instead).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tun-rs = { workspace = true, optional = true, features = ["address-management"] }
+route_manager = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", optional = true, features = [
     "Win32_Foundation",

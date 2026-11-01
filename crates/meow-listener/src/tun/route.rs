@@ -9,14 +9,73 @@
 //! case some platforms report "route exists").
 
 use ipnet::IpNet;
+#[cfg(not(target_os = "linux"))]
 use route_manager::{Route, RouteManager};
 use tracing::{debug, warn};
 
+/// Linux: the routes go over `policy_route`'s rtnetlink socket — the
+/// route_manager crate would link a second, full rtnetlink codec.
+#[cfg(target_os = "linux")]
+pub(super) struct RouteGuard {
+    if_index: u32,
+    installed: Vec<IpNet>,
+}
+
+#[cfg(target_os = "linux")]
+impl RouteGuard {
+    /// Install one on-link route per net through interface `if_index`.
+    /// Individual failures are logged and skipped so a pre-existing
+    /// equivalent route does not abort listener startup.
+    pub(super) fn setup(if_index: u32, nets: &[IpNet]) -> std::io::Result<Self> {
+        let mut nl = super::policy_route::Netlink::open()?;
+        let mut installed = Vec::with_capacity(nets.len());
+        for net in nets {
+            match nl.add_route(*net, if_index) {
+                Ok(()) => {
+                    debug!("tun auto-route: added {net} via if_index {if_index}");
+                    installed.push(*net);
+                }
+                Err(e) => warn!(
+                    "tun auto-route: failed to add {net} via if_index {if_index}: {e} \
+                     (continuing — the device subnet may already cover it)"
+                ),
+            }
+        }
+        Ok(Self {
+            if_index,
+            installed,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        if self.installed.is_empty() {
+            return;
+        }
+        let mut nl = match super::policy_route::Netlink::open() {
+            Ok(nl) => nl,
+            Err(e) => {
+                warn!("tun auto-route: cannot remove the routes: {e}");
+                return;
+            }
+        };
+        for net in &self.installed {
+            if let Err(e) = nl.del_route(*net, self.if_index) {
+                warn!("tun auto-route: failed to remove {net}: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(super) struct RouteGuard {
     manager: RouteManager,
     installed: Vec<Route>,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl RouteGuard {
     /// Install one on-link route per net through interface `if_index`.
     /// Individual failures are logged and skipped so a pre-existing
@@ -41,6 +100,7 @@ impl RouteGuard {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         for route in &self.installed {

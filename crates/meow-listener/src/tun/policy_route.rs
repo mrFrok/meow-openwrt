@@ -48,14 +48,15 @@
 //! equal fields (`EEXIST` on add), and a delete matches loosely enough to
 //! take the wrong one of two rules sharing a priority.
 
+use meow_common::atomic::{AtomicU, Uint};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use netlink_packet_core::{
-    NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
-    NLM_F_REPLACE, NLM_F_REQUEST,
+    Emitable, Parseable, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE,
+    NLM_F_REQUEST,
 };
 use netlink_packet_route::route::{
     RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
@@ -63,7 +64,7 @@ use netlink_packet_route::route::{
 use netlink_packet_route::rule::{
     RuleAction, RuleAttribute, RuleFlags, RuleMessage, RulePortRange,
 };
-use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+use netlink_packet_route::AddressFamily;
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use tracing::{debug, warn};
 
@@ -81,8 +82,8 @@ const RT_TABLE_MAIN: u8 = 254;
 /// next listener while the previous one may still be tearing down; the
 /// newer generation replaces the rules, and only the generation that owns
 /// them removes them.
-static RULES_OWNER: AtomicU64 = AtomicU64::new(0);
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static RULES_OWNER: AtomicU = AtomicU::new(0);
+static NEXT_GENERATION: AtomicU = AtomicU::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selector {
@@ -233,6 +234,22 @@ fn default_route(v6: bool, if_index: u32) -> RouteMessage {
     msg
 }
 
+/// A main-table route for `net` into device `if_index` (the fake-IP range
+/// or a split default, see `route.rs`).
+fn device_route(net: IpNet, if_index: u32) -> RouteMessage {
+    let mut msg = RouteMessage::default();
+    msg.header.address_family = family(net.addr().is_ipv6());
+    msg.header.destination_prefix_length = net.prefix_len();
+    msg.header.protocol = RouteProtocol::Static;
+    msg.header.scope = RouteScope::Universe;
+    msg.header.kind = RouteType::Unicast;
+    msg.header.table = RT_TABLE_MAIN;
+    msg.attributes
+        .push(RouteAttribute::Destination(net.network().into()));
+    msg.attributes.push(RouteAttribute::Oif(if_index));
+    msg
+}
+
 fn family(v6: bool) -> AddressFamily {
     if v6 {
         AddressFamily::Inet6
@@ -244,7 +261,7 @@ fn family(v6: bool) -> AddressFamily {
 /// The installed policy routing of one TUN listener; dropping it removes
 /// it. Dropped before the device (`TunDevice` field order).
 pub(super) struct PolicyRoutes {
-    generation: u64,
+    generation: Uint,
     rules: Vec<Rule>,
     routes: Vec<RouteMessage>,
 }
@@ -270,7 +287,8 @@ impl PolicyRoutes {
         for v6 in [false].into_iter().chain(v6.map(|_| true)) {
             let route = default_route(v6, if_index);
             nl.request(
-                RouteNetlinkMessage::NewRoute(route.clone()),
+                RTM_NEWROUTE,
+                &route,
                 NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
             )?;
             this.routes.push(route);
@@ -279,10 +297,7 @@ impl PolicyRoutes {
         let mut wanted = rules(v4, v6);
         wanted.sort_by_key(|r| r.action != Action::Nop);
         for rule in wanted {
-            nl.request(
-                RouteNetlinkMessage::NewRule(rule.message()),
-                NLM_F_ACK | NLM_F_CREATE,
-            )?;
+            nl.request(RTM_NEWRULE, &rule.message(), NLM_F_ACK | NLM_F_CREATE)?;
             this.rules.push(rule);
         }
         // A kernel without the `dport` selector (before Linux 4.17) drops
@@ -321,8 +336,7 @@ impl Drop for PolicyRoutes {
         };
         if owner {
             for rule in self.rules.iter().rev() {
-                if let Err(e) = nl.request(RouteNetlinkMessage::DelRule(rule.message()), NLM_F_ACK)
-                {
+                if let Err(e) = nl.request(RTM_DELRULE, &rule.message(), NLM_F_ACK) {
                     warn!("tun auto-route: failed to remove rule {rule:?}: {e}");
                 }
             }
@@ -330,21 +344,32 @@ impl Drop for PolicyRoutes {
         // Matches our device only, so a route a newer generation put in
         // its place stays. The kernel also drops it with the device.
         for route in &self.routes {
-            if let Err(e) = nl.request(RouteNetlinkMessage::DelRoute(route.clone()), NLM_F_ACK) {
+            if let Err(e) = nl.request(RTM_DELROUTE, route, NLM_F_ACK) {
                 debug!("tun auto-route: table {TABLE} route already gone: {e}");
             }
         }
     }
 }
 
+// rtnetlink message types (linux/rtnetlink.h) and netlink control types.
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
+const RTM_NEWRULE: u16 = 32;
+const RTM_DELRULE: u16 = 33;
+const RTM_GETRULE: u16 = 34;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+/// `struct nlmsghdr`: len u32, type u16, flags u16, seq u32, pid u32.
+const NLMSG_HDRLEN: usize = 16;
+
 /// A blocking rtnetlink socket.
-struct Netlink {
+pub(super) struct Netlink {
     socket: Socket,
     sequence: u32,
 }
 
 impl Netlink {
-    fn open() -> io::Result<Self> {
+    pub(super) fn open() -> io::Result<Self> {
         let mut socket = Socket::new(NETLINK_ROUTE)?;
         socket.bind_auto()?;
         socket.connect(&SocketAddr::new(0, 0))?;
@@ -357,14 +382,21 @@ impl Netlink {
     fn dump_rules(&mut self, family: AddressFamily) -> io::Result<Vec<RuleMessage>> {
         let mut query = RuleMessage::default();
         query.header.family = family;
-        Ok(self
-            .request(RouteNetlinkMessage::GetRule(query), NLM_F_DUMP)?
-            .into_iter()
-            .filter_map(|msg| match msg {
-                RouteNetlinkMessage::NewRule(rule) => Some(rule),
-                _ => None,
-            })
-            .collect())
+        self.request(RTM_GETRULE, &query, NLM_F_DUMP)
+    }
+
+    /// Add a main-table route for `net` into device `if_index`; fails with
+    /// `EEXIST` when an equal route is already there.
+    pub(super) fn add_route(&mut self, net: IpNet, if_index: u32) -> io::Result<()> {
+        let route = device_route(net, if_index);
+        self.request(RTM_NEWROUTE, &route, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL)
+            .map(drop)
+    }
+
+    /// Remove a route [`Self::add_route`] installed.
+    pub(super) fn del_route(&mut self, net: IpNet, if_index: u32) -> io::Result<()> {
+        let route = device_route(net, if_index);
+        self.request(RTM_DELROUTE, &route, NLM_F_ACK).map(drop)
     }
 
     /// Delete the rules [`is_ours`] recognises, in both families.
@@ -377,7 +409,7 @@ impl Netlink {
                 .collect();
             for rule in stale {
                 debug!("tun auto-route: removing a stale policy rule: {rule:?}");
-                self.request(RouteNetlinkMessage::DelRule(rule), NLM_F_ACK)?;
+                self.request(RTM_DELRULE, &rule, NLM_F_ACK)?;
             }
         }
         Ok(())
@@ -394,21 +426,29 @@ impl Netlink {
         }))
     }
 
-    /// Send one request and collect its reply: the messages of a dump, or
+    /// Send one request and collect its reply: the rules of a rule dump, or
     /// nothing for an acknowledged change.
-    fn request(
+    ///
+    /// Frames the netlink header by hand and decodes only `RuleMessage`s:
+    /// `NetlinkMessage<RouteNetlinkMessage>` would dispatch over every
+    /// rtnetlink family and link all their (de)serializers, ~300 KB on
+    /// mipsel (openwrt-fork/BENCHMARKS.md).
+    fn request<M: Emitable>(
         &mut self,
-        payload: RouteNetlinkMessage,
+        message_type: u16,
+        body: &M,
         flags: u16,
-    ) -> io::Result<Vec<RouteNetlinkMessage>> {
-        self.sequence += 1;
-        let mut header = NetlinkHeader::default();
-        header.flags = NLM_F_REQUEST | flags;
-        header.sequence_number = self.sequence;
-        let mut packet = NetlinkMessage::new(header, NetlinkPayload::from(payload));
-        packet.finalize();
-        let mut buf = vec![0; packet.header.length as usize];
-        packet.serialize(&mut buf);
+    ) -> io::Result<Vec<RuleMessage>> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let len = NLMSG_HDRLEN + body.buffer_len();
+        let len32 =
+            u32::try_from(len).map_err(|_| io::Error::other("netlink: request too large"))?;
+        let mut buf = vec![0; len];
+        buf[0..4].copy_from_slice(&len32.to_ne_bytes());
+        buf[4..6].copy_from_slice(&message_type.to_ne_bytes());
+        buf[6..8].copy_from_slice(&(NLM_F_REQUEST | flags).to_ne_bytes());
+        buf[8..12].copy_from_slice(&self.sequence.to_ne_bytes());
+        body.emit(&mut buf[NLMSG_HDRLEN..]);
         self.socket.send(&buf, 0)?;
 
         let mut replies = Vec::new();
@@ -417,27 +457,38 @@ impl Netlink {
         loop {
             let len = self.socket.recv(&mut &mut buf[..], 0)?;
             let mut offset = 0;
-            while offset < len {
-                let msg = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&buf[offset..len])
-                    .map_err(|e| io::Error::other(format!("netlink: {e}")))?;
-                let msg_len = msg.header.length as usize;
-                if msg_len == 0 {
-                    break;
+            while len.saturating_sub(offset) >= NLMSG_HDRLEN {
+                let msg = &buf[offset..len];
+                let msg_len = u32::from_ne_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
+                if msg_len < NLMSG_HDRLEN || msg_len > msg.len() {
+                    return Err(io::Error::other(format!(
+                        "netlink: bad message length {msg_len}"
+                    )));
                 }
+                let kind = u16::from_ne_bytes([msg[4], msg[5]]);
+                let sequence = u32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]]);
+                let payload = &msg[NLMSG_HDRLEN..msg_len];
                 // Netlink messages are 4-byte aligned.
                 offset += (msg_len + 3) & !3;
-                if msg.header.sequence_number != self.sequence {
+                if sequence != self.sequence {
                     continue;
                 }
-                match msg.payload {
-                    NetlinkPayload::Done(_) => return Ok(replies),
-                    NetlinkPayload::Error(e) => {
-                        return match e.code {
-                            None => Ok(replies),
-                            Some(_) => Err(e.to_io()),
+                match kind {
+                    NLMSG_DONE => return Ok(replies),
+                    NLMSG_ERROR => {
+                        let code = payload
+                            .get(0..4)
+                            .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                            .ok_or_else(|| io::Error::other("netlink: short error message"))?;
+                        return match code {
+                            0 => Ok(replies),
+                            code => Err(io::Error::from_raw_os_error(-code)),
                         };
                     }
-                    NetlinkPayload::InnerMessage(msg) => replies.push(msg),
+                    RTM_NEWRULE => replies.push(
+                        RuleMessage::parse(payload)
+                            .map_err(|e| io::Error::other(format!("netlink: {e}")))?,
+                    ),
                     _ => {}
                 }
             }

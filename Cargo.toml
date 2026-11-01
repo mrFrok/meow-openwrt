@@ -147,7 +147,10 @@ ipnet = "2"
 # stack + route table control. Optional; pulled in only by meow-listener's
 # `listener-tun` feature. The stack is madeye/lwip (lwIP), not smoltcp:
 # accept is post-handshake, PCB/window/memory caps live in lwipopts.h.
-tun-rs = { version = "2.8", features = ["async_tokio"] }
+# No `address-management` by default: on Linux tun-rs then sets the device
+# address over ioctl instead of pulling netconfig-rs (a second
+# netlink-packet-route); meow-listener re-enables it off Linux.
+tun-rs = { version = "2.8", default-features = false, features = ["async_tokio"] }
 # Published fork of `lwip` (madeye/lwip): single-owner core plus the
 # poll_next UAF / poll_flush deadlock / FIN_WAIT_2 leak / livelock fixes that
 # upstream `lwip` lacks. Registry version, not a `git =` pin — crates.io
@@ -186,7 +189,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+# No `color`/`suggestions`: plain help/errors (smaller router binary).
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 # Async traits
 async-trait = "0.1"
@@ -199,7 +203,10 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Regex
-regex = "1"
+# `perf` (literal/DFA/onepass accelerators) is opted into by meow-app's
+# `regex-perf` feature (in `full`/`minimal`); the router `tiny` profile
+# leaves it out for size (openwrt-fork/PLAN.md stage 2).
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 
 # Byte manipulation
 bytes = "1"
