@@ -36,6 +36,8 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
    Вывод: для 16 МБ флеша нужен профиль `tiny` (этап 2) и, вероятно, статическая libstdc++ / UPX-подобное.
 
 ## Этап 1 — паритет с mihomo (из research; поведение сверять с mihomo/`mlw-fork`)
+Сделано 1–4 (коммиты 4530a6a, 3b51b13): сверка API — `bench/api-compare.py`, 19/26 совпадают, остальное —
+ключи неподдерживаемых фич (tfo/mptcp/xudp у прокси, geo auto-update, …).
 1. Симлинки провайдеров — `meow-config/src/safe_path.rs:52`: лексическая проверка как `C.Path.IsSafePath`.
 2. RULE-SET в AND/OR/NOT — `ParserContext` (`meow-rules/src/parser.rs:37`) получает карту rule-set'ов,
    `parse_rule_depth` строит `RuleSetRule` (`rule_set_rule.rs:16`); `meow-config/src/rule_parser.rs:138` — на общий код.

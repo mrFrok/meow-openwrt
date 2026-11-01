@@ -30,6 +30,9 @@ external-ui-download = ["meow-config/external-ui-download"]
 logbook = ["meow-common/logbook"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
+# mimalloc as the global allocator instead of the libc one (musl mallocng on
+# OpenWrt); a memory/CPU trade-off measured in openwrt-fork/BENCHMARKS.md.
+mimalloc = ["dep:mimalloc"]
 
 # Protocol features — forwarded to meow-proxy and meow-config
 ss = ["meow-config/ss", "meow-proxy/ss"]
@@ -149,6 +152,7 @@ dashmap = { workspace = true }
 libc = "0.2"
 log = "0.4"
 dhat = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2.5"

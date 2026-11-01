@@ -267,6 +267,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # Heap profiling (optional — used only with --features dhat-heap)
 dhat = "0.3"
+mimalloc = { version = "0.1", default-features = false }
 
 # Compact string types (M2 Metadata layout)
 smol_str = { version = "0.3", features = ["serde"] }
