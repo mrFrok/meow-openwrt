@@ -206,3 +206,11 @@ Firefox против meow и mihomo на одном конфиге. Было: za
 `extra` + `PATCH /rules/disable` (отключённое правило пропускается как PASS-цель; `RuleStats` в `RouteTable`).
 Остаётся: `missCount` всегда 0 (IR не обходит все правила); порядок GLOBAL (основной исходящий первым —
 решение upstream); `lazy: false` по умолчанию (ADR-0002) — mihomo проверяет группы лениво.
+
+## TUN `stack: system` (2026-11-02)
+
+TCP через TUN в lwIP: 685/673 Мбит/с (ul/dl), 0.22–0.24 %CPU/Мбит; mihomo (system + gso) 2490/2180, 0.05–0.06.
+Сделан system stack как у mihomo/sing-box (`tun/system.rs`): NAT в помпе (C:c→D:d ⇒ B:n→A:l, ответ обратно,
+in-place, RFC 1624), ядерный `TcpListener` на адресе TUN, peek-sniff (`handle_tcp_socket`), DIRECT — splice.
+Итог: 2110/1680 Мбит/с, 0.07 %/Мбит. UDP/ICMP пока lwIP. Дальше: GSO/GRO на TUN (virtio-net hdr) — у mihomo
+`gso: true`; UDP мимо lwIP (свой разбор IP/UDP в помпе).

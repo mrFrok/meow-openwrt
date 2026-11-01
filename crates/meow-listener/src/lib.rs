@@ -42,7 +42,7 @@ pub use sniffer::SnifferRuntime;
 #[cfg(feature = "listener-tproxy")]
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
-pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope};
+pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope, TunStack};
 
 #[cfg(all(
     test,

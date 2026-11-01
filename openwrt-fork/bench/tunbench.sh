@@ -15,7 +15,8 @@
 #   sh tunbench.sh up                       # netns, iperf3 server, hy2 server
 #   sh tunbench.sh run <label> <core-bin> [scenario...]
 #   sh tunbench.sh down
-# Scenarios: direct-ul direct-dl hy2-ul hy2-dl (default: all).
+# Scenarios: direct-ul direct-dl hy2-ul hy2-dl (UDP at RATE, default: all),
+#            tcp-ul tcp-dl (DIRECT TCP, unlimited rate, 4 streams).
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
 #      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines)
 # Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit.
@@ -82,8 +83,9 @@ ticks() { awk '{print $14+$15}' /proc/$1/stat 2>/dev/null; }
 
 run1() { # label bin scenario
 	lab=$1; bin=$2; sc=$3
-	case $sc in direct-*) tgt=DIRECT ;; *) tgt=H ;; esac
+	case $sc in hy2-*) tgt=H ;; *) tgt=DIRECT ;; esac
 	case $sc in *-dl) rev=-R ;; *) rev= ;; esac
+	case $sc in tcp-*) proto="-P 4"; rate=max ;; *) proto="-u -b $RATE -l $LEN"; rate=$RATE ;; esac
 	d=$W/core; rm -rf $d; mkdir -p $d; core_cfg $tgt > $d/config.yaml
 	ip netns exec $C taskset -c "$CORE_CPU" "$bin" -d $d -f $d/config.yaml > $d/log 2>&1 &
 	pid=$!; i=0
@@ -91,17 +93,18 @@ run1() { # label bin scenario
 	ip -n $C link set mwtun up 2>/dev/null
 	ip -n $C route replace 192.0.2.0/24 dev mwtun
 	# warm-up: hy2 handshake, flow setup
-	ip netns exec $C iperf3 -c 192.0.2.2 -u -b 10M -l "$LEN" -t 2 $rev > /dev/null 2>&1
+	ip netns exec $C iperf3 -c 192.0.2.2 $proto -t 2 $rev > /dev/null 2>&1
 	t0=$(ticks $pid); s0=$(date +%s)
-	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 -u -b "$RATE" -l "$LEN" -t "$SECS" $rev 2>&1)
+	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 $proto -t "$SECS" $rev 2>&1)
 	t1=$(ticks $pid); s1=$(date +%s)
 	kill $pid 2>/dev/null; wait $pid 2>/dev/null
-	rcv=$(echo "$out" | grep receiver | tail -1)
+	rcv=$(echo "$out" | grep receiver | grep -v '^\[ *[0-9]' | tail -1)
+	[ -n "$rcv" ] || rcv=$(echo "$out" | grep receiver | tail -1)
 	mbps=$(echo "$rcv" | awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/){v=$(i-1); u=$i; if(u ~ /^G/) v*=1000; if(u ~ /^K/) v/=1000; print v; exit}}')
 	loss=$(echo "$rcv" | grep -o '([0-9.e+-]*%)' | tr -d '()')
 	cpu=$(awk -v a="${t0:-0}" -v b="${t1:-0}" -v s=$((s1-s0)) 'BEGIN{ if(s<1)s=1; printf "%.0f", (b-a)/s }')
 	per=$(awk -v c="$cpu" -v m="${mbps:-0}" 'BEGIN{ if(m>0) printf "%.2f", c/m; else print "-" }')
-	printf '%-14s %-10s rate=%-5s recv=%6s Mbit/s loss=%-7s core=%4s%% %%/Mbit=%s\n' "$lab" "$sc" "$RATE" "${mbps:--}" "${loss:--}" "$cpu" "$per"
+	printf '%-14s %-10s rate=%-5s recv=%6s Mbit/s loss=%-7s core=%4s%% %%/Mbit=%s\n' "$lab" "$sc" "$rate" "${mbps:--}" "${loss:--}" "$cpu" "$per"
 	[ -n "$mbps" ] || { echo "$out" | tail -3; tail -5 $d/log; }
 }
 

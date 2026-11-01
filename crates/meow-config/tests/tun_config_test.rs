@@ -629,3 +629,24 @@ async fn inet4_address_accepts_mihomos_list_form() {
         .expect("list form parses");
     assert_eq!(cfg.tun.inet4_address.to_string(), "172.31.0.1/30");
 }
+
+/// `tun.stack`: `system`/`mixed` select the kernel TCP stack, everything
+/// else the userspace one (meow-openwrt).
+#[tokio::test]
+async fn stack_system_and_mixed_select_the_kernel_tcp_stack() {
+    for (value, want) in [
+        ("system", meow_config::TunStack::System),
+        ("Mixed", meow_config::TunStack::System),
+        ("gvisor", meow_config::TunStack::Lwip),
+        ("lwip", meow_config::TunStack::Lwip),
+    ] {
+        let cfg = load_config_from_str(&format!("tun:\n  enable: true\n  stack: {value}\n"))
+            .await
+            .expect("parses");
+        assert_eq!(cfg.tun.stack, want, "stack: {value}");
+    }
+    let cfg = load_config_from_str("tun:\n  enable: true\n")
+        .await
+        .unwrap();
+    assert_eq!(cfg.tun.stack, meow_config::TunStack::Lwip);
+}
