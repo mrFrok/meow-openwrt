@@ -224,6 +224,13 @@ impl VlessAdapter {
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
     /// VLESS Encryption handshake if one is configured.
     async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
+        if let Some(stream) = self.transport.reuse().await {
+            #[cfg(feature = "vless-encryption")]
+            if let Some(encryption) = &self.encryption {
+                return encryption.handshake(stream).await;
+            }
+            return Ok(stream);
+        }
         let stream = self
             .dialer
             .dial(&self.server, self.port, internal)

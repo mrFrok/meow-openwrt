@@ -56,4 +56,10 @@ impl TransportChain {
         }
         Ok(stream)
     }
+
+    /// A new stream on a connection the outermost layer multiplexes (gRPC),
+    /// with no dial; `None` when there is nothing to reuse.
+    pub async fn reuse(&self) -> Option<Box<dyn Stream>> {
+        self.layers.last()?.reuse().await
+    }
 }

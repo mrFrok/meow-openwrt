@@ -206,6 +206,14 @@ pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
 pub trait Transport: Send + Sync {
     /// Wrap `inner` with this transport layer and return the upgraded stream.
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>>;
+
+    /// A multiplexing layer (gRPC over HTTP/2) can open a new logical
+    /// stream on a connection an earlier [`Self::connect`] established,
+    /// skipping the dial and every layer beneath it (TCP, TLS/REALITY).
+    /// `None`: nothing reusable — dial and `connect` as usual.
+    async fn reuse(&self) -> Option<Box<dyn Stream>> {
+        None
+    }
 }
 
 /// Crate-level `Result` alias.  Errors are always [`TransportError`].

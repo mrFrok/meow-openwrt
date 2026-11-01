@@ -155,6 +155,9 @@ async fn dial_vmess(
     security: Security,
     internal: bool,
 ) -> Result<Box<dyn ProxyConn>> {
+    if let Some(stream) = transport.reuse().await {
+        return vmess_exchange(stream, sealed, security).await;
+    }
     let stream = dialer
         .dial(server, port, internal)
         .await
@@ -172,14 +175,22 @@ async fn vmess_over(
     sealed: header::SealedHeader,
     security: Security,
 ) -> Result<Box<dyn ProxyConn>> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut stream = transport.connect(stream).await.map_err(|e| match e {
+    let stream = transport.connect(stream).await.map_err(|e| match e {
         // Io/RelayHop chains carry errno + capability classification that
         // dead-marking reads — do not stringify them away (issue #668).
         e @ (MeowError::Io(_) | MeowError::RelayHopFailed { .. }) => e,
         e => MeowError::Proxy(format!("vmess transport: {e}")),
     })?;
+    vmess_exchange(stream, sealed, security).await
+}
+
+/// Run the VMess request exchange on a fully wrapped transport stream.
+async fn vmess_exchange(
+    mut stream: Box<dyn meow_transport::Stream>,
+    sealed: header::SealedHeader,
+    security: Security,
+) -> Result<Box<dyn ProxyConn>> {
+    use tokio::io::AsyncWriteExt;
 
     stream
         .write_all(&sealed.bytes)
