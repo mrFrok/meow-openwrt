@@ -212,5 +212,7 @@ Firefox против meow и mihomo на одном конфиге. Было: za
 TCP через TUN в lwIP: 685/673 Мбит/с (ul/dl), 0.22–0.24 %CPU/Мбит; mihomo (system + gso) 2490/2180, 0.05–0.06.
 Сделан system stack как у mihomo/sing-box (`tun/system.rs`): NAT в помпе (C:c→D:d ⇒ B:n→A:l, ответ обратно,
 in-place, RFC 1624), ядерный `TcpListener` на адресе TUN, peek-sniff (`handle_tcp_socket`), DIRECT — splice.
-Итог: 2110/1680 Мбит/с, 0.07 %/Мбит. UDP/ICMP пока lwIP. Дальше: GSO/GRO на TUN (virtio-net hdr) — у mihomo
-`gso: true`; UDP мимо lwIP (свой разбор IP/UDP в помпе).
+Итог: 2110/1680 Мбит/с, 0.07 %/Мбит. Затем offload (`IFF_VNET_HDR`, `tun/vnet.rs`): NAT переписывает
+TSO/GRO-агрегаты до 64 КБ целиком (partial csum — правка только адресов), lwIP получает сегменты через
+`gso_split`. Итог: **6090/5810 Мбит/с, 0.02–0.03 %/Мбит** (mihomo 2490/2180). UDP DIRECT 300M: meow 0.44–0.46
+%/Мбит, mihomo 0.29 — дальше UDP мимо lwIP (свой разбор IP/UDP в помпе).

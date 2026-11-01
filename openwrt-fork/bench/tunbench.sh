@@ -85,7 +85,10 @@ run1() { # label bin scenario
 	lab=$1; bin=$2; sc=$3
 	case $sc in hy2-*) tgt=H ;; *) tgt=DIRECT ;; esac
 	case $sc in *-dl) rev=-R ;; *) rev= ;; esac
-	case $sc in tcp-*) proto="-P 4"; rate=max ;; *) proto="-u -b $RATE -l $LEN"; rate=$RATE ;; esac
+	case $sc in
+	tcp-*) proto="-P 4"; warm="-P 4"; rate=max ;;
+	*) proto="-u -b $RATE -l $LEN"; warm="-u -b 10M -l $LEN"; rate=$RATE ;;
+	esac
 	d=$W/core; rm -rf $d; mkdir -p $d; core_cfg $tgt > $d/config.yaml
 	ip netns exec $C taskset -c "$CORE_CPU" "$bin" -d $d -f $d/config.yaml > $d/log 2>&1 &
 	pid=$!; i=0
@@ -93,7 +96,7 @@ run1() { # label bin scenario
 	ip -n $C link set mwtun up 2>/dev/null
 	ip -n $C route replace 192.0.2.0/24 dev mwtun
 	# warm-up: hy2 handshake, flow setup
-	ip netns exec $C iperf3 -c 192.0.2.2 $proto -t 2 $rev > /dev/null 2>&1
+	ip netns exec $C iperf3 -c 192.0.2.2 $warm -t 2 $rev > /dev/null 2>&1
 	t0=$(ticks $pid); s0=$(date +%s)
 	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 $proto -t "$SECS" $rev 2>&1)
 	t1=$(ticks $pid); s1=$(date +%s)
