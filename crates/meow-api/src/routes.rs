@@ -1550,6 +1550,13 @@ async fn apply_raw_to_tunnel(
     state.tunnel.set_connection_notes(connection_notes);
     // mihomo re-applies `routing-mark` on every config load.
     meow_common::set_routing_mark(raw.routing_mark);
+    meow_tunnel::nftset::install(
+        &state.tunnel,
+        raw.dns
+            .as_ref()
+            .and_then(|d| d.nftset.as_ref())
+            .and_then(|n| n.parse().ok().flatten()),
+    );
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3809,6 +3816,14 @@ async fn put_configs(
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
     meow_common::set_routing_mark(raw_config.routing_mark);
+    meow_tunnel::nftset::install(
+        &state.tunnel,
+        raw_config
+            .dns
+            .as_ref()
+            .and_then(|d| d.nftset.as_ref())
+            .and_then(|n| n.parse().ok().flatten()),
+    );
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
