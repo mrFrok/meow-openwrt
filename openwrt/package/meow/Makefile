@@ -45,6 +45,9 @@ endif
 MEOW_STD_FEATURES ?= optimize_for_size
 MEOW_OPT_LEVEL ?= z
 MEOW_EXTRA_RUSTFLAGS ?=
+# PGO: an llvm-profdata file from openwrt-fork/bench/pgo-gen.sh. Profiles are
+# per source version; stale functions just lose the optimisation.
+MEOW_PGO_PROFILE ?=
 # Fully static binary (musl + libgcc linked in): runs on any OpenWrt release
 # whatever its musl, no libgcc dependency. MIPS is non-PIE (see below).
 MEOW_STATIC ?= 1
@@ -72,6 +75,9 @@ ifeq ($(MEOW_STATIC),1)
   endif
 endif
 CARGO_RUSTFLAGS += -Cforce-unwind-tables=no -Lnative=$(TOOLCHAIN_DIR)/lib $(MEOW_EXTRA_RUSTFLAGS)
+ifneq ($(MEOW_PGO_PROFILE),)
+  CARGO_RUSTFLAGS += -Cprofile-use=$(MEOW_PGO_PROFILE)
+endif
 ifeq ($(MEOW_BUILD_STD),1)
   CARGO_RUSTFLAGS += -Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none
   CARGO_PKG_CONFIG_VARS += RUSTC_BOOTSTRAP=1

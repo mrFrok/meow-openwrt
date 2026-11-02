@@ -91,6 +91,11 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 
 ## Этап 6 — эксперименты (Go-этап VI)
 - sockmap vs splice (после этапа 5); PGO (`cargo pgo`) с профилем с MIPS/ARMv7 у волонтёров.
+- **PGO на BPI-R4 (2026-11-03, `bench/pgo-gen.sh`, `MEOW_PGO_PROFILE=`)**: профиль из tunbench + старт на живом
+  конфиге, замер на тех же сценариях (оптимистично). %CPU/Мбит: hy2 UDP ↓ 1.31→0.98 (−25%, +11% скорости),
+  hy2 TCP ↓ 0.49→0.46, ↑ 0.43→0.39; hy2 UDP ↑ хуже на 6%; DIRECT TCP без изменений. Размер tiny +327 КБ
+  (jffs2 4.03→4.29 МБ). Нет Reality в профиле; на MIPS не проверено. По умолчанию выключено.
+- sockmap/eBPF: не делаем — DIRECT TCP уже splice ~10 Гбит/с, с dns.nftset мимо ядра; шифрование в BPF невозможно.
 
 ## Этап 7 — big-endian MIPS (BoringSSL только LE — подтверждено)
 rustls + quinn: Reality meow — свой TLS 1.3 на RustCrypto (`meow-transport/src/reality_tls.rs`, из boring только
