@@ -196,13 +196,32 @@ struct Logging {
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
+/// The dhat profiler. With `MEOW_DHAT_AFTER=<secs>` a thread drops it
+/// that long after start, so the report's "t-end" is the steady-state live
+/// heap rather than what is left after shutdown freed everything.
+#[cfg(feature = "dhat-heap")]
+fn dhat_profiler() -> Option<dhat::Profiler> {
+    let profiler = dhat::Profiler::new_heap();
+    let Some(secs) = std::env::var("MEOW_DHAT_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return Some(profiler);
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        drop(profiler);
+    });
+    None
+}
+
 type ReadyCallback = Box<dyn FnOnce() -> Result<()> + Send>;
 
 fn main() -> Result<()> {
     // dhat profiler guard — must be the first local, lives for the duration of main().
     // Writes dh_out.json on drop. Active only when compiled with --features dhat-heap.
     #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
+    let _profiler = dhat_profiler();
 
     // nyanpasu uses -v to query version (mihomo format)
     if std::env::args().any(|a| a == "-v") {

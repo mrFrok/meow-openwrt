@@ -18,13 +18,14 @@
 # Scenarios: direct-ul direct-dl hy2-ul hy2-dl (UDP at RATE, default: all),
 #            tcp-ul tcp-dl (DIRECT TCP, unlimited rate, 4 streams).
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
-#      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines)
-# Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit.
+#      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines), STACK=system|lwip
+# Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit, the core's
+# RssAnon and VmHWM (KB) at the end of the run.
 set -u
 W=/tmp/tunbench; C=mwc; S=mwb
 RATE=${RATE:-1G}; LEN=${LEN:-1200}; SECS=${SECS:-15}
 CORE_CPU=${CORE_CPU:-0,1}; CLI_CPU=${CLI_CPU:-2}; SRV_CPU=${SRV_CPU:-3}
-SRVBIN=${SRVBIN:-/usr/bin/mihomo}; MTU=${MTU:-9000}; EXTRA=${EXTRA:-}
+SRVBIN=${SRVBIN:-/usr/bin/mihomo}; MTU=${MTU:-9000}; EXTRA=${EXTRA:-}; STACK=${STACK:-system}
 
 up() {
 	mkdir -p $W/srv
@@ -64,7 +65,7 @@ routing-mark: 153
 tun:
   enable: true
   device: mwtun
-  stack: system
+  stack: $STACK
   mtu: $MTU
   inet4-address: [172.31.0.1/30]
   auto-route: false
@@ -100,6 +101,7 @@ run1() { # label bin scenario
 	t0=$(ticks $pid); s0=$(date +%s)
 	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 $proto -t "$SECS" $rev 2>&1)
 	t1=$(ticks $pid); s1=$(date +%s)
+	mem=$(awk '/^(RssAnon|VmHWM):/{printf "%s=%s ", $1, $2}' /proc/$pid/status 2>/dev/null)
 	kill $pid 2>/dev/null; wait $pid 2>/dev/null
 	rcv=$(echo "$out" | grep receiver | grep -v '^\[ *[0-9]' | tail -1)
 	[ -n "$rcv" ] || rcv=$(echo "$out" | grep receiver | tail -1)
@@ -107,7 +109,7 @@ run1() { # label bin scenario
 	loss=$(echo "$rcv" | grep -o '([0-9.e+-]*%)' | tr -d '()')
 	cpu=$(awk -v a="${t0:-0}" -v b="${t1:-0}" -v s=$((s1-s0)) 'BEGIN{ if(s<1)s=1; printf "%.0f", (b-a)/s }')
 	per=$(awk -v c="$cpu" -v m="${mbps:-0}" 'BEGIN{ if(m>0) printf "%.2f", c/m; else print "-" }')
-	printf '%-14s %-10s rate=%-5s recv=%6s Mbit/s loss=%-7s core=%4s%% %%/Mbit=%s\n' "$lab" "$sc" "$rate" "${mbps:--}" "${loss:--}" "$cpu" "$per"
+	printf '%-14s %-10s rate=%-5s recv=%6s Mbit/s loss=%-7s core=%4s%% %%/Mbit=%s %s\n' "$lab" "$sc" "$rate" "${mbps:--}" "${loss:--}" "$cpu" "$per" "$mem"
 	[ -n "$mbps" ] || { echo "$out" | tail -3; tail -5 $d/log; }
 }
 
