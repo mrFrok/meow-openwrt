@@ -187,6 +187,33 @@ async fn require_auth_ws(
     }
 }
 
+/// mihomo decodes request bodies as JSON whatever their `Content-Type`
+/// (`render.DecodeJSON`), and dashboards rely on it: some send a selection
+/// PUT as `text/plain` or with no type at all. axum's `Json` extractor
+/// answers those with 415, so a body without a type, or typed as plain
+/// text, is relabelled JSON before it reaches a handler. Other types
+/// (YAML, multipart) are left alone.
+async fn assume_json_body(mut req: Request) -> Request {
+    let relabel = match req.headers().get(header::CONTENT_TYPE) {
+        None => !matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ),
+        Some(v) => v.to_str().is_ok_and(|t| {
+            t.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/plain")
+        }),
+    };
+    if relabel {
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+    }
+    req
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // WS routes — accept header or ?token= query param for browser dashboard compat.
     // REST API routes gated behind the Bearer middleware (header-only).
@@ -315,7 +342,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             .route("/ui/{*rest}", get(ui::serve_ui))
     };
 
-    router.layer(CorsLayer::permissive()).with_state(state)
+    router
+        .layer(middleware::map_request(assume_json_body))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
@@ -3008,6 +3038,12 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
+    match meow_config::sniffer_config_from_raw(raw) {
+        Ok(cfg) => {
+            listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(cfg)));
+        }
+        Err(e) => warn!("tun: sniffer config ignored: {e}"),
+    }
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
     }

@@ -218,16 +218,19 @@ fn rebuild_from_raw_with_groups() {
     assert_eq!(proxies.len(), 9);
 }
 
+/// meow-openwrt: the auto-created GLOBAL lists members in mihomo's order —
+/// DIRECT, REJECT, proxies, then groups, each as declared — so with no
+/// stored choice it selects DIRECT, as mihomo does.
 #[test]
-fn auto_global_defaults_to_final_match_group() {
+fn auto_global_orders_members_as_mihomo() {
     let raw: RawConfig = serde_saphyr::from_str(
         r#"
 proxies:
   - {name: "137.15 G | 500.00 G", type: socks5, server: 127.0.0.1, port: 1}
   - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
 proxy-groups:
-  - {name: AutoSelect, type: url-test, proxies: ["HK 01"]}
   - {name: Proxies, type: select, proxies: [AutoSelect, "HK 01"]}
+  - {name: AutoSelect, type: url-test, proxies: ["HK 01"]}
 rules:
   - DOMAIN,example.com,DIRECT
   - MATCH,Proxies
@@ -237,15 +240,19 @@ rules:
 
     let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     let global = proxies.get("GLOBAL").expect("auto-created GLOBAL");
-
-    assert_eq!(global.current().as_deref(), Some("Proxies"));
+    assert_eq!(global.current().as_deref(), Some("DIRECT"));
     let members = global.members().expect("GLOBAL selector members");
-    assert_eq!(members.first().map(String::as_str), Some("Proxies"));
-    assert!(members.contains(&"137.15 G | 500.00 G".to_string()));
-    assert!(members.contains(&"AutoSelect".to_string()));
-    assert!(members.contains(&"HK 01".to_string()));
-    assert!(members.contains(&"DIRECT".to_string()));
-    assert!(members.contains(&"REJECT".to_string()));
+    assert_eq!(
+        members[..6],
+        [
+            "DIRECT",
+            "REJECT",
+            "137.15 G | 500.00 G",
+            "HK 01",
+            "Proxies",
+            "AutoSelect"
+        ]
+    );
 }
 
 /// Issue #533: the match-loop signal adapters register as real built-ins,
@@ -354,47 +361,6 @@ rules:
         ),
         Ok(_) => panic!("a group named REJECT must be rejected"),
     }
-}
-
-#[test]
-fn auto_global_falls_back_to_first_declared_outbound() {
-    let group_first: RawConfig = serde_saphyr::from_str(
-        r#"
-proxies:
-  - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
-proxy-groups:
-  - {name: Proxies, type: select, proxies: ["HK 01"]}
-rules:
-  - MATCH,DIRECT
-"#,
-    )
-    .unwrap();
-    let proxies = rebuild_from_raw(&group_first).unwrap().proxies;
-    assert_eq!(
-        proxies
-            .get("GLOBAL")
-            .and_then(|global| global.current())
-            .as_deref(),
-        Some("Proxies")
-    );
-
-    let proxy_only: RawConfig = serde_saphyr::from_str(
-        r#"
-proxies:
-  - {name: "HK 01", type: socks5, server: 127.0.0.1, port: 2}
-rules:
-  - MATCH,DIRECT
-"#,
-    )
-    .unwrap();
-    let proxies = rebuild_from_raw(&proxy_only).unwrap().proxies;
-    assert_eq!(
-        proxies
-            .get("GLOBAL")
-            .and_then(|global| global.current())
-            .as_deref(),
-        Some("HK 01")
-    );
 }
 
 #[test]

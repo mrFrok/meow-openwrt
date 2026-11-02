@@ -1981,20 +1981,6 @@ fn reject_group_membership_cycles(
     Ok(())
 }
 
-/// Policy names resolved internally rather than declared as usable outbounds.
-/// They must not become the default member of an auto-created `GLOBAL` group:
-/// choosing `DIRECT` would make global mode silently bypass every proxy.
-const BUILTIN_GLOBAL_POLICIES: [&str; 8] = [
-    "DIRECT",
-    "REJECT",
-    "REJECT-DROP",
-    "PASS",
-    "PASS-RULE",
-    "COMPATIBLE",
-    "GLOBAL",
-    "BLOCK",
-];
-
 /// Built-in adapter names a `proxies:` leaf or `proxy-groups:` entry must
 /// not shadow. Upstream hard-errors on the duplicate (`proxy %s is the
 /// duplicate name`); meow keeps the built-in and drops the shadowing entry
@@ -2008,13 +1994,6 @@ const BUILTIN_ADAPTER_NAMES: [&str; 6] = [
     "PASS",
     "PASS-RULE",
 ];
-
-fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>>) -> bool {
-    !BUILTIN_GLOBAL_POLICIES
-        .iter()
-        .any(|policy| name.eq_ignore_ascii_case(policy))
-        && proxies.contains_key(name)
-}
 
 /// The target of the LAST top-level `MATCH,<target>` rule — the config's
 /// default egress. A `MATCH` line can only appear at top level (the rule
@@ -2035,36 +2014,6 @@ fn last_match_target(raw: &raw::RawConfig) -> Option<&str> {
             }
             parts.next()
         })
-}
-
-/// Find the outbound a config is built around, preserving declaration order.
-/// The final valid `MATCH` target is authoritative; otherwise prefer the first
-/// successfully-built group, then the first successfully-built leaf proxy.
-fn primary_global_target<'a>(
-    raw: &'a raw::RawConfig,
-    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
-) -> Option<&'a str> {
-    let match_target = last_match_target(raw);
-    if let Some(target) = match_target.filter(|target| is_usable_global_target(target, proxies)) {
-        return Some(target);
-    }
-
-    if let Some(group) = raw
-        .proxy_groups
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|group| is_usable_global_target(&group.name, proxies))
-    {
-        return Some(&group.name);
-    }
-
-    raw.proxies
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|proxy| proxy.get("name").and_then(serde_json::Value::as_str))
-        .find(|name| is_usable_global_target(name, proxies))
 }
 
 /// Post-#562 a declared group dep that stays unbuilt can only mean it
@@ -2680,10 +2629,6 @@ fn build_proxy_layer(
 
     // Auto-create GLOBAL selector if not defined by user (mihomo compatibility).
     // clash-nyanpasu and other frontends depend on GLOBAL to build proxy tree.
-    // Keep the complete sorted list they expect, but put the config's primary
-    // outbound first: SelectorGroup uses its first member when no choice has
-    // been stored, and sorting every registry key previously made global mode
-    // default to DIRECT or an alphabetically-first quota/expiry pseudo-node.
     let had_global = proxies.contains_key("GLOBAL");
     if !had_global {
         let mut all_proxy_names: Vec<String> = proxies
@@ -2704,14 +2649,39 @@ fn build_proxy_layer(
             })
             .map(|(name, _)| name.to_string())
             .collect();
+        // meow-openwrt: mihomo's order (`proxyList`) — DIRECT, REJECT, the
+        // config's proxies, then its groups, each in declaration order — so
+        // an unchosen GLOBAL defaults to DIRECT as it does there. Members
+        // outside that list (provider leaves) follow, sorted.
         all_proxy_names.sort();
-        let primary = primary_global_target(raw, &proxies).map(str::to_string);
-        if let Some(primary) = primary.as_deref() {
-            if let Some(position) = all_proxy_names.iter().position(|name| name == primary) {
-                all_proxy_names.remove(position);
-                all_proxy_names.insert(0, primary.to_string());
+        let declared = ["DIRECT", "REJECT"]
+            .into_iter()
+            .chain(
+                raw.proxies
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str)),
+            )
+            .chain(
+                raw.proxy_groups
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|g| g.name.as_str()),
+            );
+        let mut ordered: Vec<String> = Vec::with_capacity(all_proxy_names.len());
+        for name in declared {
+            if all_proxy_names.iter().any(|n| n == name) && !ordered.iter().any(|n| n == name) {
+                ordered.push(name.to_string());
             }
         }
+        for name in all_proxy_names {
+            if !ordered.contains(&name) {
+                ordered.push(name);
+            }
+        }
+        let all_proxy_names = ordered;
         let global_config = raw::RawProxyGroup {
             name: "GLOBAL".to_string(),
             group_type: "select".to_string(),
@@ -2727,10 +2697,7 @@ fn build_proxy_layer(
         ) {
             Ok(group) => {
                 proxies.insert(SmolStr::new_static("GLOBAL"), group);
-                info!(
-                    primary = primary.as_deref().unwrap_or("DIRECT"),
-                    "Auto-created GLOBAL selector with all proxies"
-                );
+                info!("Auto-created GLOBAL selector with all proxies");
             }
             Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
         }
@@ -3254,6 +3221,12 @@ async fn load_rule_providers_async(
     })
     .await
     .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
+}
+
+/// The `sniffer:` block of a raw config (a TUN rebuilt on an API config
+/// change needs it).
+pub fn sniffer_config_from_raw(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::Error> {
+    parse_sniffer_config(raw, raw.strict.unwrap_or(false))
 }
 
 fn parse_sniffer_config(
