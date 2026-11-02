@@ -129,7 +129,10 @@ struct FlowEntry {
     last_activity: Arc<AtomicU>,
 }
 
-#[allow(clippy::too_many_arguments, reason = "the listener's UDP knobs, passed once")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's UDP knobs, passed once"
+)]
 pub(super) async fn run_udp(
     tunnel: Tunnel,
     io: UdpIo,

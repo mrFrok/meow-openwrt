@@ -81,11 +81,11 @@ impl ConnHandle {
 
 const CMD_CHANNEL_CAP: usize = 256;
 const STREAM_READ_CHANNEL_CAP: usize = 16;
-/// Received datagrams buffered per UDP session. The driver hands over a
-/// whole socket batch at once and a full queue drops: at 64 a QUIC download
-/// through the session (~50k packets/s at 600 Mbit/s) lost packets in every
-/// burst. 512 x ~1.4 KB bounds one busy session at ~0.7 MB.
-const UDP_SESSION_QUEUE: usize = 512;
+/// Received datagrams buffered per UDP session; a full queue drops (and
+/// is counted). 512 was tried for the YouTube-over-QUIC stall, which turned
+/// out to be the server's (no reply to UDP/443): back to 64, ~90 KB per
+/// session, for small routers.
+const UDP_SESSION_QUEUE: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Datagrams fed to quiche per socket wakeup before the driver flushes. One
 /// flush then acknowledges the whole batch, where a flush per datagram sent
