@@ -20,14 +20,14 @@
 #            hy2tcp-ul hy2tcp-dl (the same TCP through the hy2 proxy).
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
 #      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines), STACK=system|lwip
-#      HY2OPTS= (extra hy2 proxy keys), SHAPE= (tc tbf args: a slow client), PAR=4
+#      MODE=tun|redir (redir: TCP scenarios via nft REDIRECT), HY2OPTS= (extra hy2 proxy keys), SHAPE= (tc tbf args: a slow client), PAR=4
 # Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit, the core's
 # RssAnon and VmHWM (KB) at the end of the run.
 set -u
 W=/tmp/tunbench; C=mwc; S=mwb
 RATE=${RATE:-1G}; LEN=${LEN:-1200}; SECS=${SECS:-15}
 CORE_CPU=${CORE_CPU:-0,1}; CLI_CPU=${CLI_CPU:-2}; SRV_CPU=${SRV_CPU:-3}
-SRVBIN=${SRVBIN:-/usr/bin/mihomo}; MTU=${MTU:-9000}; EXTRA=${EXTRA:-}; STACK=${STACK:-system}
+SRVBIN=${SRVBIN:-/usr/bin/mihomo}; MTU=${MTU:-9000}; EXTRA=${EXTRA:-}; STACK=${STACK:-system}; MODE=${MODE:-tun}
 
 up() {
 	mkdir -p $W/srv
@@ -64,8 +64,9 @@ core_cfg() { # $1 = rule target
 log-level: warning
 external-controller: 127.0.0.1:19095
 routing-mark: 153
+redir-port: 7899
 tun:
-  enable: true
+  enable: $([ "$MODE" = tun ] && echo true || echo false)
   device: mwtun
   stack: $STACK
   mtu: $MTU
@@ -95,9 +96,18 @@ run1() { # label bin scenario
 	d=$W/core; rm -rf $d; mkdir -p $d; core_cfg $tgt > $d/config.yaml
 	ip netns exec $C taskset -c "$CORE_CPU" "$bin" -d $d -f $d/config.yaml > $d/log 2>&1 &
 	pid=$!; i=0
+	if [ "$MODE" = redir ]; then
+	# MODE=redir: the clashwrt TCP path — nft REDIRECT to redir-port.
+	sleep 2
+	ip -n $C route replace 192.0.2.0/24 via 203.0.113.2 dev mwc0
+	ip netns exec $C nft -f - <<NFT
+table ip mwredir { chain out { type nat hook output priority -100; meta mark 0x99 return; ip daddr 192.0.2.0/24 tcp dport 5201 redirect to :7899; }; }
+NFT
+	else
 	while [ $i -lt 50 ] && ! ip -n $C link show mwtun >/dev/null 2>&1; do sleep 0.2; i=$((i+1)); done
 	ip -n $C link set mwtun up 2>/dev/null
 	ip -n $C route replace 192.0.2.0/24 dev mwtun
+	fi
 	# SHAPE="rate 20mbit": a slow client — the TUN's egress (the client's
 	# ACKs) is throttled, so downloads back up into the core's buffers.
 	[ -n "${SHAPE:-}" ] && ip netns exec $C tc qdisc replace dev mwtun root tbf $SHAPE burst 16k latency 500ms
@@ -111,6 +121,7 @@ run1() { # label bin scenario
 	mem="anonPeak=$(cat $W/anonpeak 2>/dev/null) $(awk '/^(RssAnon|VmHWM):/{printf "%s=%s ", $1, $2}' /proc/$pid/status 2>/dev/null)"
 	kill $smp 2>/dev/null; rm -f $W/anonpeak
 	kill $pid 2>/dev/null; wait $pid 2>/dev/null
+	ip netns exec $C nft delete table ip mwredir 2>/dev/null
 	rcv=$(echo "$out" | grep receiver | grep -v '^\[ *[0-9]' | tail -1)
 	[ -n "$rcv" ] || rcv=$(echo "$out" | grep receiver | tail -1)
 	mbps=$(echo "$rcv" | awk '{for(i=1;i<=NF;i++) if($i ~ /bits\/sec/){v=$(i-1); u=$i; if(u ~ /^G/) v*=1000; if(u ~ /^K/) v/=1000; print v; exit}}')
