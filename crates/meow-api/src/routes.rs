@@ -1548,6 +1548,8 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    // mihomo re-applies `routing-mark` on every config load.
+    meow_common::set_routing_mark(raw.routing_mark);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3806,6 +3808,7 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    meow_common::set_routing_mark(raw_config.routing_mark);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,

@@ -75,12 +75,17 @@ impl TProxyListener {
         name: String,
     ) -> Self {
         // Deprecated `enable_sni` knob: synthesise a minimal sniffer config.
+        // One warning per process: `redir-port` and `tproxy-port` both take
+        // the global `tproxy-sni`, and a reload rebuilds them.
+        static DEPRECATED_SNI: std::sync::Once = std::sync::Once::new();
         let sniffer = if enable_sni {
-            warn!(
-                "`enable_sni` is deprecated; migrate to the top-level `sniffer:` block. \
+            DEPRECATED_SNI.call_once(|| {
+                warn!(
+                    "`enable_sni` is deprecated; migrate to the top-level `sniffer:` block. \
                 Accepting as `sniffer.enable: true, sniff.TLS.ports: [443]` for this release. \
                 Will be removed in a future version."
-            );
+                );
+            });
             let cfg = meow_common::SnifferConfig {
                 enable: true,
                 tls_ports: vec![443],
