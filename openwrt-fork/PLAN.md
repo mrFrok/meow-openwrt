@@ -91,6 +91,10 @@ rustls + quinn: Reality meow — свой TLS 1.3 на RustCrypto (`meow-transpo
 Hysteria2 — из clash-rs `clash-lib/src/proxy/hysteria2/` (quinn 0.11, Brutal, Salamander, port hopping);
 uTLS/ECH на rustls — открытая задача (образец ручного ClientHello — steer `src/proto/tls/reality.c`).
 Старт — после этапа 0.4.
+2026-11-03: готовый путь — clash-rs (Apache-2.0): rustls + `ring`, Reality в форке `Watfaq/rustls`
+(`clash-lib/src/proxy/transport/reality.rs`, `.with_reality`), hy2 на quinn; `mips-unknown-linux-musl` в их CI
+(`-F standard,ring`). Открыто: uTLS-отпечаток/ECH в их форке, размер на MIPS, живость форка rustls.
+Первый шаг — собрать clash-rs под mips BE в SDK. Делать после остальных этапов.
 
 ## Проверка
 - Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге clashwrt (без `cp -rL`, без предупреждений).
