@@ -128,13 +128,14 @@ endef
 
 define Package/meow-tiny/description
 $(call Package/meow/description/Default)
-  Tiny profile for 16 MB flash: Shadowsocks, Trojan, VLESS (Vision,
-  Reality), Hysteria2, mux, DoH/DoT, mixed/tproxy/tun inbounds.
+  Tiny profile for 16 MB flash: Trojan, VLESS (Vision, Reality),
+  Hysteria2, mux, DoH/DoT, mixed/tproxy/tun inbounds. Shadowsocks nodes
+  load as unavailable; use the meow package for them.
 endef
 
 define Package/meow/description
 $(call Package/meow/description/Default)
-  Tiny profile plus AnyTLS, VMess and shadow-tls.
+  Tiny profile plus Shadowsocks, AnyTLS, VMess and shadow-tls.
 endef
 
 define Package/meow-full/description

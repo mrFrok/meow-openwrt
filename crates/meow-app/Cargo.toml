@@ -105,13 +105,13 @@ minimal = ["ss", "trojan", "dns-server", "listener-mixed", "regex-perf"]
 # meow-openwrt router profile (openwrt-fork/PLAN.md stage 2): the protocols
 # routers actually use; target < 6 MB stripped on mipsel.
 tiny = [
-    "ss", "trojan", "vless", "vless-vision", "hysteria2", "mux",
+    "trojan", "vless", "vless-vision", "hysteria2", "mux",
     "dns-server", "dns-encrypted",
     "listener-mixed", "listener-tproxy", "listener-tun", "lwip-libc-malloc",
     "log-max-info",
 ]
 # meow-openwrt mid profile: `tiny` plus the other protocols subscriptions use.
-lightweight = ["tiny", "anytls", "vmess", "shadow-tls"]
+lightweight = ["tiny", "ss", "anytls", "vmess", "shadow-tls"]
 full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",
