@@ -77,6 +77,11 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
   (`meow-app/src/main.rs:512,540`), `current_thread` для 1 ядра.
 
 ## Этап 5 — быстрый путь DIRECT (Go-этап V, не начатый)
+- **Отложен до волонтёров с MT7621 (2026-11-03).** На BPI-R4 DIRECT TCP через redir — ~10 Гбит/с при 42 % ядра
+  (tunbench MODE=redir), выигрыш HFO там мал. Обучение по IP небезопасно при redir-host (общие IP CDN).
+  Безопасный дизайн — решение на один поток (5-tuple), не на IP: (1) TCP при fake-ip — домен известен на SYN,
+  DNAT fake→real для этого потока, дальше ядро + flowtable/HFO; (2) UDP — придержать первые датаграммы (SNI QUIC),
+  при DIRECT занести 5-tuple в nft-набор с timeout и вернуть пакеты в TUN.
 - Модуль `bypass` в ядре: статический анализ правил («IP-определимость»), тесты на таблице AI/RU/CDN-кейсов.
 - Поток вердиктов ядро → обвязка: формат, транспорт (unix-сокет или REST/WS), timeout, ct mark — общедоступный интерфейс.
 - Обвязка (пакет OpenWrt/clashwrt, не ядро): nft-набор `learned` до перехвата, fw4 flowtable, flush + `conntrack -D --mark`
