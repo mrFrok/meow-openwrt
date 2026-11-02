@@ -45,6 +45,9 @@ endif
 MEOW_STD_FEATURES ?= optimize_for_size
 MEOW_OPT_LEVEL ?= z
 MEOW_EXTRA_RUSTFLAGS ?=
+# Fully static binary (musl + libgcc linked in): runs on any OpenWrt release
+# whatever its musl, no libgcc dependency. MIPS is non-PIE (see below).
+MEOW_STATIC ?= 1
 # boring-sys: link libstdc++ statically (BoringSSL needs a few symbols; the
 # shared libstdcpp package would cost ~2 MB of flash).
 MEOW_CPPLIB ?= static=stdc++
@@ -57,6 +60,16 @@ endif
 # MIPS PIC code goes through the GOT for every call: non-PIE is ~14% smaller.
 ifneq ($(filter mips mipsel,$(ARCH)),)
   CARGO_RUSTFLAGS += -Crelocation-model=static
+endif
+# Overrides rust-package.mk's -crt-static (static-pie, or plain static on
+# non-PIE MIPS).
+ifeq ($(MEOW_STATIC),1)
+  CARGO_RUSTFLAGS += -Ctarget-feature=+crt-static
+  # BoringSSL's static libstdc++ calls __sync_synchronize on MIPS (libgcc_s
+  # gave it when dynamic): libgcc again after it.
+  ifneq ($(filter mips mipsel,$(ARCH)),)
+    CARGO_RUSTFLAGS += -Clink-arg=-lgcc
+  endif
 endif
 CARGO_RUSTFLAGS += -Cforce-unwind-tables=no -Lnative=$(TOOLCHAIN_DIR)/lib $(MEOW_EXTRA_RUSTFLAGS)
 ifeq ($(MEOW_BUILD_STD),1)
@@ -147,6 +160,7 @@ define Build/Compile
 		'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
 		'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)' \
 		'set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)' \
+		'set(BUILD_TESTING OFF CACHE BOOL "" FORCE)' \
 		> $(PKG_BUILD_DIR)/openwrt-toolchain.cmake
 	$(call Build/Compile/Cargo,crates/meow-app,--no-default-features --bin meow $(MEOW_CARGO_ARGS))
 endef
