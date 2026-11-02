@@ -932,6 +932,7 @@ impl TunListener {
             self.name.clone(),
             tun_net,
             std::sync::Arc::clone(&udp_flows),
+            self.sniffer.clone(),
         ));
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;

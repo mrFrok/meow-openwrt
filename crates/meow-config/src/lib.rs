@@ -3261,6 +3261,7 @@ fn parse_sniffer_config(
             // Parse per-protocol port lists.
             let mut tls_ports: Vec<u16> = Vec::new();
             let mut http_ports: Vec<u16> = Vec::new();
+            let mut quic_ports: Vec<u16> = Vec::new();
             if let Some(sniff_map) = rs.sniff.as_ref() {
                 for (key, proto) in sniff_map {
                     match key.to_uppercase().as_str() {
@@ -3271,7 +3272,7 @@ fn parse_sniffer_config(
                             http_ports = proto.ports.clone().unwrap_or_default();
                         }
                         "QUIC" => {
-                            warn!("sniffer.sniff.QUIC is not implemented in meow-rs; ignoring");
+                            quic_ports = proto.ports.clone().unwrap_or_default();
                         }
                         // An unrecognized key is a typo'd/dead declaration —
                         // a defect under strict (issue #533 review), unlike
@@ -3287,7 +3288,8 @@ fn parse_sniffer_config(
                         }
                     }
                 }
-                if enable && tls_ports.is_empty() && http_ports.is_empty() {
+                if enable && tls_ports.is_empty() && http_ports.is_empty() && quic_ports.is_empty()
+                {
                     anyhow::bail!(
                         "sniffer.sniff is present and enable: true, but no ports are configured \
                         for any supported protocol (TLS/HTTP)"
@@ -3318,6 +3320,7 @@ fn parse_sniffer_config(
                 override_destination: rs.override_destination.unwrap_or(false),
                 tls_ports,
                 http_ports,
+                quic_ports,
                 skip_domain: rs
                     .skip_domain
                     .iter()
@@ -3345,6 +3348,7 @@ fn parse_sniffer_config(
                 override_destination: false,
                 tls_ports: vec![443],
                 http_ports: Vec::new(),
+                quic_ports: Vec::new(),
                 skip_domain: Vec::new(),
                 force_domain: Vec::new(),
             })
