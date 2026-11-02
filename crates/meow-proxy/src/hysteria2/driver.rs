@@ -81,7 +81,11 @@ impl ConnHandle {
 
 const CMD_CHANNEL_CAP: usize = 256;
 const STREAM_READ_CHANNEL_CAP: usize = 16;
-const UDP_SESSION_QUEUE: usize = 64;
+/// Received datagrams buffered per UDP session. The driver hands over a
+/// whole socket batch at once and a full queue drops: at 64 a QUIC download
+/// through the session (~50k packets/s at 600 Mbit/s) lost packets in every
+/// burst. 512 x ~1.4 KB bounds one busy session at ~0.7 MB.
+const UDP_SESSION_QUEUE: usize = 512;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Datagrams fed to quiche per socket wakeup before the driver flushes. One
 /// flush then acknowledges the whole batch, where a flush per datagram sent
@@ -198,6 +202,8 @@ struct State {
     next_udp_session_id: u32,
     next_packet_id: u16,
     closed: Arc<AtomicBool>,
+    /// Received datagrams dropped on a full session queue.
+    udp_dropped: u64,
 }
 
 struct AuthCtx {
@@ -239,6 +245,7 @@ pub(crate) async fn spawn(
         next_udp_session_id: 0,
         next_packet_id: 0,
         closed: Arc::clone(&closed),
+        udp_dropped: 0,
     };
 
     let (ready_tx, ready_rx) = oneshot::channel::<Result<bool>>();
@@ -633,7 +640,15 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
                     "hysteria2 decoded UDP fragment"
                 );
                 if let Some(tx) = st.udp_sessions.get(&msg.session_id) {
-                    let _ = tx.try_send(msg);
+                    if let Err(TrySendError::Full(_)) = tx.try_send(msg) {
+                        st.udp_dropped += 1;
+                        if st.udp_dropped.is_power_of_two() {
+                            tracing::info!(
+                                dropped = st.udp_dropped,
+                                "hysteria2: UDP session queue full, datagrams dropped"
+                            );
+                        }
+                    }
                 }
             }
             Err(e) => tracing::debug!("dropping malformed hysteria2 UDP datagram: {e}"),
