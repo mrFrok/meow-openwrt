@@ -16,9 +16,11 @@
 #   sh tunbench.sh run <label> <core-bin> [scenario...]
 #   sh tunbench.sh down
 # Scenarios: direct-ul direct-dl hy2-ul hy2-dl (UDP at RATE, default: all),
-#            tcp-ul tcp-dl (DIRECT TCP, unlimited rate, 4 streams).
+#            tcp-ul tcp-dl (DIRECT TCP, unlimited rate, PAR=4 streams),
+#            hy2tcp-ul hy2tcp-dl (the same TCP through the hy2 proxy).
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
 #      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines), STACK=system|lwip
+#      HY2OPTS= (extra hy2 proxy keys), SHAPE= (tc tbf args: a slow client), PAR=4
 # Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit, the core's
 # RssAnon and VmHWM (KB) at the end of the run.
 set -u
@@ -75,7 +77,7 @@ tun:
   gso-max-size: 65536
 $EXTRA
 proxies:
-  - {name: H, type: hysteria2, server: 203.0.113.2, port: 8444, password: bench, sni: bench.test, skip-cert-verify: true, alpn: [h3]}
+  - {name: H, type: hysteria2, server: 203.0.113.2, port: 8444, password: bench, sni: bench.test, skip-cert-verify: true, alpn: [h3]${HY2OPTS:+, $HY2OPTS}}
 rules: ['MATCH,$1']
 EOF
 }
@@ -84,10 +86,10 @@ ticks() { awk '{print $14+$15}' /proc/$1/stat 2>/dev/null; }
 
 run1() { # label bin scenario
 	lab=$1; bin=$2; sc=$3
-	case $sc in hy2-*) tgt=H ;; *) tgt=DIRECT ;; esac
+	case $sc in hy2*) tgt=H ;; *) tgt=DIRECT ;; esac
 	case $sc in *-dl) rev=-R ;; *) rev= ;; esac
 	case $sc in
-	tcp-*) proto="-P 4"; warm="-P 4"; rate=max ;;
+	tcp-*|hy2tcp-*) proto="-P ${PAR:-4}"; warm="-P 4"; rate=max ;;
 	*) proto="-u -b $RATE -l $LEN"; warm="-u -b 10M -l $LEN"; rate=$RATE ;;
 	esac
 	d=$W/core; rm -rf $d; mkdir -p $d; core_cfg $tgt > $d/config.yaml
@@ -96,12 +98,18 @@ run1() { # label bin scenario
 	while [ $i -lt 50 ] && ! ip -n $C link show mwtun >/dev/null 2>&1; do sleep 0.2; i=$((i+1)); done
 	ip -n $C link set mwtun up 2>/dev/null
 	ip -n $C route replace 192.0.2.0/24 dev mwtun
+	# SHAPE="rate 20mbit": a slow client — the TUN's egress (the client's
+	# ACKs) is throttled, so downloads back up into the core's buffers.
+	[ -n "${SHAPE:-}" ] && ip netns exec $C tc qdisc replace dev mwtun root tbf $SHAPE burst 16k latency 500ms
 	# warm-up: hy2 handshake, flow setup
 	ip netns exec $C iperf3 -c 192.0.2.2 $warm -t 2 $rev > /dev/null 2>&1
 	t0=$(ticks $pid); s0=$(date +%s)
+	( m=0; while kill -0 $pid 2>/dev/null; do a=$(awk '/^RssAnon:/{print $2}' /proc/$pid/status 2>/dev/null); [ -n "$a" ] && [ "$a" -gt "$m" ] && { m=$a; echo $m > $W/anonpeak; }; sleep 0.5; done ) &
+	smp=$!
 	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 $proto -t "$SECS" $rev 2>&1)
 	t1=$(ticks $pid); s1=$(date +%s)
-	mem=$(awk '/^(RssAnon|VmHWM):/{printf "%s=%s ", $1, $2}' /proc/$pid/status 2>/dev/null)
+	mem="anonPeak=$(cat $W/anonpeak 2>/dev/null) $(awk '/^(RssAnon|VmHWM):/{printf "%s=%s ", $1, $2}' /proc/$pid/status 2>/dev/null)"
+	kill $smp 2>/dev/null; rm -f $W/anonpeak
 	kill $pid 2>/dev/null; wait $pid 2>/dev/null
 	rcv=$(echo "$out" | grep receiver | grep -v '^\[ *[0-9]' | tail -1)
 	[ -n "$rcv" ] || rcv=$(echo "$out" | grep receiver | tail -1)
