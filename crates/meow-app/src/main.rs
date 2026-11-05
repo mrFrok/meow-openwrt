@@ -129,7 +129,7 @@ enum Command {
     },
     /// Convert a rule-set file, as mihomo's `convert-ruleset`: an upstream
     /// `.mrs` (`domain` or `ipcidr`) to text, one entry per line. OpenWrt
-    /// front ends (clashwrt) read `.mrs` providers through it.
+    /// front ends read `.mrs` providers through it.
     ConvertRuleset {
         /// `domain` or `ipcidr`
         behavior: String,

@@ -9,7 +9,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// Default element timeout: at least a day, like clashwrt's DNS sets, so an
+/// Default element timeout: at least a day, as firewall DNS sets usually use, so an
 /// answer a downstream cache keeps serving stays covered.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(86_400);
 

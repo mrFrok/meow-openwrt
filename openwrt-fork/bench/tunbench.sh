@@ -9,7 +9,7 @@
 #
 # The core runs in mwc with routing-mark 0x99; marked sockets use table 100
 # (192.0.2.0/24 via the veth), everything else to 192.0.2.0/24 goes into the
-# TUN — the clashwrt redirect_tun shape, where the TUN carries LAN UDP.
+# TUN — the redirect+TUN shape, where the TUN carries LAN UDP.
 #
 # Usage (on the router):
 #   sh tunbench.sh up                       # netns, iperf3 server, hy2 server
@@ -110,7 +110,7 @@ run1() { # label bin scenario
 	ip netns exec $C taskset -c "$CORE_CPU" "$bin" -d $d -f $d/config.yaml > $d/log 2>&1 &
 	pid=$!; i=0
 	if [ "$MODE" = redir ]; then
-	# MODE=redir: the clashwrt TCP path — nft REDIRECT to redir-port.
+	# MODE=redir: the redirect TCP path — nft REDIRECT to redir-port.
 	sleep 2
 	ip -n $C route replace 192.0.2.0/24 via 203.0.113.2 dev mwc0
 	ip netns exec $C nft -f - <<NFT

@@ -501,7 +501,7 @@ mod tests {
     }
 
     /// mihomo parity: `RULE-SET` resolves inside `AND`/`OR`/`NOT` groups
-    /// (clashwrt routes UDP with `AND,((NETWORK,udp),(RULE-SET,x)),ProxyUDP`).
+    /// (e.g. UDP routed with `AND,((NETWORK,udp),(RULE-SET,x)),ProxyUDP`).
     #[test]
     fn rule_set_inside_logic_groups() {
         let providers = providers();

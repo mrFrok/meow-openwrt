@@ -5,7 +5,7 @@ Go-форк mihomo-lightweight больше не развиваем (решен�
 стоковый флеш (16 МБ, ~8 свободно) и тяжёл для 64–128 МБ ОЗУ. Базой становится meow-rs (Rust, idle RSS 15.7 МБ на BPI-R4),
 а исходные пункты Go-плана (TODO.md: урезание лишнего, память, CPU, быстрый путь DIRECT, эксперименты) переносим на Rust.
 Форк: `meow-openwrt` (имя предварительное), лицензия **GPLv3**; ядро общедоступное, совместимое с mihomo по конфигу и
-REST API, clashwrt-специфики в ядре нет. Цели: mipsel_24kc, mips_24kc, arm_cortex-a7/a9, aarch64.
+REST API, никакой специфики конкретных обвязок в ядре нет: ядро работает у всех. Цели: mipsel_24kc, mips_24kc, arm_cortex-a7/a9, aarch64.
 Источники: `~/Projects/meow-rs` (xerj `mlw-meow`), `~/Projects/clash-rs` (`mlw-clashrs`), `~/Projects/steer` (`mlw-steer`),
 deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения (`mlw-fork`). Заметки: `research/meow-rs.md`.
 
@@ -82,7 +82,12 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 
 ## Этап 5 — быстрый путь DIRECT (Go-этап V, не начатый)
 - **Сделано (2026-11-03): `dns.nftset`** (docs/nftset.md) — ядро кладёт IP ответов «не-DIRECT» доменов в nft-набор;
-  обвязка перехватывает только его (схема clashwrt без 28 МБ списков в dnsmasq). Осталось: перевод clashwrt на него.
+  файрвол перехватывает только его (без списков доменов в dnsmasq: 80k доменов там ~28 МБ, в ядре ~1.2 МБ).
+- **`dns.nftset.create`** (opt-in): ядро само создаёт сеты в указанной таблице (`flags timeout`) и пересоздаёт их,
+  если таблицу перезагрузили (ENOENT при добавлении). ~1 день.
+- **Перехват без обвязки** (opt-in, Linux): своя таблица `inet meow` — prerouting LAN (фильтр по сету, redirect TCP,
+  TPROXY UDP + policy routing), перехват DNS, сосуществование с fw4 и flowtable/offload, уборка при выходе/падении,
+  повторное применение на reload. Сначала IPv4 TCP+UDP, затем IPv6 и блок DoH/DoT. ~3–5 дней.
 - Разгрузка по потокам ниже **отложена до волонтёров с MT7621 (2026-11-03).** На BPI-R4 DIRECT TCP через redir — ~10 Гбит/с при 42 % ядра
   (tunbench MODE=redir), выигрыш HFO там мал. Обучение по IP небезопасно при redir-host (общие IP CDN).
   Безопасный дизайн — решение на один поток (5-tuple), не на IP: (1) TCP при fake-ip — домен известен на SYN,
@@ -90,7 +95,7 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
   при DIRECT занести 5-tuple в nft-набор с timeout и вернуть пакеты в TUN.
 - Модуль `bypass` в ядре: статический анализ правил («IP-определимость»), тесты на таблице AI/RU/CDN-кейсов.
 - Поток вердиктов ядро → обвязка: формат, транспорт (unix-сокет или REST/WS), timeout, ct mark — общедоступный интерфейс.
-- Обвязка (пакет OpenWrt/clashwrt, не ядро): nft-набор `learned` до перехвата, fw4 flowtable, flush + `conntrack -D --mark`
+- Обвязка (не ядро): nft-набор `learned` до перехвата, fw4 flowtable, flush + `conntrack -D --mark`
   при reload/start/stop. Тесты безопасности (BENCHMARKS «Безопасность») до замеров скорости.
 
 ## Этап 6 — эксперименты (Go-этап VI)
@@ -127,7 +132,7 @@ uTLS/ECH на rustls — открытая задача (образец ручн�
 Первый шаг — собрать clash-rs под mips BE в SDK. Делать после остальных этапов.
 
 ## Проверка
-- Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге clashwrt (без `cp -rL`, без предупреждений).
+- Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге роутера (без `cp -rL`, без предупреждений).
 - Сборки: SDK-пакеты 4 архитектур, `qemu-mipsel`, BPI-R4 (SSH), волонтёры — self-run скрипт (без SSH).
 - Замеры ≥3 прогона, таблицы в BENCHMARKS форка; после правок — `xerj autoindex <форк> --prefix mlw-meow --fresh`.
 

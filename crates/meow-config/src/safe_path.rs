@@ -8,7 +8,7 @@
 //! meow-openwrt: the check is lexical only, exactly like mihomo's. Symlinks
 //! already present under the provider directory are followed: only the
 //! administrator can create them (a config cannot), and OpenWrt front-ends
-//! (clashwrt) point provider dirs at tmpfs through such links.
+//! point provider dirs at tmpfs through such links.
 
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
