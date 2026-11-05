@@ -8,8 +8,41 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-05
+
 ### Added
 
+- **Inbound zombie-connection reaping** (`tcp-keepalive*` +
+  `tcp-idle-timeout`): every accepted TCP socket on the
+  mixed/http/socks5/tproxy/shadowsocks inbounds now gets `SO_KEEPALIVE`
+  plus configurable `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`
+  (`tcp-keepalive`, `tcp-keepalive-idle: 300`, `tcp-keepalive-interval: 30`,
+  `tcp-keepalive-probes: 5` — ~450 s to detect a peer that leaves Wi-Fi
+  without FIN/RST), and an opt-in `tcp-idle-timeout` (off by default —
+  no behaviour change without the key) tears down established relays
+  silent in **both** directions for that many seconds instead of letting
+  them pin a `max-connections` permit forever — covering what keepalive
+  cannot see (TUN netstack flows, dead-but-still-ACKing upstreams).
+  `tcp-keepalive: false` performs no setsockopt; `tcp-idle-timeout: 0`
+  (or absent) leaves the bound off. `PUT /configs` validates all five
+  keys and applies the idle bound to relays started after the commit;
+  the keepalive posture is a listener-startup snapshot.
+- **Traffic ledger** ([ADR-0015](docs/adr/0015-traffic-ledger.md)): meow
+  now keeps, for every local day, the bytes and connections per host
+  (registrable domain), app, leaf policy and interface label, for 62 days
+  in `<home>/traffic/traffic.db`, so a client can show today, this month
+  and last month grouped any of the four ways. A node that carries
+  another outbound's `dialer-proxy` hop counts that traffic in its policy
+  row too, apart in `via_upload` / `via_download` / `via_requests`; the
+  other views and the totals count each flow once. The app is the package
+  name on Android and, on Linux, macOS and Windows, the owner of a flow
+  from this host (a loopback client, or the host's own traffic through
+  TUN or a transparent listener), looked up off the connection's path.
+  `GET /traffic/ledger` serves it (`from`, `to`, `by`, and `host` /
+  `app` / `policy` / `interface` to drill down); `DELETE /traffic/ledger`
+  empties it. On by default: `traffic-ledger: {enable: false}` turns it
+  off, and `hosts: false` / `apps: false` keep no hosts / apps (no
+  lookups). In `full` builds, not `minimal`.
 - **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
   destination through `direct-nameserver` when it is set, as mihomo does,
   instead of always using the main `nameserver` list. With
@@ -27,9 +60,55 @@ the canonical, in-repo source a release is cut from.
   `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
   direct and relay connections. Explicit verification remains mandatory
   with `skip-cert-verify`; malformed pins fail configuration validation.
+- **Static 32-bit ARM musl release target** — releases and alpha
+  prereleases now ship `meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz`,
+  a statically linked musl binary for 32-bit ARM routers. The existing
+  `armv7-unknown-linux-gnueabihf` build is dynamically linked and needs
+  `GLIBC_2.28`, which Alpine's armhf `gcompat` does not provide, so
+  `execve` fails with `ENOENT` on a file that exists. The target builds in a
+  musl cross toolchain container (`scripts/build-armv7-musl.sh`) instead of
+  via `cargo zigbuild`: musl 1.2.x headers declare `time_t` as 64-bit on
+  32-bit targets (time64/Y2038 hardening) while Rust's `libc` crate types it
+  as `i32`, so bindgen emits a 64-bit `X509_VERIFY_PARAM_set_time` and
+  `boring` fails to compile; a real cross toolchain plus a one-line cast in
+  `boring` gets past both.
+
+### Changed
+
+- **The routing log names the node a group dials through.** The
+  per-connection `match` line used to name only the rule's adapter, so a
+  flow through a group read `using my-ss`. It now adds the member in
+  brackets, as mihomo prints its chain: `using my-ss[HK-01]`. Nested
+  groups print the outer group and the final member (`Proxy[HK-01]`). A
+  plain proxy, DIRECT and REJECT print as before. The member is the one
+  the dial will take, the same one `/connections` lists in `chains`; a
+  relay group prints as itself (#895).
+- **Memory reporting on Linux reads `/proc/self/status`**: `meow-api`
+  takes `VmRSS` from procfs on Linux and no longer links `sysinfo` there;
+  other platforms keep `sysinfo` with its default features off, which
+  drops rayon too. The reported number is the same kernel counter. Default
+  musl binaries shrink by about 73 KB on x86_64 and 60 KB on aarch64
+  (#835).
 
 ### Fixed
 
+- SOCKS5 UDP sessions now stop on outbound flush or reply-reader failure even
+  while a packet write is pending. A short write retires the session without
+  retrying any part of the datagram.
+
+- **PROCESS-NAME, PROCESS-PATH and UID rules match every IPv4 client of
+  a dual-stack listener** (`bind-address: "::"`). The process lookup ran
+  on the client's IPv4-mapped address, so it missed clients with an
+  AF_INET socket, the usual kind (curl, browsers). It now looks the IPv4
+  address up, in the IPv4 socket table and then (Linux, Windows) the IPv6
+  one, so it finds AF_INET clients and AF_INET6 ones on an IPv4 address
+  (Java's default) alike.
+- **`anytls` no longer silently ignores `ech-opts`** (#870): an enabled
+  `ech-opts` or a `certificate`/`private-key` client certificate is now a
+  config-load error, as for hysteria2, instead of connecting with the SNI in
+  the clear. The other ignored mihomo fields (`shadow-tls-opts`,
+  `restls-opts`, `jls-opts`, `client-metadata`, `idle-session-*`,
+  `min-idle-session`, `disable-reuse`) now log one load-time warning.
 - **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
   header — the request shape every browser sends a plain-HTTP proxy —
   was refused with 400 by the #734 hostname gate, which only looked at

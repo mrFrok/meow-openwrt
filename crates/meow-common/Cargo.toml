@@ -32,11 +32,18 @@ rusqlite = { version = "0.40", default-features = false, features = [
 # The logbook's u64 entry-id watermark: native AtomicU64 on 64-bit targets,
 # a lock-based fallback on mips32 (no 64-bit atomics).
 portable-atomic = { version = "1", features = ["fallback"], optional = true }
+# Pinned exactly, as in meow-proxy: one embedded public-suffix list.
+psl = { version = "=2.1.232", optional = true }
 
 [features]
 # Persistent logbook (`meow_common::logbook`, ADR-0014). Off, the logbook
 # API stays and records nothing.
 logbook = ["dep:rusqlite", "dep:portable-atomic"]
+# Persistent per-day traffic by host, policy and interface
+# (`meow_common::traffic_ledger`). Shares the logbook's SQLite; `psl`
+# reduces hosts to registrable domains. Off, the API stays and records
+# nothing.
+traffic-ledger = ["dep:rusqlite", "dep:psl"]
 
 [target.'cfg(not(any(target_os = "ios", target_os = "tvos")))'.dependencies]
 rusqlite = { version = "0.40", default-features = false, features = [

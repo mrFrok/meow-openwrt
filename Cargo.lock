@@ -147,10 +147,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-query"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "anstyle-wincon"
+version = "3.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+dependencies = [
+ "anstyle",
+ "once_cell_polyfill",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "anyhow"
@@ -722,8 +766,10 @@ version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
 dependencies = [
+ "anstream",
  "anstyle",
  "clap_lex",
+ "strsim",
 ]
 
 [[package]]
@@ -758,6 +804,12 @@ name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
+name = "colorchoice"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "combine"
@@ -2001,6 +2053,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "is_terminal_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
 name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2164,15 +2222,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "libproc"
 version = "0.14.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2331,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "meow-anytls"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2360,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "meow-api"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2401,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "meow-app"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2421,9 +2470,7 @@ dependencies = [
  "meow-rules",
  "meow-trie",
  "meow-tunnel",
- "mimalloc",
  "parking_lot",
- "regex",
  "serde-saphyr",
  "serde_json",
  "smol_str",
@@ -2438,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "meow-bench"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2452,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "meow-cli"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2479,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "meow-common"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2488,7 +2535,7 @@ dependencies = [
  "libc",
  "libproc",
  "parking_lot",
- "portable-atomic",
+ "psl",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2505,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "meow-config"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2539,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "meow-dns"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "boring",
@@ -2568,11 +2615,10 @@ dependencies = [
 
 [[package]]
 name = "meow-listener"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "boring",
  "futures",
  "ipnet",
  "libc",
@@ -2592,6 +2638,7 @@ dependencies = [
  "shadowsocks",
  "smallvec",
  "smol_str",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2601,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "meow-lwip"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bindgen",
  "bytes",
@@ -2615,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "meow-proxy"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -2669,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "meow-rules"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "criterion",
  "ipnet",
@@ -2686,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "meow-transport"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -2737,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "meow-trie"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2745,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "meow-tunnel"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -2770,15 +2817,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
 ]
 
 [[package]]
@@ -3088,6 +3126,12 @@ dependencies = [
  "critical-section",
  "portable-atomic",
 ]
+
+[[package]]
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oorandom"
@@ -4242,6 +4286,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4934,6 +4984,12 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "utf8parse"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
