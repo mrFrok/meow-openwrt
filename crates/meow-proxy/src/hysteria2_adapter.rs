@@ -263,17 +263,18 @@ pub struct Hy2PacketConn {
     /// A chained `UdpTarget::Name` binds the session to the domain: every
     /// datagram's address field carries `host:port` verbatim and the
     /// server resolves it (issue #657). `None` keeps per-packet stamping.
-    write_target: Option<String>,
+    write_target: Option<smol_str::SmolStr>,
 }
 
 struct UdpRx {
     session: crate::hysteria2::UdpSession,
     /// The last source parsed: replies nearly always come from one peer.
-    last_src: Option<(String, SocketAddr)>,
+    last_src: Option<(smol_str::SmolStr, SocketAddr)>,
 }
 
 impl Hy2PacketConn {
     fn new(session: crate::hysteria2::UdpSession, write_target: Option<String>) -> Self {
+        let write_target = write_target.map(smol_str::SmolStr::from);
         Self {
             sender: session.sender(),
             rx: Mutex::new(UdpRx {
@@ -339,7 +340,8 @@ impl ProxyPacketConn for Hy2PacketConn {
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
         let addr = match &self.write_target {
             Some(t) => t.clone(),
-            None => addr.to_string(),
+            // `ip:port` fits SmolStr's inline buffer: no heap per datagram.
+            None => smol_str::format_smolstr!("{addr}"),
         };
         self.sender
             .send(buf, addr)

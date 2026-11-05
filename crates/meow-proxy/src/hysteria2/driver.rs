@@ -44,7 +44,7 @@ pub(crate) enum Cmd {
     },
     SendUdp {
         session_id: u32,
-        addr: String,
+        addr: smol_str::SmolStr,
         data: Vec<u8>,
     },
 }
@@ -201,6 +201,8 @@ struct State {
     udp_sessions: HashMap<u32, mpsc::Sender<UdpMessage>>,
     next_udp_session_id: u32,
     next_packet_id: u16,
+    /// Reused encode buffer for outgoing UDP messages.
+    udp_out: Vec<u8>,
     closed: Arc<AtomicBool>,
     /// Received datagrams dropped on a full session queue.
     udp_dropped: u64,
@@ -244,6 +246,7 @@ pub(crate) async fn spawn(
         udp_sessions: HashMap::new(),
         next_udp_session_id: 0,
         next_packet_id: 0,
+        udp_out: Vec::new(),
         closed: Arc::clone(&closed),
         udp_dropped: 0,
     };
@@ -681,17 +684,13 @@ fn send_udp(
     st.next_packet_id = st.next_packet_id.wrapping_add(1);
 
     if data.len() <= payload_limit {
-        send_one_udp(
-            conn,
-            &UdpMessage {
-                session_id,
-                packet_id,
-                frag_id: 0,
-                frag_count: 1,
-                addr: addr.to_string(),
-                data: data.to_vec(),
-            },
-        );
+        let h = proto::UdpHeader {
+            session_id,
+            packet_id,
+            frag_id: 0,
+            frag_count: 1,
+        };
+        send_one_udp(conn, &mut st.udp_out, h, addr, data);
         return;
     }
     let frag_count = data.len().div_ceil(payload_limit);
@@ -699,23 +698,25 @@ fn send_udp(
         return;
     }
     for (i, chunk) in data.chunks(payload_limit).enumerate() {
-        send_one_udp(
-            conn,
-            &UdpMessage {
-                session_id,
-                packet_id,
-                frag_id: i as u8,
-                frag_count: frag_count as u8,
-                addr: addr.to_string(),
-                data: chunk.to_vec(),
-            },
-        );
+        let h = proto::UdpHeader {
+            session_id,
+            packet_id,
+            frag_id: i as u8,
+            frag_count: frag_count as u8,
+        };
+        send_one_udp(conn, &mut st.udp_out, h, addr, chunk);
     }
 }
 
-fn send_one_udp(conn: &mut quiche::Connection, msg: &UdpMessage) {
-    if let Ok(encoded) = proto::encode_udp_message(msg) {
-        if let Err(e) = conn.dgram_send(&encoded) {
+fn send_one_udp(
+    conn: &mut quiche::Connection,
+    out: &mut Vec<u8>,
+    h: proto::UdpHeader,
+    addr: &str,
+    data: &[u8],
+) {
+    if proto::encode_udp_into(out, h, addr, data).is_ok() {
+        if let Err(e) = conn.dgram_send(out) {
             tracing::debug!("hysteria2 could not queue UDP datagram: {e}");
         }
     }

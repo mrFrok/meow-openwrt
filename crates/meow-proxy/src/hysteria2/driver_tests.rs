@@ -14,7 +14,7 @@ async fn raw_udp_round_trip_without_http3_datagrams() {
     let mut udp = timeout(TEST_TIMEOUT, client.udp()).await.unwrap().unwrap();
     for size in [1, 64, 4096] {
         let payload = vec![42; size];
-        udp.sender().send(&payload, TARGET.to_string()).unwrap();
+        udp.sender().send(&payload, TARGET.into()).unwrap();
         let (received, addr) = timeout(TEST_TIMEOUT, udp.recv()).await.unwrap().unwrap();
         assert_eq!(received, payload);
         assert_eq!(addr, TARGET);

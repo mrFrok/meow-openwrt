@@ -41,7 +41,7 @@ impl UdpSession {
         }
     }
 
-    pub async fn recv(&mut self) -> Result<(Vec<u8>, String)> {
+    pub async fn recv(&mut self) -> Result<(Vec<u8>, smol_str::SmolStr)> {
         loop {
             let message = self.packets.recv().await.ok_or(Error::Closed)?;
             if let Some(message) = self.defragger.feed(message)? {
@@ -60,7 +60,7 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn send(&self, data: &[u8], addr: String) -> Result<()> {
+    pub fn send(&self, data: &[u8], addr: smol_str::SmolStr) -> Result<()> {
         send_udp(&self.cmd_tx, self.session_id, data, addr)
     }
 
@@ -72,7 +72,12 @@ impl UdpSender {
     }
 }
 
-fn send_udp(cmd_tx: &mpsc::Sender<Cmd>, session_id: u32, data: &[u8], addr: String) -> Result<()> {
+fn send_udp(
+    cmd_tx: &mpsc::Sender<Cmd>,
+    session_id: u32,
+    data: &[u8],
+    addr: smol_str::SmolStr,
+) -> Result<()> {
     if data.len() > MAX_UDP_SIZE {
         return Err(Error::protocol("UDP payload is too large"));
     }
@@ -210,7 +215,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let (_ptx, prx) = mpsc::channel(1);
         let session = super::UdpSession::new(7, tx, prx).sender();
-        let to = || "1.2.3.4:5".to_string();
+        let to = || smol_str::SmolStr::new("1.2.3.4:5");
         session.send(b"a", to()).expect("queued");
         session
             .send(b"b", to())

@@ -25,7 +25,8 @@ pub struct UdpMessage {
     pub packet_id: u16,
     pub frag_id: u8,
     pub frag_count: u8,
-    pub addr: String,
+    /// `host:port`; inline (no heap) up to 23 bytes, every IPv4 literal.
+    pub addr: smol_str::SmolStr,
     pub data: Vec<u8>,
 }
 
@@ -125,24 +126,53 @@ pub fn udp_header_len(addr: &str) -> Result<usize> {
     Ok(8 + varint_len(addr.len() as u64) + addr.len())
 }
 
+#[cfg(test)]
 pub fn encode_udp_message(message: &UdpMessage) -> Result<Vec<u8>> {
-    let header_len = udp_header_len(&message.addr)?;
+    let mut out = Vec::new();
+    encode_udp_into(
+        &mut out,
+        UdpHeader {
+            session_id: message.session_id,
+            packet_id: message.packet_id,
+            frag_id: message.frag_id,
+            frag_count: message.frag_count,
+        },
+        &message.addr,
+        &message.data,
+    )?;
+    Ok(out)
+}
+
+/// The fixed fields of a UDP message header.
+#[derive(Clone, Copy)]
+pub struct UdpHeader {
+    pub session_id: u32,
+    pub packet_id: u16,
+    pub frag_id: u8,
+    pub frag_count: u8,
+}
+
+/// Encode one UDP message into `out` (cleared first): the driver reuses one
+/// buffer, so a send costs no allocation and one copy of `data`.
+pub fn encode_udp_into(out: &mut Vec<u8>, h: UdpHeader, addr: &str, data: &[u8]) -> Result<()> {
+    let header_len = udp_header_len(addr)?;
     let size = header_len
-        .checked_add(message.data.len())
+        .checked_add(data.len())
         .ok_or_else(|| Error::protocol("UDP message size overflow"))?;
     if size > MAX_UDP_SIZE + header_len {
         return Err(Error::protocol("UDP payload is too large"));
     }
 
-    let mut out = Vec::with_capacity(size);
-    out.extend_from_slice(&message.session_id.to_be_bytes());
-    out.extend_from_slice(&message.packet_id.to_be_bytes());
-    out.push(message.frag_id);
-    out.push(message.frag_count);
-    put_varint(message.addr.len() as u64, &mut out)?;
-    out.extend_from_slice(message.addr.as_bytes());
-    out.extend_from_slice(&message.data);
-    Ok(out)
+    out.clear();
+    out.reserve(size);
+    out.extend_from_slice(&h.session_id.to_be_bytes());
+    out.extend_from_slice(&h.packet_id.to_be_bytes());
+    out.push(h.frag_id);
+    out.push(h.frag_count);
+    put_varint(addr.len() as u64, out)?;
+    out.extend_from_slice(addr.as_bytes());
+    out.extend_from_slice(data);
+    Ok(())
 }
 
 pub fn decode_udp_message(input: &[u8]) -> Result<UdpMessage> {
@@ -167,7 +197,7 @@ pub fn decode_udp_message(input: &[u8]) -> Result<UdpMessage> {
     }
     let addr = std::str::from_utf8(&input[pos..addr_end])
         .map_err(|_| Error::protocol("UDP address is not UTF-8"))?
-        .to_string();
+        .into();
     Ok(UdpMessage {
         session_id,
         packet_id,
