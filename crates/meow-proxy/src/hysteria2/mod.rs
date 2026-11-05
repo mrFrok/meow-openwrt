@@ -16,4 +16,4 @@ pub(crate) use obfs::gecko_packet_sizes;
 /// Adapter-side bound for `host:port` datagram addresses (issue #657).
 pub use proto::MAX_ADDRESS_LENGTH;
 pub use tcp::DuplexStream;
-pub use udp::UdpSession;
+pub use udp::{UdpSender, UdpSession};

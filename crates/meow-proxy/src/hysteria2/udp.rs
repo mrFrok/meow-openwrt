@@ -33,22 +33,11 @@ impl UdpSession {
         }
     }
 
-    pub fn send(&self, data: &[u8], addr: &str) -> Result<()> {
-        if data.len() > MAX_UDP_SIZE {
-            return Err(Error::protocol("UDP payload is too large"));
-        }
-        match self.cmd_tx.try_send(Cmd::SendUdp {
+    /// The send half, usable while a reader awaits [`Self::recv`].
+    pub fn sender(&self) -> UdpSender {
+        UdpSender {
             session_id: self.session_id,
-            addr: addr.to_string(),
-            data: data.to_vec(),
-        }) {
-            // A full driver queue is congestion, not a dead session: drop
-            // the datagram as UDP would (meow-openwrt). Reporting `Closed`
-            // made the caller tear the association down and open a new one
-            // — a new server-side socket and source port mid-flow, which
-            // connected UDP peers (iperf3, QUIC, games) then ignore.
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+            cmd_tx: self.cmd_tx.clone(),
         }
     }
 
@@ -59,6 +48,46 @@ impl UdpSession {
                 return Ok((message.data, message.addr));
             }
         }
+    }
+}
+
+/// The send half of a [`UdpSession`] (meow-openwrt): sending is a
+/// non-blocking hand-off to the driver, so it needs no task of its own.
+#[derive(Clone)]
+pub struct UdpSender {
+    session_id: u32,
+    cmd_tx: mpsc::Sender<Cmd>,
+}
+
+impl UdpSender {
+    pub fn send(&self, data: &[u8], addr: String) -> Result<()> {
+        send_udp(&self.cmd_tx, self.session_id, data, addr)
+    }
+
+    /// Unregister the session now: a pending `recv` then ends `Closed`.
+    pub fn close(&self) {
+        let _ = self.cmd_tx.try_send(Cmd::UnregisterUdp {
+            session_id: self.session_id,
+        });
+    }
+}
+
+fn send_udp(cmd_tx: &mpsc::Sender<Cmd>, session_id: u32, data: &[u8], addr: String) -> Result<()> {
+    if data.len() > MAX_UDP_SIZE {
+        return Err(Error::protocol("UDP payload is too large"));
+    }
+    match cmd_tx.try_send(Cmd::SendUdp {
+        session_id,
+        addr,
+        data: data.to_vec(),
+    }) {
+        // A full driver queue is congestion, not a dead session: drop
+        // the datagram as UDP would (meow-openwrt). Reporting `Closed`
+        // made the caller tear the association down and open a new one
+        // — a new server-side socket and source port mid-flow, which
+        // connected UDP peers (iperf3, QUIC, games) then ignore.
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
     }
 }
 
@@ -82,10 +111,12 @@ impl UdpDefragger {
     }
 
     fn feed(&mut self, message: UdpMessage) -> Result<Option<UdpMessage>> {
-        self.evict_stale();
         if message.frag_count <= 1 {
             return Ok(Some(message));
         }
+        // Only fragmented messages touch the map; whole ones (nearly all)
+        // skip the clock read and the scan.
+        self.evict_stale();
         if message.frag_id >= message.frag_count {
             return Ok(None);
         }
@@ -178,13 +209,14 @@ mod tests {
     fn send_drops_on_full_queue_and_fails_only_when_closed() {
         let (tx, rx) = mpsc::channel(1);
         let (_ptx, prx) = mpsc::channel(1);
-        let session = super::UdpSession::new(7, tx, prx);
-        session.send(b"a", "1.2.3.4:5").expect("queued");
+        let session = super::UdpSession::new(7, tx, prx).sender();
+        let to = || "1.2.3.4:5".to_string();
+        session.send(b"a", to()).expect("queued");
         session
-            .send(b"b", "1.2.3.4:5")
+            .send(b"b", to())
             .expect("full queue drops, session stays up");
         drop(rx);
-        assert!(session.send(b"c", "1.2.3.4:5").is_err(), "driver gone");
+        assert!(session.send(b"c", to()).is_err(), "driver gone");
     }
 
     use super::*;

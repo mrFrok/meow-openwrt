@@ -6,7 +6,6 @@
 
 use crate::hysteria2::{gecko_packet_sizes, ObfsConfig};
 use async_trait::async_trait;
-use bytes::Bytes;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
@@ -16,11 +15,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::Mutex;
 use tracing::debug;
-
-const UDP_COMMAND_QUEUE: usize = 128;
-const UDP_PACKET_QUEUE: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hy2Obfs {
@@ -258,81 +254,33 @@ impl ProxyConn for Hy2Conn {
     }
 }
 
-enum UdpCommand {
-    Send {
-        data: Bytes,
-        addr: String,
-        done: oneshot::Sender<Result<usize>>,
-    },
-    Close,
-}
-
+/// A hysteria2 UDP association. Reads pull from the session and sends hand
+/// off to the driver inline (meow-openwrt): no relay task, channel or
+/// oneshot per datagram in between.
 pub struct Hy2PacketConn {
-    commands: mpsc::Sender<UdpCommand>,
-    packets: Mutex<mpsc::Receiver<Result<(Bytes, SocketAddr)>>>,
+    sender: crate::hysteria2::UdpSender,
+    rx: Mutex<UdpRx>,
     /// A chained `UdpTarget::Name` binds the session to the domain: every
     /// datagram's address field carries `host:port` verbatim and the
     /// server resolves it (issue #657). `None` keeps per-packet stamping.
     write_target: Option<String>,
 }
 
-impl Hy2PacketConn {
-    fn new(session: crate::hysteria2::UdpSession, write_target: Option<String>) -> Self {
-        let (command_tx, command_rx) = mpsc::channel(UDP_COMMAND_QUEUE);
-        let (packet_tx, packet_rx) = mpsc::channel(UDP_PACKET_QUEUE);
-        tokio::spawn(run_udp_session(session, command_rx, packet_tx));
-        Self {
-            commands: command_tx,
-            packets: Mutex::new(packet_rx),
-            write_target,
-        }
-    }
+struct UdpRx {
+    session: crate::hysteria2::UdpSession,
+    /// The last source parsed: replies nearly always come from one peer.
+    last_src: Option<(String, SocketAddr)>,
 }
 
-async fn run_udp_session(
-    mut session: crate::hysteria2::UdpSession,
-    mut commands: mpsc::Receiver<UdpCommand>,
-    packets: mpsc::Sender<Result<(Bytes, SocketAddr)>>,
-) {
-    loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(UdpCommand::Send { data, addr, done }) => {
-                        let len = data.len();
-                        let result = session
-                            .send(&data, &addr)
-                            .map(|()| len)
-                            .map_err(|e| hy2_error("udp send", e));
-                        let _ = done.send(result);
-                    }
-                    Some(UdpCommand::Close) | None => return,
-                }
-            }
-            received = session.recv() => {
-                match received {
-                    Ok((data, addr)) => {
-                        // A bad source address is per-datagram junk: the
-                        // datagram is already consumed from the session,
-                        // so drop it rather than poison the association
-                        // with a fatal read error.
-                        match addr.parse::<SocketAddr>() {
-                            Ok(src) => {
-                                if packets.send(Ok((Bytes::from(data), src))).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => debug!(
-                                "hysteria2 udp: dropping datagram with invalid source '{addr}': {e}"
-                            ),
-                        }
-                    }
-                    Err(e) => {
-                        let _ = packets.send(Err(hy2_error("udp recv", e))).await;
-                        return;
-                    }
-                }
-            }
+impl Hy2PacketConn {
+    fn new(session: crate::hysteria2::UdpSession, write_target: Option<String>) -> Self {
+        Self {
+            sender: session.sender(),
+            rx: Mutex::new(UdpRx {
+                session,
+                last_src: None,
+            }),
+            write_target,
         }
     }
 }
@@ -340,35 +288,47 @@ async fn run_udp_session(
 #[async_trait]
 impl ProxyPacketConn for Hy2PacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let mut packets = self.packets.lock().await;
-        match packets.recv().await {
-            Some(Ok((data, addr))) => {
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                Ok((n, addr))
-            }
-            Some(Err(e)) => Err(e),
-            None => Err(MeowError::Proxy("hysteria2 udp: session closed".into())),
+        let mut rx = self.rx.lock().await;
+        loop {
+            let (data, addr) = match rx.session.recv().await {
+                Ok(m) => m,
+                Err(crate::hysteria2::Error::Closed) => {
+                    return Err(MeowError::Proxy("hysteria2 udp: session closed".into()))
+                }
+                Err(e) => return Err(hy2_error("udp recv", e)),
+            };
+            let src = match &rx.last_src {
+                Some((s, a)) if *s == addr => *a,
+                _ => {
+                    match addr.parse::<SocketAddr>() {
+                        Ok(a) => {
+                            rx.last_src = Some((addr, a));
+                            a
+                        }
+                        // A bad source address is per-datagram junk: drop it
+                        // rather than poison the association.
+                        Err(e) => {
+                            debug!("hysteria2 udp: dropping datagram with invalid source '{addr}': {e}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            return Ok((n, src));
         }
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        let (done_tx, done_rx) = oneshot::channel();
         let addr = match &self.write_target {
             Some(t) => t.clone(),
             None => addr.to_string(),
         };
-        self.commands
-            .send(UdpCommand::Send {
-                data: Bytes::copy_from_slice(buf),
-                addr,
-                done: done_tx,
-            })
-            .await
-            .map_err(|_| MeowError::Proxy("hysteria2 udp: session closed".into()))?;
-        done_rx
-            .await
-            .map_err(|_| MeowError::Proxy("hysteria2 udp: send task stopped".into()))?
+        self.sender
+            .send(buf, addr)
+            .map(|()| buf.len())
+            .map_err(|e| hy2_error("udp send", e))
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
@@ -376,7 +336,7 @@ impl ProxyPacketConn for Hy2PacketConn {
     }
 
     fn close(&self) -> Result<()> {
-        let _ = self.commands.try_send(UdpCommand::Close);
+        self.sender.close();
         Ok(())
     }
 }
