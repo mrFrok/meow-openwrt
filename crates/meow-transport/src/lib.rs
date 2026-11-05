@@ -207,13 +207,23 @@ pub trait Transport: Send + Sync {
     /// Wrap `inner` with this transport layer and return the upgraded stream.
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>>;
 
-    /// A multiplexing layer (gRPC over HTTP/2) can open a new logical
-    /// stream on a connection an earlier [`Self::connect`] established,
-    /// skipping the dial and every layer beneath it (TCP, TLS/REALITY).
-    /// `None`: nothing reusable — dial and `connect` as usual.
+    /// A multiplexing layer (gRPC, xhttp over HTTP/2) can open a new
+    /// logical stream on a connection an earlier [`Self::connect_shared`]
+    /// established, skipping the dial and every layer beneath it (TCP,
+    /// TLS/REALITY). `None`: nothing reusable — dial and connect as usual.
     async fn reuse(&self) -> Option<Box<dyn Stream>> {
         None
     }
+
+    /// [`Self::connect`], and keep the connection it opens for
+    /// [`Self::reuse`]. Plain `connect` never shares: a caller whose stream
+    /// runs over a relay chain or another proxy, or a probe, uses that.
+    async fn connect_shared(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.connect(inner).await
+    }
+
+    /// Forget the connection kept for [`Self::reuse`].
+    fn reset(&self) {}
 }
 
 /// Crate-level `Result` alias.  Errors are always [`TransportError`].

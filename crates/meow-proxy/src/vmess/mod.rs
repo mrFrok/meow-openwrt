@@ -155,14 +155,19 @@ async fn dial_vmess(
     security: Security,
     internal: bool,
 ) -> Result<Box<dyn ProxyConn>> {
-    if let Some(stream) = transport.reuse().await {
-        return vmess_exchange(stream, sealed, security).await;
+    // A user dial straight to the server shares a multiplexed (gRPC/xhttp)
+    // connection; probes and `dialer-proxy` chains keep their own.
+    let shared = !internal && !dialer.is_proxy();
+    if shared {
+        if let Some(stream) = transport.reuse().await {
+            return vmess_exchange(stream, sealed, security).await;
+        }
     }
     let stream = dialer
         .dial(server, port, internal)
         .await
         .map_err(MeowError::Io)?;
-    vmess_over(transport, stream, sealed, security).await
+    vmess_over(transport, stream, sealed, security, shared).await
 }
 
 /// Apply the transport chain and run the VMess request exchange on
@@ -174,8 +179,14 @@ async fn vmess_over(
     stream: Box<dyn meow_transport::Stream>,
     sealed: header::SealedHeader,
     security: Security,
+    shared: bool,
 ) -> Result<Box<dyn ProxyConn>> {
-    let stream = transport.connect(stream).await.map_err(|e| match e {
+    let connected = if shared {
+        transport.connect_shared(stream).await
+    } else {
+        transport.connect(stream).await
+    };
+    let stream = connected.map_err(|e| match e {
         // Io/RelayHop chains carry errno + capability classification that
         // dead-marking reads — do not stringify them away (issue #668).
         e @ (MeowError::Io(_) | MeowError::RelayHopFailed { .. }) => e,
@@ -269,7 +280,14 @@ impl ProxyAdapter for VmessAdapter {
         }
         let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
             .map_err(MeowError::Proxy)?;
-        vmess_over(&self.transport, Box::new(stream), sealed, self.security).await
+        vmess_over(
+            &self.transport,
+            Box::new(stream),
+            sealed,
+            self.security,
+            false,
+        )
+        .await
     }
 
     #[cfg_attr(not(feature = "mux"), allow(unused_variables))]
@@ -295,13 +313,15 @@ impl ProxyAdapter for VmessAdapter {
         }))
     }
 
-    /// Issue #695: close every pooled mux session so the next dial opens a
-    /// fresh physical connection (see `MuxClient::reset`).
-    #[cfg(feature = "mux")]
+    /// Issue #695: close every pooled mux session and forget the shared
+    /// gRPC/xhttp connection, so the next dial opens a fresh physical one
+    /// (see `MuxClient::reset`, `TransportChain::reset`).
     fn reset_sessions(&self) {
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             mux.reset();
         }
+        self.transport.reset();
     }
 
     fn health(&self) -> &ProxyHealth {
