@@ -48,6 +48,10 @@ currently select DIRECT, which errs on the safe side. Classical rule-sets are
 matched on domain and address only. Fake-IP answers are skipped (intercept
 the fake range as a whole).
 
+Memory: ~105 bytes of kernel memory per IPv4 element, hash table included
+(measured on a BPI-R4, 50k elements = +5 MiB slab); only proxied
+destinations seen within `timeout` are held, typically a few thousand.
+
 Caveats: elements stay after a rule change until they expire (flush the set
 on reload if that matters), and clients that bypass meow's DNS (DoH, DoT,
 hard-coded addresses) are not covered — block them in the firewall.

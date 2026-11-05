@@ -37,6 +37,7 @@ pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;
+pub mod sysmem;
 pub mod tcp_opts;
 pub mod traffic;
 pub mod traffic_ledger;

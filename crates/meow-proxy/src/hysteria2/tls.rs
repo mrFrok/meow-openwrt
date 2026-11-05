@@ -62,23 +62,6 @@ fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Window
     }
 }
 
-/// `MemTotal` in bytes, read once (Linux; `None` elsewhere).
-fn mem_total() -> Option<u64> {
-    static MEM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *MEM.get_or_init(|| {
-        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb: u64 = s
-            .lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))?
-            .trim()
-            .trim_end_matches("kB")
-            .trim()
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
-    })
-}
-
 /// Build a client `quiche::Config` for the given hysteria2 config.
 pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     let mut ssl = SslContextBuilder::new(SslMethod::tls())
@@ -110,7 +93,7 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.set_application_protos(&[ALPN_H3])
         .map_err(|e| Error::tls(format!("quiche alpn: {e}")))?;
     quic.set_max_idle_timeout(u64::try_from(MAX_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-    let w = resolve_windows(config.windows, mem_total());
+    let w = resolve_windows(config.windows, meow_common::sysmem::mem_total());
     quic.set_initial_max_data(w.initial_conn);
     quic.set_max_connection_window(w.max_conn);
     quic.set_initial_max_stream_data_bidi_local(w.initial_stream);

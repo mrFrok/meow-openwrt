@@ -328,12 +328,10 @@ async fn install_fakeip(
                     })?;
                     Arc::new(p)
                 }
-                None => {
-                    // Capacity bounded by prefix size, but cap at a sensible
-                    // upper bound so a /8 doesn't allocate 16M cache slots
-                    // up front.
-                    Arc::new(MemoryStore::new(1 << 20))
-                }
+                None => Arc::new(MemoryStore::new(fakeip_memory_cap(
+                    &prefix,
+                    meow_common::sysmem::mem_total(),
+                ))),
             };
 
             let pool = Pool::new(prefix, store)
@@ -3643,5 +3641,58 @@ mod tests {
         // Unknown names are the bootstrap builder's error to raise, not ours.
         let registry = stub_registry(&[("JP", "node.example:443")]);
         assert!(circular_proxy_tags(&entries, &registry).is_empty());
+    }
+}
+
+/// Bytes one in-memory fake-ip mapping costs at full pool (both LRUs, a
+/// typical host name), measured by `meow-dns/tests/fakeip_footprint.rs`
+/// (~356 B on x86-64), rounded up.
+const FAKEIP_ENTRY_BYTES: u64 = 400;
+
+/// Mappings the in-memory fake-ip store keeps: the range's addresses, at
+/// most 1 Mi, and on a small device at most what MemTotal / 16 holds
+/// (floor 4096) — a full /16 is ~23 MiB, too much for a 64-128 MB router.
+/// Past the cap the least recently used mapping goes first; the pool still
+/// walks the whole range, so a smaller cap only shortens how long an idle
+/// mapping survives. A device with >= 512 MB keeps a /16 whole.
+fn fakeip_memory_cap(prefix: &ipnet::IpNet, mem_total: Option<u64>) -> usize {
+    let host_bits = u32::from(prefix.max_prefix_len() - prefix.prefix_len());
+    let range = if host_bits >= 20 {
+        1 << 20
+    } else {
+        1usize << host_bits
+    };
+    let Some(mem) = mem_total else {
+        return range;
+    };
+    let budget = usize::try_from(mem / 16 / FAKEIP_ENTRY_BYTES).unwrap_or(usize::MAX);
+    let cap = range.min(budget.max(4096));
+    if cap < range {
+        tracing::info!(
+            "fake-ip: keeping the {cap} most recent of {range} mappings in memory \
+             (MemTotal {} MiB)",
+            mem >> 20
+        );
+    }
+    cap
+}
+
+#[cfg(test)]
+mod fakeip_cap_tests {
+    use super::fakeip_memory_cap;
+
+    #[test]
+    fn cap_scales_with_memory_and_never_exceeds_the_range() {
+        let p16: ipnet::IpNet = "198.18.0.0/16".parse().unwrap();
+        let mib = |m: u64| Some(m << 20);
+        assert_eq!(fakeip_memory_cap(&p16, None), 65_536);
+        assert_eq!(fakeip_memory_cap(&p16, mib(64)), 10_485);
+        assert_eq!(fakeip_memory_cap(&p16, mib(128)), 20_971);
+        assert_eq!(fakeip_memory_cap(&p16, mib(512)), 65_536);
+        assert_eq!(fakeip_memory_cap(&p16, mib(16)), 4096, "floor");
+        let p24: ipnet::IpNet = "198.18.0.0/24".parse().unwrap();
+        assert_eq!(fakeip_memory_cap(&p24, mib(64)), 256);
+        let v6: ipnet::IpNet = "fdfe:dcba:9876::/64".parse().unwrap();
+        assert_eq!(fakeip_memory_cap(&v6, None), 1 << 20);
     }
 }
