@@ -243,7 +243,8 @@ pub enum TunStack {
     Lwip,
     /// TCP goes to the host kernel's stack through an address rewrite in
     /// the packet pump (`system.rs`), as mihomo's system stack does; UDP
-    /// and ICMP stay on lwIP. Linux only — elsewhere it falls back to
+    /// is parsed and built in the pump, with fragments and IPv6 extension
+    /// headers (and ICMP) left to lwIP. Linux only — elsewhere it falls back to
     /// [`TunStack::Lwip`].
     System,
 }
@@ -512,6 +513,7 @@ impl TunListener {
 
             let offload = cfg.stack == TunStack::System;
             match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
+                let make = |offload: bool| {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
                 // The system stack takes TSO/GRO aggregates: one NAT
                 // rewrite and one write per up-to-64 KiB segment.
@@ -557,7 +559,16 @@ impl TunListener {
                         }
                     }
                 }
-                let device = builder.build_async()?;
+                builder
+                };
+                // A kernel without TSO on TUN keeps the plain framing.
+                let device = match make(offload).build_async() {
+                    Err(e) if offload => {
+                        warn!("tun: offload unavailable ({e}); the system stack runs without TSO/GRO");
+                        make(false).build_async()?
+                    }
+                    r => r?,
+                };
                 // One read of the index serves both the address setup
                 // and the caller.
                 let if_index = device.if_index()?;
@@ -896,8 +907,11 @@ impl TunListener {
             });
         }
         // System stack: UDP skips lwIP too — the pumps parse and build it.
+        // What they leave to lwIP (fragments, IPv6 extension headers) is
+        // still served from its socket, by a flow table of its own.
+        let mut lwip_udp = None;
         let (udp_io, direct_udp) = if system.is_some() {
-            drop(udp_socket);
+            lwip_udp = Some(udp_socket);
             let (in_tx, in_rx) = tokio::sync::mpsc::channel(udp::DIRECT_QUEUE);
             let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(udp::DIRECT_REPLY_QUEUE);
             (
@@ -934,6 +948,17 @@ impl TunListener {
             std::sync::Arc::clone(&udp_flows),
             self.sniffer.clone(),
         ));
+        if let Some(socket) = lwip_udp {
+            tasks.spawn(udp::run_udp(
+                self.tunnel.clone(),
+                udp::UdpIo::Lwip(socket),
+                cfg.dns_hijack,
+                cfg.udp_timeout,
+                self.name.clone(),
+                tun_net,
+                std::sync::Arc::clone(&udp_flows),
+            ));
+        }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let max_conn = cfg.max_connections;
@@ -973,6 +998,9 @@ impl TunListener {
             None
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
+        // System stack: kernel accept errors (ECONNABORTED, EMFILE under a
+        // flow storm) back off and retry, as the other listeners do.
+        let mut accept_backoff = meow_common::ErrorBackoff::new();
 
         let result = loop {
             tokio::select! {
@@ -1032,12 +1060,16 @@ impl TunListener {
                     }
                     None => break Err("netstack TCP listener closed".into()),
                 },
-                accepted = accept_system(system.as_ref()) => match accepted {
-                    Ok((stream, src, dst, guard)) => {
+                accepted = accept_system(
+                    system.as_ref(),
+                    conn_limit.clone(),
+                    &warned_saturated,
+                    &self.name,
+                    &mut accept_backoff,
+                ) => match accepted {
+                    Some((permit, stream, src, dst, guard)) => {
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
-                        let sem = conn_limit.clone();
-                        let warned = Arc::clone(&warned_saturated);
                         let sniffer = self.sniffer.clone();
                         tasks.spawn(async move {
                             let _guard = guard;
@@ -1057,9 +1089,7 @@ impl TunListener {
                                 }
                                 Ok(Ok(_)) | Err(_) => {}
                             }
-                            let Ok(_permit) = flow_slot(sem, &warned, &name).await else {
-                                return;
-                            };
+                            let _permit = permit;
                             let mut metadata = Metadata {
                                 network: Network::Tcp,
                                 conn_type: ConnType::Tun,
@@ -1077,7 +1107,7 @@ impl TunListener {
                                 .await;
                         });
                     }
-                    Err(e) => break Err(format!("system stack TCP listener failed: {e}").into()),
+                    None => break Err("system stack TCP listener closed".into()),
                 },
                 joined = &mut pump_in => {
                     break Err(pump_error("device→stack", joined).into());
@@ -1116,17 +1146,42 @@ impl TunListener {
 
 /// The next kernel-terminated TCP flow, or never when the system stack is
 /// off (a `select!` arm that stays pending).
+/// The next system-stack flow with its `max-connections` slot, taken
+/// before the accept so a saturated listener leaves connections in the
+/// kernel backlog instead of parking tasks (each holds a kernel fd). Accept
+/// errors back off and retry; `None` only when the limit is gone with the
+/// listener.
 async fn accept_system(
     system: Option<&system::SystemStack>,
-) -> io::Result<(
+    sem: Option<Arc<Semaphore>>,
+    warned: &AtomicBool,
+    name: &str,
+    backoff: &mut meow_common::ErrorBackoff,
+) -> Option<(
+    Option<tokio::sync::OwnedSemaphorePermit>,
     tokio::net::TcpStream,
     SocketAddr,
     SocketAddr,
     system::FlowGuard,
 )> {
-    match system {
-        Some(sys) => sys.accept().await,
-        None => std::future::pending().await,
+    let Some(sys) = system else {
+        return std::future::pending().await;
+    };
+    let permit = flow_slot(sem, warned, name).await.ok()?;
+    loop {
+        match sys.accept().await {
+            Ok((stream, src, dst, guard)) => {
+                backoff.succeeded();
+                return Some((permit, stream, src, dst, guard));
+            }
+            Err(e) => {
+                if backoff.failed(&e).await {
+                    warn!("TUN listener '{name}' system stack accept error: {e}");
+                } else {
+                    debug!("TUN listener '{name}' system stack accept error: {e}");
+                }
+            }
+        }
     }
 }
 
