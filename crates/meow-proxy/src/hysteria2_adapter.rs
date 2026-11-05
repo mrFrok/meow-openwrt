@@ -285,9 +285,9 @@ impl Hy2PacketConn {
     }
 }
 
-#[async_trait]
-impl ProxyPacketConn for Hy2PacketConn {
-    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+impl Hy2PacketConn {
+    /// The next datagram with its parsed source.
+    async fn recv(&self) -> Result<(Vec<u8>, SocketAddr)> {
         let mut rx = self.rx.lock().await;
         loop {
             let (data, addr) = match rx.session.recv().await {
@@ -314,10 +314,26 @@ impl ProxyPacketConn for Hy2PacketConn {
                     }
                 }
             };
-            let n = data.len().min(buf.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            return Ok((n, src));
+            return Ok((data, src));
         }
+    }
+}
+
+#[async_trait]
+impl ProxyPacketConn for Hy2PacketConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let (data, src) = self.recv().await?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok((n, src))
+    }
+
+    /// The decoded datagram as the driver made it, without the copy into
+    /// `scratch` (the TUN reply path forwards it owned).
+    async fn read_packet_owned(&self, scratch: &mut [u8]) -> Result<(Vec<u8>, SocketAddr)> {
+        let (mut data, src) = self.recv().await?;
+        data.truncate(scratch.len());
+        Ok((data, src))
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {

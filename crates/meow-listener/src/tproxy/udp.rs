@@ -178,9 +178,10 @@ pub(super) mod flow {
             async move {
                 let mut rbuf = vec![0u8; DATAGRAM_BUF];
                 loop {
-                    match conn.read_packet(&mut rbuf).await {
-                        Ok((n, _from)) => {
-                            if up_tx.send(rbuf[..n].to_vec()).await.is_err() {
+                    // Owned straight from the conn (no copy for hysteria2).
+                    match conn.read_packet_owned(&mut rbuf).await {
+                        Ok((data, _from)) => {
+                            if up_tx.send(data).await.is_err() {
                                 return Ok(()); // flow gone
                             }
                         }

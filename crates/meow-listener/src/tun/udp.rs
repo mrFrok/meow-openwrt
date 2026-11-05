@@ -485,17 +485,19 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // conn (e.g. Trojan UoT) cannot lose a partially consumed frame to a
     // dropped mid-flight read (issue #514). Each reply is copied out and
     // forwarded through `up_rx` so the select loop below sees downstream
-    // traffic for its idle deadline — the same per-datagram `to_vec`
-    // profile the pre-#514 pump had.
+    // traffic for its idle deadline — one owned buffer per datagram
+    // (`read_packet_owned`: no copy at all for a conn that owns it already).
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
     let mut reply_task = tokio::spawn({
         let conn = std::sync::Arc::clone(&conn);
         async move {
             let mut rbuf = vec![0u8; DATAGRAM_BUF];
             loop {
-                match conn.read_packet(&mut rbuf).await {
-                    Ok((n, _from)) => {
-                        if up_tx.send(rbuf[..n].to_vec()).await.is_err() {
+                // Owned straight from the conn: a hysteria2 reply arrives
+                // decoded into its own buffer and is forwarded as is.
+                match conn.read_packet_owned(&mut rbuf).await {
+                    Ok((data, _from)) => {
+                        if up_tx.send(data).await.is_err() {
                             return Ok(()); // flow gone
                         }
                     }

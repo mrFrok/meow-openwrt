@@ -40,6 +40,14 @@ pub trait ProxyPacketConn: Send + Sync {
     /// filtering on the source must skip the check for unspecified
     /// addresses or they would wedge bound conns.
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
+    /// [`Self::read_packet`] for a caller that needs the datagram owned:
+    /// at most `scratch.len()` bytes. The default reads into `scratch` and
+    /// copies out; a conn whose datagrams already arrive as owned buffers
+    /// (hysteria2) hands them over without the copy.
+    async fn read_packet_owned(&self, scratch: &mut [u8]) -> Result<(Vec<u8>, SocketAddr)> {
+        let (n, from) = self.read_packet(scratch).await?;
+        Ok((scratch[..n].to_vec(), from))
+    }
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize>;
     fn local_addr(&self) -> Result<SocketAddr>;
     fn close(&self) -> Result<()>;

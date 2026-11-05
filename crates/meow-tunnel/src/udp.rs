@@ -100,6 +100,16 @@ impl ProxyPacketConn for CountedPacketConn {
         Ok((n, from))
     }
 
+    async fn read_packet_owned(
+        &self,
+        scratch: &mut [u8],
+    ) -> meow_common::Result<(Vec<u8>, SocketAddr)> {
+        let (data, from) = self.conn.read_packet_owned(scratch).await?;
+        let n = data.len();
+        self.stats.record_download(&self.counters, n as Int);
+        Ok((data, from))
+    }
+
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
         let n = self.conn.write_packet(buf, addr).await?;
         self.stats.record_upload(&self.counters, n as Int);
