@@ -95,6 +95,13 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
   конфиге, замер на тех же сценариях (оптимистично). %CPU/Мбит: hy2 UDP ↓ 1.31→0.98 (−25%, +11% скорости),
   hy2 TCP ↓ 0.49→0.46, ↑ 0.43→0.39; hy2 UDP ↑ хуже на 6%; DIRECT TCP без изменений. Размер tiny +327 КБ
   (jffs2 4.03→4.29 МБ). Нет Reality в профиле; на MIPS не проверено. По умолчанию выключено.
+- **PGO + Reality (2026-11-05)**: tunbench получил `vrtcp-ul/dl` (VLESS+Vision+REALITY, сервер mihomo в netns,
+  dest = его TLS-контроллер, ключи из `bench/reality-*.yaml`). Профиль: все сценарии tunbench, Reality ×2.
+  `pgo-gen.sh` сам пишет cmake-toolchain (без прошлой SDK-сборки), `PGO_USE=<profdata>|none` — оптимизированная
+  и базовая сборки тем же rustup 1.96 (llvm-profdata из его llvm-tools). base vs pgo, 2 прогона, %CPU/Мбит:
+  Reality ↑ 0.08→0.07 (+2% скорости), ↓ 0.075→0.065; hy2 TCP ↑ 0.42→0.30 (+38% скорости), ↓ 0.42→0.35 (+26%);
+  hy2 UDP ↑ 0.93→0.70, ↓ 0.75→0.70; DIRECT TCP ↑ +15% скорости. Размер 8.42→8.94 МБ (+524 КБ).
+  Оптимистично (обучение = замер). Профиль ~/.cache/meow-pgo/meow.profdata (17 МБ, не в git).
 - sockmap/eBPF: не делаем — DIRECT TCP уже splice ~10 Гбит/с, с dns.nftset мимо ядра; шифрование в BPF невозможно.
 
 ## Этап 7 — big-endian MIPS (BoringSSL только LE — подтверждено)

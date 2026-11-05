@@ -17,14 +17,22 @@
 #   sh tunbench.sh down
 # Scenarios: direct-ul direct-dl hy2-ul hy2-dl (UDP at RATE, default: all),
 #            tcp-ul tcp-dl (DIRECT TCP, unlimited rate, PAR=4 streams),
-#            hy2tcp-ul hy2tcp-dl (the same TCP through the hy2 proxy).
+#            hy2tcp-ul hy2tcp-dl (the same TCP through the hy2 proxy),
+#            vrtcp-ul vrtcp-dl (the same TCP through VLESS+Vision+REALITY).
+# REALITY: the server (mihomo in mwb, dest = its own TLS controller, no
+# Internet) and the client take the bench-only throwaway keys from
+# reality-server.yaml / reality-client.yaml next to this script.
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
 #      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines), STACK=system|lwip
 #      MODE=tun|redir (redir: TCP scenarios via nft REDIRECT), HY2OPTS= (extra hy2 proxy keys), SHAPE= (tc tbf args: a slow client), PAR=4
 # Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit, the core's
 # RssAnon and VmHWM (KB) at the end of the run.
 set -u
-W=/tmp/tunbench; C=mwc; S=mwb
+W=/tmp/tunbench; C=mwc; S=mwb; B=$(cd "$(dirname "$0")" && pwd)
+# yval <file> <key> <nth>: a scalar of the bench REALITY yamls (never printed).
+yval() { grep -o "$2: [^,}]*" "$1" | sed -n "${3:-1}p" | sed "s/^$2: //; s/[][ '\"]//g"; }
+RUUID=$(yval "$B/reality-client.yaml" uuid); RPUB=$(yval "$B/reality-client.yaml" public-key)
+RSID=$(yval "$B/reality-client.yaml" short-id); RPRIV=$(yval "$B/reality-server.yaml" private-key 2)
 RATE=${RATE:-1G}; LEN=${LEN:-1200}; SECS=${SECS:-15}
 CORE_CPU=${CORE_CPU:-0,1}; CLI_CPU=${CLI_CPU:-2}; SRV_CPU=${SRV_CPU:-3}
 SRVBIN=${SRVBIN:-/usr/bin/mihomo}; MTU=${MTU:-9000}; EXTRA=${EXTRA:-}; STACK=${STACK:-system}; MODE=${MODE:-tun}
@@ -44,10 +52,14 @@ up() {
 	ip -n $C route add 192.0.2.0/24 via 203.0.113.2 dev mwc0 table 100
 	ip netns exec $S taskset -c "$SRV_CPU" iperf3 -s -D -p 5201
 	[ -f $W/srv/cert.pem ] || { echo "need $W/srv/cert.pem + key.pem"; exit 1; }
+	[ -n "$RPRIV" ] && [ -n "$RPUB" ] || echo "no REALITY keys in $B/reality-*.yaml: vrtcp-* unavailable"
 	cat > $W/srv/config.yaml <<EOF
 log-level: warning
+external-controller-tls: 127.0.0.1:9443
+tls: {certificate: $W/srv/cert.pem, private-key: $W/srv/key.pem}
 listeners:
   - {name: hy, type: hysteria2, port: 8444, listen: 203.0.113.2, users: {u: bench}, certificate: $W/srv/cert.pem, private-key: $W/srv/key.pem}
+  - {name: vr, type: vless, port: 8443, listen: 203.0.113.2, users: [{username: bench, uuid: $RUUID, flow: xtls-rprx-vision}], reality-config: {dest: 127.0.0.1:9443, private-key: $RPRIV, short-id: [$RSID], server-names: [bench.test]}}
 rules: ['MATCH,DIRECT']
 EOF
 	ip netns exec $S taskset -c "$SRV_CPU" "$SRVBIN" -d $W/srv -f $W/srv/config.yaml > $W/srv/log 2>&1 &
@@ -79,6 +91,7 @@ tun:
 $EXTRA
 proxies:
   - {name: H, type: hysteria2, server: 203.0.113.2, port: 8444, password: bench, sni: bench.test, skip-cert-verify: true, alpn: [h3]${HY2OPTS:+, $HY2OPTS}}
+  - {name: VR, type: vless, server: 203.0.113.2, port: 8443, uuid: $RUUID, network: tcp, flow: xtls-rprx-vision, tls: true, servername: bench.test, client-fingerprint: chrome, reality-opts: {public-key: $RPUB, short-id: $RSID}}
 rules: ['MATCH,$1']
 EOF
 }
@@ -87,10 +100,10 @@ ticks() { awk '{print $14+$15}' /proc/$1/stat 2>/dev/null; }
 
 run1() { # label bin scenario
 	lab=$1; bin=$2; sc=$3
-	case $sc in hy2*) tgt=H ;; *) tgt=DIRECT ;; esac
+	case $sc in hy2*) tgt=H ;; vr*) tgt=VR ;; *) tgt=DIRECT ;; esac
 	case $sc in *-dl) rev=-R ;; *) rev= ;; esac
 	case $sc in
-	tcp-*|hy2tcp-*) proto="-P ${PAR:-4}"; warm="-P 4"; rate=max ;;
+	tcp-*|hy2tcp-*|vrtcp-*) proto="-P ${PAR:-4}"; warm="-P 4"; rate=max ;;
 	*) proto="-u -b $RATE -l $LEN"; warm="-u -b 10M -l $LEN"; rate=$RATE ;;
 	esac
 	d=$W/core; rm -rf $d; mkdir -p $d; core_cfg $tgt > $d/config.yaml
@@ -114,7 +127,7 @@ NFT
 	# warm-up: hy2 handshake, flow setup
 	ip netns exec $C iperf3 -c 192.0.2.2 $warm -t 2 $rev > /dev/null 2>&1
 	t0=$(ticks $pid); s0=$(date +%s)
-	( m=0; while kill -0 $pid 2>/dev/null; do a=$(awk '/^RssAnon:/{print $2}' /proc/$pid/status 2>/dev/null); [ -n "$a" ] && [ "$a" -gt "$m" ] && { m=$a; echo $m > $W/anonpeak; }; sleep 0.5; done ) &
+	( m=0; while kill -0 $pid 2>/dev/null; do a=$(awk '/^RssAnon:/{print $2}' /proc/$pid/status 2>/dev/null); [ -n "$a" ] && [ "$a" -gt "$m" ] && { m=$a; echo $m > $W/anonpeak; }; sleep 1; done ) &
 	smp=$!
 	out=$(ip netns exec $C taskset -c "$CLI_CPU" iperf3 -c 192.0.2.2 $proto -t "$SECS" $rev 2>&1)
 	t1=$(ticks $pid); s1=$(date +%s)
