@@ -153,6 +153,26 @@ LE ничего не теряет; `MEOW_TLS_BACKEND=rustls` включает BE
   mkfs.ubifs). Цель «< 6 МБ несжатым» снята: ядро само ~6 МБ, ориентир — паритет с LE (tiny aarch64 8,5).
 Открыто: проверка на живом BE-железе (волонтёры), скорость RustCrypto/ring на 24Kc, Brutal на quinn.
 
+## Этап 8 — WireGuard / AmneziaWG через модуль ядра (2026-11-06)
+Узел mihomo `type: wireguard` (+ `amnezia-wg-option`) без userspace-стека: meow сам создаёт интерфейс
+ядра и шифрует ядро (быстро на MIPS, +десятки КБ к бинарнику, годится даже для tiny). Пользователю
+достаточно поставить `kmod-wireguard` или `kmod-amneziawg`. Upstream (#899) это не подходит (Linux-only).
+- **Netlink.** rtnetlink `RTM_NEWLINK` kind `wireguard`/`amneziawg`, адреса `ip`/`ipv6`, MTU; generic
+  netlink семейства `wireguard` / `amneziawg` (тот же uapi, у AWG доп. `WGDEVICE_A_JC..I5`, H1–H4 — u64,
+  S3/S4 — u16, I1–I5 — строки). Свой минимальный кодировщик, как в `policy_route.rs`.
+- **Выбор модуля.** Есть `amnezia-wg-option` → `amneziawg`, иначе `wireguard`. Нет семейства
+  (модуль не стоит) → узел недоступен, ошибка «install kmod-…».
+- **Ленивый подъём.** Интерфейс поднимается при первом соединении/health-check, имя `mwg<N>`
+  (хэш узла, ≤15 симв.). Узел удалён из подписки / reload / выход → интерфейс удаляется.
+- **Маршрут.** Сокеты узла: `SO_BINDTODEVICE` + своя таблица на интерфейс (default dev mwgN) и
+  правило `oif mwgN lookup T` (как `policy_route.rs`); fwmark meow, чтобы не петлять в auto-redirect/TUN.
+  `allowed-ips` идёт в peer, `0.0.0.0/0, ::/0` по умолчанию. Endpoint резолвится meow (DNS по правилам).
+- **UDP.** UDP-сессии тоже привязанные сокеты; `remote-dns-resolve`/`dns` у узла — резолвер через интерфейс.
+- **Не делаем:** userspace boringtun (для upstream/без модуля — отдельно, если попросят),
+  `reserved` (WARP: нужно в ядре — у модуля нет), `peers:` с несколькими peer — после.
+- **Тест:** обычный WG в unshare-netns против второго wg-интерфейса (модуль хоста); AWG — на машине с
+  `kmod-amneziawg` (у BPI-R4 сборки нет WG в ядре). mihomo-сервер не нужен: peer — сам ядро.
+
 ## Проверка
 - Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге роутера (без `cp -rL`, без предупреждений).
 - Сборки: SDK-пакеты 4 архитектур, `qemu-mipsel`, BPI-R4 (SSH), волонтёры — self-run скрипт (без SSH).
