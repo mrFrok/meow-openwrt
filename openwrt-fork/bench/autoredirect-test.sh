@@ -137,4 +137,38 @@ r=$($C wget -qO- -T 5 http://203.0.113.3:8080/x 2>&1)
 [ "$r" = hello ] && ! grep -q -- '203.0.113.3:8080' $W/meow2.log && ok "dns-set: .3 still bypasses" || bad "dns-set: .3: $r"
 kill $MP; sleep 2; MP=""
 grep -iE 'warn|error' $W/meow2.log | head -5
+
+# Phase 3: route-address-set follows a refreshed rule-set (http provider
+# served by the test server, interval 2 s): .3 joins without a restart.
+echo 203.0.113.2/32 > $W/www/px.txt
+cat > $W/config.yaml <<EOF
+log-level: info
+rule-providers:
+  px:
+    type: http
+    url: http://203.0.113.3:8080/px.txt
+    behavior: ipcidr
+    format: text
+    path: $W/rs/px.txt
+    interval: 2
+tun:
+  enable: true
+  stack: system
+  device: mwtun
+  auto-route: true
+  auto-redirect: true
+  route-address-set: [px]
+rules:
+  - MATCH,DIRECT
+EOF
+$G $BIN -d $W -f $W/config.yaml > $W/meow3.log 2>&1 & MP=$!
+sleep 4
+$G nft list set inet meow route4 2>&1 | grep -q '203.0.113.2' && ok "rule-set: initial set" || bad "rule-set: .2 not in route4"
+echo 203.0.113.3/32 >> $W/www/px.txt
+i=0; while [ $i -lt 15 ] && ! $G nft get element inet meow route4 '{ 203.0.113.3 }' >/dev/null 2>&1; do sleep 1; i=$((i+1)); done
+$G nft get element inet meow route4 '{ 203.0.113.3 }' >/dev/null 2>&1 && ok "rule-set: refresh reached route4" || bad "rule-set: .3 not added after refresh"
+$C wget -qO- -T 5 http://203.0.113.3:8080/x >/dev/null 2>&1
+grep -q -- '203.0.113.3:8080' $W/meow3.log && ok "rule-set: .3 now captured" || bad "rule-set: .3 not captured"
+kill $MP; sleep 2; MP=""
+grep -iE 'warn|error|sets updated' $W/meow3.log | head -5
 [ $fail = 0 ] && echo ALL PASS || echo SOME FAILED

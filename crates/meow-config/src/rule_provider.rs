@@ -378,6 +378,7 @@ impl RuleProvider {
         *self.payload_format.lock() = parsed_as;
         *installed = gen;
         self.touch();
+        notify_changed();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
         self.logbook_updated(previous, count);
         Ok(())
@@ -462,6 +463,7 @@ impl RuleProvider {
         *self.payload_format.lock() = format;
         self.filled.store(true, Ordering::Relaxed);
         self.touch();
+        notify_changed();
     }
 
     /// [`Self::swap_rules`] with a payload fetched or read for this load.
@@ -469,6 +471,21 @@ impl RuleProvider {
         self.swap_rules(parsed);
         *self.load_note.lock() = Some(LoadNote::Fresh);
     }
+}
+
+static CHANGES: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Ticks whenever any rule provider's contents or the provider registry
+/// change — for consumers that derive state from rule-sets (TUN
+/// auto-redirect's nftables sets).
+pub fn changes() -> tokio::sync::watch::Receiver<u64> {
+    CHANGES.subscribe()
+}
+
+/// Tick [`changes`].
+pub fn notify_changed() {
+    CHANGES.send_modify(|g| *g = g.wrapping_add(1));
 }
 
 /// The logbook message for a payload of `count` rules that replaced

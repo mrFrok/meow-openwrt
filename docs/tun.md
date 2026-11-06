@@ -613,8 +613,9 @@ answers: an answer whose domain the rules send anywhere but DIRECT adds its
 addresses (see [nftset.md](nftset.md) for the verdict and its limits). An
 address is captured from the first connection after its answer. With
 `dns.nftset` naming its own sets, those win and `route4_dns` stays empty.
-Rule-sets are resolved when the TUN starts; a provider refresh takes effect
-at the next TUN restart.
+Rule-sets in `route-address-set` / `route-exclude-address-set` are
+followed: a provider refresh (or its first load after the TUN started)
+replaces the nftables sets in one transaction, no restart.
 
 ## Relationship to the tproxy inbound
 

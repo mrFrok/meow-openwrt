@@ -130,6 +130,7 @@ impl RefreshSupervisor {
         map: HashMap<String, Arc<RuleProvider>>,
     ) {
         *registry.write() = map;
+        crate::rule_provider::notify_changed();
         self.reconcile(registry);
     }
 

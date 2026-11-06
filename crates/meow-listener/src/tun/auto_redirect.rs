@@ -147,10 +147,7 @@ pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
     let port = p.redirect_port;
     // Destination filters shared by every chain: local, excluded and (when
     // narrowed) not-routed destinations are left alone.
-    let mut filter = String::from("\t\tip daddr @local4 return\n");
-    if !p.exclude.is_empty() {
-        filter.push_str("\t\tip daddr @exclude4 return\n");
-    }
+    let mut filter = String::from("\t\tip daddr @local4 return\n\t\tip daddr @exclude4 return\n");
     match (p.route.is_some(), p.dns_set) {
         (true, true) => filter.push_str("\t\tip daddr != @route4 ip daddr != @route4_dns return\n"),
         (true, false) => filter.push_str("\t\tip daddr != @route4 return\n"),
@@ -166,9 +163,7 @@ pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
 
     let mut s = format!("table inet {TABLE}\ndelete table inet {TABLE}\ntable inet {TABLE} {{\n");
     s.push_str(&set("local4", local));
-    if !p.exclude.is_empty() {
-        s.push_str(&set("exclude4", &p.exclude));
-    }
+    s.push_str(&set("exclude4", &p.exclude));
     if let Some(r) = &p.route {
         s.push_str(&set("route4", r));
     }
@@ -210,6 +205,29 @@ pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
 "
     );
     s
+}
+
+/// Replace `route4` (when narrowed) and `exclude4` in one transaction.
+pub(super) fn sets_update(
+    route: Option<&[(Ipv4Addr, Ipv4Addr)]>,
+    exclude: &[(Ipv4Addr, Ipv4Addr)],
+) -> String {
+    let mut s = String::new();
+    let mut one = |name: &str, r: &[(Ipv4Addr, Ipv4Addr)]| {
+        let _ = writeln!(s, "flush set inet {TABLE} {name}");
+        if !r.is_empty() {
+            let _ = writeln!(s, "add element inet {TABLE} {name} {{ {} }}", elements(r));
+        }
+    };
+    if let Some(r) = route {
+        one("route4", r);
+    }
+    one("exclude4", exclude);
+    s
+}
+
+pub(super) fn apply(script: &str) -> io::Result<()> {
+    nft(script)
 }
 
 fn nft(script: &str) -> io::Result<()> {
@@ -333,6 +351,17 @@ mod tests {
     }
 
     #[test]
+    fn sets_update_flushes_and_refills() {
+        let s = sets_update(Some(&[(a("1.0.0.0"), a("1.0.0.255"))]), &[]);
+        assert_eq!(
+            s,
+            "flush set inet meow route4\nadd element inet meow route4 { 1.0.0.0-1.0.0.255 }\n\
+             flush set inet meow exclude4\n"
+        );
+        assert_eq!(sets_update(None, &[]), "flush set inet meow exclude4\n");
+    }
+
+    #[test]
     fn coalesce_merges_overlaps_and_neighbours() {
         let r = coalesce(vec![
             (a("10.0.0.0"), a("10.0.0.255")),
@@ -366,7 +395,7 @@ mod tests {
         assert!(s.contains("elements = { 91.108.4.0-91.108.7.255 }"));
         assert!(s.contains("ip daddr != @route4 ip daddr != @route4_dns return"));
         assert!(s.contains("set route4_dns {\n\t\ttype ipv4_addr\n\t\tflags timeout"));
-        assert!(!s.contains("@exclude4"));
+        assert!(s.contains("ip daddr @exclude4 return"));
         assert!(s.contains("redirect to :7895"));
         assert!(s.contains("udp dport 53 dnat ip to 198.18.0.2"));
         assert!(s.contains("meta mark 0x00002024 return"));

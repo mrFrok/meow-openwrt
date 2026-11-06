@@ -243,9 +243,28 @@ pub struct TunListenerConfig {
     pub auto_redirect: Option<AutoRedirect>,
 }
 
+/// Inclusive IPv4 range.
+pub type V4Range = (std::net::Ipv4Addr, std::net::Ipv4Addr);
+
+/// `(route, exclude)`: `route` `None` = every destination.
+pub type AutoRedirectRanges = (Option<Vec<V4Range>>, Vec<V4Range>);
+
+/// Re-resolves `route` / `exclude` (rule-sets) whenever `changed` ticks.
+#[derive(Clone)]
+pub struct AutoRedirectSource {
+    pub changed: tokio::sync::watch::Receiver<u64>,
+    pub resolve: Arc<dyn Fn() -> AutoRedirectRanges + Send + Sync>,
+}
+
+impl std::fmt::Debug for AutoRedirectSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AutoRedirectSource")
+    }
+}
+
 /// `tun.auto-redirect`: which IPv4 destinations are captured, as inclusive
 /// ranges (rule-sets already resolved by the caller).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct AutoRedirect {
     /// `None`: every destination.
     pub route: Option<Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>>,
@@ -253,6 +272,8 @@ pub struct AutoRedirect {
     /// `route-address-dns`: also capture `route4_dns`, which the DNS
     /// answer hook fills (`meow_common::nftset::AUTO_REDIRECT_DNS_SET`).
     pub dns_set: bool,
+    /// Set when rule-sets feed `route` / `exclude`: they are kept current.
+    pub source: Option<AutoRedirectSource>,
 }
 
 /// Which stack terminates the device's TCP flows (`tun.stack`).
@@ -1585,12 +1606,16 @@ struct RedirectGuard {
     _nft: auto_redirect::NftRedirect,
     _routes: policy_route::PolicyRoutes,
     listener: tokio::task::JoinHandle<()>,
+    sets: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for RedirectGuard {
     fn drop(&mut self) {
         self.listener.abort();
+        if let Some(t) = &self.sets {
+            t.abort();
+        }
     }
 }
 
@@ -1642,12 +1667,11 @@ impl TunListener {
 
             // A narrowed capture must still take the fake-IP range: its
             // addresses only mean something to meow.
-            let route = ar.route.clone().map(|mut r| {
-                if let Some(ipnet::IpNet::V4(f)) = fake_ip_net {
-                    r.push(auto_redirect::net_range(f));
-                }
-                auto_redirect::coalesce(r)
-            });
+            let fake = match fake_ip_net {
+                Some(ipnet::IpNet::V4(f)) => Some(auto_redirect::net_range(f)),
+                _ => None,
+            };
+            let route = ar.route.clone().map(|r| with_fake(r, fake));
             let params = auto_redirect::Params {
                 dev: dev_name.to_owned(),
                 redirect_port: port,
@@ -1658,6 +1682,8 @@ impl TunListener {
                 exclude: auto_redirect::coalesce(ar.exclude.clone()),
                 dns_set: ar.dns_set,
             };
+            let route_now = params.route.clone();
+            let exclude_now = params.exclude.clone();
             let route_mark = auto_redirect::ROUTE_MARK;
             let (routes, nft) = tokio::task::spawn_blocking(move || {
                 let routes =
@@ -1668,11 +1694,61 @@ impl TunListener {
             .await
             .map_err(|e| io::Error::other(format!("auto-redirect setup panicked: {e}")))?
             .inspect_err(|_| listener.abort())?;
+            let sets = ar.source.clone().map(|src| {
+                let name = self.name.clone();
+                let last = (route_now, exclude_now);
+                tokio::spawn(follow_rule_sets(src, fake, last, name))
+            });
             Ok(RedirectGuard {
                 _nft: nft,
                 _routes: routes,
                 listener,
+                sets,
             })
+        }
+    }
+}
+
+/// A narrowed capture must still take the fake-IP range: its addresses
+/// only mean something to meow.
+#[cfg(target_os = "linux")]
+fn with_fake(mut r: Vec<V4Range>, fake: Option<V4Range>) -> Vec<V4Range> {
+    r.extend(fake);
+    auto_redirect::coalesce(r)
+}
+
+/// Keep `route4` / `exclude4` in step with the rule-sets they come from.
+#[cfg(all(target_os = "linux", feature = "listener-tproxy"))]
+async fn follow_rule_sets(
+    mut src: AutoRedirectSource,
+    fake: Option<V4Range>,
+    mut last: (Option<Vec<V4Range>>, Vec<V4Range>),
+    name: String,
+) {
+    while src.changed.changed().await.is_ok() {
+        // A reload or refresh burst swaps several providers: settle first.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        src.changed.borrow_and_update();
+        let (route, exclude) = (src.resolve)();
+        let now = (
+            route.map(|r| with_fake(r, fake)),
+            auto_redirect::coalesce(exclude),
+        );
+        if now == last {
+            continue;
+        }
+        let script = auto_redirect::sets_update(now.0.as_deref(), &now.1);
+        match tokio::task::spawn_blocking(move || auto_redirect::apply(&script)).await {
+            Ok(Ok(())) => {
+                info!(
+                    "tun '{name}': auto-redirect sets updated ({} route, {} exclude ranges)",
+                    now.0.as_ref().map_or(0, Vec::len),
+                    now.1.len()
+                );
+                last = now;
+            }
+            Ok(Err(e)) => warn!("tun '{name}': auto-redirect set update: {e}"),
+            Err(e) => warn!("tun '{name}': auto-redirect set update panicked: {e}"),
         }
     }
 }

@@ -50,10 +50,7 @@ pub const TUN_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[cfg(feature = "listener-tun")]
 pub fn tun_config_to_listener_config(
     tun: &meow_config::TunConfig,
-    rule_providers: &std::collections::HashMap<
-        String,
-        Arc<meow_config::rule_provider::RuleProvider>,
-    >,
+    rule_providers: &ProviderRegistry,
 ) -> meow_listener::TunListenerConfig {
     meow_listener::TunListenerConfig {
         auto_redirect: tun
@@ -80,18 +77,30 @@ pub fn tun_config_to_listener_config(
     }
 }
 
-/// Resolve `route-address(-set)` / `route-exclude-address(-set)` into IPv4
-/// ranges. An unknown or non-`ipcidr` rule-set is skipped with a warning;
-/// a narrowed capture whose sets all failed still captures nothing beyond
-/// its CIDRs rather than everything.
+/// The shared rule-provider registry.
 #[cfg(feature = "listener-tun")]
-fn auto_redirect_ranges(
+pub type ProviderRegistry = Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>,
+    >,
+>;
+
+#[cfg(feature = "listener-tun")]
+type V4Ranges = Vec<meow_listener::V4Range>;
+
+/// Resolve `route-address(-set)` / `route-exclude-address(-set)` into IPv4
+/// ranges. An unknown or non-`ipcidr` rule-set is skipped (with a warning
+/// when `warn`); a narrowed capture whose sets all failed still captures
+/// nothing beyond its CIDRs rather than everything.
+#[cfg(feature = "listener-tun")]
+fn resolve_auto_redirect(
     ar: &meow_config::AutoRedirectConfig,
-    providers: &std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>,
-) -> meow_listener::AutoRedirect {
-    type Range = (std::net::Ipv4Addr, std::net::Ipv4Addr);
-    let collect = |nets: &[ipnet::IpNet], sets: &[String], key: &str| -> Vec<Range> {
-        let mut r: Vec<Range> = nets
+    registry: &ProviderRegistry,
+    warn: bool,
+) -> (Option<V4Ranges>, V4Ranges) {
+    let providers = registry.read();
+    let collect = |nets: &[ipnet::IpNet], sets: &[String], key: &str| -> V4Ranges {
+        let mut r: V4Ranges = nets
             .iter()
             .filter_map(|n| match n {
                 ipnet::IpNet::V4(n) => Some((n.network(), n.broadcast())),
@@ -100,15 +109,18 @@ fn auto_redirect_ranges(
             .collect();
         for name in sets {
             let Some(p) = providers.get(name) else {
-                tracing::warn!("tun.{key}: rule-set '{name}' not found; skipped");
+                if warn {
+                    tracing::warn!("tun.{key}: rule-set '{name}' not found; skipped");
+                }
                 continue;
             };
             let set = p.snapshot();
             match set.ip_ranges() {
                 Some(ranges) => r.extend(ranges.v4_ranges()),
-                None => tracing::warn!(
+                None if warn => tracing::warn!(
                     "tun.{key}: rule-set '{name}' is not an ipcidr rule-set; skipped"
                 ),
+                None => {}
             }
         }
         r
@@ -116,20 +128,43 @@ fn auto_redirect_ranges(
     // With the DNS set, capture is narrowed to it plus these ranges.
     let narrowed =
         !ar.route_address.is_empty() || !ar.route_address_set.is_empty() || ar.route_address_dns;
-    meow_listener::AutoRedirect {
-        dns_set: ar.route_address_dns,
-        route: narrowed.then(|| {
+    (
+        narrowed.then(|| {
             collect(
                 &ar.route_address,
                 &ar.route_address_set,
                 "route-address-set",
             )
         }),
-        exclude: collect(
+        collect(
             &ar.route_exclude_address,
             &ar.route_exclude_address_set,
             "route-exclude-address-set",
         ),
+    )
+}
+
+#[cfg(feature = "listener-tun")]
+fn auto_redirect_ranges(
+    ar: &meow_config::AutoRedirectConfig,
+    registry: &ProviderRegistry,
+) -> meow_listener::AutoRedirect {
+    let (route, exclude) = resolve_auto_redirect(ar, registry, true);
+    // Rule-sets refresh (and may first load after the TUN starts): follow them.
+    let source = (!ar.route_address_set.is_empty() || !ar.route_exclude_address_set.is_empty())
+        .then(|| {
+            let ar = ar.clone();
+            let registry = Arc::clone(registry);
+            meow_listener::AutoRedirectSource {
+                changed: meow_config::rule_provider::changes(),
+                resolve: Arc::new(move || resolve_auto_redirect(&ar, &registry, false)),
+            }
+        });
+    meow_listener::AutoRedirect {
+        dns_set: ar.route_address_dns,
+        route,
+        exclude,
+        source,
     }
 }
 
