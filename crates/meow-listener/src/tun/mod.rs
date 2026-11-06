@@ -1707,6 +1707,7 @@ impl TunListener {
                     }),
             };
             let with_v6 = params.v6.is_some();
+            let params_live = params.clone();
             let route_mark = auto_redirect::ROUTE_MARK;
             let setup = tokio::task::spawn_blocking(move || {
                 let routes = policy_route::PolicyRoutes::setup_marked(
@@ -1724,10 +1725,13 @@ impl TunListener {
                     return Err(e);
                 }
             };
-            let sets = ar.source.clone().map(|src| {
-                let name = self.name.clone();
-                tokio::spawn(follow_rule_sets(src, fake, with_v6, (route, exclude), name))
-            });
+            let sets = Some(tokio::spawn(maintain(
+                params_live,
+                ar.source.clone(),
+                fake,
+                (route, exclude),
+                self.name.clone(),
+            )));
             Ok(RedirectGuard {
                 _nft: nft,
                 _routes: routes,
@@ -1786,48 +1790,95 @@ fn normalize((route, exclude): AutoRedirectRanges, fake: Option<V4Range>) -> Aut
     (route, exclude)
 }
 
-/// Keep the `route` / `exclude` sets in step with the rule-sets they come
-/// from.
+/// How often the auto-redirect table is checked for external removal.
 #[cfg(all(target_os = "linux", feature = "listener-tproxy"))]
-async fn follow_rule_sets(
-    mut src: AutoRedirectSource,
+const TABLE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keep the auto-redirect table alive: follow the rule-sets `route` /
+/// `exclude` come from, and put the table back (with the current sets) when
+/// something removes it — `nft flush ruleset`, a firewall restart, another
+/// tool.
+#[cfg(all(target_os = "linux", feature = "listener-tproxy"))]
+async fn maintain(
+    mut params: auto_redirect::Params,
+    mut src: Option<AutoRedirectSource>,
     fake: Option<V4Range>,
-    v6: bool,
     mut last: AutoRedirectRanges,
     name: String,
 ) {
-    while src.changed.changed().await.is_ok() {
-        // A reload or refresh burst swaps several providers: settle first.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        src.changed.borrow_and_update();
-        let now = normalize((src.resolve)(), fake);
-        if now == last {
-            continue;
-        }
-        let mut script = String::new();
-        auto_redirect::sets_update(
-            &mut script,
-            now.0.as_ref().map(|r| r.v4.as_slice()),
-            &now.1.v4,
-        );
-        if v6 {
-            auto_redirect::sets_update(
-                &mut script,
-                now.0.as_ref().map(|r| r.v6.as_slice()),
-                &now.1.v6,
-            );
-        }
-        match tokio::task::spawn_blocking(move || auto_redirect::apply(&script)).await {
-            Ok(Ok(())) => {
-                info!(
-                    "tun '{name}': auto-redirect sets updated ({} route, {} exclude ranges)",
-                    now.0.as_ref().map_or(0, |r| r.v4.len() + r.v6.len()),
-                    now.1.v4.len() + now.1.v6.len()
-                );
-                last = now;
+    let v6 = params.v6.is_some();
+    let mut tick = tokio::time::interval(TABLE_CHECK_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        let changed = async {
+            match src.as_mut() {
+                Some(s) => s.changed.changed().await.is_ok(),
+                None => std::future::pending().await,
             }
-            Ok(Err(e)) => warn!("tun '{name}': auto-redirect set update: {e}"),
-            Err(e) => warn!("tun '{name}': auto-redirect set update panicked: {e}"),
+        };
+        tokio::select! {
+            alive = changed => {
+                if !alive {
+                    src = None;
+                    continue;
+                }
+                // A reload or refresh burst swaps several providers: settle first.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(s) = src.as_mut() else { continue };
+                s.changed.borrow_and_update();
+                let now = normalize((s.resolve)(), fake);
+                if now == last {
+                    continue;
+                }
+                let mut script = String::new();
+                auto_redirect::sets_update(
+                    &mut script,
+                    now.0.as_ref().map(|r| r.v4.as_slice()),
+                    &now.1.v4,
+                );
+                if v6 {
+                    auto_redirect::sets_update(
+                        &mut script,
+                        now.0.as_ref().map(|r| r.v6.as_slice()),
+                        &now.1.v6,
+                    );
+                }
+                match tokio::task::spawn_blocking(move || auto_redirect::apply(&script)).await {
+                    Ok(Ok(())) => {
+                        info!(
+                            "tun '{name}': auto-redirect sets updated ({} route, {} exclude ranges)",
+                            now.0.as_ref().map_or(0, |r| r.v4.len() + r.v6.len()),
+                            now.1.v4.len() + now.1.v6.len()
+                        );
+                        last = now;
+                    }
+                    Ok(Err(e)) => warn!("tun '{name}': auto-redirect set update: {e}"),
+                    Err(e) => warn!("tun '{name}': auto-redirect set update panicked: {e}"),
+                }
+            }
+            _ = tick.tick() => {
+                let present = tokio::task::spawn_blocking(auto_redirect::table_present)
+                    .await
+                    .unwrap_or(true);
+                if present {
+                    continue;
+                }
+                params.v4.route = last.0.as_ref().map(|r| r.v4.clone());
+                params.v4.exclude.clone_from(&last.1.v4);
+                if let Some(f) = params.v6.as_mut() {
+                    f.route = last.0.as_ref().map(|r| r.v6.clone());
+                    f.exclude.clone_from(&last.1.v6);
+                }
+                let p = params.clone();
+                match tokio::task::spawn_blocking(move || auto_redirect::reinstall(&p)).await {
+                    Ok(Ok(())) => warn!(
+                        "tun '{name}': auto-redirect nftables table was removed externally; reinstalled"
+                    ),
+                    Ok(Err(e)) => warn!("tun '{name}': auto-redirect table reinstall: {e}"),
+                    Err(e) => warn!("tun '{name}': auto-redirect table reinstall panicked: {e}"),
+                }
+            }
         }
     }
 }

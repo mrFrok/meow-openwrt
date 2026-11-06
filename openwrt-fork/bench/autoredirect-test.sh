@@ -12,7 +12,8 @@
 # meow runs in mwg with tun.auto-redirect and route-address 203.0.113.2/32.
 # Checks: LAN TCP and UDP to .2 go through meow, to .3 they do not; LAN DNS
 # is answered by meow (hosts entry); the gateway's own TCP to .2 goes through
-# meow; on SIGTERM the nft table and policy rules are gone.
+# meow; a table deleted from outside comes back; on SIGTERM the nft table
+# and policy rules are gone.
 # Usage: sh autoredirect-test.sh <meow-bin>
 LC_ALL=C; export LC_ALL
 BIN=${1:?meow binary}
@@ -93,6 +94,16 @@ r=$($C nslookup test.lan 203.0.113.3 2>&1 | grep -c 1.2.3.4)
 n0=$(seen '203.0.113.2:8080')
 r=$($G wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
 [ "$r" = hello ] && [ "$(seen '203.0.113.2:8080')" -gt "$n0" ] && ok "gateway's own TCP through meow" || bad "gateway own TCP: $r"
+
+# Removed from outside (nft flush ruleset, a firewall restart): meow puts
+# the table back within its 10 s check, and capture works again.
+$G nft delete table inet meow
+sleep 12
+$G nft list table inet meow >/dev/null 2>&1 && ok "table reinstalled after external delete" || bad "table not reinstalled"
+grep -q 'removed externally; reinstalled' $W/meow.log && ok "  ...and logged" || bad "  ...no reinstall log line"
+n0=$(seen '203.0.113.2:8080')
+r=$($C wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
+[ "$r" = hello ] && [ "$(seen '203.0.113.2:8080')" -gt "$n0" ] && ok "  ...LAN TCP captured again" || bad "  ...LAN TCP after reinstall: $r"
 
 kill $MP; sleep 2; MP=""
 $G nft list table inet meow >/dev/null 2>&1 && bad "table left after SIGTERM" || ok "table removed"

@@ -80,6 +80,7 @@ impl Family for Ipv6Addr {
 }
 
 /// One family's capture.
+#[derive(Clone)]
 pub(super) struct Fam<A> {
     pub redirect_port: u16,
     /// DNS hijack target: the device's peer address.
@@ -185,6 +186,7 @@ pub(super) fn with_builtin_doh<A: Family + std::str::FromStr>(
 }
 
 /// What the ruleset is built from.
+#[derive(Clone)]
 pub(super) struct Params {
     pub dev: String,
     pub bypass_mark: u32,
@@ -432,6 +434,30 @@ pub(super) fn sets_update<A: Family>(s: &mut String, route: Option<&[(A, A)]>, e
 
 pub(super) fn apply(script: &str) -> io::Result<()> {
     nft(script)
+}
+
+/// Whether `table inet meow` is still there. Something else may remove it:
+/// `nft flush ruleset`, a firewall restart, another tool. Errors (no `nft`)
+/// report it present, so a broken probe never makes meow reinstall in a loop.
+pub(super) fn table_present() -> bool {
+    match Command::new("nft")
+        .args(["list", "tables"])
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.trim() == format!("table inet {TABLE}")),
+        _ => true,
+    }
+}
+
+/// Put the table back after [`table_present`] found it gone; the DNS set
+/// comes back empty, so the answer hook starts over (epoch bump).
+pub(super) fn reinstall(p: &Params) -> io::Result<()> {
+    nft(&ruleset(p))?;
+    meow_common::nftset::bump_epoch();
+    Ok(())
 }
 
 fn nft(script: &str) -> io::Result<()> {
