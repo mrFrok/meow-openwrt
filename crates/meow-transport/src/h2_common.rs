@@ -189,7 +189,7 @@ impl RecvState {
         }
     }
 
-    async fn drain(mut self) {
+    pub(crate) async fn drain(mut self) {
         if std::future::poll_fn(|cx| self.poll_ready(cx))
             .await
             .is_err()
@@ -397,6 +397,18 @@ impl SharedH2 {
         wait: bool,
         tag: fn(String) -> TransportError,
     ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), TransportError> {
+        self.send_request_end(request, wait, false, tag).await
+    }
+
+    /// [`Self::send_request`]; `end` closes the request with its headers
+    /// (a request without a body).
+    pub(crate) async fn send_request_end(
+        &self,
+        request: http::Request<()>,
+        wait: bool,
+        end: bool,
+        tag: fn(String) -> TransportError,
+    ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), TransportError> {
         if !wait && !self.has_room() {
             return Err(tag("connection full".into()));
         }
@@ -410,7 +422,7 @@ impl SharedH2 {
                 .map_err(|e| h2_to_transport(e, tag))?
         };
         let pair = h2
-            .send_request(request, false)
+            .send_request(request, end)
             .map_err(|e| h2_to_transport(e, tag))?;
         if let Ok(mut last) = self.last_open.lock() {
             *last = Instant::now();
@@ -526,9 +538,25 @@ pub struct H2Stream {
 
 impl H2Stream {
     pub fn new(send: h2::SendStream<Bytes>, recv: RecvState) -> Self {
+        let mut stream = Self::new_inner(send);
+        stream.recv = Some(recv);
+        stream
+    }
+
+    /// The upload half of a tunnel whose response another stream reads
+    /// (XHTTP stream-up); it must never be read from.
+    #[cfg_attr(
+        not(feature = "xhttp"),
+        allow(dead_code, reason = "only XHTTP splits a tunnel over two requests")
+    )]
+    pub(crate) fn send_only(send: h2::SendStream<Bytes>) -> Self {
+        Self::new_inner(send)
+    }
+
+    fn new_inner(send: h2::SendStream<Bytes>) -> Self {
         Self {
             send,
-            recv: Some(recv),
+            recv: None,
             read_buf: Bytes::new(),
             pending_write: None,
             remote_no_error_is_eof: false,

@@ -137,8 +137,10 @@ Method and the full size history are in
 
 ## Known gaps
 
-- XHTTP supports only `mode: stream-one`. Nodes with `packet-up` or
-  `stream-up` load as unavailable.
+- XHTTP runs `stream-one`, `stream-up` and `packet-up` (data in the body,
+  headers or cookies), checked against Xray with
+  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh). Nodes with
+  `download-settings` or `x-padding-obfs-mode` load as unavailable.
 - Config keys meow does not implement, such as `tun.auto-detect-interface`,
   are logged as warnings and ignored.
 - No GUI of its own. Use a front-end or a dashboard on `external-controller`.

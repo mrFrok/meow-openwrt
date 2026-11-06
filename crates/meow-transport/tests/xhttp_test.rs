@@ -266,7 +266,7 @@ async fn xhttp_config_validation() {
     assert_xhttp_config_error(
         "invalid_mode",
         XhttpConfig {
-            mode: "packet-up".into(),
+            mode: "packet-down".into(),
             ..Default::default()
         },
         "unsupported mode",

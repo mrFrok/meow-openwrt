@@ -136,8 +136,10 @@ Banana Pi BPI-R4 (MT7988A, aarch64), статические сборки musl б
 
 ## Чего пока нет
 
-- XHTTP поддерживает только `mode: stream-one`. Узлы с `packet-up` или
-  `stream-up` загружаются недоступными.
+- XHTTP работает в режимах `stream-one`, `stream-up` и `packet-up` (данные в
+  теле, заголовках или cookie), проверено против Xray скриптом
+  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh). Узлы с
+  `download-settings` или `x-padding-obfs-mode` загружаются недоступными.
 - Ключи конфига, которых нет в meow, например `tun.auto-detect-interface`,
   попадают в лог предупреждением и игнорируются.
 - Своего GUI нет. Используйте обвязку или панель на `external-controller`.

@@ -2913,33 +2913,118 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
+    if xhttp_opts.is_some_and(|o| o.get("download-settings").is_some()) {
+        return Err(
+            "vless: xhttp download-settings (download over a separate connection) is not \
+             supported"
+                .into(),
+        );
+    }
     let mut mode = xhttp_opts
         .and_then(|o| o.get("mode"))
         .and_then(|v| v.as_str())
-        .unwrap_or("stream-one")
-        .to_string();
-    if mode.eq_ignore_ascii_case("auto") {
-        // Xray's client resolution (splithttp/dialer.go): REALITY without
-        // `download-settings` is stream-one; with them stream-up, and
-        // without REALITY packet-up — neither of which meow implements.
-        let reality = config.contains_key("reality-opts");
-        let split = xhttp_opts.is_some_and(|o| o.get("download-settings").is_some());
-        mode = match (reality, split) {
-            (true, false) => "stream-one".into(),
-            (true, true) => "stream-up".into(),
-            (false, _) => "packet-up".into(),
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    if mode == "auto" {
+        // Xray's client resolution (splithttp/dialer.go): REALITY is
+        // stream-one (stream-up with download-settings, refused above),
+        // anything else packet-up.
+        mode = if config.contains_key("reality-opts") {
+            "stream-one".into()
+        } else {
+            "packet-up".into()
         };
-        if mode != "stream-one" {
-            return Err(format!(
-                "vless: xhttp mode 'auto' resolves to '{mode}' here (as in Xray); only \
-                 'stream-one' is implemented"
-            ));
-        }
     }
-    if !mode.eq_ignore_ascii_case("stream-one") {
+    if !matches!(mode.as_str(), "stream-one" | "stream-up" | "packet-up") {
+        return Err(format!("vless: unsupported xhttp mode '{mode}'"));
+    }
+    let opt_str = |key: &str| {
+        xhttp_opts
+            .and_then(|o| o.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    if xhttp_opts
+        .and_then(|o| o.get("x-padding-obfs-mode"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("vless: xhttp x-padding-obfs-mode is not supported".into());
+    }
+    let placement =
+        |key: &str| -> std::result::Result<meow_transport::xhttp::MetaPlacement, String> {
+            use meow_transport::xhttp::MetaPlacement;
+            match opt_str(key).to_ascii_lowercase().as_str() {
+                "" | "path" => Ok(MetaPlacement::Path),
+                "query" => Ok(MetaPlacement::Query),
+                "header" => Ok(MetaPlacement::Header),
+                "cookie" => Ok(MetaPlacement::Cookie),
+                other => Err(format!("vless: unsupported xhttp {key} '{other}'")),
+            }
+        };
+    let uplink_data = match opt_str("uplink-data-placement")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "auto" | "body" => meow_transport::xhttp::UplinkData::Body,
+        "header" => meow_transport::xhttp::UplinkData::Header,
+        "cookie" => meow_transport::xhttp::UplinkData::Cookie,
+        other => {
+            return Err(format!(
+                "vless: unsupported xhttp uplink-data-placement '{other}'"
+            ))
+        }
+    };
+    let range = |key: &str, default: (u64, u64)| -> std::result::Result<(u64, u64), String> {
+        let Some(value) = xhttp_opts.and_then(|o| o.get(key)) else {
+            return Ok(default);
+        };
+        let text = match value {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) if !s.trim().is_empty() => s.trim().to_string(),
+            serde_json::Value::String(_) | serde_json::Value::Null => return Ok(default),
+            _ => return Err(format!("vless: xhttp {key} must be a number or 'min-max'")),
+        };
+        let parse = |s: &str| {
+            s.trim()
+                .parse::<u64>()
+                .map_err(|e| format!("vless: invalid xhttp {key} '{text}': {e}"))
+        };
+        let (min, max) = match text.split_once('-') {
+            Some((a, b)) => (parse(a)?, parse(b)?),
+            None => {
+                let v = parse(&text)?;
+                (v, v)
+            }
+        };
+        if min > max {
+            return Err(format!("vless: xhttp {key} min exceeds max in '{text}'"));
+        }
+        Ok((min, max))
+    };
+    let to_usize = |(a, b): (u64, u64)| {
+        (
+            usize::try_from(a).unwrap_or(usize::MAX),
+            usize::try_from(b).unwrap_or(usize::MAX),
+        )
+    };
+    let max_each_post_bytes = to_usize(range("sc-max-each-post-bytes", (1_000_000, 1_000_000))?);
+    if max_each_post_bytes.1 > meow_transport::xhttp::MAX_EACH_POST_BYTES {
         return Err(format!(
-            "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
+            "vless: xhttp sc-max-each-post-bytes exceeds {}",
+            meow_transport::xhttp::MAX_EACH_POST_BYTES
         ));
+    }
+    let min_posts_interval_ms = range("sc-min-posts-interval-ms", (30, 30))?;
+    let uplink_chunk_size =
+        Some(to_usize(range("uplink-chunk-size", (0, 0))?)).filter(|&(_, max)| max > 0);
+    let uplink_method = match opt_str("uplink-http-method") {
+        m if m.is_empty() => "POST".to_string(),
+        m => m.to_ascii_uppercase(),
+    };
+    if uplink_method == "GET" && mode != "packet-up" {
+        return Err("vless: xhttp uplink-http-method GET works only in packet-up".into());
     }
     let extra_headers: Vec<(String, String)> = match xhttp_opts
         .and_then(|o| o.get("headers"))
@@ -3044,6 +3129,16 @@ fn parse_vless_xhttp_config(
         mode,
         no_grpc_header,
         x_padding_bytes,
+        uplink_method,
+        uplink_data,
+        uplink_data_key: opt_str("uplink-data-key"),
+        uplink_chunk_size,
+        max_each_post_bytes,
+        min_posts_interval_ms,
+        session_placement: placement("session-placement")?,
+        session_key: opt_str("session-key"),
+        seq_placement: placement("seq-placement")?,
+        seq_key: opt_str("seq-key"),
     })
 }
 
@@ -4031,13 +4126,41 @@ mod tests {
             "reality-opts:\n  public-key: k\nxhttp-opts:\n  mode: auto\n  download-settings:\n    path: /d\n",
         );
         let err = parse_vless_xhttp_config(&split, "203.0.113.7", "cdn.example.com", true)
-            .expect_err("auto + download-settings is stream-up");
-        assert!(err.contains("stream-up"), "{err}");
+            .expect_err("download-settings is not supported");
+        assert!(err.contains("download-settings"), "{err}");
 
         let tls = proxy_config("xhttp-opts:\n  mode: auto\n");
-        let err = parse_vless_xhttp_config(&tls, "203.0.113.7", "cdn.example.com", true)
-            .expect_err("auto without REALITY is packet-up");
-        assert!(err.contains("packet-up"), "{err}");
+        let parsed = parse_vless_xhttp_config(&tls, "203.0.113.7", "cdn.example.com", true)
+            .expect("auto without REALITY is packet-up");
+        assert_eq!(parsed.mode, "packet-up");
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_packet_up_options() {
+        use meow_transport::xhttp::{MetaPlacement, UplinkData};
+        let cfg = proxy_config(
+            "xhttp-opts:\n  path: /x\n  mode: packet-up\n  uplink-http-method: get\n  \
+             uplink-data-placement: header\n  uplink-chunk-size: 0\n  \
+             sc-max-each-post-bytes: 8192\n  sc-min-posts-interval-ms: 1-5\n  \
+             session-placement: query\n",
+        );
+        let parsed = parse_vless_xhttp_config(&cfg, "203.0.113.7", "cdn.example.com", true)
+            .expect("packet-up options parse");
+        assert_eq!(parsed.mode, "packet-up");
+        assert_eq!(parsed.uplink_method, "GET");
+        assert_eq!(parsed.uplink_data, UplinkData::Header);
+        assert_eq!(parsed.uplink_chunk_size, None);
+        assert_eq!(parsed.max_each_post_bytes, (8192, 8192));
+        assert_eq!(parsed.min_posts_interval_ms, (1, 5));
+        assert_eq!(parsed.session_placement, MetaPlacement::Query);
+        assert_eq!(parsed.seq_placement, MetaPlacement::Path);
+
+        let get_stream =
+            proxy_config("xhttp-opts:\n  mode: stream-up\n  uplink-http-method: GET\n");
+        assert!(parse_vless_xhttp_config(&get_stream, "h", "", true).is_err());
+        let obfs = proxy_config("xhttp-opts:\n  mode: packet-up\n  x-padding-obfs-mode: true\n");
+        assert!(parse_vless_xhttp_config(&obfs, "h", "", true).is_err());
     }
 
     #[cfg(feature = "vless")]

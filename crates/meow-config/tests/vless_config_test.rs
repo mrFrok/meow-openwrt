@@ -1629,7 +1629,7 @@ proxies:
     tls: true
     network: xhttp
     xhttp-opts:
-      mode: auto
+      mode: packet-down
 "#;
     let config = load_config_from_str(yaml)
         .await
