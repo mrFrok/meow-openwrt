@@ -25,6 +25,7 @@ G="ip netns exec mwg"; C="ip netns exec mwc"; S="ip netns exec mws"
 cleanup() {
 	[ -n "$MP" ] && kill $MP 2>/dev/null
 	for p in $SRV; do kill $p 2>/dev/null; done
+	[ -f $W/iperf.pid ] && kill "$(cat $W/iperf.pid)" 2>/dev/null
 	for n in mwc mwg mws; do ip netns del $n 2>/dev/null; done
 }
 trap cleanup EXIT
@@ -44,7 +45,7 @@ $S ip route add 192.168.77.0/24 via 10.78.0.1
 $G ip route add 203.0.113.0/24 via 10.78.0.2
 SRV=""
 for a in 203.0.113.2 203.0.113.3; do $S uhttpd -f -p $a:8080 -h $W/www & SRV="$SRV $!"; done
-$S iperf3 -s -D -B 203.0.113.2 >/dev/null 2>&1
+$S iperf3 -s -D -B 203.0.113.2 -I $W/iperf.pid >/dev/null 2>&1
 
 cat > $W/config.yaml <<EOF
 log-level: info

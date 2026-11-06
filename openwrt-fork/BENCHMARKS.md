@@ -54,3 +54,15 @@ Current profiles (all three pass `meow -t` under qemu-mipsel):
 | meow-full (no build-std, keeps panic messages) | 14.00 | 4.07 | 6.85 |
 Live-checked in `unshare -rn` (x86 tiny): auto-route true (v4+v6 rules 9200–9205, table, addresses) and fake-ip
 (main-table 198.18.0.0/16) install and fully clean up on SIGTERM.
+
+## Release profiles on the BPI-R4 (2026-11-06)
+aarch64 musl static, no PGO (`pgo-gen.sh PROFILE=… PGO_USE=none`). `autoredirect-test.sh` (5 phases) ALL PASS
+for all three. tunbench SECS=8, mihomo server (`SRVBIN=/tmp/mihomo-srv`); memory: meowmem on the live config, idle 20 s.
+
+| profile | size | DIRECT TCP ↓ | hy2 TCP ↓ | VLESS+Reality ↓ | bench anon peak | live idle anon (end) | live HWM |
+|---|---|---|---|---|---|---|---|
+| tiny | 8.48 MB | 5690 Mbit/s, 0.02 %/Mbit | 306, 0.39 | 2020, 0.08 | 1.3 MB | 5.1 MB | 14.1 MB |
+| lightweight | 9.08 MB | 5450, 0.02 | 312, 0.44 | 2030, 0.08 | 1.3 MB | 5.1 MB | 14.0 MB |
+| full | 12.18 MB | 5660, 0.02 | 323, 0.44 | 2000, 0.08 | 4.6 MB | 6.0 MB | 16.2 MB |
+
+Speeds are the same across profiles; `full` costs +3.7 MB on flash and ~3 MB anon (logbook/traffic-ledger SQLite).
