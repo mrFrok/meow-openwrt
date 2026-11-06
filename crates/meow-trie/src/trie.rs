@@ -114,6 +114,66 @@ impl Hasher for FastHasher {
 
 type FastBuild = BuildHasherDefault<FastHasher>;
 
+/// Label interner of the build phase: every distinct label once in one
+/// arena, found through a hash → id map with per-id collision chains. A
+/// `HashMap<Box<str>, u32>` cost one heap block per label plus a 24-byte
+/// slot; on an 80k-domain list that was ~3 MiB of the load peak.
+#[derive(Default)]
+struct Interner {
+    /// Each label followed by a `.` terminator, the sealed arena's layout,
+    /// so sealing takes it over instead of copying.
+    arena: String,
+    /// id → (offset, len) in `arena`, `len` without the terminator.
+    spans: Vec<(u32, u32)>,
+    /// id → next id with the same hash, `NO_LABEL` ends the chain.
+    next: Vec<u32>,
+    /// Low 32 bits of the label hash → newest id with it (chains resolve
+    /// the rest, so a narrower key only costs an occasional extra compare).
+    heads: HashMap<u32, u32, FastBuild>,
+}
+
+const NO_LABEL: u32 = u32::MAX;
+
+impl Interner {
+    fn hash(label: &str) -> u32 {
+        let mut h = FastHasher::default();
+        h.write(label.as_bytes());
+        h.finish() as u32
+    }
+
+    fn label(&self, id: u32) -> &str {
+        let (off, len) = self.spans[id as usize];
+        &self.arena[off as usize..(off + len) as usize]
+    }
+
+    fn get(&self, label: &str) -> Option<u32> {
+        let mut id = *self.heads.get(&Self::hash(label))?;
+        while id != NO_LABEL {
+            if self.label(id) == label {
+                return Some(id);
+            }
+            id = self.next[id as usize];
+        }
+        None
+    }
+
+    fn intern(&mut self, label: &str) -> u32 {
+        if let Some(id) = self.get(label) {
+            return id;
+        }
+        let id = u32::try_from(self.spans.len()).expect("label id overflow");
+        let off = u32::try_from(self.arena.len()).expect("label arena overflow");
+        let len = u32::try_from(label.len()).expect("label too long");
+        self.arena.push_str(label);
+        self.arena.push('.');
+        self.spans.push((off, len));
+        let head = self.heads.entry(Self::hash(label)).or_insert(NO_LABEL);
+        self.next.push(*head);
+        *head = id;
+        id
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Build phase
 // ---------------------------------------------------------------------------
@@ -131,7 +191,7 @@ struct Builder<T> {
     /// `(parent node, label id) → child node`.
     edges: HashMap<(u32, u32), u32, FastBuild>,
     /// Interned labels; id 0 is the empty root label.
-    labels: HashMap<Box<str>, u32, FastBuild>,
+    labels: Interner,
 }
 
 impl<T> Builder<T> {
@@ -139,13 +199,13 @@ impl<T> Builder<T> {
         Self {
             nodes: Vec::new(),
             edges: HashMap::default(),
-            labels: HashMap::default(),
+            labels: Interner::default(),
         }
     }
 
     fn ensure_root(&mut self) {
         if self.nodes.is_empty() {
-            self.labels.insert(Box::from(""), 0);
+            self.labels.intern("");
             self.nodes.push(BuildNode {
                 label: 0,
                 exact: None,
@@ -156,14 +216,7 @@ impl<T> Builder<T> {
     }
 
     fn child_or_insert(&mut self, parent: u32, label: &str) -> u32 {
-        let id = match self.labels.get(label) {
-            Some(&id) => id,
-            None => {
-                let id = u32::try_from(self.labels.len()).expect("label id overflow");
-                self.labels.insert(Box::from(label), id);
-                id
-            }
-        };
+        let id = self.labels.intern(label);
         match self.edges.entry((parent, id)) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
@@ -182,7 +235,7 @@ impl<T> Builder<T> {
 
     #[inline]
     fn child(&self, parent: u32, label: &str) -> Option<u32> {
-        let id = *self.labels.get(label)?;
+        let id = self.labels.get(label)?;
         self.edges.get(&(parent, id)).copied()
     }
 
@@ -238,16 +291,13 @@ impl<T> Builder<T> {
         };
 
         // Label id → bytes, for sorting children and building the arena.
-        let mut label_by_id: Vec<&str> = vec![""; self.labels.len()];
-        for (label, &id) in &self.labels {
-            label_by_id[id as usize] = label;
-        }
+        let labels = &self.labels;
         let nodes = &self.nodes;
         for p in 0..n {
             let group = &mut children_old[run(p)];
             group.sort_unstable_by(|&a, &b| {
-                let la = label_by_id[nodes[a as usize].label as usize].as_bytes();
-                let lb = label_by_id[nodes[b as usize].label as usize].as_bytes();
+                let la = labels.label(nodes[a as usize].label).as_bytes();
+                let lb = labels.label(nodes[b as usize].label).as_bytes();
                 la.cmp(lb)
             });
         }
@@ -272,19 +322,11 @@ impl<T> Builder<T> {
         // Arena: every label followed by a `.` terminator (labels come from
         // splitting on `.`, so the byte never occurs inside one). Nodes then
         // need only an offset, and comparisons read straight from the arena.
-        let total_label_bytes: usize = label_by_id.iter().map(|l| l.len() + 1).sum();
-        assert!(
-            u32::try_from(total_label_bytes).is_ok(),
-            "DomainTrie: label arena exceeds u32 range"
-        );
-        let mut label_offset: Vec<u32> = Vec::with_capacity(label_by_id.len());
-        let mut labels: Vec<u8> = Vec::with_capacity(total_label_bytes);
-        for label in &label_by_id {
-            label_offset.push(labels.len() as u32);
-            labels.extend_from_slice(label.as_bytes());
-            labels.push(b'.');
-        }
-        drop(label_by_id);
+        // The interner already holds exactly that, deduplicated.
+        let Interner { arena, spans, .. } = std::mem::take(&mut self.labels);
+        let label_offset: Vec<u32> = spans.iter().map(|&(off, _)| off).collect();
+        drop(spans);
+        let labels = arena.into_bytes();
 
         let mut sealed_nodes: Vec<Node> = Vec::with_capacity(n + 1);
         let mut values: Vec<T> = Vec::new();
