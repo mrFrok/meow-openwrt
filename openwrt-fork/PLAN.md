@@ -139,15 +139,19 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 - sockmap/eBPF: не делаем — DIRECT TCP уже splice ~10 Гбит/с, с dns.nftset мимо ядра; шифрование в BPF невозможно.
 
 ## Этап 7 — big-endian MIPS (BoringSSL только LE — подтверждено)
-rustls + quinn: Reality meow — свой TLS 1.3 на RustCrypto (`meow-transport/src/reality_tls.rs`, из boring только
-`boring::aead` → `aes-gcm`/`chacha20poly1305`); обычный TLS — rustls (удалённый бэкенд из истории meow-rs);
-Hysteria2 — из clash-rs `clash-lib/src/proxy/hysteria2/` (quinn 0.11, Brutal, Salamander, port hopping);
-uTLS/ECH на rustls — открытая задача (образец ручного ClientHello — steer `src/proto/tls/reality.c`).
-Старт — после этапа 0.4.
-2026-11-03: готовый путь — clash-rs (Apache-2.0): rustls + `ring`, Reality в форке `Watfaq/rustls`
-(`clash-lib/src/proxy/transport/reality.rs`, `.with_reality`), hy2 на quinn; `mips-unknown-linux-musl` в их CI
-(`-F standard,ring`). Открыто: uTLS-отпечаток/ECH в их форке, размер на MIPS, живость форка rustls.
-Первый шаг — собрать clash-rs под mips BE в SDK. Делать после остальных этапов.
+Сделано 2026-11-06 (бэкенд выбирают build.rs: `cfg(boring)` в meow-transport, `cfg(hy2_quiche)` в meow-proxy;
+LE ничего не теряет; `MEOW_TLS_BACKEND=rustls` включает BE-путь на хосте для тестов):
+- 7.1 крипто-фасад `meow_transport::crypto` — BoringSSL на LE, RustCrypto на BE (sniffer QUIC, AEAD
+  VMess/Snell/VLESS-enc, REALITY, ShadowTLS).
+- 7.2 TLS на rustls + ring (`tls/rustls_backend.rs`): SNI/ALPN/версии/pin/mTLS/curves/distrust. Нет на BE:
+  uTLS-отпечатков (warn), ECH (ошибка конфига), Vision-passthrough, restls/jls (compile_error).
+- 7.3 REALITY + Vision на BE — проверено под qemu-mips против mihomo-сервера.
+- 7.4 hysteria2 на quinn (`hysteria2/driver_quinn.rs`, тот же `Cmd`-протокол, BBR, Salamander/Gecko,
+  port hopping); общий static-only QPACK (`qpack.rs`, Huffman через `octets`). TCP+UDP проверены под qemu.
+- 7.5 сборка: `bench/mips-be-build.sh` (ath79 SDK, build-std). tiny = 11 МБ статический stripped
+  (xz 2,9 / gzip 4,6 МБ; на UBIFS ≈ 5,5 МБ zlib / 5,7 zstd / 7,5 lzo — поблочная оценка, zlib сверена с
+  mkfs.ubifs). Цель «< 6 МБ несжатым» снята: ядро само ~6 МБ, ориентир — паритет с LE (tiny aarch64 8,5).
+Открыто: проверка на живом BE-железе (волонтёры), скорость RustCrypto/ring на 24Kc, Brutal на quinn.
 
 ## Проверка
 - Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге роутера (без `cp -rL`, без предупреждений).

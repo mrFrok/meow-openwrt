@@ -55,8 +55,18 @@ snell = ["dep:argon2", "meow-transport/crypto", "dep:blake2", "meow-transport/si
 # TlsLayer through anytls-rs's `TlsConnect` hook, so no second TLS stack.
 anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
-# QUIC + HTTP/3), so it links no rustls and no second crypto library.
-hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:tokio-util"]
+# QUIC + HTTP/3), so it links no rustls and no second crypto library. On
+# big-endian targets (no BoringSSL) it runs on quinn + rustls instead
+# (build.rs `cfg(hy2_quiche)`; meow-openwrt stage 7).
+hysteria2 = [
+    "dep:quiche",
+    "dep:boring",
+    "dep:blake2",
+    "dep:tokio-util",
+    "dep:quinn",
+    "dep:octets",
+    "meow-transport/tls",
+]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["dep:h2", "dep:tokio-util"]
 # The HTTP/3 transport for that outbound (`quic: true`). Rides quiche on the
@@ -93,13 +103,10 @@ tokio-util = { workspace = true, optional = true }
 yamux = { workspace = true, optional = true }
 h2 = { version = "0.4", optional = true }
 meow-anytls = { workspace = true, optional = true }
-# quiche = QUIC + HTTP/3 for the hysteria2 outbound, on BoringSSL (shares the
-# `boring` crate's vendored copy). No rustls, no second crypto library.
-quiche = { workspace = true, optional = true }
-# BoringSSL SslContextBuilder for the quiche TLS config (cert verify / pin),
-# and the Snell / VMess / VLESS-encryption record AEAD (`src/aead.rs`). Same
-# `boring` crate (and vendored library) meow-transport links.
-boring = { workspace = true, optional = true }
+# hysteria2 on big-endian targets (build.rs): quinn + rustls, and `octets`
+# for the auth exchange's QPACK Huffman strings (also used on little-endian).
+quinn = { workspace = true, optional = true }
+octets = { version = "0.3", features = ["huffman_hpack"], optional = true }
 # Mozilla CA roots for the hysteria2 quiche verify store (mirrors meow-transport).
 webpki-root-certs = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
@@ -133,6 +140,15 @@ ctr = { workspace = true, optional = true }
 # near-daily cadence, so a caret range would auto-resolve to releases only
 # hours old. Bump deliberately.
 psl = { version = "=2.1.232", optional = true }
+
+# BoringSSL does not build on big-endian targets (meow-openwrt stage 7).
+[target.'cfg(target_endian = "little")'.dependencies]
+# quiche = QUIC + HTTP/3 for the hysteria2 outbound, on BoringSSL (shares the
+# `boring` crate's vendored copy). No rustls, no second crypto library.
+quiche = { workspace = true, optional = true }
+# BoringSSL SslContextBuilder for the quiche TLS config (cert verify / pin).
+# Same `boring` crate (and vendored library) meow-transport links.
+boring = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

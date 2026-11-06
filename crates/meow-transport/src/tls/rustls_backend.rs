@@ -355,6 +355,13 @@ fn shared_config(config: &TlsConfig) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::clone(map.entry(key).or_insert(built)))
 }
 
+/// The validated, shared rustls `ClientConfig` for `config` — what the
+/// hysteria2 quinn driver hands to QUIC.
+pub fn client_config(config: &TlsConfig) -> Result<Arc<rustls::ClientConfig>> {
+    RustlsInner::validate(config)?;
+    shared_config(config)
+}
+
 // ─── connector ────────────────────────────────────────────────────────────────
 
 pub(super) struct RustlsInner {

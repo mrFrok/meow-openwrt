@@ -3,17 +3,42 @@
 //! Hysteria relays UDP as raw QUIC DATAGRAMs. Advertising SETTINGS_H3_DATAGRAM
 //! makes quic-go start an HTTP/3 receiver that steals those datagrams. Quiche's
 //! high-level h3 connection always advertises it when QUIC datagrams are on,
-//! so send the small auth exchange directly, reusing quiche's QPACK codec.
-//! Empty SETTINGS also leave the QPACK dynamic table disabled.
+//! so send the small auth exchange directly with a static-only QPACK codec
+//! (`qpack.rs`, shared with the quinn driver of big-endian builds). Empty
+//! SETTINGS also leave the QPACK dynamic table disabled.
 
-use super::{proto, Error, Result};
-use quiche::h3::{qpack, Header, NameValue};
+use super::{proto, qpack, Error, Result};
 
-const MAX_AUTH_BYTES: usize = 64 * 1024;
+pub(super) const MAX_AUTH_BYTES: usize = 64 * 1024;
+#[cfg(hy2_quiche)]
 const AUTH_STREAM: u64 = 0;
-// Client-initiated unidirectional control stream: type 0, SETTINGS (4), length 0.
-const SETTINGS: &[u8] = &[0, 4, 0];
+/// Client-initiated unidirectional control stream: type 0, SETTINGS (4),
+/// length 0.
+pub(super) const SETTINGS: &[u8] = &[0, 4, 0];
 
+/// The auth request: one HEADERS frame (`POST /auth`).
+pub(super) fn request(password: &str, rx_bps: u64) -> Result<Vec<u8>> {
+    let padding = proto::auth_request_padding();
+    let rx = rx_bps.to_string();
+    let block = qpack::encode(&[
+        (b":method", b"POST"),
+        (b":scheme", b"https"),
+        (b":authority", b"hysteria"),
+        (b":path", b"/auth"),
+        (b"hysteria-auth", password.as_bytes()),
+        (b"hysteria-cc-rx", rx.as_bytes()),
+        (b"hysteria-padding", padding.as_bytes()),
+    ]);
+    if block.len() > MAX_AUTH_BYTES {
+        return Err(Error::Http3("auth headers too large".into()));
+    }
+    let mut request = vec![1]; // HEADERS frame
+    proto::put_varint(block.len() as u64, &mut request)?;
+    request.extend_from_slice(&block);
+    Ok(request)
+}
+
+#[cfg(hy2_quiche)]
 pub(super) struct Auth {
     request: Vec<u8>,
     request_sent: usize,
@@ -21,28 +46,11 @@ pub(super) struct Auth {
     response: Vec<u8>,
 }
 
+#[cfg(hy2_quiche)]
 impl Auth {
     pub(super) fn new(password: &str, rx_bps: u64) -> Result<Self> {
-        let padding = proto::auth_request_padding();
-        let rx = rx_bps.to_string();
-        let headers = [
-            Header::new(b":method", b"POST"),
-            Header::new(b":scheme", b"https"),
-            Header::new(b":authority", b"hysteria"),
-            Header::new(b":path", b"/auth"),
-            Header::new(b"hysteria-auth", password.as_bytes()),
-            Header::new(b"hysteria-cc-rx", rx.as_bytes()),
-            Header::new(b"hysteria-padding", padding.as_bytes()),
-        ];
-        let mut block = vec![0; MAX_AUTH_BYTES];
-        let n = qpack::Encoder::new()
-            .encode(&headers, &mut block)
-            .map_err(|e| Error::Http3(format!("auth headers: {e}")))?;
-        let mut request = vec![1]; // HEADERS frame
-        proto::put_varint(n as u64, &mut request)?;
-        request.extend_from_slice(&block[..n]);
         Ok(Self {
-            request,
+            request: request(password, rx_bps)?,
             request_sent: 0,
             settings_sent: 0,
             response: Vec::new(),
@@ -80,6 +88,7 @@ impl Auth {
     }
 }
 
+#[cfg(hy2_quiche)]
 fn send(
     conn: &mut quiche::Connection,
     id: u64,
@@ -97,7 +106,7 @@ fn send(
     Ok(*offset == bytes.len())
 }
 
-fn decode_response(bytes: &[u8]) -> Result<bool> {
+pub(super) fn decode_response(bytes: &[u8]) -> Result<bool> {
     let mut pos = 0;
     let mut status_seen = false;
     let mut udp_enabled = false;
@@ -116,17 +125,15 @@ fn decode_response(bytes: &[u8]) -> Result<bool> {
                 if !payload.starts_with(&[0, 0]) {
                     return Err(Error::Http3("dynamic QPACK auth block".into()));
                 }
-                let headers = qpack::Decoder::new()
-                    .decode(payload, MAX_AUTH_BYTES as u64)
-                    .map_err(|e| Error::Http3(format!("auth response headers: {e}")))?;
+                let headers = qpack::decode(payload, MAX_AUTH_BYTES)?;
                 let mut status = None;
-                for h in &headers {
-                    if h.name() == b":status" {
-                        if status.replace(h.value()).is_some() || status_seen {
+                for (name, value) in &headers {
+                    if name == b":status" {
+                        if status.replace(value.as_slice()).is_some() || status_seen {
                             return Err(Error::Auth("duplicate authentication status".into()));
                         }
-                    } else if h.name() == b"hysteria-udp" && !status_seen {
-                        let value = std::str::from_utf8(h.value()).unwrap_or("").trim();
+                    } else if name == b"hysteria-udp" && !status_seen {
+                        let value = std::str::from_utf8(value).unwrap_or("").trim();
                         udp_enabled = value.eq_ignore_ascii_case("true")
                             || value == "1"
                             || value.eq_ignore_ascii_case("yes");
@@ -159,19 +166,10 @@ mod tests {
     use super::*;
 
     fn response(status: &[u8], udp: &[u8]) -> Vec<u8> {
-        let mut encoded = [0; 1024];
-        let n = qpack::Encoder::new()
-            .encode(
-                &[
-                    Header::new(b":status", status),
-                    Header::new(b"hysteria-udp", udp),
-                ],
-                &mut encoded,
-            )
-            .unwrap();
+        let encoded = qpack::encode(&[(b":status", status), (b"hysteria-udp", udp)]);
         let mut frame = vec![1];
-        proto::put_varint(n as u64, &mut frame).unwrap();
-        frame.extend_from_slice(&encoded[..n]);
+        proto::put_varint(encoded.len() as u64, &mut frame).unwrap();
+        frame.extend_from_slice(&encoded);
         frame
     }
 

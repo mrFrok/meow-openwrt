@@ -16,9 +16,9 @@ export CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-openwrt-linux-musl-gcc
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_PANIC=abort CARGO_PROFILE_RELEASE_STRIP=true CARGO_PROFILE_RELEASE_DEBUG=false
 # std's `unwind` links -lunwind even with panic=abort; the SDK only has
 # libgcc_eh, so a one-line linker script stands in for libunwind.a.
-SHIM=${TGT:-/tmp/meow-mips-target}/unwind-shim
+SHIM=$(realpath -m "${TGT:-target/mips-be}")/unwind-shim
 mkdir -p "$SHIM" && echo 'INPUT(-lgcc_eh)' > "$SHIM/libunwind.a"
 export RUSTFLAGS="-Clink-self-contained=no -Lnative=$SHIM -Ctarget-cpu=mips32r2 -Ctarget-feature=+crt-static -Cforce-unwind-tables=no -Lnative=$TC/lib -Clink-arg=-lssp_nonshared -Zlocation-detail=none"
 cargo +1.96.0 build -Zbuild-std=std,panic_abort \
 	--release -p meow-app --bin meow --no-default-features --features "${PROFILE:-tiny}" \
-	--target mips-unknown-linux-musl --target-dir "${TGT:-/tmp/meow-mips-target}"
+	--target mips-unknown-linux-musl --target-dir "${TGT:-target/mips-be}"

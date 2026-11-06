@@ -1,11 +1,18 @@
 mod auth;
 mod client;
 mod config;
+#[cfg(hy2_quiche)]
+mod driver;
+#[cfg(not(hy2_quiche))]
+#[path = "driver_quinn.rs"]
 mod driver;
 mod error;
 mod obfs;
+mod params;
 mod proto;
+mod qpack;
 mod tcp;
+#[cfg(hy2_quiche)]
 mod tls;
 mod udp;
 

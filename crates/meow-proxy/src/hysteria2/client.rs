@@ -209,6 +209,25 @@ async fn connect_addr(
     enlarge_recv_buffer(&socket);
     let local = socket.local_addr().map_err(Error::Io)?;
 
+    #[cfg(not(hy2_quiche))]
+    {
+        let _ = local;
+        driver::spawn(cfg, socket, server_addr, server_name).await
+    }
+    #[cfg(hy2_quiche)]
+    {
+        connect_quiche(cfg, socket, local, server_addr, server_name).await
+    }
+}
+
+#[cfg(hy2_quiche)]
+async fn connect_quiche(
+    cfg: &Config,
+    socket: tokio::net::UdpSocket,
+    local: SocketAddr,
+    server_addr: SocketAddr,
+    server_name: &str,
+) -> Result<ConnHandle> {
     let mut config = super::tls::build_quiche_config(cfg)?;
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     for b in &mut scid {
