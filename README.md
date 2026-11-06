@@ -34,7 +34,9 @@ work.
 | OpenWrt arch | Example devices | TLS and QUIC |
 |---|---|---|
 | `aarch64_cortex-a53`, `aarch64_generic`, `-a72`, `-a76` | MT7981/MT7986/MT7988 (Filogic), RK3328/RK3568/RK3588 | BoringSSL, quiche |
-| `arm_cortex-a7_neon-vfpv4` | IPQ40xx | BoringSSL, quiche |
+| `arm_cortex-a7_neon-vfpv4`, `arm_cortex-a15_neon-vfpv4` | IPQ40xx, IPQ806x | BoringSSL, quiche |
+| `arm_cortex-a9_vfpv3-d16`, `arm_cortex-a9_neon` | Armada 370/XP/38x (mvebu), i.MX6 | BoringSSL, quiche |
+| `arm_cortex-a9` (no FPU) | BCM4708/4709 (bcm53xx: R7000, RT-AC68U) | BoringSSL, quiche |
 | `mipsel_24kc` | MT7621 | BoringSSL, quiche |
 | `mips_24kc` | ath79 (big-endian) | rustls, quinn |
 

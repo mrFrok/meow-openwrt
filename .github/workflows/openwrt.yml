@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [aarch64, armv7, mipsel, mips]
+        arch: [aarch64, armv7, armv7-a9, armv7-sf, mipsel, mips]
         profile: [tiny, lightweight, full]
     steps:
       - uses: actions/checkout@v5
@@ -76,7 +76,10 @@ jobs:
           esac
           case "${{ matrix.arch }}" in
             aarch64) labels="aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76" ;;
-            armv7) labels="arm_cortex-a7_neon-vfpv4" ;;
+            # Cortex-A15 runs the A7 build (same ARMv7VE + NEON-VFPv4 ISA).
+            armv7) labels="arm_cortex-a7_neon-vfpv4 arm_cortex-a15_neon-vfpv4" ;;
+            armv7-a9) labels="arm_cortex-a9_vfpv3-d16 arm_cortex-a9_neon" ;;
+            armv7-sf) labels="arm_cortex-a9" ;;
             mipsel) labels="mipsel_24kc" ;;
             mips) labels="mips_24kc" ;;
           esac

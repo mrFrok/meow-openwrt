@@ -5,11 +5,15 @@
 # .github/workflows/openwrt.yml; runs the same on a workstation.
 #
 # usage: build.sh <arch> <profile>
-#   arch:    aarch64 | armv7 | mipsel | mips
+#   arch:    aarch64 | armv7 | armv7-a9 | armv7-sf | mipsel | mips
+#            armv7: Cortex-A7/A15 (NEON, VFPv4); armv7-a9: Cortex-A9 with
+#            VFPv3-D16, no NEON (mvebu); armv7-sf: no FPU (bcm53xx)
 #   profile: tiny | lightweight | full
 # env:     TC_CACHE  toolchain dir cache (default ~/.cache/meow-owrt-tc)
 #          TGT       cargo target dir (default target/owrt-<arch>)
 #          OUT       where meow-<profile>-<arch> is copied (default dist)
+#          EXTRA_FEATURES  extra cargo features (experiments only)
+#          OPENWRT_MIRROR  SDK mirror base (sha256 is checked either way)
 set -euo pipefail
 ARCH=${1:?arch}; PROFILE=${2:?profile}
 cd "$(dirname "$0")/../.."
@@ -26,6 +30,19 @@ armv7)
 	SDK_FILE=openwrt-sdk-$SDK_REL-ipq40xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
 	RT=armv7-unknown-linux-musleabihf; GCC=arm-openwrt-linux-muslgnueabi
 	CFL="-Os -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"; RFL="-Ctarget-cpu=cortex-a7" ;;
+armv7-a9)
+	SDK_TGT=mvebu/cortexa9; SDK_SHA=fc59dddc696b88e32662f4b1611c880bed24a88115ae423b640c81d071bec8ab
+	SDK_FILE=openwrt-sdk-$SDK_REL-mvebu-cortexa9_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
+	RT=armv7-unknown-linux-musleabihf; GCC=arm-openwrt-linux-muslgnueabi
+	# rustc 1.96 turns `d32` on for this target despite its vfp3d16 spec:
+	# VFPv3-D16 parts (Armada 370/XP) SIGILL on d16-d31 without -d32.
+	CFL="-Os -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard"; RFL="-Ctarget-feature=-d32" ;;
+armv7-sf)
+	SDK_TGT=bcm53xx/generic; SDK_SHA=291c0899a045a963aa5f610e885b9eb335cfeb5c8478c9c431770ba9cdbc98bf
+	SDK_FILE=openwrt-sdk-$SDK_REL-bcm53xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
+	RT=armv7-unknown-linux-musleabi; GCC=arm-openwrt-linux-muslgnueabi
+	# No target-cpu: cortex-a9 would let LLVM emit VFP code the BCM4708 lacks.
+	CFL="-Os -mcpu=cortex-a9 -mfloat-abi=soft"; RFL="" ;;
 mipsel)
 	SDK_TGT=ramips/mt7621; SDK_SHA=e4e3f25962ddf3ed55207fed456ecd1d6e55f3482c976b3183a640df6ef0adf0
 	SDK_FILE=openwrt-sdk-$SDK_REL-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64.tar.zst
@@ -45,14 +62,18 @@ TC_CACHE=${TC_CACHE:-$HOME/.cache/meow-owrt-tc}
 TCROOT=$TC_CACHE/$ARCH-$SDK_SHA
 if ! { [ -d "$TCROOT/host/lib" ] && ls -d "$TCROOT"/toolchain-* >/dev/null 2>&1; }; then
 	mkdir -p "$TCROOT"
-	dl=$(mktemp -d)
-	curl -fsSL --retry 3 -o "$dl/sdk.tar.zst" \
-		"https://downloads.openwrt.org/releases/$SDK_REL/targets/$SDK_TGT/$SDK_FILE"
-	echo "$SDK_SHA  $dl/sdk.tar.zst" | sha256sum -c -
+	# The download server drops long transfers now and then: resume.
+	dl=$TC_CACHE/$SDK_FILE.part
+	for try in 1 2 3 4 5 6; do
+		curl -fsSL --retry 3 --retry-all-errors -C - -o "$dl" \
+			"${OPENWRT_MIRROR:-https://downloads.openwrt.org}/releases/$SDK_REL/targets/$SDK_TGT/$SDK_FILE" && break
+		echo "SDK download interrupted (try $try), resuming" >&2
+	done
+	echo "$SDK_SHA  $dl" | sha256sum -c - || { rm -f "$dl"; exit 1; }
 	# Release SDK compilers run through their own loader in host/lib.
-	tar --zstd -xf "$dl/sdk.tar.zst" -C "$TCROOT" --strip-components=2 --wildcards \
+	tar --zstd -xf "$dl" -C "$TCROOT" --strip-components=2 --wildcards \
 		'*/staging_dir/toolchain-*' '*/staging_dir/host/lib/*'
-	rm -rf "$dl"
+	rm -f "$dl"
 fi
 TC=$(ls -d "$TCROOT"/toolchain-* | head -1)
 export PATH=$TC/bin:$PATH STAGING_DIR=$TCROOT RUSTC_BOOTSTRAP=1
@@ -103,6 +124,8 @@ export RUSTFLAGS="$FLAGS"
 
 # restls and jls need BoringSSL, which big-endian targets do not build.
 FEAT=$PROFILE; [ "$ARCH" = mips ] && [ "$PROFILE" = full ] && FEAT=full-be
+# EXTRA_FEATURES: comma list added for experiments (e.g. mimalloc); releases leave it empty.
+FEAT=$FEAT${EXTRA_FEATURES:+,$EXTRA_FEATURES}
 
 cargo +1.96.0 build -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
 	--release -p meow-app --bin meow --no-default-features --features "$FEAT" \
