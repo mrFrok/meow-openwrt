@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> **meow-openwrt fork (branch `openwrt`).** Unofficial GPLv3 fork of meow-rs for OpenWrt routers
+> **meow-openwrt fork (repo mrFrok/meow-openwrt, local branch `openwrt` → its `main`).** Unofficial GPLv3 fork of meow-rs for OpenWrt routers
 > (see `NOTICE-FORK.md`). Fork work lives in `openwrt-fork/`: **`PLAN.md` (stages 0–7, start here)**,
 > `research/meow-rs.md` (recon, findings with file:line), `research/go-fork/` (TODO/BENCHMARKS of the
 > abandoned Go fork mihomo-lightweight — behaviour reference), `bench/` (router bench scripts).

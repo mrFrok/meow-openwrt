@@ -101,7 +101,7 @@ define Package/meow/Default
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
-  URL:=https://github.com/madeye/meow-rs
+  URL:=https://github.com/mrFrok/meow-openwrt
   DEPENDS:=$(RUST_ARCH_DEPENDS)
   PROVIDES:=meow-core
 endef

@@ -159,7 +159,7 @@ attach its output to an issue. It changes nothing and prints no addresses,
 MACs or keys.
 
 ```sh
-wget -O /tmp/hwprobe.sh https://raw.githubusercontent.com/mrFrok/meow-rs/openwrt/openwrt-fork/bench/hwprobe.sh
+wget -O /tmp/hwprobe.sh https://raw.githubusercontent.com/mrFrok/meow-openwrt/main/openwrt-fork/bench/hwprobe.sh
 sh /tmp/hwprobe.sh > /tmp/probe.txt
 ```
 

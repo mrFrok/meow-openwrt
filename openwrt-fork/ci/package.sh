@@ -17,7 +17,7 @@ full) NAME=meow-full; CONFL="meow-tiny meow"; WHAT="all protocols" ;;
 *) echo "unknown profile $PROFILE" >&2; exit 2 ;;
 esac
 DESC="Clash Meta compatible proxy kernel (meow-openwrt, $WHAT)"
-URL=https://github.com/mrFrok/meow-rs
+URL=https://github.com/mrFrok/meow-openwrt
 mkdir -p "$OUT"; OUT=$(realpath "$OUT")
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
