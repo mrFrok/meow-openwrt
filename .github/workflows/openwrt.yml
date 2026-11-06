@@ -30,10 +30,12 @@ jobs:
         arch: [aarch64, armv7, mipsel, mips]
         profile: [tiny, lightweight, full]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Host packages
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev cmake zstd
+      # clang/libclang (bindgen), cmake and zstd come with the ubuntu-24.04
+      # image; apt-get here hung for 10+ minutes on some runners.
+      - name: Host tools
+        run: clang --version | head -1 && cmake --version | head -1 && zstd --version
 
       - name: Rust 1.96.0 with rust-src
         run: |
@@ -43,7 +45,7 @@ jobs:
       # The SDK toolchain (only staging_dir/toolchain-* and host/lib are
       # unpacked); the key is build.sh, which pins the SDK and its sha256.
       - name: Cache OpenWrt toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/meow-owrt-tc
           key: owrt-tc-${{ matrix.arch }}-${{ hashFiles('openwrt-fork/ci/build.sh') }}
@@ -84,7 +86,7 @@ jobs:
           done
           ls -la dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: meow-${{ matrix.profile }}-${{ matrix.arch }}
           path: dist/*
@@ -97,7 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
