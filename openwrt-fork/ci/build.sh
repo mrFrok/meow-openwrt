@@ -101,8 +101,11 @@ case $ARCH in mips|mipsel) FLAGS="$FLAGS -Crelocation-model=static -Clink-arg=-l
 [ "$PROFILE" != full ] && FLAGS="$FLAGS -Zunstable-options -Cpanic=immediate-abort"
 export RUSTFLAGS="$FLAGS"
 
+# restls and jls need BoringSSL, which big-endian targets do not build.
+FEAT=$PROFILE; [ "$ARCH" = mips ] && [ "$PROFILE" = full ] && FEAT=full-be
+
 cargo +1.96.0 build -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
-	--release -p meow-app --bin meow --no-default-features --features "$PROFILE" \
+	--release -p meow-app --bin meow --no-default-features --features "$FEAT" \
 	--target "$RT" --target-dir "$TGT"
 
 OUT=${OUT:-dist}; mkdir -p "$OUT"

@@ -116,9 +116,12 @@ tiny = [
 ]
 # meow-openwrt mid profile: `tiny` plus the other protocols subscriptions use.
 lightweight = ["tiny", "ss", "anytls", "vmess", "shadow-tls"]
-full = [
+full = ["full-be", "restls", "jls"]
+# `full` without what needs BoringSSL (restls, jls): the big-endian MIPS
+# build of the full profile, on rustls + quinn (openwrt-fork/ci/build.sh).
+full-be = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
-    "shadow-tls", "restls", "jls", "gost-plugin",
+    "shadow-tls", "gost-plugin",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks",
