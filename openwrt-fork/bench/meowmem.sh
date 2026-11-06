@@ -26,7 +26,7 @@ END { print "mixed-port: 17890"; print "external-controller: 127.0.0.1:19090" }
 ' "$DIR/config.yaml" > "$H/config.yaml"
 
 kb() { awk -v k="$2" '$1==k":"{print $2}' /proc/$1/status 2>/dev/null; }
-printf '%-22s %9s %9s %9s %9s %9s\n' binary idlePeak idleEnd loadPeak loadEnd File
+printf '%-22s %9s %9s %9s %9s %9s %9s\n' binary idlePeak idleEnd loadPeak loadEnd File HWM
 for bin in "$@"; do
 	env $ENVS "$bin" -d "$H" -f "$H/config.yaml" >"$W/${bin##*/}.log" 2>&1 & pid=$!
 	peak=0; i=0
@@ -45,8 +45,8 @@ for bin in "$@"; do
 		done
 		wait $cp 2>/dev/null; sleep 5; lend=$(kb $pid RssAnon)
 	fi
-	file=$(kb $pid RssFile)
-	printf '%-22s %9s %9s %9s %9s %9s\n' "${bin##*/}" "$peak" "${idle:-dead}" "$lpeak" "$lend" "${file:--}"
+	file=$(kb $pid RssFile); hwm=$(kb $pid VmHWM)
+	printf '%-22s %9s %9s %9s %9s %9s %9s\n' "${bin##*/}" "$peak" "${idle:-dead}" "$lpeak" "$lend" "${file:--}" "${hwm:--}"
 	kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 2
 done
 echo "logs: $W/*.log"

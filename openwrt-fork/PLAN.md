@@ -61,10 +61,16 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 - CI: матрица профилей × архитектур через SDK, SHA-256, `workflow_dispatch` с выбором фич.
 
 ## Этап 3 — память (аналог Go-этапа III)
-- Аллокатор: проверить фактический (ADR-0008 планировал mimalloc, в `meow-app/src/main.rs` — только dhat); сравнить
-  musl malloc / mimalloc на RSS и CPU на BPI-R4 и mipsel.
-- Аналог `lw_free_after_load`: `malloc_trim(0)` (musl — `mallctl`/нет; для mimalloc `mi_collect(true)`) после загрузки
-  конфига и обновления провайдеров.
+- ✅ **Аллокатор (2026-11-06)**: musl mallocng остаётся. meowmem, tiny aarch64, живой конфиг, 2 прогона, RssAnon КБ:
+  musl простой 5.2–5.5 / пик старта ~7 / 50 потоков 9.0; mimalloc 34–50 / 58–64 / 28–48, с
+  `MIMALLOC_PURGE_DELAY=0 ARENA_EAGER_COMMIT=0` 9.7 / 14 / 13. Feature `mimalloc` остаётся опцией, не в профилях.
+- ✅ **Аналог `lw_free_after_load` не нужен**: mallocng сам отдаёт память (пик старта ~7–8.5 МБ → 5.2 МБ в простое).
+- ✅ **Память на соединение (dhat, 200 потоков)**: async-обёртки `ConnNotes::scope`/`run_until_closed` удваивали фрейм
+  задачи (аргумент-фьючер в префиксе генератора + awaitee). Исправлено: задача mixed 24.8 → 13.0 КБ, общий
+  `route_inbound_tcp` 22.1 → 11.2 КБ (daeed6d, b14c9d3; годится в upstream). Остаток на поток: 8 КБ стековых буферов,
+  +32 КБ bulk-буфер у качающих (паритет с mihomo).
+- ✅ **`max-connections` по умолчанию от MemTotal**: MemTotal/8/32 КиБ, 256..16384 (64 МБ → 256, 256 МБ → 1024).
+  При лимите accept встаёт в очередь — 256 на домашнем шлюзе мало.
 - Аналог `lw_auto_memlimit`: лимиты кэшей (DNS, fake-ip, соединения, буферы) от MemTotal, если не заданы в конфиге.
 - Пик при загрузке провайдеров (`dhat-heap`), чтение .mrs потоково; окна QUIC (quiche/quinn) в low-memory режиме;
   размер буферов splice/копирования; проверка UDP > 8 КиБ.
