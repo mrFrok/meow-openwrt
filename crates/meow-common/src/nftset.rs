@@ -59,6 +59,8 @@ pub const AUTO_REDIRECT_BYPASS_MARK: u32 = 0x2024;
 /// `tun.route-address-dns`: the set in auto-redirect's table that DNS
 /// answers feed.
 pub const AUTO_REDIRECT_DNS_SET: &str = "inet#meow#route4_dns";
+/// The IPv6 counterpart (when the TUN device has an IPv6 address).
+pub const AUTO_REDIRECT_DNS_SET6: &str = "inet#meow#route6_dns";
 
 static SET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

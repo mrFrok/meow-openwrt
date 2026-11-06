@@ -148,7 +148,7 @@ fn rules(v4: Ipv4Net, v6: Option<Ipv6Net>) -> Vec<Rule> {
     rules
 }
 
-/// `auto-redirect` (IPv4): nftables marks the flows to capture; meow's own
+/// `auto-redirect`: nftables marks the flows to capture; meow's own
 /// sockets and every flow decided against carry `bypass`.
 ///
 /// | pref | rule |
@@ -156,18 +156,24 @@ fn rules(v4: Ipv4Net, v6: Option<Ipv6Net>) -> Vec<Rule> {
 /// | 9200 | `fwmark <bypass> goto 9205` |
 /// | 9201 | `fwmark 0x2023 lookup TABLE` |
 /// | 9205 | `nop` |
-fn marked_rules(bypass: u32, route: u32) -> Vec<Rule> {
-    let rule = |offset, selector, action| Rule {
+fn marked_rules(bypass: u32, route: u32, with_v6: bool) -> Vec<Rule> {
+    let rule = |offset, v6, selector, action| Rule {
         priority: PRIORITY + offset,
-        v6: false,
+        v6,
         selector,
         action,
     };
-    vec![
-        rule(0, Selector::Mark(bypass), Action::SkipDevice),
-        rule(1, Selector::Mark(route), Action::Device),
-        rule(5, Selector::All, Action::Nop),
-    ]
+    [false]
+        .into_iter()
+        .chain(with_v6.then_some(true))
+        .flat_map(|v6| {
+            [
+                rule(0, v6, Selector::Mark(bypass), Action::SkipDevice),
+                rule(1, v6, Selector::Mark(route), Action::Device),
+                rule(5, v6, Selector::All, Action::Nop),
+            ]
+        })
+        .collect()
 }
 
 impl Rule {
@@ -306,8 +312,18 @@ impl PolicyRoutes {
 
     /// `auto-redirect`: the device's IPv4 default route in [`TABLE`] and
     /// [`marked_rules`].
-    pub(super) fn setup_marked(if_index: u32, bypass: u32, route: u32) -> io::Result<Self> {
-        Self::install(if_index, false, marked_rules(bypass, route), false)
+    pub(super) fn setup_marked(
+        if_index: u32,
+        bypass: u32,
+        route: u32,
+        with_v6: bool,
+    ) -> io::Result<Self> {
+        Self::install(
+            if_index,
+            with_v6,
+            marked_rules(bypass, route, with_v6),
+            false,
+        )
     }
 
     fn install(

@@ -497,7 +497,7 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | by RAM: 256 on 64 MB, 512 on 128 MB, … up to 16384 | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 | `auto-redirect` | `false` | Linux, needs `auto-route: true`: capture with nftables instead of plain policy routing — see *auto-redirect*. (meow-openwrt, mihomo's key) |
-| `route-address` / `route-address-set` | all | With `auto-redirect`: capture only these CIDRs / `ipcidr` rule-sets (IPv4; the fake-IP range always counts). |
+| `route-address` / `route-address-set` | all | With `auto-redirect`: capture only these CIDRs / `ipcidr` rule-sets (IPv4 and, with `inet6-address`, IPv6; the fake-IP range always counts). |
 | `route-exclude-address` / `route-exclude-address-set` | none | With `auto-redirect`: never capture these. |
 | `route-address-dns` | `false` | With `auto-redirect` (meow): also capture addresses DNS answers give for domains the rules do not send DIRECT. |
 
@@ -593,7 +593,10 @@ sing-tun's), and policy rules 9200–9205:
   from the device, and fw4 is reloaded.
 
 Everything is removed on shutdown; a stale table from a crash is replaced
-at the next start. IPv4 only for now.
+at the next start. With `inet6-address` IPv6 gets the same chains
+(`output6`, ...), a second redirect listener on `[::]` and policy rules of
+its own; link-local and multicast are never captured. Without it IPv6 is
+left alone.
 
 Narrowing what is captured (everything else never enters meow):
 

@@ -85,10 +85,7 @@ pub type ProviderRegistry = Arc<
     >,
 >;
 
-#[cfg(feature = "listener-tun")]
-type V4Ranges = Vec<meow_listener::V4Range>;
-
-/// Resolve `route-address(-set)` / `route-exclude-address(-set)` into IPv4
+/// Resolve `route-address(-set)` / `route-exclude-address(-set)` into
 /// ranges. An unknown or non-`ipcidr` rule-set is skipped (with a warning
 /// when `warn`); a narrowed capture whose sets all failed still captures
 /// nothing beyond its CIDRs rather than everything.
@@ -97,16 +94,16 @@ fn resolve_auto_redirect(
     ar: &meow_config::AutoRedirectConfig,
     registry: &ProviderRegistry,
     warn: bool,
-) -> (Option<V4Ranges>, V4Ranges) {
+) -> meow_listener::AutoRedirectRanges {
     let providers = registry.read();
-    let collect = |nets: &[ipnet::IpNet], sets: &[String], key: &str| -> V4Ranges {
-        let mut r: V4Ranges = nets
-            .iter()
-            .filter_map(|n| match n {
-                ipnet::IpNet::V4(n) => Some((n.network(), n.broadcast())),
-                ipnet::IpNet::V6(_) => None,
-            })
-            .collect();
+    let collect = |nets: &[ipnet::IpNet], sets: &[String], key: &str| {
+        let mut r = meow_listener::Ranges::default();
+        for n in nets {
+            match n {
+                ipnet::IpNet::V4(n) => r.v4.push((n.network(), n.broadcast())),
+                ipnet::IpNet::V6(n) => r.v6.push((n.network(), n.broadcast())),
+            }
+        }
         for name in sets {
             let Some(p) = providers.get(name) else {
                 if warn {
@@ -116,7 +113,10 @@ fn resolve_auto_redirect(
             };
             let set = p.snapshot();
             match set.ip_ranges() {
-                Some(ranges) => r.extend(ranges.v4_ranges()),
+                Some(ranges) => {
+                    r.v4.extend(ranges.v4_ranges());
+                    r.v6.extend(ranges.v6_ranges());
+                }
                 None if warn => tracing::warn!(
                     "tun.{key}: rule-set '{name}' is not an ipcidr rule-set; skipped"
                 ),

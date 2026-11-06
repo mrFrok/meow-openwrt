@@ -104,7 +104,7 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
   `route-exclude-address(-set)`; meow-ключ **`route-address-dns: true`** — сет `route4_dns` (timeout) наполняет
   хук dns.nftset, т.е. в ядро идёт только «не-DIRECT», остальное мимо: обвязке достаточно ключей в конфиге
   (заменяет `dns.nftset.create`). `bench/autoredirect-test.sh` (3 netns на BPI-R4): всё PASS.
-  Сеты следуют за refresh rule-set без рестарта (тест фаза 3). Осталось: IPv6; блок DoH/DoT; повторная
+  Сеты следуют за refresh rule-set без рестарта (фаза 3); IPv6 при `inet6-address` (фаза 4). Осталось: блок DoH/DoT; повторная
   установка, если таблицу снесли извне (`fw4 reload` её не трогает — своя таблица).
 - Разгрузка по потокам ниже **отложена до волонтёров с MT7621 (2026-11-03).** На BPI-R4 DIRECT TCP через redir — ~10 Гбит/с при 42 % ядра
   (tunbench MODE=redir), выигрыш HFO там мал. Обучение по IP небезопасно при redir-host (общие IP CDN).

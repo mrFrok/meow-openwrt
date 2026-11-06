@@ -171,4 +171,51 @@ $C wget -qO- -T 5 http://203.0.113.3:8080/x >/dev/null 2>&1
 grep -q -- '203.0.113.3:8080' $W/meow3.log && ok "rule-set: .3 now captured" || bad "rule-set: .3 not captured"
 kill $MP; sleep 2; MP=""
 grep -iE 'warn|error|sets updated' $W/meow3.log | head -5
+
+# Phase 4: IPv6 — the device gets inet6-address; v6 TCP to a route-address
+# goes through meow, another v6 destination bypasses, v6 DNS is hijacked.
+$C ip -6 addr add 2001:db8:77::2/64 dev mwc0 nodad; $C ip -6 route add default via 2001:db8:77::1
+$G ip -6 addr add 2001:db8:77::1/64 dev mwg0 nodad; $G ip -6 addr add fd78::1/64 dev mwg1 nodad
+$G ip -6 route add default via fd78::2; $G sysctl -qw net.ipv6.conf.all.forwarding=1
+$S ip -6 addr add fd78::2/64 dev mws0 nodad; $S ip -6 route add 2001:db8:77::/64 via fd78::1
+$S ip -6 addr add 2001:db8:113::2/128 dev lo; $S ip -6 addr add 2001:db8:113::3/128 dev lo
+for a in 2001:db8:113::2 2001:db8:113::3; do $S uhttpd -f -p "[$a]:8080" -h $W/www & SRV="$SRV $!"; done
+cat > $W/config.yaml <<EOF
+log-level: info
+ipv6: true
+hosts:
+  six.lan: 2001:db8::1234
+dns:
+  enable: true
+  ipv6: true
+  listen: 127.0.0.1:11053
+  enhanced-mode: redir-host
+  use-hosts: true
+  nameserver: [203.0.113.3]
+tun:
+  enable: true
+  stack: system
+  device: mwtun
+  inet6-address: fdfe:dcba:9876::1/126
+  auto-route: true
+  auto-redirect: true
+  route-address: [203.0.113.2/32, 2001:db8:113::2/128]
+rules:
+  - MATCH,DIRECT
+EOF
+$G $BIN -d $W -f $W/config.yaml > $W/meow4.log 2>&1 & MP=$!
+sleep 4
+$G nft list chain inet meow output6 >/dev/null 2>&1 && ok "v6: chains installed" || bad "v6: no output6 chain"
+$G ip -6 rule | grep -q 'fwmark 0x2023' && ok "v6: fwmark rule" || bad "v6: no fwmark rule"
+r=$($C wget -qO- -T 5 'http://[2001:db8:113::2]:8080/x' 2>&1)
+[ "$r" = hello ] && grep -q -- '2001:db8:113::2\]:8080' $W/meow4.log && ok "v6: LAN TCP to captured ::2 through meow" || bad "v6: LAN TCP to ::2: $r"
+r=$($C wget -qO- -T 5 'http://[2001:db8:113::3]:8080/x' 2>&1)
+[ "$r" = hello ] && ! grep -q -- '2001:db8:113::3\]:8080' $W/meow4.log && ok "v6: ::3 bypasses" || bad "v6: ::3: $r"
+r=$($C nslookup -type=AAAA six.lan 2001:db8:113::3 2>&1 | grep -c 2001:db8::1234)
+[ "$r" -ge 1 ] && ok "v6: DNS over IPv6 hijacked" || bad "v6: DNS over IPv6 not hijacked"
+r=$($C wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
+[ "$r" = hello ] && ok "v6 config: v4 still works" || bad "v6 config: v4: $r"
+kill $MP; sleep 2; MP=""
+$G ip -6 rule | grep -q 'fwmark 0x2023' && bad "v6: rules left" || ok "v6: rules removed"
+grep -iE 'warn|error' $W/meow4.log | head -5
 [ $fail = 0 ] && echo ALL PASS || echo SOME FAILED

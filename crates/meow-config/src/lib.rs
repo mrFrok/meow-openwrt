@@ -519,9 +519,13 @@ pub fn effective_nftset(raw: &raw::RawConfig) -> Option<meow_common::nftset::Nft
     if !dns_set {
         return None;
     }
+    let v6 = raw
+        .tun
+        .as_ref()
+        .is_some_and(|t| t.inet6_address.as_ref().is_some_and(|v| !v.is_null()));
     meow_common::nftset::NftsetConfig::parse(
         Some(meow_common::nftset::AUTO_REDIRECT_DNS_SET),
-        None,
+        v6.then_some(meow_common::nftset::AUTO_REDIRECT_DNS_SET6),
         timeout,
     )
     .ok()

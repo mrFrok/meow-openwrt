@@ -17,7 +17,8 @@
 //!   device's subnet). `route-address(-set)` limits capture to its
 //!   destinations, `route-exclude-address(-set)` exempts some.
 //!
-//! IPv4 only for now: IPv6 traffic is left alone.
+//! IPv6 gets the same chains (`output6`, ...) when the device has an IPv6
+//! address; otherwise IPv6 traffic is left alone.
 //!
 //! On OpenWrt, fw4's `input` / `forward` chains drop what its zones do
 //! not accept, the device included; like sing-tun, an include in
@@ -26,10 +27,10 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::{Command, Stdio};
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use tracing::{debug, info, warn};
 
 pub(super) const TABLE: &str = "meow";
@@ -40,20 +41,66 @@ pub(super) const DEFAULT_BYPASS_MARK: u32 = meow_common::nftset::AUTO_REDIRECT_B
 
 const FW4_INCLUDE: &str = "/etc/nftables.d/0-meow-auto-redirect.nft";
 
+/// Inclusive address range.
+pub(super) type Range<A> = (A, A);
+
+/// An address family's spelling in nftables.
+pub(super) trait Family: Copy + Ord + std::fmt::Display {
+    /// `4` / `6`: set and chain name suffix.
+    const SUFFIX: &'static str;
+    /// `ip` / `ip6`.
+    const KW: &'static str;
+    const NFPROTO: &'static str;
+    const ICMP: &'static str;
+    const TYPE: &'static str;
+    /// `b` directly follows `a`.
+    fn next_to(a: Self, b: Self) -> bool;
+}
+
+impl Family for Ipv4Addr {
+    const SUFFIX: &'static str = "4";
+    const KW: &'static str = "ip";
+    const NFPROTO: &'static str = "ipv4";
+    const ICMP: &'static str = "icmp";
+    const TYPE: &'static str = "ipv4_addr";
+    fn next_to(a: Self, b: Self) -> bool {
+        u32::from(b) <= u32::from(a).saturating_add(1)
+    }
+}
+
+impl Family for Ipv6Addr {
+    const SUFFIX: &'static str = "6";
+    const KW: &'static str = "ip6";
+    const NFPROTO: &'static str = "ipv6";
+    const ICMP: &'static str = "icmpv6";
+    const TYPE: &'static str = "ipv6_addr";
+    fn next_to(a: Self, b: Self) -> bool {
+        u128::from(b) <= u128::from(a).saturating_add(1)
+    }
+}
+
+/// One family's capture.
+pub(super) struct Fam<A> {
+    pub redirect_port: u16,
+    /// DNS hijack target: the device's peer address.
+    pub dns_target: Option<A>,
+    /// `None`: capture every destination.
+    pub route: Option<Vec<(A, A)>>,
+    pub exclude: Vec<(A, A)>,
+    /// Never captured: the host's subnets, loopback, the device's subnet
+    /// (and for IPv6 link-local and multicast).
+    pub local: Vec<(A, A)>,
+}
+
 /// What the ruleset is built from.
 pub(super) struct Params {
     pub dev: String,
-    pub redirect_port: u16,
     pub bypass_mark: u32,
-    /// The device's subnet (local) and its peer address (DNS hijack target).
-    pub tun_net: Ipv4Net,
-    pub dns_target: Option<Ipv4Addr>,
-    /// `None`: capture every destination.
-    pub route: Option<Vec<(Ipv4Addr, Ipv4Addr)>>,
-    pub exclude: Vec<(Ipv4Addr, Ipv4Addr)>,
-    /// `route-address-dns`: an empty timeout set (`route4_dns`) the DNS
-    /// answer hook fills; captured like `route4`.
+    /// `route-address-dns`: an empty timeout set (`route4_dns` /
+    /// `route6_dns`) the DNS answer hook fills; captured like `route4`.
     pub dns_set: bool,
+    pub v4: Fam<Ipv4Addr>,
+    pub v6: Option<Fam<Ipv6Addr>>,
 }
 
 /// The installed table (and fw4 include); dropping it removes both.
@@ -63,14 +110,15 @@ pub(super) struct NftRedirect {
 
 impl NftRedirect {
     pub(super) fn setup(p: &Params) -> io::Result<Self> {
-        let local = local_ranges(p.tun_net);
-        let script = ruleset(p, &local);
-        nft(&script)?;
+        nft(&ruleset(p))?;
         // The DNS set starts empty: the answer hook must add everything anew.
         meow_common::nftset::bump_epoch();
         info!(
-            "tun auto-redirect: nftables table inet {TABLE} installed (TCP -> :{}, UDP via '{}')",
-            p.redirect_port, p.dev
+            "tun auto-redirect: nftables table inet {TABLE} installed (TCP -> :{}{}, UDP via '{}')",
+            p.v4.redirect_port,
+            p.v6.as_ref()
+                .map_or(String::new(), |f| format!(" / [::]:{}", f.redirect_port)),
+            p.dev
         );
         let fw4 = fw4_accept(&p.dev);
         Ok(Self { fw4 })
@@ -93,12 +141,12 @@ impl Drop for NftRedirect {
 
 /// Sort and merge inclusive ranges: nftables refuses overlapping interval
 /// elements.
-pub(super) fn coalesce(mut r: Vec<(Ipv4Addr, Ipv4Addr)>) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+pub(super) fn coalesce<A: Family>(mut r: Vec<(A, A)>) -> Vec<(A, A)> {
     r.sort_unstable();
-    let mut out: Vec<(Ipv4Addr, Ipv4Addr)> = Vec::with_capacity(r.len());
+    let mut out: Vec<(A, A)> = Vec::with_capacity(r.len());
     for (s, e) in r {
         if let Some(last) = out.last_mut() {
-            if u32::from(s) <= u32::from(last.1).saturating_add(1) {
+            if A::next_to(last.1, s) {
                 if e > last.1 {
                     last.1 = e;
                 }
@@ -114,7 +162,11 @@ pub(super) fn net_range(n: Ipv4Net) -> (Ipv4Addr, Ipv4Addr) {
     (n.network(), n.broadcast())
 }
 
-fn elements(r: &[(Ipv4Addr, Ipv4Addr)]) -> String {
+pub(super) fn net6_range(n: Ipv6Net) -> (Ipv6Addr, Ipv6Addr) {
+    (n.network(), n.broadcast())
+}
+
+fn elements<A: Family>(r: &[(A, A)]) -> String {
     let mut s = String::with_capacity(r.len() * 32);
     for (i, (a, b)) in r.iter().enumerate() {
         if i > 0 {
@@ -129,8 +181,12 @@ fn elements(r: &[(Ipv4Addr, Ipv4Addr)]) -> String {
     s
 }
 
-fn set(name: &str, r: &[(Ipv4Addr, Ipv4Addr)]) -> String {
-    let mut s = format!("\tset {name} {{\n\t\ttype ipv4_addr\n\t\tflags interval\n");
+fn set<A: Family>(name: &str, r: &[(A, A)]) -> String {
+    let mut s = format!(
+        "\tset {name}{} {{\n\t\ttype {}\n\t\tflags interval\n",
+        A::SUFFIX,
+        A::TYPE
+    );
     if !r.is_empty() {
         let _ = writeln!(s, "\t\telements = {{ {} }}", elements(r));
     }
@@ -138,92 +194,114 @@ fn set(name: &str, r: &[(Ipv4Addr, Ipv4Addr)]) -> String {
     s
 }
 
-/// The whole table, preceded by a create-then-delete so a stale one from a
-/// crashed run is replaced atomically.
-pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
-    let bypass = format!("0x{:08x}", p.bypass_mark);
+/// One family's sets and chains (each chain ignores the other family).
+fn family<A: Family>(dev: &str, bypass: u32, dns_set: bool, f: &Fam<A>) -> String {
+    let bypass = format!("0x{bypass:08x}");
     let route = format!("0x{ROUTE_MARK:08x}");
-    let dev = &p.dev;
-    let port = p.redirect_port;
+    let (sx, kw, nf, icmp, port) = (A::SUFFIX, A::KW, A::NFPROTO, A::ICMP, f.redirect_port);
+    let mut s = set("local", &f.local);
+    s.push_str(&set("exclude", &f.exclude));
+    if let Some(r) = &f.route {
+        s.push_str(&set("route", r));
+    }
+    if dns_set {
+        let _ = write!(
+            s,
+            "\tset route{sx}_dns {{\n\t\ttype {}\n\t\tflags timeout\n\t}}\n",
+            A::TYPE
+        );
+    }
     // Destination filters shared by every chain: local, excluded and (when
     // narrowed) not-routed destinations are left alone.
-    let mut filter = String::from("\t\tip daddr @local4 return\n\t\tip daddr @exclude4 return\n");
-    match (p.route.is_some(), p.dns_set) {
-        (true, true) => filter.push_str("\t\tip daddr != @route4 ip daddr != @route4_dns return\n"),
-        (true, false) => filter.push_str("\t\tip daddr != @route4 return\n"),
-        (false, true) => filter.push_str("\t\tip daddr != @route4_dns return\n"),
+    let mut filter =
+        format!("\t\t{kw} daddr @local{sx} return\n\t\t{kw} daddr @exclude{sx} return\n");
+    match (f.route.is_some(), dns_set) {
+        (true, true) => {
+            let _ = writeln!(
+                filter,
+                "\t\t{kw} daddr != @route{sx} {kw} daddr != @route{sx}_dns return"
+            );
+        }
+        (true, false) => {
+            let _ = writeln!(filter, "\t\t{kw} daddr != @route{sx} return");
+        }
+        (false, true) => {
+            let _ = writeln!(filter, "\t\t{kw} daddr != @route{sx}_dns return");
+        }
         (false, false) => {}
     }
-    let dns_out = p.dns_target.map_or(String::new(), |t| {
-        format!("\t\tmeta nfproto ipv4 oifname != \"lo\" udp dport 53 dnat ip to {t}\n")
+    let dns_out = f.dns_target.map_or(String::new(), |t| {
+        format!("\t\toifname != \"lo\" udp dport 53 dnat {kw} to {t}\n")
     });
-    let dns_pre = p.dns_target.map_or(String::new(), |t| {
-        format!("\t\tip saddr @local4 udp dport 53 dnat ip to {t}\n")
+    let dns_pre = f.dns_target.map_or(String::new(), |t| {
+        format!("\t\t{kw} saddr @local{sx} udp dport 53 dnat {kw} to {t}\n")
     });
-
-    let mut s = format!("table inet {TABLE}\ndelete table inet {TABLE}\ntable inet {TABLE} {{\n");
-    s.push_str(&set("local4", local));
-    s.push_str(&set("exclude4", &p.exclude));
-    if let Some(r) = &p.route {
-        s.push_str(&set("route4", r));
-    }
-    if p.dns_set {
-        s.push_str("\tset route4_dns {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}\n");
-    }
     let _ = write!(
         s,
-        "\tchain output {{
+        "\tchain output{sx} {{
 \t\ttype nat hook output priority mangle; policy accept;
+\t\tmeta nfproto != {nf} return
 \t\tmeta mark {bypass} return
-{dns_out}{filter}\t\tmeta nfproto ipv4 meta l4proto tcp redirect to :{port}
+{dns_out}{filter}\t\tmeta l4proto tcp redirect to :{port}
 \t}}
-\tchain output_udp {{
+\tchain output_udp{sx} {{
 \t\ttype route hook output priority mangle; policy accept;
-\t\tmeta nfproto != ipv4 return
-\t\tmeta l4proto != {{ icmp, udp }} return
+\t\tmeta nfproto != {nf} return
+\t\tmeta l4proto != {{ {icmp}, udp }} return
 \t\tmeta mark {bypass} return
 \t\tct mark {bypass} return
 \t\toifname \"lo\" return
 {filter}\t\tmeta mark set {route} ct mark set meta mark
 \t}}
-\tchain prerouting {{
+\tchain prerouting{sx} {{
 \t\ttype nat hook prerouting priority dstnat + 1; policy accept;
+\t\tmeta nfproto != {nf} return
 \t\tiifname \"{dev}\" return
-\t\tmeta nfproto != ipv4 return
 {dns_pre}{filter}\t\tmeta l4proto tcp redirect to :{port}
-\t\tmeta l4proto {{ icmp, udp }} meta mark set {route} ct mark set meta mark
+\t\tmeta l4proto {{ {icmp}, udp }} meta mark set {route} ct mark set meta mark
 \t}}
-\tchain prerouting_udp {{
+\tchain prerouting_udp{sx} {{
 \t\ttype filter hook prerouting priority dstnat + 2; policy accept;
-\t\tmeta nfproto != ipv4 return
-\t\tmeta l4proto != {{ icmp, udp }} return
+\t\tmeta nfproto != {nf} return
+\t\tmeta l4proto != {{ {icmp}, udp }} return
 \t\tiifname \"{dev}\" return
 \t\tct mark {route} meta mark set ct mark return
 \t\tmeta mark set {bypass} ct mark set meta mark
 \t}}
-}}
 "
     );
     s
 }
 
-/// Replace `route4` (when narrowed) and `exclude4` in one transaction.
-pub(super) fn sets_update(
-    route: Option<&[(Ipv4Addr, Ipv4Addr)]>,
-    exclude: &[(Ipv4Addr, Ipv4Addr)],
-) -> String {
-    let mut s = String::new();
-    let mut one = |name: &str, r: &[(Ipv4Addr, Ipv4Addr)]| {
-        let _ = writeln!(s, "flush set inet {TABLE} {name}");
+/// The whole table, preceded by a create-then-delete so a stale one from a
+/// crashed run is replaced atomically.
+pub(super) fn ruleset(p: &Params) -> String {
+    let mut s = format!("table inet {TABLE}\ndelete table inet {TABLE}\ntable inet {TABLE} {{\n");
+    s.push_str(&family(&p.dev, p.bypass_mark, p.dns_set, &p.v4));
+    if let Some(v6) = &p.v6 {
+        s.push_str(&family(&p.dev, p.bypass_mark, p.dns_set, v6));
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// Flush and refill `route` (when narrowed) and `exclude` of one family.
+pub(super) fn sets_update<A: Family>(s: &mut String, route: Option<&[(A, A)]>, exclude: &[(A, A)]) {
+    let mut one = |name: &str, r: &[(A, A)]| {
+        let _ = writeln!(s, "flush set inet {TABLE} {name}{}", A::SUFFIX);
         if !r.is_empty() {
-            let _ = writeln!(s, "add element inet {TABLE} {name} {{ {} }}", elements(r));
+            let _ = writeln!(
+                s,
+                "add element inet {TABLE} {name}{} {{ {} }}",
+                A::SUFFIX,
+                elements(r)
+            );
         }
     };
     if let Some(r) = route {
-        one("route4", r);
+        one("route", r);
     }
-    one("exclude4", exclude);
-    s
+    one("exclude", exclude);
 }
 
 pub(super) fn apply(script: &str) -> io::Result<()> {
@@ -253,32 +331,59 @@ fn nft(script: &str) -> io::Result<()> {
     }
 }
 
-/// Every IPv4 address range of the host's interfaces, loopback and the
-/// device's subnet: destinations never captured.
-fn local_ranges(tun_net: Ipv4Net) -> Vec<(Ipv4Addr, Ipv4Addr)> {
-    let mut r = vec![
+/// The host's interface subnets, loopback and the device's subnet (IPv4),
+/// plus link-local and multicast (IPv6): destinations never captured.
+pub(super) fn local_ranges(
+    tun4: Ipv4Net,
+    tun6: Option<Ipv6Net>,
+) -> (Vec<Range<Ipv4Addr>>, Vec<Range<Ipv6Addr>>) {
+    let mut r4 = vec![
         net_range(Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8)),
-        net_range(tun_net.trunc()),
+        net_range(tun4.trunc()),
     ];
+    let mut r6 = vec![
+        (Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST),
+        net6_range(Ipv6Net::new_assert(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+            10,
+        )),
+        net6_range(Ipv6Net::new_assert(
+            Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
+            8,
+        )),
+    ];
+    r6.extend(tun6.map(|n| net6_range(n.trunc())));
     // SAFETY: getifaddrs/freeifaddrs pair; entries are read only while the
-    // list is alive, and sockaddr_in is read only for AF_INET entries.
+    // list is alive, and each sockaddr only as the type its family names.
     unsafe {
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&raw mut head) == 0 {
             let mut cur = head;
             while !cur.is_null() {
                 let ifa = &*cur;
-                if !ifa.ifa_addr.is_null()
-                    && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET
-                    && !ifa.ifa_netmask.is_null()
-                {
-                    let a = &*ifa.ifa_addr.cast::<libc::sockaddr_in>();
-                    let m = &*ifa.ifa_netmask.cast::<libc::sockaddr_in>();
-                    let addr = Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr));
-                    let mask = u32::from_be(m.sin_addr.s_addr);
-                    let prefix = u8::try_from(mask.leading_ones()).unwrap_or(32);
-                    if let Ok(net) = Ipv4Net::new(addr, prefix) {
-                        r.push(net_range(net.trunc()));
+                if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() {
+                    match i32::from((*ifa.ifa_addr).sa_family) {
+                        libc::AF_INET => {
+                            let a = &*ifa.ifa_addr.cast::<libc::sockaddr_in>();
+                            let m = &*ifa.ifa_netmask.cast::<libc::sockaddr_in>();
+                            let addr = Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr));
+                            let mask = u32::from_be(m.sin_addr.s_addr);
+                            let prefix = u8::try_from(mask.leading_ones()).unwrap_or(32);
+                            if let Ok(net) = Ipv4Net::new(addr, prefix) {
+                                r4.push(net_range(net.trunc()));
+                            }
+                        }
+                        libc::AF_INET6 => {
+                            let a = &*ifa.ifa_addr.cast::<libc::sockaddr_in6>();
+                            let m = &*ifa.ifa_netmask.cast::<libc::sockaddr_in6>();
+                            let addr = Ipv6Addr::from(a.sin6_addr.s6_addr);
+                            let mask = u128::from_be_bytes(m.sin6_addr.s6_addr);
+                            let prefix = u8::try_from(mask.leading_ones()).unwrap_or(128);
+                            if let Ok(net) = Ipv6Net::new(addr, prefix) {
+                                r6.push(net6_range(net.trunc()));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 cur = ifa.ifa_next;
@@ -286,7 +391,7 @@ fn local_ranges(tun_net: Ipv4Net) -> Vec<(Ipv4Addr, Ipv4Addr)> {
             libc::freeifaddrs(head);
         }
     }
-    coalesce(r)
+    (coalesce(r4), coalesce(r6))
 }
 
 /// On OpenWrt (fw4 present), accept traffic from and to the device in
@@ -350,15 +455,32 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn fam4(
+        route: Option<Vec<(Ipv4Addr, Ipv4Addr)>>,
+        exclude: Vec<(Ipv4Addr, Ipv4Addr)>,
+        dns: Option<Ipv4Addr>,
+    ) -> Fam<Ipv4Addr> {
+        Fam {
+            redirect_port: 7895,
+            dns_target: dns,
+            route,
+            exclude,
+            local: vec![(a("127.0.0.0"), a("127.255.255.255"))],
+        }
+    }
+
     #[test]
     fn sets_update_flushes_and_refills() {
-        let s = sets_update(Some(&[(a("1.0.0.0"), a("1.0.0.255"))]), &[]);
+        let mut s = String::new();
+        sets_update(&mut s, Some(&[(a("1.0.0.0"), a("1.0.0.255"))]), &[]);
         assert_eq!(
             s,
             "flush set inet meow route4\nadd element inet meow route4 { 1.0.0.0-1.0.0.255 }\n\
              flush set inet meow exclude4\n"
         );
-        assert_eq!(sets_update(None, &[]), "flush set inet meow exclude4\n");
+        let mut s = String::new();
+        sets_update::<Ipv6Addr>(&mut s, None, &[]);
+        assert_eq!(s, "flush set inet meow exclude6\n");
     }
 
     #[test]
@@ -376,21 +498,27 @@ mod tests {
                 (a("192.168.0.0"), a("192.168.0.255"))
             ]
         );
+        let six = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(
+            coalesce(vec![(six("::2"), six("::3")), (six("::1"), six("::1"))]),
+            vec![(six("::1"), six("::3"))]
+        );
     }
 
     #[test]
     fn ruleset_narrowed_has_route_set_and_filters() {
         let p = Params {
             dev: "Meta".into(),
-            redirect_port: 7895,
             bypass_mark: DEFAULT_BYPASS_MARK,
-            tun_net: "198.18.0.1/30".parse().unwrap(),
-            dns_target: Some(a("198.18.0.2")),
-            route: Some(vec![(a("91.108.4.0"), a("91.108.7.255"))]),
-            exclude: Vec::new(),
             dns_set: true,
+            v4: fam4(
+                Some(vec![(a("91.108.4.0"), a("91.108.7.255"))]),
+                Vec::new(),
+                Some(a("198.18.0.2")),
+            ),
+            v6: None,
         };
-        let s = ruleset(&p, &[(a("127.0.0.0"), a("127.255.255.255"))]);
+        let s = ruleset(&p);
         assert!(s.starts_with("table inet meow\ndelete table inet meow\n"));
         assert!(s.contains("elements = { 91.108.4.0-91.108.7.255 }"));
         assert!(s.contains("ip daddr != @route4 ip daddr != @route4_dns return"));
@@ -399,24 +527,53 @@ mod tests {
         assert!(s.contains("redirect to :7895"));
         assert!(s.contains("udp dport 53 dnat ip to 198.18.0.2"));
         assert!(s.contains("meta mark 0x00002024 return"));
+        assert!(!s.contains("output6"));
     }
 
     #[test]
     fn ruleset_capture_all_has_no_route_set() {
         let p = Params {
             dev: "Meta".into(),
-            redirect_port: 1,
             bypass_mark: 7,
-            tun_net: "198.18.0.1/30".parse().unwrap(),
-            dns_target: None,
-            route: None,
-            exclude: vec![(a("1.1.1.1"), a("1.1.1.1"))],
             dns_set: false,
+            v4: fam4(None, vec![(a("1.1.1.1"), a("1.1.1.1"))], None),
+            v6: None,
         };
-        let s = ruleset(&p, &[]);
+        let s = ruleset(&p);
         assert!(!s.contains("@route4"));
         assert!(s.contains("elements = { 1.1.1.1 }"));
         assert!(s.contains("ip daddr @exclude4 return"));
         assert!(!s.contains("dport 53"));
+    }
+
+    #[test]
+    fn ruleset_v6_gets_its_own_chains() {
+        let six = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        let p = Params {
+            dev: "Meta".into(),
+            bypass_mark: DEFAULT_BYPASS_MARK,
+            dns_set: true,
+            v4: fam4(None, Vec::new(), None),
+            v6: Some(Fam {
+                redirect_port: 7896,
+                dns_target: Some(six("fdfe:dcba:9876::2")),
+                route: None,
+                exclude: Vec::new(),
+                local: vec![(
+                    six("fe80::"),
+                    six("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+                )],
+            }),
+        };
+        let s = ruleset(&p);
+        assert!(s.contains("chain output6 {"));
+        assert!(s.contains("meta nfproto != ipv6 return"));
+        assert!(s.contains("meta l4proto != { icmpv6, udp } return"));
+        assert!(s.contains("ip6 daddr != @route6_dns return"));
+        assert!(s.contains("udp dport 53 dnat ip6 to fdfe:dcba:9876::2"));
+        assert!(s.contains("redirect to :7896"));
+        assert!(s.contains(
+            "set local6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n\t\telements = { fe80::-febf:"
+        ));
     }
 }

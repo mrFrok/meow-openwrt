@@ -55,8 +55,8 @@ pub(crate) mod sniffer_quic;
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{
-    AutoRedirect, AutoRedirectSource, OutboundBinding, TunListener, TunListenerConfig, TunReady,
-    TunRouteScope, TunStack, V4Range,
+    AutoRedirect, AutoRedirectRanges, AutoRedirectSource, OutboundBinding, Ranges, TunListener,
+    TunListenerConfig, TunReady, TunRouteScope, TunStack, V4Range, V6Range,
 };
 
 #[cfg(all(

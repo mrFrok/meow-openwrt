@@ -245,9 +245,18 @@ pub struct TunListenerConfig {
 
 /// Inclusive IPv4 range.
 pub type V4Range = (std::net::Ipv4Addr, std::net::Ipv4Addr);
+/// Inclusive IPv6 range.
+pub type V6Range = (std::net::Ipv6Addr, std::net::Ipv6Addr);
+
+/// Destination ranges of both families.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ranges {
+    pub v4: Vec<V4Range>,
+    pub v6: Vec<V6Range>,
+}
 
 /// `(route, exclude)`: `route` `None` = every destination.
-pub type AutoRedirectRanges = (Option<Vec<V4Range>>, Vec<V4Range>);
+pub type AutoRedirectRanges = (Option<Ranges>, Ranges);
 
 /// Re-resolves `route` / `exclude` (rule-sets) whenever `changed` ticks.
 #[derive(Clone)]
@@ -262,15 +271,16 @@ impl std::fmt::Debug for AutoRedirectSource {
     }
 }
 
-/// `tun.auto-redirect`: which IPv4 destinations are captured, as inclusive
-/// ranges (rule-sets already resolved by the caller).
+/// `tun.auto-redirect`: which destinations are captured, as inclusive
+/// ranges (rule-sets already resolved by the caller). IPv6 applies when
+/// the device has an `inet6-address`.
 #[derive(Debug, Clone, Default)]
 pub struct AutoRedirect {
     /// `None`: every destination.
-    pub route: Option<Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>>,
-    pub exclude: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
-    /// `route-address-dns`: also capture `route4_dns`, which the DNS
-    /// answer hook fills (`meow_common::nftset::AUTO_REDIRECT_DNS_SET`).
+    pub route: Option<Ranges>,
+    pub exclude: Ranges,
+    /// `route-address-dns`: also capture `route4_dns` / `route6_dns`, which
+    /// the DNS answer hook fills (`meow_common::nftset::AUTO_REDIRECT_DNS_SET`).
     pub dns_set: bool,
     /// Set when rule-sets feed `route` / `exclude`: they are kept current.
     pub source: Option<AutoRedirectSource>,
@@ -704,7 +714,7 @@ impl TunListener {
         #[cfg(target_os = "linux")]
         let auto_redirect = match &cfg.auto_redirect {
             Some(ar) if cfg.auto_route && cfg.route_scope == TunRouteScope::Global => Some(
-                self.start_auto_redirect(ar, &dev_name, tun_net.v4, fake_ip_net, if_index)
+                self.start_auto_redirect(ar, &dev_name, &tun_net, fake_ip_net, if_index)
                     .await?,
             ),
             _ => None,
@@ -1605,14 +1615,16 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 struct RedirectGuard {
     _nft: auto_redirect::NftRedirect,
     _routes: policy_route::PolicyRoutes,
-    listener: tokio::task::JoinHandle<()>,
+    listeners: Vec<tokio::task::JoinHandle<()>>,
     sets: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for RedirectGuard {
     fn drop(&mut self) {
-        self.listener.abort();
+        for l in &self.listeners {
+            l.abort();
+        }
         if let Some(t) = &self.sets {
             t.abort();
         }
@@ -1621,19 +1633,19 @@ impl Drop for RedirectGuard {
 
 #[cfg(target_os = "linux")]
 impl TunListener {
-    /// Start the TCP redirect listener, the marked policy routing and the
+    /// Start the TCP redirect listeners, the marked policy routing and the
     /// nftables table (see `auto_redirect.rs`).
     async fn start_auto_redirect(
         &self,
         ar: &AutoRedirect,
         dev_name: &str,
-        tun_v4: Ipv4Net,
+        tun_net: &udp::TunNets,
         fake_ip_net: Option<ipnet::IpNet>,
         if_index: u32,
     ) -> io::Result<RedirectGuard> {
         #[cfg(not(feature = "listener-tproxy"))]
         {
-            let _ = (ar, dev_name, tun_v4, fake_ip_net, if_index);
+            let _ = (ar, dev_name, tun_net, fake_ip_net, if_index);
             Err(io::Error::other(
                 "tun.auto-redirect needs the 'listener-tproxy' feature (its TCP redirect listener)",
             ))
@@ -1644,106 +1656,164 @@ impl TunListener {
                 meow_common::set_routing_mark(Some(auto_redirect::DEFAULT_BYPASS_MARK));
                 auto_redirect::DEFAULT_BYPASS_MARK
             });
-            let tcp = crate::tproxy::bind_tcp((Ipv4Addr::UNSPECIFIED, 0).into(), false)?;
-            let port = tcp.local_addr()?.port();
-            let mut redirect = crate::tproxy::TProxyListener::new(
-                self.tunnel.clone(),
-                tcp.local_addr()?,
-                false,
-                None,
-                format!("{}-redirect", self.name),
-            )
-            .with_firewall(false)
-            .with_max_connections(self.cfg.max_connections);
-            if let Some(sniffer) = &self.sniffer {
-                redirect = redirect.with_sniffer(Arc::clone(sniffer));
-            }
-            let name = self.name.clone();
-            let listener = tokio::spawn(async move {
-                if let Err(e) = redirect.run_on(tcp).await {
-                    warn!("tun '{name}': auto-redirect TCP listener stopped: {e}");
-                }
-            });
+            let mut listeners = Vec::new();
+            let port4 = self.spawn_redirect(Ipv4Addr::UNSPECIFIED.into(), &mut listeners)?;
+            let port6 = match tun_net.v6 {
+                Some(_) => Some(
+                    self.spawn_redirect(std::net::Ipv6Addr::UNSPECIFIED.into(), &mut listeners)
+                        .inspect_err(|_| {
+                            listeners.iter().for_each(tokio::task::JoinHandle::abort)
+                        })?,
+                ),
+                None => None,
+            };
 
-            // A narrowed capture must still take the fake-IP range: its
-            // addresses only mean something to meow.
             let fake = match fake_ip_net {
                 Some(ipnet::IpNet::V4(f)) => Some(auto_redirect::net_range(f)),
                 _ => None,
             };
-            let route = ar.route.clone().map(|r| with_fake(r, fake));
+            let (route, exclude) = normalize((ar.route.clone(), ar.exclude.clone()), fake);
+            let (local4, local6) = auto_redirect::local_ranges(tun_net.v4, tun_net.v6);
+            let dns = self.cfg.dns_hijack;
             let params = auto_redirect::Params {
                 dev: dev_name.to_owned(),
-                redirect_port: port,
                 bypass_mark: bypass,
-                tun_net: tun_v4,
-                dns_target: self.cfg.dns_hijack.then(|| peer_v4(tun_v4)),
-                route,
-                exclude: auto_redirect::coalesce(ar.exclude.clone()),
                 dns_set: ar.dns_set,
+                v4: auto_redirect::Fam {
+                    redirect_port: port4,
+                    dns_target: dns.then(|| peer_v4(tun_net.v4)),
+                    route: route.as_ref().map(|r| r.v4.clone()),
+                    exclude: exclude.v4.clone(),
+                    local: local4,
+                },
+                v6: tun_net
+                    .v6
+                    .zip(port6)
+                    .map(|(net6, port6)| auto_redirect::Fam {
+                        redirect_port: port6,
+                        dns_target: dns.then(|| peer_v6(net6)),
+                        route: route.as_ref().map(|r| r.v6.clone()),
+                        exclude: exclude.v6.clone(),
+                        local: local6,
+                    }),
             };
-            let route_now = params.route.clone();
-            let exclude_now = params.exclude.clone();
+            let with_v6 = params.v6.is_some();
             let route_mark = auto_redirect::ROUTE_MARK;
-            let (routes, nft) = tokio::task::spawn_blocking(move || {
-                let routes =
-                    policy_route::PolicyRoutes::setup_marked(if_index, bypass, route_mark)?;
+            let setup = tokio::task::spawn_blocking(move || {
+                let routes = policy_route::PolicyRoutes::setup_marked(
+                    if_index, bypass, route_mark, with_v6,
+                )?;
                 let nft = auto_redirect::NftRedirect::setup(&params)?;
                 Ok::<_, io::Error>((routes, nft))
             })
             .await
-            .map_err(|e| io::Error::other(format!("auto-redirect setup panicked: {e}")))?
-            .inspect_err(|_| listener.abort())?;
+            .map_err(|e| io::Error::other(format!("auto-redirect setup panicked: {e}")));
+            let (routes, nft) = match setup.and_then(|r| r) {
+                Ok(v) => v,
+                Err(e) => {
+                    listeners.iter().for_each(tokio::task::JoinHandle::abort);
+                    return Err(e);
+                }
+            };
             let sets = ar.source.clone().map(|src| {
                 let name = self.name.clone();
-                let last = (route_now, exclude_now);
-                tokio::spawn(follow_rule_sets(src, fake, last, name))
+                tokio::spawn(follow_rule_sets(src, fake, with_v6, (route, exclude), name))
             });
             Ok(RedirectGuard {
                 _nft: nft,
                 _routes: routes,
-                listener,
+                listeners,
                 sets,
             })
         }
     }
+
+    /// Bind an internal REDIRECT listener on `ip`, port chosen by the kernel.
+    #[cfg(feature = "listener-tproxy")]
+    fn spawn_redirect(
+        &self,
+        ip: std::net::IpAddr,
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> io::Result<u16> {
+        let tcp = crate::tproxy::bind_tcp(SocketAddr::new(ip, 0), false)?;
+        let addr = tcp.local_addr()?;
+        let mut redirect = crate::tproxy::TProxyListener::new(
+            self.tunnel.clone(),
+            addr,
+            false,
+            None,
+            format!("{}-redirect", self.name),
+        )
+        .with_firewall(false)
+        .with_max_connections(self.cfg.max_connections);
+        if let Some(sniffer) = &self.sniffer {
+            redirect = redirect.with_sniffer(Arc::clone(sniffer));
+        }
+        let name = self.name.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = redirect.run_on(tcp).await {
+                warn!("tun '{name}': auto-redirect TCP listener stopped: {e}");
+            }
+        }));
+        Ok(addr.port())
+    }
 }
 
-/// A narrowed capture must still take the fake-IP range: its addresses
-/// only mean something to meow.
+/// Coalesce both families; a narrowed capture must still take the fake-IP
+/// range, whose addresses only mean something to meow.
 #[cfg(target_os = "linux")]
-fn with_fake(mut r: Vec<V4Range>, fake: Option<V4Range>) -> Vec<V4Range> {
-    r.extend(fake);
-    auto_redirect::coalesce(r)
+fn normalize((route, exclude): AutoRedirectRanges, fake: Option<V4Range>) -> AutoRedirectRanges {
+    let route = route.map(|mut r| {
+        r.v4.extend(fake);
+        Ranges {
+            v4: auto_redirect::coalesce(r.v4),
+            v6: auto_redirect::coalesce(r.v6),
+        }
+    });
+    let exclude = Ranges {
+        v4: auto_redirect::coalesce(exclude.v4),
+        v6: auto_redirect::coalesce(exclude.v6),
+    };
+    (route, exclude)
 }
 
-/// Keep `route4` / `exclude4` in step with the rule-sets they come from.
+/// Keep the `route` / `exclude` sets in step with the rule-sets they come
+/// from.
 #[cfg(all(target_os = "linux", feature = "listener-tproxy"))]
 async fn follow_rule_sets(
     mut src: AutoRedirectSource,
     fake: Option<V4Range>,
-    mut last: (Option<Vec<V4Range>>, Vec<V4Range>),
+    v6: bool,
+    mut last: AutoRedirectRanges,
     name: String,
 ) {
     while src.changed.changed().await.is_ok() {
         // A reload or refresh burst swaps several providers: settle first.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         src.changed.borrow_and_update();
-        let (route, exclude) = (src.resolve)();
-        let now = (
-            route.map(|r| with_fake(r, fake)),
-            auto_redirect::coalesce(exclude),
-        );
+        let now = normalize((src.resolve)(), fake);
         if now == last {
             continue;
         }
-        let script = auto_redirect::sets_update(now.0.as_deref(), &now.1);
+        let mut script = String::new();
+        auto_redirect::sets_update(
+            &mut script,
+            now.0.as_ref().map(|r| r.v4.as_slice()),
+            &now.1.v4,
+        );
+        if v6 {
+            auto_redirect::sets_update(
+                &mut script,
+                now.0.as_ref().map(|r| r.v6.as_slice()),
+                &now.1.v6,
+            );
+        }
         match tokio::task::spawn_blocking(move || auto_redirect::apply(&script)).await {
             Ok(Ok(())) => {
                 info!(
                     "tun '{name}': auto-redirect sets updated ({} route, {} exclude ranges)",
-                    now.0.as_ref().map_or(0, Vec::len),
-                    now.1.len()
+                    now.0.as_ref().map_or(0, |r| r.v4.len() + r.v6.len()),
+                    now.1.v4.len() + now.1.v6.len()
                 );
                 last = now;
             }
@@ -1751,6 +1821,15 @@ async fn follow_rule_sets(
             Err(e) => warn!("tun '{name}': auto-redirect set update panicked: {e}"),
         }
     }
+}
+
+/// The IPv6 peer: the subnet's other host for a /126../127, else address + 1.
+#[cfg(target_os = "linux")]
+fn peer_v6(net: ipnet::Ipv6Net) -> std::net::Ipv6Addr {
+    let addr = u128::from(net.addr());
+    let first = u128::from(net.network()) + 1;
+    let peer = if addr == first { addr + 1 } else { first };
+    std::net::Ipv6Addr::from(peer)
 }
 
 /// The device's peer address: the subnet's other host for a /30 or /31
