@@ -15,11 +15,11 @@ checked under qemu on MIPS. Reports from other hardware are welcome.
 
 One package per profile. They conflict with each other, so install one.
 
-| Package | What it carries | aarch64 | mipsel |
-|---|---|---|---|
-| `meow-tiny` | Trojan, VLESS (Vision, Reality), Hysteria2, mux, DoH/DoT, mixed, TProxy and TUN inbounds | 8.5 MB | 8.7 MB |
-| `meow` | tiny plus Shadowsocks, AnyTLS, VMess, ShadowTLS | 9.1 MB | 9.1 MB |
-| `meow-full` | everything meow-rs ships, logbook and traffic ledger included | 12.2 MB | 14.0 MB |
+| Package | What it carries | aarch64 | armv7 | mipsel | mips |
+|---|---|---|---|---|---|
+| `meow-tiny` | Trojan, VLESS (Vision, Reality), Hysteria2, mux, DoH/DoT, mixed, TProxy and TUN inbounds | 6.8 MB | 7.5 MB | 9.0 MB | 8.5 MB |
+| `meow` | tiny plus Shadowsocks, AnyTLS, VMess, ShadowTLS | 7.2 MB | 8.0 MB | 9.7 MB | 9.1 MB |
+| `meow-full` | everything meow-rs ships, logbook and traffic ledger included | 10.2 MB | 11.7 MB | 14.8 MB | 14.2 MB |
 
 Sizes are of the stripped static binary. Flash takes less than that: squashfs
 stores `meow-tiny` in about 2.6 MB, JFFS2 in 4.4 MB, UBIFS with zlib in about

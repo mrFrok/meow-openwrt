@@ -15,11 +15,11 @@ meow-openwrt — неофициальный форк [meow-rs](https://github.co
 
 Один пакет на профиль. Пакеты конфликтуют между собой, ставится один.
 
-| Пакет | Что внутри | aarch64 | mipsel |
-|---|---|---|---|
-| `meow-tiny` | Trojan, VLESS (Vision, Reality), Hysteria2, mux, DoH/DoT, входы mixed, TProxy и TUN | 8,5 МБ | 8,7 МБ |
-| `meow` | tiny плюс Shadowsocks, AnyTLS, VMess, ShadowTLS | 9,1 МБ | 9,1 МБ |
-| `meow-full` | всё, что есть в meow-rs, вместе с logbook и traffic ledger | 12,2 МБ | 14,0 МБ |
+| Пакет | Что внутри | aarch64 | armv7 | mipsel | mips |
+|---|---|---|---|---|---|
+| `meow-tiny` | Trojan, VLESS (Vision, Reality), Hysteria2, mux, DoH/DoT, входы mixed, TProxy и TUN | 6,8 МБ | 7,5 МБ | 9,0 МБ | 8,5 МБ |
+| `meow` | tiny плюс Shadowsocks, AnyTLS, VMess, ShadowTLS | 7,2 МБ | 8,0 МБ | 9,7 МБ | 9,1 МБ |
+| `meow-full` | всё, что есть в meow-rs, вместе с logbook и traffic ledger | 10,2 МБ | 11,7 МБ | 14,8 МБ | 14,2 МБ |
 
 Размеры даны для статического бинарника после strip. На флеше он занимает
 меньше: squashfs хранит `meow-tiny` примерно в 2,6 МБ, JFFS2 в 4,4 МБ, UBIFS
