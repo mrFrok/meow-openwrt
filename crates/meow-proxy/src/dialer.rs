@@ -1122,11 +1122,15 @@ pub(crate) fn front_hop_last_resort() -> bool {
         .unwrap_or(false)
 }
 
-/// Run `f`, a front-hop dial, with [`FRONT_HOP`] set to `hop`.
-async fn scoped_front_hop<F: std::future::Future>(hop: Option<FrontHop>, f: F) -> F::Output {
+/// Run `f`, a front-hop dial, with [`FRONT_HOP`] set to `hop`. A plain
+/// `fn`: an `async fn` would hold `f` twice (argument + awaitee).
+fn scoped_front_hop<F: std::future::Future>(
+    hop: Option<FrontHop>,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
     match hop {
-        Some(hop) => FRONT_HOP.scope(hop, f).await,
-        None => f.await,
+        Some(hop) => futures::future::Either::Left(FRONT_HOP.scope(hop, f)),
+        None => futures::future::Either::Right(f),
     }
 }
 

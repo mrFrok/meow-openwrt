@@ -157,8 +157,11 @@ pub fn in_dns_via_proxy_dial() -> bool {
 
 /// Run `fut` with the [`in_dns_via_proxy_dial`] task-local set — the DNS
 /// client's counterpart of `resolve_via_hook`'s `IN_HOST_RESOLVER` scope.
-pub async fn dns_via_proxy_dial_scope<F: std::future::Future>(fut: F) -> F::Output {
-    IN_DNS_VIA_PROXY_DIAL.scope((), fut).await
+/// A plain `fn`: an `async fn` would hold `fut` twice (argument + awaitee).
+pub fn dns_via_proxy_dial_scope<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    IN_DNS_VIA_PROXY_DIAL.scope((), fut)
 }
 
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
