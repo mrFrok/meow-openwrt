@@ -1569,14 +1569,8 @@ async fn apply_raw_to_tunnel(
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
     // mihomo re-applies `routing-mark` on every config load.
-    meow_common::set_routing_mark(raw.routing_mark);
-    meow_tunnel::nftset::install(
-        &state.tunnel,
-        raw.dns
-            .as_ref()
-            .and_then(|d| d.nftset.as_ref())
-            .and_then(|n| n.parse().ok().flatten()),
-    );
+    meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw));
+    meow_tunnel::nftset::install(&state.tunnel, meow_config::effective_nftset(&raw));
     state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
@@ -3904,15 +3898,8 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
-    meow_common::set_routing_mark(raw_config.routing_mark);
-    meow_tunnel::nftset::install(
-        &state.tunnel,
-        raw_config
-            .dns
-            .as_ref()
-            .and_then(|d| d.nftset.as_ref())
-            .and_then(|n| n.parse().ok().flatten()),
-    );
+    meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw_config));
+    meow_tunnel::nftset::install(&state.tunnel, meow_config::effective_nftset(&raw_config));
     state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     if dropped > 0 {
         tracing::warn!(

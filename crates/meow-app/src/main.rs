@@ -630,7 +630,7 @@ fn run_application_inner(
 
         // mihomo's `routing-mark` marks every outbound socket, from the first
         // provider fetch on (meow-openwrt; the deployer's rules exempt it).
-        meow_common::set_routing_mark(raw.routing_mark);
+        meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw));
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1261,15 +1261,7 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
-    meow_tunnel::nftset::install(
-        &tunnel,
-        config
-            .raw
-            .dns
-            .as_ref()
-            .and_then(|d| d.nftset.as_ref())
-            .and_then(|n| n.parse().ok().flatten()),
-    );
+    meow_tunnel::nftset::install(&tunnel, meow_config::effective_nftset(&config.raw));
     if config.api.external_controller.is_none() {
         // No API can inspect individual connections. Keep cancellation handles
         // for cold reloads without storing their display metadata.

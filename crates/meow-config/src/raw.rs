@@ -466,6 +466,9 @@ pub struct RawTun {
     /// With `auto-redirect`: these destinations are never captured.
     pub route_exclude_address: Option<Vec<String>>,
     pub route_exclude_address_set: Option<Vec<String>>,
+    /// meow: with `auto-redirect`, also capture what `dns.nftset` would add
+    /// (addresses of domains the rules do not send DIRECT).
+    pub route_address_dns: Option<bool>,
     pub include_uid: Option<serde_json::Value>,
     pub exclude_uid: Option<serde_json::Value>,
 }

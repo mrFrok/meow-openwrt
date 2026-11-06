@@ -167,6 +167,8 @@ struct HookState {
     /// timeout`).
     no_timeout: [bool; 2],
     warned: bool,
+    /// `meow_common::nftset::epoch()` when `seen` was last valid.
+    epoch: u64,
 }
 
 const SEEN_CAP: usize = 8192;
@@ -182,6 +184,7 @@ impl NftsetHook {
                 seen: HashMap::new(),
                 no_timeout: [false; 2],
                 warned: false,
+                epoch: meow_common::nftset::epoch(),
             }),
         }
     }
@@ -202,6 +205,12 @@ impl meow_dns::answer_hook::AnswerHook for NftsetHook {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let epoch = meow_common::nftset::epoch();
+        if st.epoch != epoch {
+            // The set was recreated empty: everything must be added again.
+            st.seen.clear();
+            st.epoch = epoch;
+        }
         if st.seen.get(&ip).is_some_and(|exp| *exp > now + timeout / 2) {
             return;
         }

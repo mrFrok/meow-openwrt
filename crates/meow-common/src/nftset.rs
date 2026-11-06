@@ -52,6 +52,26 @@ impl SetRef {
     }
 }
 
+/// `tun.auto-redirect`'s bypass mark when `routing-mark` is unset (mihomo's
+/// default): meow's own sockets carry it and are never captured.
+pub const AUTO_REDIRECT_BYPASS_MARK: u32 = 0x2024;
+
+/// `tun.route-address-dns`: the set in auto-redirect's table that DNS
+/// answers feed.
+pub const AUTO_REDIRECT_DNS_SET: &str = "inet#meow#route4_dns";
+
+static SET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped whenever a set the hook feeds was (re)created empty, so the hook
+/// forgets which elements it already added.
+pub fn bump_epoch() {
+    SET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn epoch() -> u64 {
+    SET_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The parsed `dns.nftset` section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftsetConfig {

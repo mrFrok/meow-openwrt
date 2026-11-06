@@ -36,7 +36,7 @@ pub(super) const TABLE: &str = "meow";
 /// Packets of captured UDP/ICMP flows: policy-routed into the device.
 pub(super) const ROUTE_MARK: u32 = 0x2023;
 /// meow's own sockets and flows decided not to be captured.
-pub(super) const DEFAULT_BYPASS_MARK: u32 = 0x2024;
+pub(super) const DEFAULT_BYPASS_MARK: u32 = meow_common::nftset::AUTO_REDIRECT_BYPASS_MARK;
 
 const FW4_INCLUDE: &str = "/etc/nftables.d/0-meow-auto-redirect.nft";
 
@@ -51,6 +51,9 @@ pub(super) struct Params {
     /// `None`: capture every destination.
     pub route: Option<Vec<(Ipv4Addr, Ipv4Addr)>>,
     pub exclude: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// `route-address-dns`: an empty timeout set (`route4_dns`) the DNS
+    /// answer hook fills; captured like `route4`.
+    pub dns_set: bool,
 }
 
 /// The installed table (and fw4 include); dropping it removes both.
@@ -63,6 +66,8 @@ impl NftRedirect {
         let local = local_ranges(p.tun_net);
         let script = ruleset(p, &local);
         nft(&script)?;
+        // The DNS set starts empty: the answer hook must add everything anew.
+        meow_common::nftset::bump_epoch();
         info!(
             "tun auto-redirect: nftables table inet {TABLE} installed (TCP -> :{}, UDP via '{}')",
             p.redirect_port, p.dev
@@ -146,8 +151,11 @@ pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
     if !p.exclude.is_empty() {
         filter.push_str("\t\tip daddr @exclude4 return\n");
     }
-    if p.route.is_some() {
-        filter.push_str("\t\tip daddr != @route4 return\n");
+    match (p.route.is_some(), p.dns_set) {
+        (true, true) => filter.push_str("\t\tip daddr != @route4 ip daddr != @route4_dns return\n"),
+        (true, false) => filter.push_str("\t\tip daddr != @route4 return\n"),
+        (false, true) => filter.push_str("\t\tip daddr != @route4_dns return\n"),
+        (false, false) => {}
     }
     let dns_out = p.dns_target.map_or(String::new(), |t| {
         format!("\t\tmeta nfproto ipv4 oifname != \"lo\" udp dport 53 dnat ip to {t}\n")
@@ -163,6 +171,9 @@ pub(super) fn ruleset(p: &Params, local: &[(Ipv4Addr, Ipv4Addr)]) -> String {
     }
     if let Some(r) = &p.route {
         s.push_str(&set("route4", r));
+    }
+    if p.dns_set {
+        s.push_str("\tset route4_dns {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}\n");
     }
     let _ = write!(
         s,
@@ -348,11 +359,13 @@ mod tests {
             dns_target: Some(a("198.18.0.2")),
             route: Some(vec![(a("91.108.4.0"), a("91.108.7.255"))]),
             exclude: Vec::new(),
+            dns_set: true,
         };
         let s = ruleset(&p, &[(a("127.0.0.0"), a("127.255.255.255"))]);
         assert!(s.starts_with("table inet meow\ndelete table inet meow\n"));
         assert!(s.contains("elements = { 91.108.4.0-91.108.7.255 }"));
-        assert!(s.contains("ip daddr != @route4 return"));
+        assert!(s.contains("ip daddr != @route4 ip daddr != @route4_dns return"));
+        assert!(s.contains("set route4_dns {\n\t\ttype ipv4_addr\n\t\tflags timeout"));
         assert!(!s.contains("@exclude4"));
         assert!(s.contains("redirect to :7895"));
         assert!(s.contains("udp dport 53 dnat ip to 198.18.0.2"));
@@ -369,6 +382,7 @@ mod tests {
             dns_target: None,
             route: None,
             exclude: vec![(a("1.1.1.1"), a("1.1.1.1"))],
+            dns_set: false,
         };
         let s = ruleset(&p, &[]);
         assert!(!s.contains("@route4"));

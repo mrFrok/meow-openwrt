@@ -724,3 +724,26 @@ tun:
 "#;
     assert!(load_config_from_str(yaml).await.is_err());
 }
+
+#[tokio::test]
+async fn route_address_dns_feeds_the_auto_redirect_set() {
+    let yaml = r#"
+tun:
+  enable: true
+  auto-route: true
+  auto-redirect: true
+  route-address-dns: true
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    let nft = meow_config::effective_nftset(&cfg.raw);
+    let mark = meow_config::effective_routing_mark(&cfg.raw);
+    if !cfg!(target_os = "linux") {
+        assert!(nft.is_none() && mark.is_none());
+        return;
+    }
+    assert!(cfg.tun.auto_redirect.expect("on").route_address_dns);
+    let nft = nft.expect("hook feeds route4_dns");
+    let v4 = nft.ipv4.expect("v4 set");
+    assert_eq!((v4.table.as_str(), v4.set.as_str()), ("meow", "route4_dns"));
+    assert_eq!(mark, Some(meow_common::nftset::AUTO_REDIRECT_BYPASS_MARK));
+}

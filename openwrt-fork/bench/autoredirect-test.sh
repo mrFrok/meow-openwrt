@@ -97,4 +97,44 @@ kill $MP; sleep 2; MP=""
 $G nft list table inet meow >/dev/null 2>&1 && bad "table left after SIGTERM" || ok "table removed"
 $G ip rule | grep -q 'fwmark 0x2023' && bad "rules left after SIGTERM" || ok "rules removed"
 echo "--- meow log (warn/error):"; grep -iE 'warn|error' $W/meow.log | head -8
+
+# Phase 2: route-address-dns — capture only what the rules do not send
+# DIRECT, learned from DNS answers.
+cat > $W/config.yaml <<EOF
+log-level: info
+hosts:
+  blocked.lan: 203.0.113.2
+  ok.lan: 203.0.113.3
+dns:
+  enable: true
+  listen: 127.0.0.1:11053
+  enhanced-mode: redir-host
+  use-hosts: true
+  nameserver: [203.0.113.3]
+tun:
+  enable: true
+  stack: system
+  device: mwtun
+  auto-route: true
+  auto-redirect: true
+  route-address-dns: true
+rules:
+  - DOMAIN,blocked.lan,REJECT
+  - MATCH,DIRECT
+EOF
+$G $BIN -d $W -f $W/config.yaml > $W/meow2.log 2>&1 & MP=$!
+sleep 4
+r=$($C wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
+[ "$r" = hello ] && ! grep -q -- '203.0.113.2:8080' $W/meow2.log && ok "dns-set: .2 bypasses before any DNS answer" || bad "dns-set: .2 before DNS: $r"
+$C nslookup blocked.lan 203.0.113.3 >/dev/null 2>&1; $C nslookup ok.lan 203.0.113.3 >/dev/null 2>&1
+$G nft list set inet meow route4_dns 2>&1 | grep -q '203.0.113.2' && ok "dns-set: REJECT domain's address added" || bad "dns-set: .2 not in route4_dns"
+$G nft list set inet meow route4_dns 2>&1 | grep -q '203.0.113.3' && bad "dns-set: DIRECT domain's address added" || ok "dns-set: DIRECT domain's address not added"
+# (A hosts answer leaves no IP->domain mapping, so the flow itself matches
+# by IP; what matters here is that it reaches meow.)
+$C wget -qO- -T 5 http://203.0.113.2:8080/x >/dev/null 2>&1
+grep -q -- '203.0.113.2:8080' $W/meow2.log && ok "dns-set: .2 now captured" || bad "dns-set: .2 still bypasses"
+r=$($C wget -qO- -T 5 http://203.0.113.3:8080/x 2>&1)
+[ "$r" = hello ] && ! grep -q -- '203.0.113.3:8080' $W/meow2.log && ok "dns-set: .3 still bypasses" || bad "dns-set: .3: $r"
+kill $MP; sleep 2; MP=""
+grep -iE 'warn|error' $W/meow2.log | head -5
 [ $fail = 0 ] && echo ALL PASS || echo SOME FAILED

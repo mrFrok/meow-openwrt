@@ -250,6 +250,9 @@ pub struct AutoRedirect {
     /// `None`: every destination.
     pub route: Option<Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>>,
     pub exclude: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
+    /// `route-address-dns`: also capture `route4_dns`, which the DNS
+    /// answer hook fills (`meow_common::nftset::AUTO_REDIRECT_DNS_SET`).
+    pub dns_set: bool,
 }
 
 /// Which stack terminates the device's TCP flows (`tun.stack`).
@@ -1653,6 +1656,7 @@ impl TunListener {
                 dns_target: self.cfg.dns_hijack.then(|| peer_v4(tun_v4)),
                 route,
                 exclude: auto_redirect::coalesce(ar.exclude.clone()),
+                dns_set: ar.dns_set,
             };
             let route_mark = auto_redirect::ROUTE_MARK;
             let (routes, nft) = tokio::task::spawn_blocking(move || {

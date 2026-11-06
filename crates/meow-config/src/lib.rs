@@ -425,6 +425,9 @@ pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net 
 /// destinations, `route-exclude-address(-set)` exempts some.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutoRedirectConfig {
+    /// `route-address-dns` (meow): also capture the addresses DNS answers
+    /// give for domains the rules send anywhere but DIRECT.
+    pub route_address_dns: bool,
     pub route_address: Vec<ipnet::IpNet>,
     /// Names of `ipcidr` rule-providers, resolved when the listener starts.
     pub route_address_set: Vec<String>,
@@ -474,11 +477,55 @@ fn parse_auto_redirect(
         ));
     }
     Ok(Some(AutoRedirectConfig {
+        route_address_dns: r.route_address_dns == Some(true),
         route_address,
         route_address_set: r.route_address_set.clone().unwrap_or_default(),
         route_exclude_address,
         route_exclude_address_set: r.route_exclude_address_set.clone().unwrap_or_default(),
     }))
+}
+
+/// Whether `tun.auto-redirect` will run (enabled TUN, Linux).
+fn auto_redirect_on(raw: &raw::RawConfig) -> Option<&raw::RawTun> {
+    raw.tun
+        .as_ref()
+        .filter(|t| cfg!(target_os = "linux") && t.enable && t.auto_redirect == Some(true))
+}
+
+/// The global `routing-mark` to install: the configured one, else
+/// auto-redirect's bypass mark while it runs — meow's own sockets must
+/// carry it or its nftables rules would capture them. Use at every config
+/// load and reload.
+pub fn effective_routing_mark(raw: &raw::RawConfig) -> Option<u32> {
+    raw.routing_mark
+        .or_else(|| auto_redirect_on(raw).map(|_| meow_common::nftset::AUTO_REDIRECT_BYPASS_MARK))
+}
+
+/// The `dns.nftset` hook config: the explicit one, else auto-redirect's
+/// own DNS set when `tun.route-address-dns` asks for it.
+pub fn effective_nftset(raw: &raw::RawConfig) -> Option<meow_common::nftset::NftsetConfig> {
+    let explicit = raw.dns.as_ref().and_then(|d| d.nftset.as_ref());
+    let timeout = explicit.and_then(|n| n.timeout);
+    let dns_set = auto_redirect_on(raw).is_some_and(|t| t.route_address_dns == Some(true));
+    if let Some(n) = explicit.filter(|n| n.ipv4.is_some() || n.ipv6.is_some()) {
+        if dns_set {
+            warn!(
+                "tun.route-address-dns: dns.nftset names its own sets; the auto-redirect \
+                 DNS set stays empty"
+            );
+        }
+        return n.parse().ok().flatten();
+    }
+    if !dns_set {
+        return None;
+    }
+    meow_common::nftset::NftsetConfig::parse(
+        Some(meow_common::nftset::AUTO_REDIRECT_DNS_SET),
+        None,
+        timeout,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Default for `max-connections` when the config leaves it out

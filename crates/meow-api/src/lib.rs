@@ -113,8 +113,11 @@ fn auto_redirect_ranges(
         }
         r
     };
-    let narrowed = !ar.route_address.is_empty() || !ar.route_address_set.is_empty();
+    // With the DNS set, capture is narrowed to it plus these ranges.
+    let narrowed =
+        !ar.route_address.is_empty() || !ar.route_address_set.is_empty() || ar.route_address_dns;
     meow_listener::AutoRedirect {
+        dns_set: ar.route_address_dns,
         route: narrowed.then(|| {
             collect(
                 &ar.route_address,
