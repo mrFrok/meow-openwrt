@@ -171,6 +171,7 @@ mod tests {
                 udp_timeout: std::time::Duration::from_secs(60),
                 max_connections: 0,
                 stack: super::super::TunStack::Lwip,
+                auto_redirect: None,
             },
             "meow-tun-test".into(),
         )

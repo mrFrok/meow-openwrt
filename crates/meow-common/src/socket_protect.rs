@@ -354,6 +354,17 @@ pub fn set_routing_mark(mark: Option<u32>) {
     let _ = mark;
 }
 
+/// The global routing mark, `None` when unset (always `None` off Linux).
+pub fn routing_mark() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    return match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        mark => Some(mark),
+    };
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn routing_mark_set() -> bool {
     #[cfg(target_os = "linux")]

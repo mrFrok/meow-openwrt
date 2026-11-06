@@ -1692,7 +1692,7 @@ async fn run(
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let mut listener = TunListener::new(
                 tunnel.clone(),
-                tun_config_to_listener_config(&config.tun),
+                tun_config_to_listener_config(&config.tun, &rule_providers.read().clone()),
                 "meow-tun".to_string(),
             )
             .with_readiness_signal(ready_tx)

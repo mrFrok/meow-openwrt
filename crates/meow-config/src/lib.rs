@@ -292,6 +292,8 @@ pub struct NamedListener {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
     pub enable: bool,
+    /// `auto-redirect` (Linux): `None` when off.
+    pub auto_redirect: Option<AutoRedirectConfig>,
     /// Device name; `None` = platform default.
     pub device: Option<String>,
     pub mtu: u16,
@@ -380,6 +382,7 @@ impl Default for TunConfig {
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: default_max_connections(),
             stack: TunStack::Lwip,
+            auto_redirect: None,
         }
     }
 }
@@ -415,6 +418,69 @@ pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net 
 
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
+/// `tun.auto-redirect` (mihomo's key; Linux, meow-openwrt): TCP is captured
+/// by an nftables `redirect` to an internal listener, UDP is marked and
+/// policy-routed into the device, for the host's own traffic and the LAN
+/// it forwards alike. `route-address(-set)` narrows capture to those
+/// destinations, `route-exclude-address(-set)` exempts some.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutoRedirectConfig {
+    pub route_address: Vec<ipnet::IpNet>,
+    /// Names of `ipcidr` rule-providers, resolved when the listener starts.
+    pub route_address_set: Vec<String>,
+    pub route_exclude_address: Vec<ipnet::IpNet>,
+    pub route_exclude_address_set: Vec<String>,
+}
+
+fn parse_auto_redirect(
+    r: &raw::RawTun,
+    global: bool,
+) -> Result<Option<AutoRedirectConfig>, anyhow::Error> {
+    let cidrs = |key: &str, v: &Option<Vec<String>>| -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+        v.iter()
+            .flatten()
+            .map(|s| {
+                let s = s.trim();
+                s.parse::<ipnet::IpNet>()
+                    .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|e| anyhow::anyhow!("tun.{key}: invalid CIDR '{s}': {e}"))
+            })
+            .collect()
+    };
+    let route_address = cidrs("route-address", &r.route_address)?;
+    let route_exclude_address = cidrs("route-exclude-address", &r.route_exclude_address)?;
+    if r.auto_redirect != Some(true) {
+        let narrowed = !route_address.is_empty()
+            || !route_exclude_address.is_empty()
+            || r.route_address_set.as_ref().is_some_and(|v| !v.is_empty())
+            || r.route_exclude_address_set
+                .as_ref()
+                .is_some_and(|v| !v.is_empty());
+        if narrowed {
+            warn!(
+                "tun.route-address / route-exclude-address (and -set): only used with \
+                 'auto-redirect: true'; ignored"
+            );
+        }
+        return Ok(None);
+    }
+    if !cfg!(target_os = "linux") {
+        warn!("tun.auto-redirect: Linux only; ignored");
+        return Ok(None);
+    }
+    if !global {
+        return Err(anyhow::anyhow!(
+            "tun.auto-redirect requires 'auto-route: true'"
+        ));
+    }
+    Ok(Some(AutoRedirectConfig {
+        route_address,
+        route_address_set: r.route_address_set.clone().unwrap_or_default(),
+        route_exclude_address,
+        route_exclude_address_set: r.route_exclude_address_set.clone().unwrap_or_default(),
+    }))
+}
+
 /// Default for `max-connections` when the config leaves it out
 /// (meow-openwrt): one slot per 32 KiB of an eighth of MemTotal, between
 /// 256 and 16384 — 256 on a 64 MB router, 512 on 128 MB, 1024 on 256 MB,
@@ -456,11 +522,8 @@ pub fn parse_tun_config(
     for (name, val) in [
         ("strict-route", &r.strict_route),
         ("auto-detect-interface", &r.auto_detect_interface),
-        ("auto-redirect", &r.auto_redirect),
         ("endpoint-independent-nat", &r.endpoint_independent_nat),
         ("mtu-v6", &r.mtu_v6),
-        ("route-address", &r.route_address),
-        ("route-exclude-address", &r.route_exclude_address),
         ("include-uid", &r.include_uid),
         ("exclude-uid", &r.exclude_uid),
     ] {
@@ -550,6 +613,8 @@ pub fn parse_tun_config(
     }
     let inet6_address = inet6_address.filter(|_| global);
 
+    let auto_redirect = parse_auto_redirect(r, global)?;
+
     Ok(TunConfig {
         enable: r.enable,
         device: r.device.clone().filter(|s| !s.is_empty()),
@@ -563,6 +628,7 @@ pub fn parse_tun_config(
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
         stack: parse_tun_stack(r.stack.as_ref()),
+        auto_redirect,
     })
 }
 

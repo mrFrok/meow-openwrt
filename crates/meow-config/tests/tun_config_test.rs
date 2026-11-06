@@ -651,3 +651,76 @@ async fn stack_system_and_mixed_select_the_kernel_tcp_stack() {
         .unwrap();
     assert_eq!(cfg.tun.stack, meow_config::TunStack::Lwip);
 }
+
+// ─── auto-redirect (meow-openwrt) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn auto_redirect_parses_route_addresses_and_sets() {
+    let yaml = r#"
+tun:
+  enable: true
+  auto-route: true
+  auto-redirect: true
+  route-address: [91.108.4.0/22, 1.1.1.1]
+  route-address-set: [telegram]
+  route-exclude-address: [10.0.0.0/8]
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    if !cfg!(target_os = "linux") {
+        assert!(cfg.tun.auto_redirect.is_none(), "Linux only");
+        return;
+    }
+    let ar = cfg.tun.auto_redirect.expect("auto-redirect on");
+    assert_eq!(
+        ar.route_address,
+        vec![
+            "91.108.4.0/22".parse::<ipnet::IpNet>().unwrap(),
+            "1.1.1.1/32".parse().unwrap()
+        ]
+    );
+    assert_eq!(ar.route_address_set, vec!["telegram".to_string()]);
+    assert_eq!(
+        ar.route_exclude_address,
+        vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn auto_redirect_needs_global_auto_route() {
+    let yaml = r#"
+tun:
+  enable: true
+  auto-route: fake-ip
+  auto-redirect: true
+"#;
+    let res = load_config_from_str(yaml).await;
+    if cfg!(target_os = "linux") {
+        assert!(
+            res.is_err(),
+            "auto-redirect without auto-route: true must fail"
+        );
+    }
+}
+
+#[tokio::test]
+async fn route_address_without_auto_redirect_is_ignored() {
+    let yaml = r#"
+tun:
+  enable: true
+  route-address: [1.1.1.1/32]
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    assert!(cfg.tun.auto_redirect.is_none());
+}
+
+#[tokio::test]
+async fn auto_redirect_rejects_a_bad_cidr() {
+    let yaml = r#"
+tun:
+  enable: true
+  auto-route: true
+  auto-redirect: true
+  route-address: [not-a-cidr]
+"#;
+    assert!(load_config_from_str(yaml).await.is_err());
+}

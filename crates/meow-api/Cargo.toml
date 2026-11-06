@@ -13,6 +13,7 @@ default = []
 listener-tun = ["meow-listener/listener-tun"]
 
 [dependencies]
+ipnet = { workspace = true }
 meow-common = { workspace = true }
 meow-tunnel = { workspace = true }
 meow-dns = { workspace = true, default-features = false }

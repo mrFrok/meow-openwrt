@@ -93,6 +93,8 @@ enum Selector {
     Local(Option<IpNet>),
     /// Every packet.
     All,
+    /// `fwmark <mark>` (exact, mask 0xffffffff): `auto-redirect`.
+    Mark(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +148,28 @@ fn rules(v4: Ipv4Net, v6: Option<Ipv6Net>) -> Vec<Rule> {
     rules
 }
 
+/// `auto-redirect` (IPv4): nftables marks the flows to capture; meow's own
+/// sockets and every flow decided against carry `bypass`.
+///
+/// | pref | rule |
+/// |------|------|
+/// | 9200 | `fwmark <bypass> goto 9205` |
+/// | 9201 | `fwmark 0x2023 lookup TABLE` |
+/// | 9205 | `nop` |
+fn marked_rules(bypass: u32, route: u32) -> Vec<Rule> {
+    let rule = |offset, selector, action| Rule {
+        priority: PRIORITY + offset,
+        v6: false,
+        selector,
+        action,
+    };
+    vec![
+        rule(0, Selector::Mark(bypass), Action::SkipDevice),
+        rule(1, Selector::Mark(route), Action::Device),
+        rule(5, Selector::All, Action::Nop),
+    ]
+}
+
 impl Rule {
     fn message(&self) -> RuleMessage {
         let mut msg = RuleMessage::default();
@@ -168,6 +192,10 @@ impl Rule {
                 }
             }
             Selector::All => {}
+            Selector::Mark(mark) => {
+                msg.attributes.push(RuleAttribute::FwMark(mark));
+                msg.attributes.push(RuleAttribute::FwMask(u32::MAX));
+            }
         }
         match self.action {
             Action::MainWithoutDefault => {
@@ -273,6 +301,21 @@ impl PolicyRoutes {
     /// routing (`CONFIG_IP_MULTIPLE_TABLES`) or refuses a rule; the caller
     /// then falls back to split default routes.
     pub(super) fn setup(if_index: u32, v4: Ipv4Net, v6: Option<Ipv6Net>) -> io::Result<Self> {
+        Self::install(if_index, v6.is_some(), rules(v4, v6), true)
+    }
+
+    /// `auto-redirect`: the device's IPv4 default route in [`TABLE`] and
+    /// [`marked_rules`].
+    pub(super) fn setup_marked(if_index: u32, bypass: u32, route: u32) -> io::Result<Self> {
+        Self::install(if_index, false, marked_rules(bypass, route), false)
+    }
+
+    fn install(
+        if_index: u32,
+        with_v6: bool,
+        mut wanted: Vec<Rule>,
+        check_port_selector: bool,
+    ) -> io::Result<Self> {
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         RULES_OWNER.store(generation, Ordering::Relaxed);
         let mut this = Self {
@@ -284,7 +327,7 @@ impl PolicyRoutes {
         nl.purge_rules()?;
         // Replace, not create: a previous generation's device may still
         // hold the table's default route while it tears down.
-        for v6 in [false].into_iter().chain(v6.map(|_| true)) {
+        for v6 in [false].into_iter().chain(with_v6.then_some(true)) {
             let route = default_route(v6, if_index);
             nl.request(
                 RTM_NEWROUTE,
@@ -294,7 +337,6 @@ impl PolicyRoutes {
             this.routes.push(route);
         }
         // The `nop` target goes in before the rules that jump to it.
-        let mut wanted = rules(v4, v6);
         wanted.sort_by_key(|r| r.action != Action::Nop);
         for rule in wanted {
             nl.request(RTM_NEWRULE, &rule.message(), NLM_F_ACK | NLM_F_CREATE)?;
@@ -303,7 +345,7 @@ impl PolicyRoutes {
         // A kernel without the `dport` selector (before Linux 4.17) drops
         // it and keeps the first rule as one that never matches, which
         // would send the LAN into the device too.
-        if !nl.port_selector_kept()? {
+        if check_port_selector && !nl.port_selector_kept()? {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the kernel has no `dport` rule selector (Linux 4.17+)",

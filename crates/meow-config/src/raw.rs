@@ -454,11 +454,18 @@ pub struct RawTun {
     pub stack: Option<serde_json::Value>,
     pub strict_route: Option<serde_json::Value>,
     pub auto_detect_interface: Option<serde_json::Value>,
-    pub auto_redirect: Option<serde_json::Value>,
     pub endpoint_independent_nat: Option<serde_json::Value>,
     pub mtu_v6: Option<serde_json::Value>,
-    pub route_address: Option<serde_json::Value>,
-    pub route_exclude_address: Option<serde_json::Value>,
+    /// mihomo's `auto-redirect` (Linux, meow-openwrt): TCP through an
+    /// nftables redirect, UDP through the device by fwmark, LAN included.
+    pub auto_redirect: Option<bool>,
+    /// With `auto-redirect`: only these destinations are captured
+    /// (CIDRs, and ipcidr rule-set names).
+    pub route_address: Option<Vec<String>>,
+    pub route_address_set: Option<Vec<String>>,
+    /// With `auto-redirect`: these destinations are never captured.
+    pub route_exclude_address: Option<Vec<String>>,
+    pub route_exclude_address_set: Option<Vec<String>>,
     pub include_uid: Option<serde_json::Value>,
     pub exclude_uid: Option<serde_json::Value>,
 }

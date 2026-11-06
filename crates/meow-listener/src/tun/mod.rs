@@ -64,6 +64,8 @@
 //! binary is written out. The process must run elevated. On Linux/macOS
 //! creating the device requires root (CAP_NET_ADMIN).
 
+#[cfg(target_os = "linux")]
+mod auto_redirect;
 mod device;
 mod direct_udp;
 mod dns;
@@ -236,6 +238,18 @@ pub struct TunListenerConfig {
     pub max_connections: usize,
     /// Which stack terminates TCP (see [`TunStack`]).
     pub stack: TunStack,
+    /// `auto-redirect` (Linux, global scope): nftables capture of the host's
+    /// and the LAN's traffic instead of plain policy routing.
+    pub auto_redirect: Option<AutoRedirect>,
+}
+
+/// `tun.auto-redirect`: which IPv4 destinations are captured, as inclusive
+/// ranges (rule-sets already resolved by the caller).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoRedirect {
+    /// `None`: every destination.
+    pub route: Option<Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>>,
+    pub exclude: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)>,
 }
 
 /// Which stack terminates the device's TCP flows (`tun.stack`).
@@ -344,6 +358,11 @@ impl Drop for ReadyNotifier {
 /// away — ensuring route deletion always succeeds because the adapter is
 /// still alive.
 struct TunDevice {
+    /// `auto-redirect`'s nftables table, marked policy routing and redirect
+    /// listener, removed first of all.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "held only for its Drop side effect")]
+    auto_redirect: Option<RedirectGuard>,
     /// Global scope's policy routing on Linux, removed first: while its
     /// rules stand, the outbound binding (`iface_guard`) must hold.
     #[cfg(target_os = "linux")]
@@ -658,37 +677,51 @@ impl TunListener {
         };
         let fake_ip_net = self.tunnel.resolver().fake_ip_v4_net();
 
+        #[cfg(target_os = "linux")]
+        let auto_redirect = match &cfg.auto_redirect {
+            Some(ar) if cfg.auto_route && cfg.route_scope == TunRouteScope::Global => Some(
+                self.start_auto_redirect(ar, &dev_name, tun_net.v4, fake_ip_net, if_index)
+                    .await?,
+            ),
+            _ => None,
+        };
+        #[cfg(target_os = "linux")]
+        let redirected = auto_redirect.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let redirected = false;
+
         // Global scope on Linux: the device's default routes go in a table
         // of their own, which policy rules send only the flows this host
         // originates to (see `policy_route.rs`). Without policy routing
         // the split defaults below go in the main table instead.
         #[cfg(target_os = "linux")]
-        let policy_routes = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
-            let (v4, v6) = (tun_net.v4, tun_net.v6);
-            match tokio::task::spawn_blocking(move || {
-                policy_route::PolicyRoutes::setup(if_index, v4, v6)
-            })
-            .await
-            {
-                Ok(Ok(routes)) => Some(routes),
-                Ok(Err(e)) => {
-                    warn!(
-                        "tun '{}': policy routing unavailable ({e}); routing everything \
+        let policy_routes =
+            if !redirected && cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
+                let (v4, v6) = (tun_net.v4, tun_net.v6);
+                match tokio::task::spawn_blocking(move || {
+                    policy_route::PolicyRoutes::setup(if_index, v4, v6)
+                })
+                .await
+                {
+                    Ok(Ok(routes)) => Some(routes),
+                    Ok(Err(e)) => {
+                        warn!(
+                            "tun '{}': policy routing unavailable ({e}); routing everything \
                          through the main table instead, which also sends the replies on \
                          connections accepted from other networks into '{dev_name}'",
-                        self.name
-                    );
-                    None
+                            self.name
+                        );
+                        None
+                    }
+                    Err(join_err) => {
+                        return Err(Box::new(io::Error::other(format!(
+                            "policy-route spawn_blocking panicked: {join_err}"
+                        ))));
+                    }
                 }
-                Err(join_err) => {
-                    return Err(Box::new(io::Error::other(format!(
-                        "policy-route spawn_blocking panicked: {join_err}"
-                    ))));
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         #[cfg(target_os = "linux")]
         let policy_routed = policy_routes.is_some();
         #[cfg(not(target_os = "linux"))]
@@ -698,6 +731,8 @@ impl TunListener {
         // module docs).
         let route_nets: Vec<ipnet::IpNet> = match (cfg.auto_route, cfg.route_scope) {
             (false, _) => Vec::new(),
+            // nftables marks and policy routing carry everything.
+            (true, TunRouteScope::Global) if redirected => Vec::new(),
             // The policy rules leave traffic the host forwards
             // (containers, VMs, a gateway's LAN clients) to the main table,
             // where the fake-IP range still catches its domain flows.
@@ -757,6 +792,8 @@ impl TunListener {
         // succeeds because the adapter is still alive.
         let device = Arc::new(TunDevice {
             #[cfg(target_os = "linux")]
+            auto_redirect,
+            #[cfg(target_os = "linux")]
             policy_routes,
             route_guard,
             iface_guard,
@@ -785,7 +822,9 @@ impl TunListener {
         // which can take tens of seconds on Windows, so run them on a
         // blocking thread. The outer TUN_STARTUP_TIMEOUT guards the overall
         // startup.
-        let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
+        // auto-redirect hijacks DNS with an nftables `dnat`; resolv.conf
+        // stays untouched.
+        let _dns_guard = if cfg.dns_hijack && cfg.auto_route && !redirected {
             let t_dns = Instant::now();
             let guard = match fake_ip_gateway {
                 Some(gateway) => {
@@ -1535,6 +1574,114 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TunTcpConn<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S> {}
+
+/// `auto-redirect`'s pieces, dropped in this order: the nftables table
+/// (no more capture), the marked policy routing, the redirect listener.
+#[cfg(target_os = "linux")]
+struct RedirectGuard {
+    _nft: auto_redirect::NftRedirect,
+    _routes: policy_route::PolicyRoutes,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RedirectGuard {
+    fn drop(&mut self) {
+        self.listener.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TunListener {
+    /// Start the TCP redirect listener, the marked policy routing and the
+    /// nftables table (see `auto_redirect.rs`).
+    async fn start_auto_redirect(
+        &self,
+        ar: &AutoRedirect,
+        dev_name: &str,
+        tun_v4: Ipv4Net,
+        fake_ip_net: Option<ipnet::IpNet>,
+        if_index: u32,
+    ) -> io::Result<RedirectGuard> {
+        #[cfg(not(feature = "listener-tproxy"))]
+        {
+            let _ = (ar, dev_name, tun_v4, fake_ip_net, if_index);
+            Err(io::Error::other(
+                "tun.auto-redirect needs the 'listener-tproxy' feature (its TCP redirect listener)",
+            ))
+        }
+        #[cfg(feature = "listener-tproxy")]
+        {
+            let bypass = meow_common::routing_mark().unwrap_or_else(|| {
+                meow_common::set_routing_mark(Some(auto_redirect::DEFAULT_BYPASS_MARK));
+                auto_redirect::DEFAULT_BYPASS_MARK
+            });
+            let tcp = crate::tproxy::bind_tcp((Ipv4Addr::UNSPECIFIED, 0).into(), false)?;
+            let port = tcp.local_addr()?.port();
+            let mut redirect = crate::tproxy::TProxyListener::new(
+                self.tunnel.clone(),
+                tcp.local_addr()?,
+                false,
+                None,
+                format!("{}-redirect", self.name),
+            )
+            .with_firewall(false)
+            .with_max_connections(self.cfg.max_connections);
+            if let Some(sniffer) = &self.sniffer {
+                redirect = redirect.with_sniffer(Arc::clone(sniffer));
+            }
+            let name = self.name.clone();
+            let listener = tokio::spawn(async move {
+                if let Err(e) = redirect.run_on(tcp).await {
+                    warn!("tun '{name}': auto-redirect TCP listener stopped: {e}");
+                }
+            });
+
+            // A narrowed capture must still take the fake-IP range: its
+            // addresses only mean something to meow.
+            let route = ar.route.clone().map(|mut r| {
+                if let Some(ipnet::IpNet::V4(f)) = fake_ip_net {
+                    r.push(auto_redirect::net_range(f));
+                }
+                auto_redirect::coalesce(r)
+            });
+            let params = auto_redirect::Params {
+                dev: dev_name.to_owned(),
+                redirect_port: port,
+                bypass_mark: bypass,
+                tun_net: tun_v4,
+                dns_target: self.cfg.dns_hijack.then(|| peer_v4(tun_v4)),
+                route,
+                exclude: auto_redirect::coalesce(ar.exclude.clone()),
+            };
+            let route_mark = auto_redirect::ROUTE_MARK;
+            let (routes, nft) = tokio::task::spawn_blocking(move || {
+                let routes =
+                    policy_route::PolicyRoutes::setup_marked(if_index, bypass, route_mark)?;
+                let nft = auto_redirect::NftRedirect::setup(&params)?;
+                Ok::<_, io::Error>((routes, nft))
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("auto-redirect setup panicked: {e}")))?
+            .inspect_err(|_| listener.abort())?;
+            Ok(RedirectGuard {
+                _nft: nft,
+                _routes: routes,
+                listener,
+            })
+        }
+    }
+}
+
+/// The device's peer address: the subnet's other host for a /30 or /31
+/// (`198.18.0.1/30` -> `198.18.0.2`), else address + 1.
+#[cfg(target_os = "linux")]
+fn peer_v4(net: Ipv4Net) -> Ipv4Addr {
+    let addr = u32::from(net.addr());
+    let first = u32::from(net.network()) + 1;
+    let peer = if addr == first { addr + 1 } else { first };
+    Ipv4Addr::from(peer)
+}
 
 #[cfg(test)]
 mod tests {

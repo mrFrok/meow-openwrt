@@ -3046,6 +3046,7 @@ async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
     binding: Option<OutboundBinding>,
+    rule_providers: &HashMap<String, Arc<RuleProvider>>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(
         raw.tun.as_ref(),
@@ -3064,7 +3065,7 @@ async fn spawn_tun_from_raw(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut listener = TunListener::new(
         tunnel.clone(),
-        crate::tun_config_to_listener_config(&tun_cfg),
+        crate::tun_config_to_listener_config(&tun_cfg, rule_providers),
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
@@ -3131,6 +3132,7 @@ async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
     _binding: Option<OutboundBinding>,
+    _rule_providers: &HashMap<String, Arc<RuleProvider>>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
@@ -3337,7 +3339,8 @@ async fn swap_config_and_reconcile_tun(
             let raw = state.raw_config.read().clone();
             let binding = preinstalled.take_binding();
             let adopted = binding.is_some();
-            match spawn_tun_from_raw(&state.tunnel, &raw, binding).await {
+            let providers = state.rule_providers.read().clone();
+            match spawn_tun_from_raw(&state.tunnel, &raw, binding, &providers).await {
                 Ok(Some(handle)) => {
                     state.tunnel.set_tun_handle(handle).await;
                     info!(
@@ -3384,7 +3387,8 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         let binding = preinstalled.take_binding();
         let adopted = binding.is_some();
-        match spawn_tun_from_raw(&state.tunnel, &snapshot, binding).await {
+        let providers = state.rule_providers.read().clone();
+        match spawn_tun_from_raw(&state.tunnel, &snapshot, binding, &providers).await {
             Ok(Some(handle)) => {
                 state.tunnel.set_tun_handle(handle).await;
                 info!("TUN listener started via config reload");

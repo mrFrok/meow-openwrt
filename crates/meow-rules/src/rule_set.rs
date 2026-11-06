@@ -93,6 +93,12 @@ pub trait RuleSet: Send + Sync {
     fn matches_domain(&self, _domain: &str) -> bool {
         false
     }
+
+    /// The address ranges of an ipcidr set (`tun.route-address-set`);
+    /// `None` for every other behavior.
+    fn ip_ranges(&self) -> Option<&IpRangeSet> {
+        None
+    }
 }
 
 /// Build a rule-set of the given behavior from already-parsed entries.
@@ -512,6 +518,10 @@ impl IpCidrRuleSetBuilder {
 impl RuleSet for IpCidrRuleSet {
     fn behavior(&self) -> RuleSetBehavior {
         RuleSetBehavior::IpCidr
+    }
+
+    fn ip_ranges(&self) -> Option<&IpRangeSet> {
+        Some(&self.set)
     }
 
     fn matches(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {

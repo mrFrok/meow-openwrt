@@ -74,6 +74,25 @@ pub struct IpRangeSet {
 }
 
 impl IpRangeSet {
+    /// The IPv4 intervals, inclusive and sorted (e.g. for an nftables
+    /// interval set).
+    pub fn v4_ranges(&self) -> impl Iterator<Item = (Ipv4Addr, Ipv4Addr)> + '_ {
+        self.v4
+            .starts
+            .iter()
+            .zip(self.v4.ends.iter())
+            .map(|(&s, &e)| (Ipv4Addr::from(s), Ipv4Addr::from(e)))
+    }
+
+    /// The IPv6 intervals, inclusive and sorted.
+    pub fn v6_ranges(&self) -> impl Iterator<Item = (Ipv6Addr, Ipv6Addr)> + '_ {
+        self.v6
+            .starts
+            .iter()
+            .zip(self.v6.ends.iter())
+            .map(|(&s, &e)| (Ipv6Addr::from(s), Ipv6Addr::from(e)))
+    }
+
     /// Build directly from networks; convenience over the builder.
     pub fn from_nets<I: IntoIterator<Item = IpNet>>(nets: I) -> Self {
         let mut builder = IpRangeSetBuilder::default();

@@ -50,8 +50,16 @@ pub const TUN_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[cfg(feature = "listener-tun")]
 pub fn tun_config_to_listener_config(
     tun: &meow_config::TunConfig,
+    rule_providers: &std::collections::HashMap<
+        String,
+        Arc<meow_config::rule_provider::RuleProvider>,
+    >,
 ) -> meow_listener::TunListenerConfig {
     meow_listener::TunListenerConfig {
+        auto_redirect: tun
+            .auto_redirect
+            .as_ref()
+            .map(|ar| auto_redirect_ranges(ar, rule_providers)),
         device: tun.device.clone(),
         mtu: tun.mtu,
         inet4_address: tun.inet4_address,
@@ -69,6 +77,56 @@ pub fn tun_config_to_listener_config(
             meow_config::TunStack::Lwip => meow_listener::TunStack::Lwip,
             meow_config::TunStack::System => meow_listener::TunStack::System,
         },
+    }
+}
+
+/// Resolve `route-address(-set)` / `route-exclude-address(-set)` into IPv4
+/// ranges. An unknown or non-`ipcidr` rule-set is skipped with a warning;
+/// a narrowed capture whose sets all failed still captures nothing beyond
+/// its CIDRs rather than everything.
+#[cfg(feature = "listener-tun")]
+fn auto_redirect_ranges(
+    ar: &meow_config::AutoRedirectConfig,
+    providers: &std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>,
+) -> meow_listener::AutoRedirect {
+    type Range = (std::net::Ipv4Addr, std::net::Ipv4Addr);
+    let collect = |nets: &[ipnet::IpNet], sets: &[String], key: &str| -> Vec<Range> {
+        let mut r: Vec<Range> = nets
+            .iter()
+            .filter_map(|n| match n {
+                ipnet::IpNet::V4(n) => Some((n.network(), n.broadcast())),
+                ipnet::IpNet::V6(_) => None,
+            })
+            .collect();
+        for name in sets {
+            let Some(p) = providers.get(name) else {
+                tracing::warn!("tun.{key}: rule-set '{name}' not found; skipped");
+                continue;
+            };
+            let set = p.snapshot();
+            match set.ip_ranges() {
+                Some(ranges) => r.extend(ranges.v4_ranges()),
+                None => tracing::warn!(
+                    "tun.{key}: rule-set '{name}' is not an ipcidr rule-set; skipped"
+                ),
+            }
+        }
+        r
+    };
+    let narrowed = !ar.route_address.is_empty() || !ar.route_address_set.is_empty();
+    meow_listener::AutoRedirect {
+        route: narrowed.then(|| {
+            collect(
+                &ar.route_address,
+                &ar.route_address_set,
+                "route-address-set",
+            )
+        }),
+        exclude: collect(
+            &ar.route_exclude_address,
+            &ar.route_exclude_address_set,
+            "route-exclude-address-set",
+        ),
     }
 }
 
