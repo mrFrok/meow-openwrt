@@ -360,9 +360,14 @@ impl TProxyListener {
         if !self.firewall {
             info!(
                 "TProxy listener '{}': external firewall management — no rules \
-                 installed or cleaned up; TCP REDIRECT (and loop-prevention \
-                 bypass) is the deployer's responsibility",
-                self.name
+                 installed or cleaned up; the TCP {} rules (and loop-prevention \
+                 bypass) are the deployer's responsibility",
+                self.name,
+                if self.transparent {
+                    "TPROXY"
+                } else {
+                    "REDIRECT"
+                }
             );
         }
 
