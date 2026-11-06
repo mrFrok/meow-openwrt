@@ -38,6 +38,10 @@ pub struct DirectAdapter {
     /// SYN retransmit grid). `None` preserves the legacy unbounded
     /// behaviour for downstream consumers that haven't opted in.
     connect_timeout: Option<Duration>,
+    /// meow-openwrt: bind every socket to this interface (`SO_BINDTODEVICE`)
+    /// instead of the TUN outbound binding — the `wireguard` outbound dials
+    /// through its kernel link this way. Linux only.
+    interface: Option<Arc<str>>,
     health: ProxyHealth,
 }
 
@@ -49,6 +53,7 @@ impl DirectAdapter {
             resolver: None,
             direct_slot: None,
             connect_timeout: None,
+            interface: None,
             health: ProxyHealth::new(),
         }
     }
@@ -62,6 +67,30 @@ impl DirectAdapter {
             adapter_type: AdapterType::Compatible,
             ..Self::new()
         }
+    }
+
+    /// Send everything through `name` (see the `interface` field).
+    pub fn with_interface(mut self, name: &str) -> Self {
+        self.interface = Some(Arc::from(name));
+        self
+    }
+
+    /// TCP connect, bound to the adapter's interface when it has one.
+    async fn connect(&self, dest: SocketAddr) -> std::io::Result<TcpStream> {
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = &self.interface {
+            return connect_bound(dest, iface, self.routing_mark).await;
+        }
+        connect_with_mark(dest, self.routing_mark).await
+    }
+
+    /// UDP socket for `peer`, bound to the adapter's interface when it has one.
+    async fn bind_udp(&self, peer: std::net::IpAddr) -> std::io::Result<tokio::net::UdpSocket> {
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = &self.interface {
+            return udp_bound(peer, iface, self.routing_mark);
+        }
+        meow_common::bind_udp_for_peer(peer).await
     }
 
     pub fn with_routing_mark(mut self, routing_mark: u32) -> Self {
@@ -348,6 +377,58 @@ where
 /// the installed `meow_common::SocketProtector` is applied to the socket
 /// fd (also pre-connect) so the dial bypasses VpnService when meow-rs runs
 /// inside a VPN app.
+/// A socket bound to `iface` and marked (the adapter's mark, else the
+/// global `routing-mark`), so the deployer's capture rules skip it.
+#[cfg(target_os = "linux")]
+fn bound_socket(
+    peer: std::net::IpAddr,
+    ty: socket2::Type,
+    iface: &str,
+    mark: Option<u32>,
+) -> std::io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket};
+    let domain = if peer.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, ty, None)?;
+    if let Some(mark) = mark.or_else(meow_common::routing_mark) {
+        socket.set_mark(mark)?;
+    }
+    socket.bind_device(Some(iface.as_bytes()))?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_bound(
+    dest: SocketAddr,
+    iface: &str,
+    mark: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    let socket = bound_socket(dest.ip(), socket2::Type::STREAM, iface, mark)?;
+    tokio::net::TcpSocket::from_std_stream(socket.into())
+        .connect(dest)
+        .await
+}
+
+#[cfg(target_os = "linux")]
+fn udp_bound(
+    peer: std::net::IpAddr,
+    iface: &str,
+    mark: Option<u32>,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = bound_socket(peer, socket2::Type::DGRAM, iface, mark)?;
+    let any: std::net::IpAddr = if peer.is_ipv4() {
+        Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        std::net::Ipv6Addr::UNSPECIFIED.into()
+    };
+    socket.bind(&SocketAddr::new(any, 0).into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
 async fn connect_with_mark(
     dest: SocketAddr,
     routing_mark: Option<u32>,
@@ -412,13 +493,7 @@ impl ProxyAdapter for DirectAdapter {
         let mut last_err = None;
 
         for dest in dests {
-            match apply_connect_timeout(
-                connect_with_mark(dest, self.routing_mark),
-                self.connect_timeout,
-                dest,
-            )
-            .await
-            {
+            match apply_connect_timeout(self.connect(dest), self.connect_timeout, dest).await {
                 Ok(stream) => return Ok(Box::new(DirectConn(stream))),
                 // An errno-backed connect failure (e.g. EMFILE on
                 // socket()) outranks a later context-only error — the
@@ -458,7 +533,7 @@ impl ProxyAdapter for DirectAdapter {
             let mut last_err = None;
             for addr in self.resolve_targets(metadata).await? {
                 let addr = meow_common::canonical_socket_addr(addr);
-                let socket = match meow_common::bind_udp_for_peer(addr.ip()).await {
+                let socket = match self.bind_udp(addr.ip()).await {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = MeowError::prefer_errno_io(last_err, e);
@@ -494,9 +569,7 @@ impl ProxyAdapter for DirectAdapter {
             .dst_ip
             .or_else(|| meow_common::metadata_ip_literal(&metadata.host))
             .unwrap_or(Ipv4Addr::UNSPECIFIED.into());
-        let socket = meow_common::bind_udp_for_peer(peer)
-            .await
-            .map_err(MeowError::Io)?;
+        let socket = self.bind_udp(peer).await.map_err(MeowError::Io)?;
         Ok(Box::new(DirectPacketConn {
             socket,
             bound: None,

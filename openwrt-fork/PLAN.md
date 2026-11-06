@@ -154,6 +154,10 @@ LE ничего не теряет; `MEOW_TLS_BACKEND=rustls` включает BE
 Открыто: проверка на живом BE-железе (волонтёры), скорость RustCrypto/ring на 24Kc, Brutal на quinn.
 
 ## Этап 8 — WireGuard / AmneziaWG через модуль ядра (2026-11-06)
+**Статус:** обычный WireGuard сделан и проверен (`bench/wg-test.sh`, netns, ALL PASS: TCP/UDP, пересоздание
+линка, уборка). AmneziaWG: атрибуты по uapi модуля (H1–H4 по версии семейства: v1 u32, v2 строка, v3 u64),
+на живом `kmod-amneziawg` ещё не проверено. Код: `meow-proxy/src/wireguard/`, `DirectAdapter::with_interface`.
+rp_filter: meow ставит 0 на линке; при `all.rp_filter=1` ответы режутся (OpenWrt: 0) — предупреждение в логе.
 Узел mihomo `type: wireguard` (+ `amnezia-wg-option`) без userspace-стека: meow сам создаёт интерфейс
 ядра и шифрует ядро (быстро на MIPS, +десятки КБ к бинарнику, годится даже для tiny). Пользователю
 достаточно поставить `kmod-wireguard` или `kmod-amneziawg`. Upstream (#899) это не подходит (Linux-only).

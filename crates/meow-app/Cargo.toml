@@ -50,6 +50,7 @@ snell = ["meow-config/snell", "meow-proxy/snell"]
 # binaries carry it; excluded from `minimal` (ADR-0007 binary-size caps).
 anytls = ["meow-config/anytls", "meow-proxy/anytls"]
 hysteria2 = ["meow-config/hysteria2", "meow-proxy/hysteria2"]
+wireguard = ["meow-config/wireguard", "meow-proxy/wireguard"]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["meow-config/trusttunnel", "meow-proxy/trusttunnel"]
 # `quic: true` for that outbound; see meow-proxy's `trusttunnel-h3`.
@@ -109,7 +110,7 @@ minimal = ["ss", "trojan", "dns-server", "listener-mixed", "regex-perf"]
 # meow-openwrt router profile (openwrt-fork/PLAN.md stage 2): the protocols
 # routers actually use, for stock 16 MB flash (~8.7 MB stripped on mipsel).
 tiny = [
-    "trojan", "vless", "vless-vision", "hysteria2", "mux",
+    "trojan", "vless", "vless-vision", "hysteria2", "wireguard", "mux",
     "dns-server", "dns-encrypted",
     "listener-mixed", "listener-tproxy", "listener-tun", "lwip-libc-malloc",
     "log-max-info",
@@ -120,7 +121,7 @@ full = ["full-be", "restls", "jls"]
 # `full` without what needs BoringSSL (restls, jls): the big-endian MIPS
 # build of the full profile, on rustls + quinn (openwrt-fork/ci/build.sh).
 full-be = [
-    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
+    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "wireguard", "anytls", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "gost-plugin",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",

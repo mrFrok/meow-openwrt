@@ -18,6 +18,8 @@ pub enum AdapterType {
     Vless,
     Trojan,
     Hysteria2,
+    /// meow-openwrt: kernel WireGuard / AmneziaWG link (mihomo `wireguard`).
+    WireGuard,
     TrustTunnel,
     Anytls,
     Snell,
@@ -51,6 +53,7 @@ impl fmt::Display for AdapterType {
             AdapterType::Vless => write!(f, "Vless"),
             AdapterType::Trojan => write!(f, "Trojan"),
             AdapterType::Hysteria2 => write!(f, "Hysteria2"),
+            AdapterType::WireGuard => write!(f, "WireGuard"),
             AdapterType::TrustTunnel => write!(f, "TrustTunnel"),
             AdapterType::Anytls => write!(f, "AnyTLS"),
             AdapterType::Snell => write!(f, "Snell"),

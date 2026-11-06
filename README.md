@@ -101,6 +101,12 @@ mount --bind /usr/bin/meow /usr/bin/mihomo
   include. Narrow it with `route-address-set` and `route-exclude-address-set`.
   The sets follow rule-set refreshes, the table comes back if something
   removes it, and meow cleans everything up on exit. See [docs/tun.md](docs/tun.md).
+- **WireGuard and AmneziaWG nodes** (`type: wireguard`, with
+  `amnezia-wg-option` for AmneziaWG) run on the kernel module: install
+  `kmod-wireguard` or `kmod-amneziawg`, and meow creates and configures the
+  link itself the first time a node is used. The kernel does the crypto, so
+  it is fast on MIPS and adds almost nothing to the binary. `reserved` (some
+  WARP setups) is not supported by the module.
 - **`dns.nftset`**. meow puts the addresses of domains that go to a proxy into
   an nftables set, so the firewall captures only that traffic. 80 000 domains
   take about 1.2 MB in meow, against about 28 MB as dnsmasq lists. See

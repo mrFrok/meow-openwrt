@@ -30,6 +30,8 @@ pub mod transport_chain;
 #[cfg(feature = "trusttunnel")]
 pub mod trusttunnel;
 pub mod unavailable;
+#[cfg(all(feature = "wireguard", target_os = "linux"))]
+pub mod wireguard;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;

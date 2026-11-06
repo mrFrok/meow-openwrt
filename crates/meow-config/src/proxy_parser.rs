@@ -500,6 +500,14 @@ pub fn parse_proxy_with_dialer(
             let adapter = parse_anytls(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(all(feature = "wireguard", target_os = "linux"))]
+        "wireguard" => {
+            reject_unthreaded_dialer(name, "wireguard", dialer)?;
+            let cfg = parse_wireguard(name, config)?;
+            let inner = parse_direct(name, config, ipv6, None)?;
+            let adapter = meow_proxy::wireguard::WireGuardAdapter::new(cfg, inner);
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
         #[cfg(feature = "hysteria2")]
         "hysteria2" => {
             reject_unthreaded_dialer(name, "hysteria2", dialer)?;
@@ -1396,6 +1404,274 @@ fn reject_unsupported_anytls_options(
 /// - unsupported security/transport options (mTLS, ECH, realm).
 ///
 /// upstream: `adapter/outbound/hysteria2.go`
+/// mihomo's `type: wireguard` node (meow-openwrt stage 8): one peer, from
+/// the top level or `peers[0]`, plus `amnezia-wg-option` for AmneziaWG.
+#[cfg(all(feature = "wireguard", target_os = "linux"))]
+fn parse_wireguard(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<meow_proxy::wireguard::WireGuardConfig, String> {
+    use base64::Engine as _;
+    use meow_proxy::wireguard::{Amnezia, HRange, WireGuardConfig};
+    use serde_json::Value;
+    use std::net::IpAddr;
+
+    let key = |m: &serde_json::Map<String, Value>,
+               k: &str|
+     -> std::result::Result<Option<[u8; 32]>, String> {
+        let Some(v) = m.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(v.trim())
+            .map_err(|e| format!("wireguard[{name}]: {k}: {e}"))?;
+        raw.try_into()
+            .map(Some)
+            .map_err(|_| format!("wireguard[{name}]: {k} is not a 32-byte key"))
+    };
+    let num = |v: &Value| -> Option<u64> {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let top: serde_json::Map<String, Value> =
+        config.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // mihomo accepts the peer at the top level or as the first of `peers`.
+    let peer = match top.get("peers").and_then(Value::as_array) {
+        Some(peers) if !peers.is_empty() => {
+            if peers.len() > 1 {
+                tracing::warn!(
+                    "wireguard[{name}]: {} peers; meow uses the first",
+                    peers.len()
+                );
+            }
+            peers[0]
+                .as_object()
+                .cloned()
+                .ok_or_else(|| format!("wireguard[{name}]: peers[0] is not a map"))?
+        }
+        _ => top.clone(),
+    };
+    let server = peer
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("wireguard[{name}]: missing server"))?
+        .to_owned();
+    let port = peer
+        .get("port")
+        .and_then(num)
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| format!("wireguard[{name}]: missing or invalid port"))?;
+    let private_key = key(&top, "private-key")?
+        .ok_or_else(|| format!("wireguard[{name}]: missing private-key"))?;
+    let public_key = key(&peer, "public-key")?
+        .ok_or_else(|| format!("wireguard[{name}]: missing public-key"))?;
+    let pre_shared_key = key(&peer, "pre-shared-key")?;
+    let addr = |k: &str| -> std::result::Result<Option<(IpAddr, u8)>, String> {
+        let Some(v) = top.get(k).and_then(Value::as_str).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let (ip, prefix) = v.split_once('/').unwrap_or((v, ""));
+        let ip: IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|e| format!("wireguard[{name}]: {k}: {e}"))?;
+        let full = if ip.is_ipv4() { 32 } else { 128 };
+        let prefix = if prefix.is_empty() {
+            full
+        } else {
+            prefix
+                .parse()
+                .ok()
+                .filter(|p| *p <= full)
+                .ok_or_else(|| format!("wireguard[{name}]: {k}: bad prefix"))?
+        };
+        Ok(Some((ip, prefix)))
+    };
+    let ip = match addr("ip")? {
+        Some((IpAddr::V4(a), p)) => Some((a, p)),
+        Some(_) => return Err(format!("wireguard[{name}]: ip must be IPv4")),
+        None => None,
+    };
+    let ipv6 = match addr("ipv6")? {
+        Some((IpAddr::V6(a), p)) => Some((a, p)),
+        Some(_) => return Err(format!("wireguard[{name}]: ipv6 must be IPv6")),
+        None => None,
+    };
+    if ip.is_none() && ipv6.is_none() {
+        return Err(format!("wireguard[{name}]: needs ip or ipv6"));
+    }
+    let mut allowed_ips = Vec::new();
+    for v in peer
+        .get("allowed-ips")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("wireguard[{name}]: allowed-ips entries must be strings"))?;
+        let net: ipnet::IpNet = s
+            .trim()
+            .parse()
+            .map_err(|e| format!("wireguard[{name}]: allowed-ips {s}: {e}"))?;
+        allowed_ips.push((net.network(), net.prefix_len()));
+    }
+    if peer.get("reserved").is_some() {
+        tracing::warn!(
+            "wireguard[{name}]: `reserved` is not supported by the kernel module; ignored"
+        );
+    }
+    for k in [
+        "remote-dns-resolve",
+        "dns",
+        "workers",
+        "refresh-server-ip-interval",
+        "ip-stack",
+    ] {
+        if top.contains_key(k) {
+            tracing::warn!("wireguard[{name}]: `{k}` is accepted and ignored (kernel link)");
+        }
+    }
+    let amnezia = match top.get("amnezia-wg-option").and_then(Value::as_object) {
+        None => None,
+        Some(o) => {
+            let u16k = |k: &str| -> std::result::Result<Option<u16>, String> {
+                o.get(k)
+                    .map(|v| {
+                        num(v).and_then(|n| u16::try_from(n).ok()).ok_or_else(|| {
+                            format!("wireguard[{name}]: amnezia-wg-option.{k}: not a u16")
+                        })
+                    })
+                    .transpose()
+            };
+            let range = |k: &str| -> std::result::Result<Option<HRange>, String> {
+                let Some(v) = o.get(k) else { return Ok(None) };
+                let s = match v {
+                    Value::String(s) => s.trim().to_owned(),
+                    Value::Number(n) => n.to_string(),
+                    _ => {
+                        return Err(format!(
+                            "wireguard[{name}]: amnezia-wg-option.{k}: bad value"
+                        ))
+                    }
+                };
+                if s.is_empty() {
+                    return Ok(None);
+                }
+                let (lo, hi) = s.split_once('-').unwrap_or((&s, &s));
+                let p = |x: &str| {
+                    x.trim()
+                        .parse::<u32>()
+                        .map_err(|e| format!("wireguard[{name}]: amnezia-wg-option.{k}: {e}"))
+                };
+                let (lo, hi) = (p(lo)?, p(hi)?);
+                if lo > hi {
+                    return Err(format!(
+                        "wireguard[{name}]: amnezia-wg-option.{k}: {lo} > {hi}"
+                    ));
+                }
+                Ok(Some(HRange { lo, hi }))
+            };
+            let text = |k: &str| {
+                o.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            let flag = |k: &str| {
+                o.get(k)
+                    .and_then(|v| v.as_bool().or_else(|| num(v).map(|n| n != 0)))
+            };
+            for k in ["j1", "j2", "j3", "itime"] {
+                if o.contains_key(k) {
+                    tracing::warn!("wireguard[{name}]: amnezia-wg-option.{k} (AmneziaWG 1.5 only) is not in the kernel module; ignored");
+                }
+            }
+            let header_protection_key = match text("header-protection-key") {
+                None => None,
+                Some(v) => Some(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(v.trim())
+                        .ok()
+                        .and_then(|k| <[u8; 32]>::try_from(k).ok())
+                        .ok_or_else(|| format!("wireguard[{name}]: amnezia-wg-option.header-protection-key is not a 32-byte base64 key"))?,
+                ),
+            };
+            let u32_or_range = |k: &str| -> std::result::Result<Option<u32>, String> {
+                // mihomo takes these as strings ("lo-hi" ranges in v3); the
+                // module packs a u16 range as hi<<16 | lo.
+                let Some(v) = o.get(k) else { return Ok(None) };
+                let s = match v {
+                    Value::String(s) => s.trim().to_owned(),
+                    Value::Number(n) => n.to_string(),
+                    _ => {
+                        return Err(format!(
+                            "wireguard[{name}]: amnezia-wg-option.{k}: bad value"
+                        ))
+                    }
+                };
+                if s.is_empty() {
+                    return Ok(None);
+                }
+                let (lo, hi) = s.split_once('-').unwrap_or((&s, &s));
+                let p = |x: &str| {
+                    x.trim()
+                        .parse::<u16>()
+                        .map_err(|e| format!("wireguard[{name}]: amnezia-wg-option.{k}: {e}"))
+                };
+                Ok(Some(u32::from(p(hi)?) << 16 | u32::from(p(lo)?)))
+            };
+            Some(Amnezia {
+                jc: u16k("jc")?,
+                jmin: u16k("jmin")?,
+                jmax: u16k("jmax")?,
+                s: [u16k("s1")?, u16k("s2")?, u16k("s3")?, u16k("s4")?],
+                h: [range("h1")?, range("h2")?, range("h3")?, range("h4")?],
+                i: [text("i1"), text("i2"), text("i3"), text("i4"), text("i5")],
+                header_protection_key,
+                content_padding_addition: u32_or_range("content-padding-addition")?,
+                rekey_after_time: u32_or_range("rekey-after-time")?,
+                rekey_timeout: u32_or_range("rekey-timeout")?,
+                reject_after_time: u32_or_range("reject-after-time")?,
+                keepalive_timeout: u32_or_range("keepalive-timeout")?,
+                max_handshake_attempts: u32_or_range("max-handshake-attempts")?,
+                random_trailers: flag("random-trailers"),
+                disable_cookies: flag("disable-cookies"),
+            })
+        }
+    };
+    let mtu = top
+        .get("mtu")
+        .and_then(num)
+        .and_then(|m| u32::try_from(m).ok())
+        .filter(|m| *m >= 576)
+        .unwrap_or(1408);
+    let persistent_keepalive = top
+        .get("persistent-keepalive")
+        .or_else(|| peer.get("persistent-keepalive"))
+        .and_then(num)
+        .and_then(|k| u16::try_from(k).ok())
+        .unwrap_or(0);
+    let udp = top.get("udp").and_then(Value::as_bool).unwrap_or(false);
+    Ok(WireGuardConfig {
+        name: name.to_owned(),
+        server,
+        port,
+        ip,
+        ipv6,
+        private_key,
+        public_key,
+        pre_shared_key,
+        allowed_ips,
+        mtu,
+        persistent_keepalive,
+        udp,
+        amnezia,
+    })
+}
+
 #[cfg(feature = "hysteria2")]
 fn parse_hysteria2(
     name: &str,
@@ -4503,6 +4779,49 @@ tls: true
     #[cfg(feature = "hysteria2")]
     fn hy2_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_saphyr::from_str(yaml).unwrap()
+    }
+
+    #[cfg(all(feature = "wireguard", target_os = "linux"))]
+    #[test]
+    fn parse_wireguard_with_amnezia_option() {
+        use meow_proxy::wireguard::HRange;
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let cfg = hy2_config(&format!(
+            "name: w\ntype: wireguard\nserver: 1.2.3.4\nport: 51820\nip: 172.16.0.2/32\n\
+             private-key: {key}\npublic-key: {key}\nudp: true\nreserved: [1, 2, 3]\n\
+             amnezia-wg-option: {{jc: 4, jmin: 40, jmax: 70, s1: 10, s3: 5, h1: 1, h2: '2', \
+             h3: 3-10, h4: 4, i1: '<b 0xf6ab>', j1: x}}\n"
+        ));
+        let w = super::parse_wireguard("w", &cfg).unwrap();
+        assert_eq!(w.ip, Some(("172.16.0.2".parse().unwrap(), 32)));
+        assert!(w.udp);
+        assert_eq!(w.mtu, 1408);
+        let a = w.amnezia.unwrap();
+        assert_eq!((a.jc, a.jmin, a.jmax), (Some(4), Some(40), Some(70)));
+        assert_eq!(a.s, [Some(10), None, Some(5), None]);
+        assert_eq!(a.h[2], Some(HRange { lo: 3, hi: 10 }));
+        assert_eq!(a.h[1], Some(HRange { lo: 2, hi: 2 }));
+        assert_eq!(a.i[0].as_deref(), Some("<b 0xf6ab>"));
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(all(feature = "wireguard", target_os = "linux"))]
+    #[test]
+    fn parse_wireguard_peer_from_peers_list() {
+        let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let cfg = hy2_config(&format!(
+            "name: w\ntype: wireguard\nipv6: fd01::2\nprivate-key: {key}\n\
+             peers:\n  - {{server: wg.example, port: 2408, public-key: {key}, allowed-ips: ['0.0.0.0/0', '::/0']}}\n"
+        ));
+        let w = super::parse_wireguard("w", &cfg).unwrap();
+        assert_eq!((w.server.as_str(), w.port), ("wg.example", 2408));
+        assert_eq!(w.allowed_ips.len(), 2);
+        assert!(w.ip.is_none() && w.ipv6.is_some());
+        let bad = hy2_config("name: w\ntype: wireguard\nserver: a\nport: 1\nprivate-key: eA==\npublic-key: eA==\nip: 10.0.0.2\n");
+        assert!(super::parse_wireguard("w", &bad)
+            .err()
+            .unwrap()
+            .contains("32-byte"));
     }
 
     #[cfg(feature = "hysteria2")]

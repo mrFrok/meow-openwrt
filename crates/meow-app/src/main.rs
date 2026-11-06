@@ -1778,6 +1778,10 @@ async fn run(
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
     drop(controller_file);
+    // Kernel WireGuard links of `type: wireguard` nodes outlive their
+    // adapters at exit (statics never drop): remove them here.
+    #[cfg(all(feature = "wireguard", target_os = "linux"))]
+    meow_proxy::wireguard::cleanup_all();
 
     Ok(())
 }
