@@ -1,0 +1,111 @@
+# meow-openwrt: static meow for OpenWrt routers, 4 archs x 3 profiles, as
+# raw binaries plus .ipk (opkg) and .apk (apk-tools 3) packages.
+#
+# Push to `openwrt` builds and keeps the files as workflow artifacts.
+# A tag `owrt-vX.Y.Z-N` also publishes them as a GitHub release.
+name: openwrt
+
+on:
+  push:
+    branches: [openwrt]
+    tags: ["owrt-v*"]
+    paths-ignore: ["**.md", "docs/**", "website/**", "openwrt-fork/research/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: openwrt-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.arch }} ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, armv7, mipsel, mips]
+        profile: [tiny, lightweight, full]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev cmake zstd
+
+      - name: Rust 1.96.0 with rust-src
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rust-src
+          rustc +1.96.0 -V
+
+      # The SDK toolchain (only staging_dir/toolchain-* and host/lib are
+      # unpacked); the key is build.sh, which pins the SDK and its sha256.
+      - name: Cache OpenWrt toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/meow-owrt-tc
+          key: owrt-tc-${{ matrix.arch }}-${{ hashFiles('openwrt-fork/ci/build.sh') }}
+
+      # Registry, git deps and the target dir (BoringSSL's cmake build and
+      # build-std's std are the slow parts; the final LTO link always reruns).
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: owrt-${{ matrix.arch }}-${{ matrix.profile }}
+          workspaces: ". -> target/owrt-${{ matrix.arch }}"
+          cache-all-crates: true
+          cache-on-failure: true
+
+      - name: Build
+        run: bash openwrt-fork/ci/build.sh ${{ matrix.arch }} ${{ matrix.profile }}
+
+      - name: apk-tools
+        run: |
+          bash openwrt/install-apk-tools.sh "$HOME/apk-tools"
+          echo "APK=$HOME/apk-tools/apk" >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/owrt-v*) v=${GITHUB_REF#refs/tags/owrt-v} ;;
+            *) v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)_git${GITHUB_RUN_NUMBER}-0 ;;
+          esac
+          case "${{ matrix.arch }}" in
+            aarch64) labels="aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76" ;;
+            armv7) labels="arm_cortex-a7_neon-vfpv4" ;;
+            mipsel) labels="mipsel_24kc" ;;
+            mips) labels="mips_24kc" ;;
+          esac
+          bin=dist/meow-${{ matrix.profile }}-${{ matrix.arch }}
+          for l in $labels; do
+            bash openwrt-fork/ci/package.sh "$bin" ${{ matrix.profile }} "$l" "$v" dist
+          done
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meow-${{ matrix.profile }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/owrt-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "meow-openwrt ${GITHUB_REF_NAME#owrt-v}" --generate-notes

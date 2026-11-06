@@ -51,9 +51,14 @@ Download the package for your profile and architecture from
 # OpenWrt 25.x (apk)
 apk add --allow-untrusted /tmp/meow-tiny_*.apk
 
-# OpenWrt 24.10 and older (opkg)
+# OpenWrt 22.03 to 24.10 (opkg)
 opkg install /tmp/meow-tiny_*.ipk
 ```
+
+The binary is fully static, so one package installs on any OpenWrt release
+of its architecture, 22.03 and newer. `tun.auto-redirect` and `dns.nftset`
+need nftables (fw4, 22.03+); on iptables firmware the TProxy, redirect and
+TUN modes still work.
 
 The package installs one file, `/usr/bin/meow`. Check that it reads your
 current config before switching anything:

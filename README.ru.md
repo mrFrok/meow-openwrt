@@ -50,9 +50,14 @@ TLS-отпечатка игнорируется с предупреждение�
 # OpenWrt 25.x (apk)
 apk add --allow-untrusted /tmp/meow-tiny_*.apk
 
-# OpenWrt 24.10 и старше (opkg)
+# OpenWrt 22.03–24.10 (opkg)
 opkg install /tmp/meow-tiny_*.ipk
 ```
+
+Бинарник полностью статический, поэтому один пакет ставится на любой релиз
+OpenWrt своей архитектуры, от 22.03 и новее. `tun.auto-redirect` и
+`dns.nftset` требуют nftables (fw4, с 22.03). На прошивках с iptables режимы
+TProxy, redirect и TUN всё равно работают.
 
 Пакет ставит один файл, `/usr/bin/meow`. Перед переключением проверьте, что
 он читает ваш текущий конфиг:
