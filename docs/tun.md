@@ -496,6 +496,10 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump (mihomo's `mixed` uses gVisor for it; here `mixed` is `system`, with a warning); IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` falls back to `lwip` with a warning. (meow-openwrt) |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | by RAM: 256 on 64 MB, 512 on 128 MB, … up to 16384 | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
+| `auto-redirect` | `false` | Linux, needs `auto-route: true`: capture with nftables instead of plain policy routing — see *auto-redirect*. (meow-openwrt, mihomo's key) |
+| `route-address` / `route-address-set` | all | With `auto-redirect`: capture only these CIDRs / `ipcidr` rule-sets (IPv4; the fake-IP range always counts). |
+| `route-exclude-address` / `route-exclude-address-set` | none | With `auto-redirect`: never capture these. |
+| `route-address-dns` | `false` | With `auto-redirect` (meow): also capture addresses DNS answers give for domains the rules do not send DIRECT. |
 
 mihomo fields meow does not implement (`strict-route`,
 `auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
@@ -567,6 +571,50 @@ Non-global candidates (`auto-route: fake-ip`/`false`, TUN disabled)
 install nothing. A pre-install failure is not fatal — it is logged at
 debug and the listener retries before installing routes, failing closed as
 at startup.
+
+## auto-redirect (Linux, meow-openwrt)
+
+`auto-redirect: true` (with `auto-route: true`) is mihomo's nftables
+capture: meow itself installs everything a gateway needs, so a wrapper only
+sets config keys. It puts table `inet meow` in place (laid out like
+sing-tun's), and policy rules 9200–9205:
+
+- TCP from the host (`output`) and from the LAN (`prerouting`) is
+  `redirect`ed to an internal listener that reads `SO_ORIGINAL_DST` — the
+  kernel terminates TCP, no userspace stack;
+- UDP and ICMP get fwmark `0x2023` (kept on conntrack) and that mark is
+  routed into the TUN device;
+- DNS (UDP :53) from the host and the LAN is `dnat`ed to the device's peer,
+  where `dns-hijack` answers it; `/etc/resolv.conf` is not touched;
+- the host's own subnets, loopback and the device are never captured;
+  meow's own sockets carry `routing-mark` (`0x2024` when unset) and bypass;
+- on OpenWrt, when fw4 runs in the same netns, an
+  `/etc/nftables.d/0-meow-auto-redirect.nft` include accepts traffic to and
+  from the device, and fw4 is reloaded.
+
+Everything is removed on shutdown; a stale table from a crash is replaced
+at the next start. IPv4 only for now.
+
+Narrowing what is captured (everything else never enters meow):
+
+```yaml
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-redirect: true
+  route-address-set: [telegram-cidr]   # ipcidr rule-providers
+  route-exclude-address: [10.0.0.0/8]
+  route-address-dns: true              # + what DNS says goes to a proxy
+```
+
+`route-address-dns` (meow) feeds a `timeout` set `route4_dns` from DNS
+answers: an answer whose domain the rules send anywhere but DIRECT adds its
+addresses (see [nftset.md](nftset.md) for the verdict and its limits). An
+address is captured from the first connection after its answer. With
+`dns.nftset` naming its own sets, those win and `route4_dns` stays empty.
+Rule-sets are resolved when the TUN starts; a provider refresh takes effect
+at the next TUN restart.
 
 ## Relationship to the tproxy inbound
 

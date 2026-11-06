@@ -94,14 +94,18 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 - TUN (lwIP) vs tproxy vs redirect; ChaCha20 vs AES-GCM на mt7621 (через волонтёров); tokio worker-потоки по ядрам
   (`meow-app/src/main.rs:512,540`), `current_thread` для 1 ядра.
 
-## Этап 5 — быстрый путь DIRECT (Go-этап V, не начатый)
+## Этап 5 — быстрый путь DIRECT (Go-этап V)
 - **Сделано (2026-11-03): `dns.nftset`** (docs/nftset.md) — ядро кладёт IP ответов «не-DIRECT» доменов в nft-набор;
   файрвол перехватывает только его (без списков доменов в dnsmasq: 80k доменов там ~28 МБ, в ядре ~1.2 МБ).
-- **`dns.nftset.create`** (opt-in): ядро само создаёт сеты в указанной таблице (`flags timeout`) и пересоздаёт их,
-  если таблицу перезагрузили (ENOENT при добавлении). ~1 день.
-- **Перехват без обвязки** (opt-in, Linux): своя таблица `inet meow` — prerouting LAN (фильтр по сету, redirect TCP,
-  TPROXY UDP + policy routing), перехват DNS, сосуществование с fw4 и flowtable/offload, уборка при выходе/падении,
-  повторное применение на reload. Сначала IPv4 TCP+UDP, затем IPv6 и блок DoH/DoT. ~3–5 дней.
+- **Сделано (2026-11-06): перехват без обвязки — `tun.auto-redirect`** (0b738f7, 3665619; docs/tun.md). Ключ
+  mihomo: таблица `inet meow` как у sing-tun (redirect TCP host+LAN во внутренний SO_ORIGINAL_DST-листенер,
+  UDP/ICMP fwmark 0x2023 → policy rules 9200–9205 → TUN, DNS dnat → TUN-пир), свои подсети/lo не трогает,
+  bypass-mark 0x2024 сам, include для fw4, уборка при выходе. Сужение: `route-address(-set)` (ipcidr rule-sets),
+  `route-exclude-address(-set)`; meow-ключ **`route-address-dns: true`** — сет `route4_dns` (timeout) наполняет
+  хук dns.nftset, т.е. в ядро идёт только «не-DIRECT», остальное мимо: обвязке достаточно ключей в конфиге
+  (заменяет `dns.nftset.create`). `bench/autoredirect-test.sh` (3 netns на BPI-R4): всё PASS.
+  Осталось: IPv6; обновление сетов при refresh rule-set (сейчас — на старте TUN); блок DoH/DoT; повторная
+  установка, если таблицу снесли извне (`fw4 reload` её не трогает — своя таблица).
 - Разгрузка по потокам ниже **отложена до волонтёров с MT7621 (2026-11-03).** На BPI-R4 DIRECT TCP через redir — ~10 Гбит/с при 42 % ядра
   (tunbench MODE=redir), выигрыш HFO там мал. Обучение по IP небезопасно при redir-host (общие IP CDN).
   Безопасный дизайн — решение на один поток (5-tuple), не на IP: (1) TCP при fake-ip — домен известен на SYN,
