@@ -15,6 +15,8 @@ mod tcp;
 #[cfg(hy2_quiche)]
 mod tls;
 mod udp;
+#[cfg(hy2_quiche)]
+mod udp_io;
 
 pub use client::ReconnectableClient;
 pub use config::{Config, ObfsConfig, ReceiveWindows};

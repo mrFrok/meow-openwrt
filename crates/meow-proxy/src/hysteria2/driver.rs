@@ -14,6 +14,7 @@ use super::auth::Auth;
 use super::obfs::{HopState, Obfs};
 use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
+use super::udp_io;
 use super::{Config, Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -206,6 +207,15 @@ struct State {
     closed: Arc<AtomicBool>,
     /// Received datagrams dropped on a full session queue.
     udp_dropped: u64,
+    /// Batched UDP I/O ([`udp_io`]): GSO sends until a send proves the
+    /// path cannot take them, GRO receives when the kernel has it.
+    gso: bool,
+    gro: bool,
+    /// Pending GSO run: equal-sized datagrams for `batch_dest`.
+    batch: Vec<u8>,
+    batch_seg: usize,
+    batch_count: usize,
+    batch_dest: Option<SocketAddr>,
 }
 
 struct AuthCtx {
@@ -233,6 +243,7 @@ pub(crate) async fn spawn(
         cfg.hop_interval_max_secs,
     )?;
 
+    let gro = udp_io::enable_gro(&socket);
     let state = State {
         socket,
         local,
@@ -249,6 +260,12 @@ pub(crate) async fn spawn(
         udp_out: Vec::new(),
         closed: Arc::clone(&closed),
         udp_dropped: 0,
+        gso: udp_io::GSO_SUPPORTED,
+        gro,
+        batch: Vec::new(),
+        batch_seg: 0,
+        batch_count: 0,
+        batch_dest: None,
     };
 
     let (ready_tx, ready_rx) = oneshot::channel::<Result<bool>>();
@@ -752,7 +769,7 @@ async fn flush_send(
     loop {
         let (write, info) = match conn.send(out) {
             Ok(v) => v,
-            Err(quiche::Error::Done) => return Ok(()),
+            Err(quiche::Error::Done) => return flush_batch(st).await,
             Err(e) => {
                 return Err(std::io::Error::other(format!("quiche send: {e}")));
             }
@@ -769,41 +786,108 @@ async fn flush_send(
         let packet = &out[..write];
         match st.obfs.as_mut() {
             Some(obfs) => {
-                for datagram in obfs.encode(packet).datagrams() {
-                    st.socket.send_to(datagram, dest).await?;
+                let wire = obfs.encode(packet);
+                for datagram in wire.datagrams() {
+                    queue_datagram(st, datagram, dest).await?;
                 }
             }
-            None => {
-                st.socket.send_to(packet, dest).await?;
-            }
+            None => queue_datagram(st, packet, dest).await?,
         }
     }
 }
 
+/// Send `datagram`, or add it to the GSO run when it can join one: same
+/// destination, no larger than the run's segment size (a shorter one
+/// closes the run), within the kernel's segment and byte caps.
+async fn queue_datagram(st: &mut State, datagram: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+    if !st.gso {
+        return st.socket.send_to(datagram, dest).await.map(drop);
+    }
+    if st.batch_count > 0
+        && (st.batch_dest != Some(dest)
+            || datagram.len() > st.batch_seg
+            || st.batch_count == udp_io::MAX_SEGMENTS
+            || st.batch.len() + datagram.len() > udp_io::MAX_BATCH_BYTES)
+    {
+        flush_batch(st).await?;
+    }
+    if st.batch_count == 0 {
+        st.batch_seg = datagram.len();
+        st.batch_dest = Some(dest);
+    }
+    st.batch.extend_from_slice(datagram);
+    st.batch_count += 1;
+    if datagram.len() < st.batch_seg {
+        flush_batch(st).await?;
+    }
+    Ok(())
+}
+
+/// Send the pending GSO run. A path that refuses GSO turns it off for the
+/// connection and the run goes out one datagram at a time.
+async fn flush_batch(st: &mut State) -> std::io::Result<()> {
+    let Some(dest) = st.batch_dest.take() else {
+        return Ok(());
+    };
+    let count = std::mem::take(&mut st.batch_count);
+    let seg = st.batch_seg;
+    let result = if count == 1 {
+        st.socket.send_to(&st.batch, dest).await.map(drop)
+    } else {
+        match udp_io::send_segments(&st.socket, &st.batch, seg, dest).await {
+            Err(e) if udp_io::gso_unsupported(&e) => {
+                tracing::debug!("hysteria2: UDP GSO unavailable ({e}); sending per packet");
+                st.gso = false;
+                let mut r = Ok(());
+                for datagram in st.batch.chunks(seg) {
+                    r = st.socket.send_to(datagram, dest).await.map(drop);
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                r
+            }
+            other => other,
+        }
+    };
+    st.batch.clear();
+    result
+}
+
 /// Feed the datagrams queued on the socket to quiche, at most
-/// [`RECV_BATCH`] of them, undoing obfs and port-hopping.
+/// [`RECV_BATCH`] reads of them (each read a GRO run of several when the
+/// kernel coalesced them), undoing obfs and port-hopping.
 fn recv_batch(
     st: &mut State,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
 ) -> std::io::Result<()> {
     for _ in 0..RECV_BATCH {
-        let (n, from) = match st.socket.try_recv_from(buf) {
+        let read = if st.gro {
+            udp_io::try_recv_gro(&st.socket, buf)
+        } else {
+            st.socket
+                .try_recv_from(buf)
+                .map(|(n, from)| (n, from, None))
+        };
+        let (n, from, seg) = match read {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
         };
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };
-        let received = match st.obfs.as_mut() {
-            Some(obfs) => match obfs.decode(&buf[..n], from) {
-                Some(mut dgram) => conn.recv(&mut dgram, info),
-                None => continue,
-            },
-            None => conn.recv(&mut buf[..n], info),
-        };
-        if let Err(e) = received {
-            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+        for datagram in buf[..n].chunks_mut(seg.unwrap_or(n.max(1))) {
+            let received = match st.obfs.as_mut() {
+                Some(obfs) => match obfs.decode(datagram, from) {
+                    Some(mut dgram) => conn.recv(&mut dgram, info),
+                    None => continue,
+                },
+                None => conn.recv(datagram, info),
+            };
+            if let Err(e) = received {
+                tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+            }
         }
     }
     Ok(())
