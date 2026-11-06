@@ -23,6 +23,7 @@ default = ["tls", "ws"]
 # runs quiche on the same vendored BoringSSL, and rustls is linked only by the
 # loopback test servers under [dev-dependencies].
 tls = [
+    "boring-crypto",
     "dep:boring",
     "dep:tokio-boring",
     "dep:boring-sys",
@@ -34,6 +35,14 @@ tls = [
 # implied) so existing `--features boring-tls` invocations and downstream
 # manifests keep building. New code should enable `tls`.
 boring-tls = ["tls", "reality"]
+# `crypto`: the `crypto` module (AEAD, HMAC, AES block, random). Its backend
+# is BoringSSL with `boring-crypto` (part of `tls`), RustCrypto otherwise —
+# for targets BoringSSL does not build on (big-endian MIPS, stage 7).
+crypto = ["dep:chacha20poly1305", "dep:getrandom"]
+boring-crypto = ["dep:boring"]
+sha1-digest = ["crypto", "dep:sha1"]
+mlkem = ["crypto", "boring?/mlkem", "dep:ml-kem"]
+p256-share = ["crypto", "dep:p256"]
 # reality: xray REALITY client handshake (issue #377). The record layer, the
 # X25519 / HKDF crypto and the browser-shaped ClientHello builder
 # (`reality_hello.rs`, issue #708) are all in-tree (`reality_tls.rs`) on top
@@ -42,7 +51,8 @@ boring-tls = ["tls", "reality"]
 # share of the `firefox` profile.
 reality = [
     "tls",
-    "boring/mlkem",
+    "mlkem",
+    "p256-share",
     "dep:rand",
     "dep:x25519-dalek",
 ]
@@ -82,7 +92,7 @@ simple-obfs = ["dep:base64", "dep:rand"]
 # `tls`-only consumers (meow-dns et al.) don't compile ~1.7k lines they
 # can't use; subtle is its dep alone (sha2 stays unconditional for the
 # REALITY backend, and the record HMAC-SHA1 runs on BoringSSL's SHA-1).
-shadow-tls = ["tls", "dep:subtle"]
+shadow-tls = ["tls", "sha1-digest", "dep:subtle"]
 # restls client transport — a record-level TLS client whose session_id
 # authenticates the relay and whose post-handshake records carry blake3
 # MACs + masks; `tls` supplies BoringSSL for the cover-handshake
@@ -140,6 +150,9 @@ subtle = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 # restls offers CHACHA20-POLY1305 alongside AES-GCM for cover-parity
 chacha20poly1305 = { workspace = true, optional = true }
+getrandom = { version = "0.3", optional = true }
+ml-kem = { workspace = true, optional = true }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"], optional = true }
 
 # ws feature
 tokio-tungstenite = { workspace = true, optional = true }

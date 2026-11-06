@@ -398,20 +398,8 @@ fn alpn_data<S: AsRef<str>>(protocols: &[S]) -> Result<Vec<u8>> {
 /// server authenticates on the X25519 share, and a peer that picks P-256
 /// anyway is rejected by `parse_server_hello`.
 fn p256_decoy_share() -> Result<Vec<u8>> {
-    use boring::{
-        bn::BigNumContext,
-        ec::{EcGroup, EcKey, PointConversionForm},
-        nid::Nid,
-    };
-    let err = |e: boring::error::ErrorStack| {
-        TransportError::Tls(format!("Reality TLS: P-256 key share: {e}"))
-    };
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).map_err(err)?;
-    let key = EcKey::generate(&group).map_err(err)?;
-    let mut ctx = BigNumContext::new().map_err(err)?;
-    key.public_key()
-        .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut ctx)
-        .map_err(err)
+    crate::crypto::p256_public_uncompressed()
+        .map_err(|e| TransportError::Tls(format!("Reality TLS: P-256 key share: {e}")))
 }
 
 fn grease_ech_data(aeads: &[u16], payload_lens: &[u16]) -> Vec<u8> {

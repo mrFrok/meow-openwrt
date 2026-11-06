@@ -35,6 +35,9 @@ pub const MAX_EXTRA_HEADERS: usize = 64;
 
 mod error;
 
+#[cfg(feature = "crypto")]
+pub mod crypto;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 

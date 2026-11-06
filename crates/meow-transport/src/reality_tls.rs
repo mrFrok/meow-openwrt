@@ -6,13 +6,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::crypto::{Aead, AeadAlg, MlKem768};
 #[cfg(test)]
 use aes_gcm::Tag;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Nonce,
 };
-use boring::aead::{AeadCtx, Algorithm};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -197,7 +197,7 @@ async fn reality_handshake(
     // servers reject a ClientHello without it).
     let mlkem = if reality.support_x25519_mlkem768 {
         Some(
-            boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
+            MlKem768::generate()
                 .map_err(|e| TransportError::Tls(format!("ML-KEM-768 keygen: {e}")))?,
         )
     } else {
@@ -210,7 +210,7 @@ async fn reality_handshake(
         alpn,
         &client_random,
         &client_public,
-        mlkem.as_ref().map(|(public, _)| public.as_bytes()),
+        mlkem.as_ref().map(MlKem768::public),
         &auth_key,
         reality,
         profile,
@@ -242,7 +242,7 @@ async fn reality_handshake(
     } else {
         // X25519MLKEM768: server share = ML-KEM ciphertext || X25519;
         // shared secret = ML-KEM secret || X25519 secret.
-        let Some((_, mlkem_private)) = mlkem.as_ref() else {
+        let Some(mlkem_private) = mlkem.as_ref() else {
             return Err(TransportError::Tls(
                 "Reality TLS: server picked X25519MLKEM768, which was not offered".into(),
             ));
@@ -1237,7 +1237,7 @@ const MAX_WRITE_BATCH: usize = 4 * MAX_RECORD_PLAINTEXT;
 /// code compiled at the release profile's `opt-level = "z"` runs an order of
 /// magnitude behind BoringSSL's assembly (see `meow-proxy`'s `aead` module).
 struct RecordKey {
-    aead: AeadCtx,
+    aead: Aead,
     iv: [u8; 12],
     seq: u64,
 }
@@ -1251,13 +1251,12 @@ impl RecordKey {
         let mut iv_arr = [0u8; 12];
         iv_arr.copy_from_slice(&iv);
         let algorithm = match cipher_suite {
-            CipherSuite::Aes128GcmSha256 => Algorithm::aes_128_gcm(),
-            CipherSuite::Aes256GcmSha384 => Algorithm::aes_256_gcm(),
-            CipherSuite::ChaCha20Poly1305Sha256 => Algorithm::chacha20_poly1305(),
+            CipherSuite::Aes128GcmSha256 => AeadAlg::Aes128Gcm,
+            CipherSuite::Aes256GcmSha384 => AeadAlg::Aes256Gcm,
+            CipherSuite::ChaCha20Poly1305Sha256 => AeadAlg::ChaCha20Poly1305,
         };
         Self {
-            aead: AeadCtx::new_default_tag(&algorithm, &key)
-                .expect("TLS 1.3 key length matches the suite"),
+            aead: Aead::new(algorithm, &key).expect("TLS 1.3 key length matches the suite"),
             iv: iv_arr,
             seq: 0,
         }
@@ -1290,7 +1289,6 @@ impl RecordKey {
         let (data, tag) = body.split_at_mut(body_len);
         self.aead
             .seal_in_place(&nonce, data, tag, header)
-            .map(|_| ())
             .map_err(|e| TransportError::Tls(format!("TLS record encrypt: {e}")))
     }
 
@@ -2488,12 +2486,8 @@ mod tests {
                     &client_public,
                     "shared X25519 key"
                 );
-                let ek = boring::mlkem::MlKemPublicKey::from_slice(
-                    boring::mlkem::Algorithm::MlKem768,
-                    &data[..data.len() - 32],
-                )
-                .expect("ML-KEM-768 encapsulation key");
-                let (ct, pq_secret) = ek.encapsulate().expect("encapsulate");
+                let (ct, pq_secret) = crate::crypto::mlkem768_encapsulate(&data[..data.len() - 32])
+                    .expect("ML-KEM-768 encapsulation");
                 let mut share = ct;
                 share.extend_from_slice(&eph_public);
                 let mut secret = pq_secret.to_vec();

@@ -28,13 +28,13 @@ jls = ["ss", "meow-transport/jls"]
 gost-plugin = ["ss", "mux"]
 trojan = []
 vless = []
-vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
+vmess = ["dep:md-5", "dep:hmac", "dep:aes", "meow-transport/crypto", "dep:crc32fast"]
 vless-vision = ["vless"]
 # VLESS post-quantum Encryption layer (`encryption: mlkem768x25519plus...`),
 # the ML-KEM-768 + X25519 hybrid handshake used by Xray-core / mihomo. Adds the
 # BLAKE3 / ML-KEM / X25519 / AES-CTR crypto stack, so it is opt-in (bundled into
 # the app `full` profile, kept out of `minimal` — ADR-0007 binary-size caps).
-# The record AEAD is BoringSSL's (`src/aead.rs`).
+# The record AEAD is `src/aead.rs` (BoringSSL, RustCrypto on big-endian).
 vless-encryption = [
     "vless",
     "dep:blake3",
@@ -42,14 +42,14 @@ vless-encryption = [
     "dep:x25519-dalek",
     "dep:ctr",
     "dep:aes",
-    "dep:boring",
+    "meow-transport/crypto",
 ]
 # Snell v3/v4/v5/v6 outbound — argon2id KDF + AES-128-GCM AEAD frames
 # (BoringSSL's, see `src/aead.rs`), optional http/tls obfs (reused from
 # the SS simple-obfs module), UDP-over-TCP, and an opt-in v4–v6 reuse pool
 # (CommandConnectV2). v6's PSK-derived traffic-shaping profile is seeded
 # with BLAKE2b.
-snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
+snell = ["dep:argon2", "meow-transport/crypto", "dep:blake2", "meow-transport/simple-obfs"]
 # Opt-in anytls outbound (uses the vendored `meow-anytls` crate, lib name
 # `anytls_rs`). The client's TLS is supplied by meow-transport's BoringSSL
 # TlsLayer through anytls-rs's `TlsConnect` hook, so no second TLS stack.

@@ -9,9 +9,7 @@
 //! post-quantum key share makes it ~1.8 KB) and shuffle CRYPTO frames, so
 //! the frames are reassembled by offset across datagrams.
 
-use boring::aead::{AeadCtx, Algorithm};
-use boring::hash::hmac_sha256;
-use boring::symm::{encrypt, Cipher};
+use meow_transport::crypto::{aes128_encrypt_block, hmac_sha256, Aead, AeadAlg};
 use smol_str::SmolStr;
 
 const V1: u32 = 1;
@@ -186,7 +184,7 @@ fn varint(p: &mut &[u8]) -> Option<u64> {
     Some(v)
 }
 
-fn hkdf_expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> {
+fn hkdf_expand_label(secret: &[u8], label: &str, len: usize) -> Vec<u8> {
     let full = format!("tls13 {label}");
     let mut info = Vec::with_capacity(4 + full.len());
     #[allow(clippy::cast_possible_truncation, reason = "lengths of 32 or less")]
@@ -197,8 +195,8 @@ fn hkdf_expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> 
     info.extend_from_slice(full.as_bytes());
     info.push(0);
     info.push(1); // T(1): every output here fits one SHA-256 block
-    let t1 = hmac_sha256(secret, &info).ok()?;
-    Some(t1[..len].to_vec())
+    let t1 = hmac_sha256(secret, &info);
+    t1[..len].to_vec()
 }
 
 /// The first packet of a datagram.
@@ -294,14 +292,14 @@ fn decrypt_initial(
     pn_offset: usize,
     length: usize,
 ) -> Option<Vec<u8>> {
-    let initial = hmac_sha256(salt, dcid).ok()?;
-    let client = hkdf_expand_label(&initial, "client in", 32)?;
-    let key = hkdf_expand_label(&client, &format!("{prefix} key"), 16)?;
-    let iv = hkdf_expand_label(&client, &format!("{prefix} iv"), 12)?;
-    let hp = hkdf_expand_label(&client, &format!("{prefix} hp"), 16)?;
+    let initial = hmac_sha256(salt, dcid);
+    let client = hkdf_expand_label(&initial, "client in", 32);
+    let key = hkdf_expand_label(&client, &format!("{prefix} key"), 16);
+    let iv = hkdf_expand_label(&client, &format!("{prefix} iv"), 12);
+    let hp = hkdf_expand_label(&client, &format!("{prefix} hp"), 16);
 
     let sample = &d[pn_offset + 4..pn_offset + 20];
-    let mask = encrypt(Cipher::aes_128_ecb(), &hp, None, sample).ok()?;
+    let mask = aes128_encrypt_block(hp.as_slice().try_into().ok()?, sample.try_into().ok()?);
     let mut header = d[..pn_offset + 4].to_vec();
     header[0] ^= mask[0] & 0x0f;
     let pn_len = usize::from(header[0] & 0x03) + 1;
@@ -322,7 +320,7 @@ fn decrypt_initial(
     }
     let (ct, tag) = body.split_at(body.len() - 16);
     let mut plain = ct.to_vec();
-    let ctx = AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), &key).ok()?;
+    let ctx = Aead::new(AeadAlg::Aes128Gcm, &key).ok()?;
     ctx.open_in_place(&nonce, &mut plain, tag, &header).ok()?;
     Some(plain)
 }
@@ -343,22 +341,22 @@ mod tests {
     #[test]
     fn rfc9001_initial_keys() {
         let dcid = hex("8394c8f03e515708");
-        let initial = hmac_sha256(&SALT_V1, &dcid).unwrap();
-        let client = hkdf_expand_label(&initial, "client in", 32).unwrap();
+        let initial = hmac_sha256(&SALT_V1, &dcid);
+        let client = hkdf_expand_label(&initial, "client in", 32);
         assert_eq!(
             client,
             hex("c00cf151ca5be075ed0ebfb5c80323c4 2d6b7db67881289af4008f1f6c357aea")
         );
         assert_eq!(
-            hkdf_expand_label(&client, "quic key", 16).unwrap(),
+            hkdf_expand_label(&client, "quic key", 16),
             hex("1f369613dd76d5467730efcbe3b1a22d")
         );
         assert_eq!(
-            hkdf_expand_label(&client, "quic iv", 12).unwrap(),
+            hkdf_expand_label(&client, "quic iv", 12),
             hex("fa044b2f42a3fd3b46fb255c")
         );
         assert_eq!(
-            hkdf_expand_label(&client, "quic hp", 16).unwrap(),
+            hkdf_expand_label(&client, "quic hp", 16),
             hex("9f50449e04a0e810283a1e9933adedd2")
         );
     }
@@ -395,11 +393,11 @@ mod tests {
     /// Seal `frames` as a v1 client Initial (packet number `pn`, padded to
     /// at least the header-protection sample).
     fn seal_initial(dcid: &[u8], pn: u32, frames: &[u8]) -> Vec<u8> {
-        let initial = hmac_sha256(&SALT_V1, dcid).unwrap();
-        let client = hkdf_expand_label(&initial, "client in", 32).unwrap();
-        let key = hkdf_expand_label(&client, "quic key", 16).unwrap();
-        let iv = hkdf_expand_label(&client, "quic iv", 12).unwrap();
-        let hp = hkdf_expand_label(&client, "quic hp", 16).unwrap();
+        let initial = hmac_sha256(&SALT_V1, dcid);
+        let client = hkdf_expand_label(&initial, "client in", 32);
+        let key = hkdf_expand_label(&client, "quic key", 16);
+        let iv = hkdf_expand_label(&client, "quic iv", 12);
+        let hp = hkdf_expand_label(&client, "quic hp", 16);
         let mut plain = frames.to_vec();
         plain.resize(plain.len().max(32), 0); // PADDING
         let length = 4 + plain.len() + 16;
@@ -414,19 +412,16 @@ mod tests {
         for (n, b) in nonce[4..].iter_mut().zip(u64::from(pn).to_be_bytes()) {
             *n ^= b;
         }
-        let ctx = AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), &key).unwrap();
+        let ctx = Aead::new(AeadAlg::Aes128Gcm, &key).unwrap();
         let mut tag = [0u8; 16];
         ctx.seal_in_place(&nonce, &mut plain, &mut tag, &pkt)
             .unwrap();
         pkt.extend_from_slice(&plain);
         pkt.extend_from_slice(&tag);
-        let mask = encrypt(
-            Cipher::aes_128_ecb(),
-            &hp,
-            None,
-            &pkt[pn_offset + 4..pn_offset + 20],
-        )
-        .unwrap();
+        let mask = aes128_encrypt_block(
+            hp.as_slice().try_into().unwrap(),
+            pkt[pn_offset + 4..pn_offset + 20].try_into().unwrap(),
+        );
         pkt[0] ^= mask[0] & 0x0f;
         for i in 0..4 {
             pkt[pn_offset + i] ^= mask[1 + i];

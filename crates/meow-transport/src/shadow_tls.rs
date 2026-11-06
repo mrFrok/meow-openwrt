@@ -56,7 +56,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use boring::sha::Sha1;
+use crate::crypto::Sha1;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -102,7 +102,8 @@ const SERVER_RANDOM_INDEX: usize = RECORD_HDR + 4 + 2;
 /// ClientHello-bearing record: + client_random(32).
 const CH_SID_LEN_INDEX: usize = SERVER_RANDOM_INDEX + TLS_RANDOM_LEN;
 
-/// HMAC-SHA1 (RFC 2104) on BoringSSL's assembly SHA-1.  Every v3 data
+/// HMAC-SHA1 (RFC 2104) on BoringSSL's assembly SHA-1 (RustCrypto's on
+/// big-endian targets).  Every v3 data
 /// record is tagged or verified with it, so it runs over every byte
 /// relayed; the RustCrypto software SHA-1 managed about a quarter of the
 /// speed in the size-optimised release profile on CPUs without SHA-NI.
@@ -816,8 +817,8 @@ fn patch_client_hello(record: &mut [u8], password: &[u8]) -> io::Result<[u8; SES
     let mut orig_sid = [0u8; SESSION_ID_LEN];
     orig_sid.copy_from_slice(&record[sid_start..sid_start + SESSION_ID_LEN]);
     let mut rand_part = [0u8; SESSION_ID_LEN - HMAC_LEN];
-    boring::rand::rand_bytes(&mut rand_part)
-        .map_err(|e| io::Error::other(format!("boring rand: {e}")))?;
+    crate::crypto::rand_bytes(&mut rand_part)
+        .map_err(|e| io::Error::other(format!("rand: {e}")))?;
 
     let mut chain = sha1_hmac(password);
     chain.update(&record[RECORD_HDR..sid_start]); // hello[..39] incl. sid_len
@@ -1216,7 +1217,7 @@ impl VerifiedStream {
         record[1] = 3;
         record[2] = 3;
         record[3..5].copy_from_slice(&(26u16).to_be_bytes());
-        if boring::rand::rand_bytes(&mut record[RECORD_HDR..]).is_err() {
+        if crate::crypto::rand_bytes(&mut record[RECORD_HDR..]).is_err() {
             return;
         }
         outbox.extend(record);
