@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mihomo Lightweight — read-only hardware/kernel probe for OpenWrt routers.
+# meow-openwrt — read-only hardware/kernel probe for OpenWrt routers.
 # Changes nothing, installs nothing, sends nothing anywhere. Prints a report to stdout.
 # Addresses, MACs, hostnames and keys are not printed.
 # Usage: sh hwprobe.sh > probe.txt   (then share probe.txt)

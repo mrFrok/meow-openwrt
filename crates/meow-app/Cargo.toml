@@ -107,7 +107,7 @@ log-max-info = ["tracing/release_max_level_info"]
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed", "regex-perf"]
 # meow-openwrt router profile (openwrt-fork/PLAN.md stage 2): the protocols
-# routers actually use; target < 6 MB stripped on mipsel.
+# routers actually use, for stock 16 MB flash (~8.7 MB stripped on mipsel).
 tiny = [
     "trojan", "vless", "vless-vision", "hysteria2", "mux",
     "dns-server", "dns-encrypted",
