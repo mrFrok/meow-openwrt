@@ -500,6 +500,8 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `route-address` / `route-address-set` | all | With `auto-redirect`: capture only these CIDRs / `ipcidr` rule-sets (IPv4 and, with `inet6-address`, IPv6; the fake-IP range always counts). |
 | `route-exclude-address` / `route-exclude-address-set` | none | With `auto-redirect`: never capture these. |
 | `route-address-dns` | `false` | With `auto-redirect` (meow): also capture addresses DNS answers give for domains the rules do not send DIRECT. |
+| `block-encrypted-dns` | `false` | With `auto-redirect` (meow): reject DoT/DoQ (port 853) and DoH to well-known public resolvers, so clients fall back to the hijacked plain DNS — see *auto-redirect*. |
+| `block-encrypted-dns-address` | none | Extra resolver addresses (CIDRs) whose port 443 `block-encrypted-dns` rejects. |
 
 mihomo fields meow does not implement (`strict-route`,
 `auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
@@ -610,6 +612,17 @@ tun:
   route-exclude-address: [10.0.0.0/8]
   route-address-dns: true              # + what DNS says goes to a proxy
 ```
+
+`block-encrypted-dns: true` (meow, separate opt-in) stops clients from
+going around the DNS hijack: new flows from the LAN and the host to port
+853 (DoT, DoQ), and to port 443 of well-known public resolvers (Google,
+Cloudflare, Quad9, AdGuard, OpenDNS, CleanBrowsing, Yandex, NextDNS,
+Control D, IPv4 and IPv6) plus `block-encrypted-dns-address`, are rejected
+(TCP reset, ICMP unreachable for UDP), so browsers and Android's Private
+DNS fall back to plain DNS at once. meow's own resolvers (`tls://`,
+`https://` nameservers) are not affected. The HTTPS pages of those
+resolver addresses (e.g. `https://1.1.1.1`) are cut off too; DoH to a
+resolver not on the list still gets through.
 
 `route-address-dns` (meow) feeds a `timeout` set `route4_dns` from DNS
 answers: an answer whose domain the rules send anywhere but DIRECT adds its

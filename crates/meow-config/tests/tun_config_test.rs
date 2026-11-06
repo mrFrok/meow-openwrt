@@ -747,3 +747,45 @@ tun:
     assert_eq!((v4.table.as_str(), v4.set.as_str()), ("meow", "route4_dns"));
     assert_eq!(mark, Some(meow_common::nftset::AUTO_REDIRECT_BYPASS_MARK));
 }
+
+#[tokio::test]
+async fn block_encrypted_dns_is_a_separate_opt_in() {
+    let on = r#"
+tun:
+  enable: true
+  auto-route: true
+  auto-redirect: true
+  block-encrypted-dns: true
+  block-encrypted-dns-address: [203.0.113.7, 2001:db8::/64]
+"#;
+    let off = r#"
+tun:
+  enable: true
+  auto-route: true
+  auto-redirect: true
+"#;
+    let on = load_config_from_str(on).await.expect("config must load");
+    let off = load_config_from_str(off).await.expect("config must load");
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let extra = on
+        .tun
+        .auto_redirect
+        .expect("on")
+        .block_encrypted_dns
+        .expect("block on");
+    assert_eq!(
+        extra,
+        vec![
+            "203.0.113.7/32".parse::<ipnet::IpNet>().unwrap(),
+            "2001:db8::/64".parse().unwrap()
+        ]
+    );
+    assert!(off
+        .tun
+        .auto_redirect
+        .expect("on")
+        .block_encrypted_dns
+        .is_none());
+}

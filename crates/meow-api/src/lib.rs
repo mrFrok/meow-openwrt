@@ -160,11 +160,22 @@ fn auto_redirect_ranges(
                 resolve: Arc::new(move || resolve_auto_redirect(&ar, &registry, false)),
             }
         });
+    let block_encrypted_dns = ar.block_encrypted_dns.as_ref().map(|nets| {
+        let mut r = meow_listener::Ranges::default();
+        for n in nets {
+            match n {
+                ipnet::IpNet::V4(n) => r.v4.push((n.network(), n.broadcast())),
+                ipnet::IpNet::V6(n) => r.v6.push((n.network(), n.broadcast())),
+            }
+        }
+        r
+    });
     meow_listener::AutoRedirect {
         dns_set: ar.route_address_dns,
         route,
         exclude,
         source,
+        block_encrypted_dns,
     }
 }
 

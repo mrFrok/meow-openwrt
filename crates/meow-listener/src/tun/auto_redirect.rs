@@ -90,6 +90,98 @@ pub(super) struct Fam<A> {
     /// Never captured: the host's subnets, loopback, the device's subnet
     /// (and for IPv6 link-local and multicast).
     pub local: Vec<(A, A)>,
+    /// `block-encrypted-dns`: resolvers whose DoH (443) is rejected, along
+    /// with every DoT/DoQ (853). `None`: off.
+    pub block: Option<Vec<(A, A)>>,
+}
+
+/// Well-known public DoH resolvers (anycast; Google, Cloudflare, Quad9,
+/// AdGuard, OpenDNS, CleanBrowsing, Yandex, NextDNS, Control D). Their
+/// HTTPS web pages are cut off too.
+pub(super) const DOH_V4: &[&str] = &[
+    "8.8.8.8",
+    "8.8.4.4",
+    "1.1.1.1",
+    "1.0.0.1",
+    "1.1.1.2",
+    "1.0.0.2",
+    "1.1.1.3",
+    "1.0.0.3",
+    "9.9.9.9",
+    "149.112.112.112",
+    "9.9.9.10",
+    "149.112.112.10",
+    "9.9.9.11",
+    "149.112.112.11",
+    "94.140.14.14",
+    "94.140.15.15",
+    "94.140.14.15",
+    "94.140.15.16",
+    "94.140.14.140",
+    "94.140.14.141",
+    "208.67.222.222",
+    "208.67.220.220",
+    "208.67.222.123",
+    "208.67.220.123",
+    "185.228.168.9",
+    "185.228.169.9",
+    "185.228.168.168",
+    "185.228.169.168",
+    "77.88.8.8",
+    "77.88.8.1",
+    "77.88.8.88",
+    "77.88.8.2",
+    "77.88.8.7",
+    "77.88.8.3",
+    "45.90.28.0",
+    "45.90.30.0",
+    "76.76.2.0",
+    "76.76.10.0",
+];
+
+pub(super) const DOH_V6: &[&str] = &[
+    "2001:4860:4860::8888",
+    "2001:4860:4860::8844",
+    "2606:4700:4700::1111",
+    "2606:4700:4700::1001",
+    "2606:4700:4700::1112",
+    "2606:4700:4700::1002",
+    "2606:4700:4700::1113",
+    "2606:4700:4700::1003",
+    "2620:fe::fe",
+    "2620:fe::9",
+    "2620:fe::10",
+    "2620:fe::fe:10",
+    "2620:fe::11",
+    "2620:fe::fe:11",
+    "2a10:50c0::ad1:ff",
+    "2a10:50c0::ad2:ff",
+    "2a10:50c0::1:ff",
+    "2a10:50c0::2:ff",
+    "2620:119:35::35",
+    "2620:119:53::53",
+    "2a0d:2a00:1::2",
+    "2a0d:2a00:2::2",
+    "2a02:6b8::feed:0ff",
+    "2a02:6b8:0:1::feed:0ff",
+    "2a07:a8c0::",
+    "2a07:a8c1::",
+    "2606:1a40::",
+    "2606:1a40:1::",
+];
+
+/// The built-in resolvers plus `extra`, coalesced.
+pub(super) fn with_builtin_doh<A: Family + std::str::FromStr>(
+    mut extra: Vec<(A, A)>,
+    builtin: &[&str],
+) -> Vec<(A, A)> {
+    extra.extend(
+        builtin
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .map(|a| (a, a)),
+    );
+    coalesce(extra)
 }
 
 /// What the ruleset is built from.
@@ -204,6 +296,10 @@ fn family<A: Family>(dev: &str, bypass: u32, dns_set: bool, f: &Fam<A>) -> Strin
     if let Some(r) = &f.route {
         s.push_str(&set("route", r));
     }
+    if let Some(b) = &f.block {
+        s.push_str(&set("doh", b));
+        s.push_str(&block_chains::<A>(&bypass));
+    }
     if dns_set {
         let _ = write!(
             s,
@@ -270,6 +366,36 @@ fn family<A: Family>(dev: &str, bypass: u32, dns_set: bool, f: &Fam<A>) -> Strin
 \t}}
 "
     );
+    s
+}
+
+/// `block-encrypted-dns`: reject, before fw4's filter chains, new flows
+/// from the LAN (`forward`, and `input` for those redirected to meow) and
+/// from the host (`output`, meow's own sockets excepted) to port 853, and
+/// to port 443 of `@doh`. TCP gets a reset, UDP (DoQ, HTTP/3) an ICMP
+/// unreachable, so clients fall back at once.
+fn block_chains<A: Family>(bypass: &str) -> String {
+    let (sx, kw, nf) = (A::SUFFIX, A::KW, A::NFPROTO);
+    let body = format!(
+        "\t\tmeta nfproto != {nf} return
+\t\tct direction reply return
+\t\tmeta l4proto tcp ct original proto-dst 853 reject with tcp reset
+\t\tmeta l4proto udp ct original proto-dst 853 reject
+\t\tmeta l4proto tcp ct original {kw} daddr @doh{sx} ct original proto-dst 443 reject with tcp reset
+\t\tmeta l4proto udp ct original {kw} daddr @doh{sx} ct original proto-dst 443 reject
+"
+    );
+    let mut s = String::new();
+    for (hook, skip) in [
+        ("input", String::new()),
+        ("forward", String::new()),
+        ("output", format!("\t\tmeta mark {bypass} return\n")),
+    ] {
+        let _ = write!(
+            s,
+            "\tchain block_{hook}{sx} {{\n\t\ttype filter hook {hook} priority filter - 1; policy accept;\n{skip}{body}\t}}\n"
+        );
+    }
     s
 }
 
@@ -466,6 +592,7 @@ mod tests {
             route,
             exclude,
             local: vec![(a("127.0.0.0"), a("127.255.255.255"))],
+            block: None,
         }
     }
 
@@ -563,10 +690,17 @@ mod tests {
                     six("fe80::"),
                     six("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
                 )],
+                block: Some(with_builtin_doh(Vec::new(), DOH_V6)),
             }),
         };
         let s = ruleset(&p);
         assert!(s.contains("chain output6 {"));
+        assert!(
+            s.contains("chain block_forward6 {\n\t\ttype filter hook forward priority filter - 1;")
+        );
+        assert!(s.contains("ip6 daddr @doh6 ct original proto-dst 443 reject with tcp reset"));
+        assert!(s.contains("2001:4860:4860::8888"));
+        assert!(!s.contains("block_forward4"));
         assert!(s.contains("meta nfproto != ipv6 return"));
         assert!(s.contains("meta l4proto != { icmpv6, udp } return"));
         assert!(s.contains("ip6 daddr != @route6_dns return"));

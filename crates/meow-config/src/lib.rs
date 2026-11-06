@@ -433,6 +433,10 @@ pub struct AutoRedirectConfig {
     pub route_address_set: Vec<String>,
     pub route_exclude_address: Vec<ipnet::IpNet>,
     pub route_exclude_address_set: Vec<String>,
+    /// `block-encrypted-dns` (meow): reject DoT/DoQ (port 853) and DoH to
+    /// well-known public resolvers plus these, so clients fall back to the
+    /// hijacked plain DNS. `None`: off.
+    pub block_encrypted_dns: Option<Vec<ipnet::IpNet>>,
 }
 
 fn parse_auto_redirect(
@@ -452,6 +456,18 @@ fn parse_auto_redirect(
     };
     let route_address = cidrs("route-address", &r.route_address)?;
     let route_exclude_address = cidrs("route-exclude-address", &r.route_exclude_address)?;
+    let block_extra = cidrs(
+        "block-encrypted-dns-address",
+        &r.block_encrypted_dns_address,
+    )?;
+    if r.auto_redirect != Some(true) && r.block_encrypted_dns == Some(true) {
+        warn!("tun.block-encrypted-dns: only used with 'auto-redirect: true'; ignored");
+    }
+    if r.block_encrypted_dns != Some(true) && !block_extra.is_empty() {
+        warn!(
+            "tun.block-encrypted-dns-address: only used with 'block-encrypted-dns: true'; ignored"
+        );
+    }
     if r.auto_redirect != Some(true) {
         let narrowed = !route_address.is_empty()
             || !route_exclude_address.is_empty()
@@ -482,6 +498,7 @@ fn parse_auto_redirect(
         route_address_set: r.route_address_set.clone().unwrap_or_default(),
         route_exclude_address,
         route_exclude_address_set: r.route_exclude_address_set.clone().unwrap_or_default(),
+        block_encrypted_dns: (r.block_encrypted_dns == Some(true)).then_some(block_extra),
     }))
 }
 

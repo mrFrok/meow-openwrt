@@ -284,6 +284,9 @@ pub struct AutoRedirect {
     pub dns_set: bool,
     /// Set when rule-sets feed `route` / `exclude`: they are kept current.
     pub source: Option<AutoRedirectSource>,
+    /// `block-encrypted-dns`: extra resolver addresses on top of the
+    /// built-in list. `None`: off.
+    pub block_encrypted_dns: Option<Ranges>,
 }
 
 /// Which stack terminates the device's TCP flows (`tun.stack`).
@@ -1662,7 +1665,7 @@ impl TunListener {
                 Some(_) => Some(
                     self.spawn_redirect(std::net::Ipv6Addr::UNSPECIFIED.into(), &mut listeners)
                         .inspect_err(|_| {
-                            listeners.iter().for_each(tokio::task::JoinHandle::abort)
+                            listeners.iter().for_each(tokio::task::JoinHandle::abort);
                         })?,
                 ),
                 None => None,
@@ -1685,6 +1688,9 @@ impl TunListener {
                     route: route.as_ref().map(|r| r.v4.clone()),
                     exclude: exclude.v4.clone(),
                     local: local4,
+                    block: ar.block_encrypted_dns.as_ref().map(|b| {
+                        auto_redirect::with_builtin_doh(b.v4.clone(), auto_redirect::DOH_V4)
+                    }),
                 },
                 v6: tun_net
                     .v6
@@ -1695,6 +1701,9 @@ impl TunListener {
                         route: route.as_ref().map(|r| r.v6.clone()),
                         exclude: exclude.v6.clone(),
                         local: local6,
+                        block: ar.block_encrypted_dns.as_ref().map(|b| {
+                            auto_redirect::with_builtin_doh(b.v6.clone(), auto_redirect::DOH_V6)
+                        }),
                     }),
             };
             let with_v6 = params.v6.is_some();

@@ -218,4 +218,44 @@ r=$($C wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
 kill $MP; sleep 2; MP=""
 $G ip -6 rule | grep -q 'fwmark 0x2023' && bad "v6: rules left" || ok "v6: rules removed"
 grep -iE 'warn|error' $W/meow4.log | head -5
+
+# Phase 5: block-encrypted-dns — 853 rejected on both paths (.3 forwarded,
+# .2 redirected to meow), 443 to a built-in resolver (1.1.1.1) and to an
+# extra address (.2) rejected, plain traffic untouched.
+$S ip addr add 1.1.1.1/32 dev lo; $G ip route add 1.1.1.1/32 via 10.78.0.2
+for a in 203.0.113.2:853 203.0.113.3:853 203.0.113.2:443 1.1.1.1:443 203.0.113.3:443; do
+	$S uhttpd -f -p $a -h $W/www & SRV="$SRV $!"
+done
+cat > $W/config.yaml <<EOF
+log-level: info
+tun:
+  enable: true
+  stack: system
+  device: mwtun
+  auto-route: true
+  auto-redirect: true
+  route-address: [203.0.113.2/32]
+  block-encrypted-dns: true
+  block-encrypted-dns-address: [203.0.113.2]
+rules:
+  - MATCH,DIRECT
+EOF
+$G $BIN -d $W -f $W/config.yaml > $W/meow5.log 2>&1 & MP=$!
+sleep 4
+blocked() { r=$($1 wget -qO- -T 5 "$2" 2>&1); [ "$r" != hello ]; }
+blocked "$C" http://203.0.113.3:853/x && ok "dot: LAN 853 (forwarded) rejected" || bad "dot: LAN .3:853 passed"
+blocked "$C" http://203.0.113.2:853/x && ok "dot: LAN 853 (redirected) rejected" || bad "dot: LAN .2:853 passed"
+blocked "$C" http://1.1.1.1:443/x && ok "doh: built-in 1.1.1.1:443 rejected" || bad "doh: 1.1.1.1:443 passed"
+blocked "$C" http://203.0.113.2:443/x && ok "doh: extra .2:443 rejected" || bad "doh: .2:443 passed"
+blocked "$G" http://203.0.113.3:853/x && ok "dot: gateway's own 853 rejected" || bad "dot: gateway .3:853 passed"
+r=$($C wget -qO- -T 5 http://203.0.113.3:443/x 2>&1)
+[ "$r" = hello ] && ok "doh: other 443 untouched" || bad "doh: .3:443: $r"
+r=$($C wget -qO- -T 5 http://203.0.113.2:8080/x 2>&1)
+[ "$r" = hello ] && ok "doh: plain captured traffic untouched" || bad "doh: .2:8080: $r"
+t0=$(date +%s); $C wget -qO- -T 10 http://203.0.113.3:853/x >/dev/null 2>&1; t1=$(date +%s)
+[ $((t1-t0)) -le 2 ] && ok "dot: rejected fast ($((t1-t0)) s)" || bad "dot: took $((t1-t0)) s (dropped, not rejected?)"
+kill $MP; sleep 2; MP=""
+r=$($C wget -qO- -T 5 http://203.0.113.3:853/x 2>&1)
+[ "$r" = hello ] && ok "dot: 853 open again after SIGTERM" || bad "dot: still blocked after SIGTERM"
+grep -iE 'warn|error' $W/meow5.log | head -5
 [ $fail = 0 ] && echo ALL PASS || echo SOME FAILED

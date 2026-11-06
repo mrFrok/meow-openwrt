@@ -469,6 +469,10 @@ pub struct RawTun {
     /// meow: with `auto-redirect`, also capture what `dns.nftset` would add
     /// (addresses of domains the rules do not send DIRECT).
     pub route_address_dns: Option<bool>,
+    /// meow: with `auto-redirect`, reject DoT/DoQ and DoH to well-known
+    /// resolvers (plus `block-encrypted-dns-address`).
+    pub block_encrypted_dns: Option<bool>,
+    pub block_encrypted_dns_address: Option<Vec<String>>,
     pub include_uid: Option<serde_json::Value>,
     pub exclude_uid: Option<serde_json::Value>,
 }
