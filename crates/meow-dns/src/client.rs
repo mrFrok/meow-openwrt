@@ -345,7 +345,7 @@ struct PoolEntry<E> {
 /// the adapter's own `ProxyConn` — one boxed element type covers both, so
 /// pooled reuse skips the per-query `dial_tcp`/`protect(fd)` entirely.
 #[cfg(feature = "encrypted")]
-type TlsConn = Pin<Box<tokio_boring::SslStream<Box<dyn meow_common::ProxyConn>>>>;
+type TlsConn = Pin<Box<meow_transport::tls::TypedTlsStream<Box<dyn meow_common::ProxyConn>>>>;
 
 /// A pooled TLS conn plus the conn's own last successful exchange
 /// duration, recorded at push: it bounds the *next* reuse attempt's
@@ -1216,13 +1216,13 @@ impl DnsClient {
     /// Run the TLS handshake for a DoT/DoH exchange over `inner` — a
     /// direct `TcpStream` or a proxied `ProxyConn` — and pin the result.
     /// `Pin<Box<_>>` keeps the `Unpin` bound regardless of whether
-    /// `tokio_boring::SslStream<S>` itself is `Unpin`.
+    /// `meow_transport::tls::TypedTlsStream<S>` itself is `Unpin`.
     #[cfg(feature = "encrypted")]
     async fn tls_connect_pinned<S>(
         &self,
         tls: &TlsLayer,
         inner: S,
-    ) -> Result<Pin<Box<tokio_boring::SslStream<S>>>, ClientError>
+    ) -> Result<Pin<Box<meow_transport::tls::TypedTlsStream<S>>>, ClientError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -2139,7 +2139,7 @@ async fn tls_conn_alive(stream: &mut TlsConn) -> bool {
     use std::task::Poll;
     use tokio::io::{AsyncRead, ReadBuf};
 
-    if stream.ssl().pending() > 0 {
+    if meow_transport::tls::plaintext_pending(stream) {
         return false;
     }
     let mut byte = [0u8; 1];

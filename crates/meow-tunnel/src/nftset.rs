@@ -168,7 +168,7 @@ struct HookState {
     no_timeout: [bool; 2],
     warned: bool,
     /// `meow_common::nftset::epoch()` when `seen` was last valid.
-    epoch: u64,
+    epoch: u32,
 }
 
 const SEEN_CAP: usize = 8192;

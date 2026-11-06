@@ -24,6 +24,9 @@ default = ["tls", "ws"]
 # loopback test servers under [dev-dependencies].
 tls = [
     "boring-crypto",
+    "crypto",
+    "dep:rustls",
+    "dep:tokio-rustls",
     "dep:boring",
     "dep:tokio-boring",
     "dep:boring-sys",
@@ -200,11 +203,6 @@ tokio-snappy = { version = "0.2", optional = true }
 # `SO_RCVBUF`/`SO_SNDBUF`/`TOS` on the kcptun UDP socket (`sockbuf`/`dscp`).
 socket2 = { workspace = true, optional = true }
 
-# tls feature (BoringSSL)
-boring             = { workspace = true, optional = true }
-tokio-boring       = { workspace = true, optional = true }
-boring-sys         = { workspace = true, optional = true }
-foreign-types      = { workspace = true, optional = true }
 # Mozilla CA bundle for boring's X509Store. The BoringSSL connector
 # starts with an *empty* trust store; sandboxed runtimes (iOS
 # NetworkExtension, sealed app extensions) don't pick up system roots
@@ -216,6 +214,18 @@ foreign-types      = { workspace = true, optional = true }
 # parity with rustls and makes verification work uniformly across
 # platforms. Adds ~150 KB of DER blobs to the .rlib.
 webpki-root-certs  = { workspace = true, optional = true }
+# The rustls backend (`cfg(not(boring))`, see build.rs): big-endian targets.
+# On little-endian builds it is compiled but unreferenced, so LTO drops it.
+rustls             = { workspace = true, optional = true }
+tokio-rustls       = { workspace = true, optional = true }
+
+# tls feature (BoringSSL). BoringSSL does not support big-endian targets:
+# there `tls` takes the rustls backend above (build.rs, `cfg(boring)`).
+[target.'cfg(target_endian = "little")'.dependencies]
+boring             = { workspace = true, optional = true }
+tokio-boring       = { workspace = true, optional = true }
+boring-sys         = { workspace = true, optional = true }
+foreign-types      = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` enables paused-time tests (start_paused / time::advance) —

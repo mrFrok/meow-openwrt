@@ -14,7 +14,7 @@ default = ["encrypted", "dns-server"]
 # DNS shares the process-wide backend (BoringSSL when the app is built with
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
-encrypted = ["dep:meow-transport", "dep:tokio-boring"]
+encrypted = ["dep:meow-transport"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
 # only `hickory-proto`, so the feature is a no-op kept for API stability.
 dns-server = []
@@ -25,10 +25,6 @@ meow-trie = { workspace = true }
 tokio = { workspace = true }
 hickory-proto = { workspace = true }
 meow-transport = { workspace = true, features = ["tls"], optional = true }
-# `TlsLayer::connect_typed` returns `tokio_boring::SslStream<S>` in its
-# public signature — naming the type (DoT/DoH over `ProxyConn`) needs the
-# crate itself, not just the transport wrapper.
-tokio-boring = { workspace = true, optional = true }
 rand = { workspace = true }
 lru = { workspace = true }
 dashmap = { workspace = true }

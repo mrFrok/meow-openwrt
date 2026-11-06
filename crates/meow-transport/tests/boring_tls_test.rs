@@ -1,3 +1,4 @@
+#![cfg(boring)]
 //! BoringSSL-backed TLS tests: fingerprint profile connections and JA3 capture.
 //!
 //! Required features: `tls`.

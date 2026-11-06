@@ -13,7 +13,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
@@ -166,7 +166,7 @@ pub struct TunnelInner {
     /// [`Tunnel::set_tcp_idle_timeout`]. `0` disables the bound. Read once
     /// per relay setup; relays already in flight keep the bound they
     /// started with (same per-connection semantics as every per-conn knob).
-    tcp_idle_timeout: AtomicU64,
+    tcp_idle_timeout: AtomicU32,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -251,7 +251,7 @@ impl TunnelInner {
     pub fn tcp_idle_timeout(&self) -> Option<std::time::Duration> {
         match self.tcp_idle_timeout.load(Ordering::Relaxed) {
             0 => None,
-            secs => Some(std::time::Duration::from_secs(secs)),
+            secs => Some(std::time::Duration::from_secs(secs.into())),
         }
     }
 
@@ -1043,7 +1043,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
-                tcp_idle_timeout: AtomicU64::new(0),
+                tcp_idle_timeout: AtomicU32::new(0),
             }),
         }
     }
@@ -1091,7 +1091,11 @@ impl Tunnel {
         );
         self.inner
             .tcp_idle_timeout
-            .store(d.map_or(0, |d| d.as_secs()), Ordering::Relaxed);
+            // Seconds as u32 (136 years): 32-bit MIPS has no 64-bit atomics.
+            .store(
+                d.map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+                Ordering::Relaxed,
+            );
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {

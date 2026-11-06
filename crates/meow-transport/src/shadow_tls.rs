@@ -206,7 +206,7 @@ pub async fn dial(
                 .connect_typed(shim)
                 .await
                 .map_err(ConnectTypedError::into_transport)?;
-            let mut shim = std::mem::take(tls_stream.get_mut());
+            let mut shim = std::mem::take(crate::tls::typed_get_mut(&mut tls_stream));
             drop(tls_stream);
             match version {
                 // v1 continues on the raw conn; `pending` may hold backend
@@ -264,13 +264,11 @@ async fn dial_v3(
     shim: HandshakeShim,
     strict_mode: bool,
 ) -> Result<Box<dyn Stream>> {
-    use boring::ssl::SslVerifyMode;
-
     let shim = match tls.connect_typed(shim).await {
         Ok(mut tls_stream) => {
             // Unreachable in practice — a patched CH always diverges the
             // transcript — but handle it like upstream's success path.
-            std::mem::take(tls_stream.get_mut())
+            std::mem::take(crate::tls::typed_get_mut(&mut tls_stream))
         }
         Err(ConnectTypedError::Transport(e)) => return Err(e),
         Err(ConnectTypedError::Handshake(e)) => {
@@ -286,7 +284,7 @@ async fn dial_v3(
                 if io_err.kind() == io::ErrorKind::OutOfMemory {
                     return Err(TransportError::Io(io::Error::new(
                         io_err.kind(),
-                        format!("boring TLS handshake: {e}"),
+                        format!("TLS handshake: {e}"),
                     )));
                 }
             }
@@ -295,14 +293,7 @@ async fn dial_v3(
             // session's verify result is meaningful.  TLS 1.3 covers
             // never reach it (undecryptable flight) — authorized tags
             // are the whole check there.
-            let cert_ok = e.ssl().is_some_and(|ssl| {
-                ssl.verify_mode() == SslVerifyMode::NONE
-                    // `verify_result` reports X509_V_OK even when the
-                    // check never ran (e.g. the flight died before the
-                    // Certificate message) — require a seen chain so
-                    // "no cert" fails closed too.
-                    || (ssl.verify_result().is_ok() && ssl.peer_cert_chain().is_some())
-            });
+            let cert_ok = crate::tls::handshake_cert_ok(&e);
             // Prefer the shim-originated io error (e.g. "hmac mismatch",
             // "no 32-byte session id") over the TLS-side wrapper text —
             // it names the real failure.
@@ -310,7 +301,7 @@ async fn dial_v3(
                 .as_io_error()
                 .map_or_else(|| e.to_string(), std::string::ToString::to_string);
             let Some(shim) = e.into_source_stream() else {
-                return Err(TransportError::Tls(format!("boring TLS handshake: {msg}")));
+                return Err(TransportError::Tls(format!("TLS handshake: {msg}")));
             };
             let state = shim.v3_state();
             // Upstream `strictMode && !isTLS13` runs before the

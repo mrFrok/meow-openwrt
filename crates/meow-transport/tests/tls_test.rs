@@ -507,7 +507,9 @@ fn tls_ech_config_over_u16_bound_rejected() {
         .err()
         .expect("oversized ECHConfigList");
     assert!(
-        err.to_string().contains("ECHConfigList"),
+        // The rustls backend (big-endian builds) rejects any ECH config.
+        err.to_string().contains("ECHConfigList")
+            || err.to_string().contains("ECH is not supported"),
         "unexpected error: {err}"
     );
 }

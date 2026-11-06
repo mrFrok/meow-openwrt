@@ -18,8 +18,11 @@
 //! certificate `fingerprint` replaces CA validation entirely and is not
 //! filtered.
 
+#[cfg(boring)]
 use boring::hash::{hash, MessageDigest};
+#[cfg(boring)]
 use boring::stack::StackRef;
+#[cfg(boring)]
 use boring::x509::{X509Ref, X509StoreContextRef, X509VerifyError, X509};
 
 /// eMudhra's P-384 "G3B" / "G3C" intermediates, generated on 30 April 2025
@@ -81,6 +84,7 @@ const DISTRUSTED_SPKI_SHA256: [[u8; 32]; 8] = [
     ],
 ];
 
+#[cfg(boring)]
 /// Whether `cert`'s public key is on the distrust list.
 ///
 /// A key that cannot be parsed is reported as trusted: BoringSSL fails the
@@ -93,11 +97,13 @@ pub fn is_distrusted(cert: &X509Ref) -> bool {
         .is_ok_and(|digest| DISTRUSTED_SPKI_SHA256.iter().any(|d| d[..] == digest[..]))
 }
 
+#[cfg(boring)]
 /// Whether any certificate in a verified chain is distrusted.
 pub fn chain_is_distrusted(chain: &StackRef<X509>) -> bool {
     chain.iter().any(is_distrusted)
 }
 
+#[cfg(boring)]
 /// `SSL_CTX_set_verify` callback: BoringSSL's result, except that a
 /// distrusted certificate anywhere in the chain fails the handshake with
 /// `X509_V_ERR_CERT_REVOKED`.
@@ -112,7 +118,99 @@ pub fn verify_callback(preverify_ok: bool, ctx: &mut X509StoreContextRef) -> boo
     preverify_ok
 }
 
+/// Whether a DER certificate's `SubjectPublicKeyInfo` is distrusted (the
+/// rustls backend's check; malformed DER is reported as trusted, webpki has
+/// already rejected it).
+#[cfg_attr(boring, allow(dead_code, reason = "rustls backend only"))]
+pub fn der_is_distrusted(cert: &[u8]) -> bool {
+    use sha2::{Digest as _, Sha256};
+    spki_der(cert).is_some_and(|spki| {
+        let digest: [u8; 32] = Sha256::digest(spki).into();
+        DISTRUSTED_SPKI_SHA256.contains(&digest)
+    })
+}
+
+/// One DER element at the start of `der`: (tag, whole element, content).
+fn der_elem(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *der.first()?;
+    let first = *der.get(1)?;
+    let (len, hdr) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let len = der
+            .get(2..2 + n)?
+            .iter()
+            .fold(0usize, |a, &b| (a << 8) | b as usize);
+        (len, 2 + n)
+    };
+    let end = hdr.checked_add(len)?;
+    Some((tag, der.get(..end)?, der.get(hdr..end)?))
+}
+
+/// The `subjectPublicKeyInfo` element of an X.509 certificate (RFC 5280
+/// §4.1: Certificate → tbsCertificate → [version], serial, signature,
+/// issuer, validity, subject, subjectPublicKeyInfo).
+fn spki_der(cert: &[u8]) -> Option<&[u8]> {
+    let (_, _, cert) = der_elem(cert)?;
+    let (_, _, mut tbs) = der_elem(cert)?;
+    let mut field = 0;
+    loop {
+        let (tag, whole, _) = der_elem(tbs)?;
+        tbs = &tbs[whole.len()..];
+        if tag == 0xa0 {
+            continue;
+        }
+        if field == 5 {
+            return (tag == 0x30).then_some(whole);
+        }
+        field += 1;
+    }
+}
+
 #[cfg(test)]
+mod der_tests {
+    use super::der_is_distrusted;
+    use base64::Engine as _;
+
+    fn pem_certs(pem: &str) -> Vec<Vec<u8>> {
+        pem.split("-----BEGIN CERTIFICATE-----")
+            .skip(1)
+            .map(|b| {
+                let b64: String = b
+                    .split("-----END CERTIFICATE-----")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn der_check_finds_every_compromised_key() {
+        let certs = pem_certs(include_str!("testdata/emudhra-g3-compromised.pem"));
+        assert_eq!(certs.len(), 16);
+        assert!(certs.iter().all(|c| der_is_distrusted(c)));
+    }
+
+    #[test]
+    fn der_check_passes_mozilla_roots_and_garbage() {
+        assert!(!webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .any(|c| der_is_distrusted(c.as_ref())));
+        assert!(!der_is_distrusted(&[0x30, 0x82, 0xff]));
+        assert!(!der_is_distrusted(&[]));
+    }
+}
+
+#[cfg(all(test, boring))]
 mod tests {
     use super::*;
     use boring::x509::store::X509StoreBuilder;

@@ -38,6 +38,14 @@ mod error;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 
+// restls and jls drive BoringSSL's X.509 and ECDH directly; they have no
+// rustls port (big-endian builds, see build.rs).
+#[cfg(all(not(boring), any(feature = "restls", feature = "jls")))]
+compile_error!(
+    "the `restls` / `jls` features need BoringSSL, which this target \
+     (big-endian, or MEOW_TLS_BACKEND=rustls) does not build"
+);
+
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -79,7 +87,7 @@ pub mod shadow_tls;
 /// authenticates the restls relay; post-handshake data rides tagged
 /// records shaped by the record script.  Used by the `restls`
 /// Shadowsocks plugin in `meow-proxy`.
-#[cfg(feature = "restls")]
+#[cfg(all(feature = "restls", boring))]
 pub mod restls;
 
 /// jls client transport — a record-level TLS 1.3 client whose
@@ -87,7 +95,7 @@ pub mod restls;
 /// post-handshake data is plain TLS application records.  Used by the
 /// `jls` Shadowsocks plugin in meow-proxy. Built on `restls`'s shared
 /// tls13 driver.
-#[cfg(feature = "jls")]
+#[cfg(all(feature = "jls", boring))]
 pub mod jls;
 
 /// SIP004 simple-obfs HTTP/TLS obfuscation codec (client +, later, server).
@@ -137,9 +145,11 @@ pub fn supports_raw_passthrough(stream: &mut dyn Stream) -> bool {
                 return true;
             }
         }
+        #[cfg(boring)]
         if any.is::<tls::boring_stream::BoringTlsStream>() {
             return true;
         }
+        let _ = any;
     }
 
     let _ = stream;
@@ -168,9 +178,11 @@ pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
                 return true;
             }
         }
+        #[cfg(boring)]
         if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
             return boring.enable_raw_read_passthrough();
         }
+        let _ = any;
     }
 
     let _ = stream;
@@ -192,9 +204,11 @@ pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
                 return true;
             }
         }
+        #[cfg(boring)]
         if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
             return boring.enable_raw_write_passthrough();
         }
+        let _ = any;
     }
 
     let _ = stream;

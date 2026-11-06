@@ -4,13 +4,14 @@
 //!
 //! Two backends, picked at build time (meow-openwrt stage 7):
 //!
-//! - `boring-crypto` (on with `tls`): BoringSSL, the library the TLS layer
-//!   already links; its assembly keeps the record layers fast under the
-//!   release profile's `opt-level = "z"` (issue #659).
-//! - `crypto-rust` (without `boring-crypto`): RustCrypto, for targets
-//!   BoringSSL does not support (big-endian MIPS).
+//! - `cfg(boring)` (`tls` or `boring-crypto` on a little-endian target, see
+//!   build.rs): BoringSSL, the library the TLS layer already links; its
+//!   assembly keeps the record layers fast under the release profile's
+//!   `opt-level = "z"` (issue #659).
+//! - otherwise RustCrypto, for targets BoringSSL does not support
+//!   (big-endian MIPS).
 
-#[cfg(not(feature = "boring-crypto"))]
+#[cfg(not(boring))]
 use aes_gcm::aead::AeadInPlace as _;
 
 /// AEAD algorithms used here; all take a 12-byte nonce and a 16-byte tag.
@@ -51,10 +52,10 @@ impl std::error::Error for CryptoError {}
 /// One key's AEAD context.
 pub struct Aead(Inner);
 
-#[cfg(feature = "boring-crypto")]
+#[cfg(boring)]
 type Inner = boring::aead::AeadCtx;
 
-#[cfg(not(feature = "boring-crypto"))]
+#[cfg(not(boring))]
 enum Inner {
     Aes128Gcm(Box<aes_gcm::Aes128Gcm>),
     Aes256Gcm(Box<aes_gcm::Aes256Gcm>),
@@ -67,7 +68,7 @@ impl Aead {
         if key.len() != alg.key_len() {
             return Err(CryptoError);
         }
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             use boring::aead::Algorithm;
             let a = match alg {
@@ -79,7 +80,7 @@ impl Aead {
                 .map(Self)
                 .map_err(|_| CryptoError)
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use aes_gcm::KeyInit as _;
             Ok(Self(match alg {
@@ -109,14 +110,14 @@ impl Aead {
         if tag.len() != TAG_LEN {
             return Err(CryptoError);
         }
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             self.0
                 .seal_in_place(nonce, data, tag, ad)
                 .map(|_| ())
                 .map_err(|_| CryptoError)
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             let n = aes_gcm::Nonce::from_slice(nonce);
             let t = match &self.0 {
@@ -141,13 +142,13 @@ impl Aead {
         if tag.len() != TAG_LEN {
             return Err(CryptoError);
         }
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             self.0
                 .open_in_place(nonce, data, tag, ad)
                 .map_err(|_| CryptoError)
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             let n = aes_gcm::Nonce::from_slice(nonce);
             let t = aes_gcm::Tag::from_slice(tag);
@@ -163,11 +164,11 @@ impl Aead {
 
 /// HMAC-SHA256.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     {
         boring::hash::hmac_sha256(key, data).expect("HMAC-SHA256 takes any key")
     }
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     {
         use hmac::Mac as _;
         let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC takes any key");
@@ -178,7 +179,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// One AES-128 block encryption (QUIC header protection).
 pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     {
         let out = boring::symm::encrypt(boring::symm::Cipher::aes_128_ecb(), key, None, block)
             .expect("AES-128-ECB of one block");
@@ -186,7 +187,7 @@ pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
         b.copy_from_slice(&out[..16]);
         b
     }
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     {
         use aes_gcm::aes::cipher::{BlockEncrypt as _, KeyInit as _};
         let c = aes_gcm::aes::Aes128::new(key.into());
@@ -201,8 +202,8 @@ pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
 #[cfg(feature = "sha1-digest")]
 #[derive(Clone)]
 pub struct Sha1(
-    #[cfg(feature = "boring-crypto")] boring::sha::Sha1,
-    #[cfg(not(feature = "boring-crypto"))] sha1::Sha1,
+    #[cfg(boring)] boring::sha::Sha1,
+    #[cfg(not(boring))] sha1::Sha1,
 );
 
 #[cfg(feature = "sha1-digest")]
@@ -215,11 +216,11 @@ impl Default for Sha1 {
 #[cfg(feature = "sha1-digest")]
 impl Sha1 {
     pub fn new() -> Self {
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             Self(boring::sha::Sha1::new())
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use sha1::Digest as _;
             Self(sha1::Sha1::new())
@@ -227,11 +228,11 @@ impl Sha1 {
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             self.0.update(data);
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use sha1::Digest as _;
             self.0.update(data);
@@ -239,11 +240,11 @@ impl Sha1 {
     }
 
     pub fn finish(self) -> [u8; 20] {
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             self.0.finish()
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use sha1::Digest as _;
             self.0.finalize().into()
@@ -253,11 +254,11 @@ impl Sha1 {
 
 /// Cryptographically secure random bytes.
 pub fn rand_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     {
         boring::rand::rand_bytes(buf).map_err(|_| CryptoError)
     }
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     {
         getrandom::fill(buf).map_err(|_| CryptoError)
     }
@@ -267,9 +268,9 @@ pub fn rand_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
 /// key shares).
 #[cfg(feature = "mlkem")]
 pub struct MlKem768 {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     private: boring::mlkem::MlKemPrivateKey,
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     private: Box<ml_kem::DecapsulationKey<ml_kem::MlKem768>>,
     public: Vec<u8>,
 }
@@ -277,7 +278,7 @@ pub struct MlKem768 {
 #[cfg(feature = "mlkem")]
 impl MlKem768 {
     pub fn generate() -> Result<Self, CryptoError> {
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             let (public, private) =
                 boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
@@ -287,7 +288,7 @@ impl MlKem768 {
                 public: public.as_bytes().to_vec(),
             })
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use ml_kem::kem::{Kem as _, KeyExport as _};
             let (dk, ek) = ml_kem::MlKem768::generate_keypair();
@@ -305,7 +306,7 @@ impl MlKem768 {
 
     /// The shared secret a peer's ciphertext carries.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; 32], CryptoError> {
-        #[cfg(feature = "boring-crypto")]
+        #[cfg(boring)]
         {
             let s = self
                 .private
@@ -313,7 +314,7 @@ impl MlKem768 {
                 .map_err(|_| CryptoError)?;
             s.as_ref().try_into().map_err(|_| CryptoError)
         }
-        #[cfg(not(feature = "boring-crypto"))]
+        #[cfg(not(boring))]
         {
             use ml_kem::kem::Decapsulate as _;
             let s = self
@@ -329,7 +330,7 @@ impl MlKem768 {
 /// ciphertext and the shared secret. The server side; tests use it.
 #[cfg(feature = "mlkem")]
 pub fn mlkem768_encapsulate(public: &[u8]) -> Result<(Vec<u8>, [u8; 32]), CryptoError> {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     {
         let ek =
             boring::mlkem::MlKemPublicKey::from_slice(boring::mlkem::Algorithm::MlKem768, public)
@@ -337,7 +338,7 @@ pub fn mlkem768_encapsulate(public: &[u8]) -> Result<(Vec<u8>, [u8; 32]), Crypto
         let (ct, s) = ek.encapsulate().map_err(|_| CryptoError)?;
         Ok((ct, s.as_ref().try_into().map_err(|_| CryptoError)?))
     }
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     {
         use ml_kem::kem::{Encapsulate as _, TryKeyInit as _};
         let ek = ml_kem::EncapsulationKey::<ml_kem::MlKem768>::new_from_slice(public)
@@ -354,7 +355,7 @@ pub fn mlkem768_encapsulate(public: &[u8]) -> Result<(Vec<u8>, [u8; 32]), Crypto
 /// private half is dropped (REALITY's decoy key share).
 #[cfg(feature = "p256-share")]
 pub fn p256_public_uncompressed() -> Result<Vec<u8>, CryptoError> {
-    #[cfg(feature = "boring-crypto")]
+    #[cfg(boring)]
     {
         use boring::{
             bn::BigNumContext,
@@ -368,7 +369,7 @@ pub fn p256_public_uncompressed() -> Result<Vec<u8>, CryptoError> {
             .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut ctx)
             .map_err(|_| CryptoError)
     }
-    #[cfg(not(feature = "boring-crypto"))]
+    #[cfg(not(boring))]
     {
         use p256::elliptic_curve::sec1::ToEncodedPoint as _;
         // A random 32-byte string is a valid scalar with overwhelming

@@ -62,7 +62,7 @@ pub const AUTO_REDIRECT_DNS_SET: &str = "inet#meow#route4_dns";
 /// The IPv6 counterpart (when the TUN device has an IPv6 address).
 pub const AUTO_REDIRECT_DNS_SET6: &str = "inet#meow#route6_dns";
 
-static SET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SET_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Bumped whenever a set the hook feeds was (re)created empty, so the hook
 /// forgets which elements it already added.
@@ -70,7 +70,7 @@ pub fn bump_epoch() {
     SET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn epoch() -> u64 {
+pub fn epoch() -> u32 {
     SET_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 

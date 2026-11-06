@@ -50,17 +50,25 @@ use tracing::warn;
 
 use crate::{Result, Stream, Transport, TransportError};
 
+#[cfg(boring)]
 pub(crate) mod boring_backend;
+#[cfg(boring)]
 pub(crate) mod boring_stream;
 pub mod distrust;
+#[cfg(not(boring))]
+pub mod rustls_backend;
 
 /// The Mozilla CA bundle, parsed once per process. `X509` is refcounted,
 /// so a store built from these clones shares the parsed certificates.
+#[cfg(boring)]
 pub fn mozilla_roots() -> &'static [boring::x509::X509] {
     boring_backend::boring_roots()
 }
 
-use boring_backend::{BoringInner, LazyBoringInner};
+#[cfg(boring)]
+use boring_backend::{BoringInner as Inner, LazyBoringInner};
+#[cfg(not(boring))]
+use rustls_backend::RustlsInner as Inner;
 
 // ─── Config structs ───────────────────────────────────────────────────────────
 
@@ -210,12 +218,19 @@ impl TlsConfig {
 /// use this to tell a resolved profile's own group list from the
 /// default hello.
 pub fn is_supported_fingerprint(fp: &str) -> bool {
-    boring_backend::fingerprint_is_known(fp)
+    #[cfg(boring)]
+    {
+        boring_backend::fingerprint_is_known(fp)
+    }
+    #[cfg(not(boring))]
+    {
+        rustls_backend::fingerprint_is_known(fp)
+    }
 }
 
 /// TLS protocol version bound for [`TlsConfig::min_version`] /
 /// [`TlsConfig::max_version`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TlsVersion {
     /// TLS 1.2
     Tls12,
@@ -237,7 +252,10 @@ pub struct ClientCert {
 enum TlsBackend {
     #[cfg(feature = "reality")]
     Reality(crate::reality_tls::RealityTlsLayer),
+    #[cfg(boring)]
     Boring(Box<LazyBoringInner>),
+    #[cfg(not(boring))]
+    Rustls(Box<Inner>),
 }
 
 // ─── TlsLayer (public facade) ─────────────────────────────────────────────────
@@ -285,7 +303,14 @@ impl TlsLayer {
         // path. `BoringInner` repeats the fold for direct construction.
         let mut config = config.clone();
         if let Some(sni) = &mut config.sni {
-            *sni = boring_backend::unbracket_ip_literal(sni).to_owned();
+            #[cfg(boring)]
+            {
+                *sni = boring_backend::unbracket_ip_literal(sni).to_owned();
+            }
+            #[cfg(not(boring))]
+            {
+                *sni = rustls_backend::unbracket_ip_literal(sni).to_owned();
+            }
         }
 
         #[cfg(feature = "reality")]
@@ -306,16 +331,25 @@ impl TlsLayer {
             );
         }
 
-        BoringInner::validate(&config)?;
-        tracing::debug!(
-            fingerprint = ?config.fingerprint,
-            ech = config.ech.is_some(),
-            sni = ?config.sni,
-            "TLS: BoringSSL backend (lazy init)"
-        );
-        Ok(Self {
-            backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config))),
-        })
+        Inner::validate(&config)?;
+        #[cfg(boring)]
+        {
+            tracing::debug!(
+                fingerprint = ?config.fingerprint,
+                ech = config.ech.is_some(),
+                sni = ?config.sni,
+                "TLS: BoringSSL backend (lazy init)"
+            );
+            Ok(Self {
+                backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config))),
+            })
+        }
+        #[cfg(not(boring))]
+        {
+            Ok(Self {
+                backend: TlsBackend::Rustls(Box::new(Inner::new(&config)?)),
+            })
+        }
     }
 
     /// Handshake over a caller-owned stream type, returning the concrete
@@ -344,14 +378,99 @@ impl TlsLayer {
                     "connect_typed is not supported on the REALITY backend".into(),
                 )))
             }
+            #[cfg(boring)]
             TlsBackend::Boring(lazy) => lazy.connect_typed(inner).await,
+            #[cfg(not(boring))]
+            TlsBackend::Rustls(r) => r.connect_typed(inner).await,
         }
     }
 }
 
+/// The concrete stream [`TlsLayer::connect_typed`] returns.
+#[cfg(boring)]
+pub type TypedTlsStream<S> = tokio_boring::SslStream<S>;
+/// The concrete stream [`TlsLayer::connect_typed`] returns.
+#[cfg(not(boring))]
+pub type TypedTlsStream<S> = rustls_backend::TlsStream<S>;
+
+/// A failed [`TlsLayer::connect_typed`] handshake.
+#[cfg(boring)]
+pub type HandshakeError<S> = tokio_boring::HandshakeError<S>;
+/// A failed [`TlsLayer::connect_typed`] handshake.
+#[cfg(not(boring))]
+pub type HandshakeError<S> = rustls_backend::HandshakeError<S>;
+
+/// ALPN protocol the server selected on a [`TypedTlsStream`].
+pub fn selected_alpn<S>(s: &TypedTlsStream<S>) -> Option<&[u8]> {
+    #[cfg(boring)]
+    {
+        s.ssl().selected_alpn_protocol()
+    }
+    #[cfg(not(boring))]
+    {
+        rustls_backend::selected_alpn(s)
+    }
+}
+
+/// Whether TLS holds decrypted plaintext the caller has not read yet
+/// (BoringSSL's `SSL_pending`). rustls reports nothing here; its buffered
+/// plaintext surfaces on the next read instead.
+pub fn plaintext_pending<S>(s: &TypedTlsStream<S>) -> bool {
+    #[cfg(boring)]
+    {
+        s.ssl().pending() > 0
+    }
+    #[cfg(not(boring))]
+    {
+        let _ = s;
+        false
+    }
+}
+
+/// The caller's stream under a [`TypedTlsStream`].
+pub fn typed_get_mut<S>(s: &mut TypedTlsStream<S>) -> &mut S {
+    #[cfg(boring)]
+    {
+        s.get_mut()
+    }
+    #[cfg(not(boring))]
+    {
+        s.get_mut().0
+    }
+}
+
+/// Whether a failed handshake left certificate verification satisfied:
+/// verification was disabled, or it ran on a received chain and passed
+/// (shadow-tls v3 with a TLS 1.2 cover, whose handshake always dies at
+/// Finished). BoringSSL keeps the aborted session to ask; rustls verifies
+/// inside the handshake, so there a failure that is not a certificate
+/// error means the chain (if one arrived) passed.
+pub fn handshake_cert_ok<S>(e: &HandshakeError<S>) -> bool {
+    #[cfg(boring)]
+    {
+        use boring::ssl::SslVerifyMode;
+        e.ssl().is_some_and(|ssl| {
+            ssl.verify_mode() == SslVerifyMode::NONE
+                // `verify_result` reports X509_V_OK even when the check
+                // never ran (e.g. the flight died before the Certificate
+                // message) — require a seen chain so "no cert" fails
+                // closed too.
+                || (ssl.verify_result().is_ok() && ssl.peer_cert_chain().is_some())
+        })
+    }
+    #[cfg(not(boring))]
+    {
+        !matches!(
+            e.error
+                .get_ref()
+                .and_then(|x| x.downcast_ref::<rustls::Error>()),
+            Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+        )
+    }
+}
+
 /// Result of [`TlsLayer::connect_typed`].
-pub type TypedConnectResult<S> =
-    std::result::Result<tokio_boring::SslStream<S>, ConnectTypedError<S>>;
+pub type TypedConnectResult<S> = std::result::Result<TypedTlsStream<S>, ConnectTypedError<S>>;
 
 /// Failure of [`TlsLayer::connect_typed`].
 ///
@@ -366,7 +485,7 @@ pub enum ConnectTypedError<S> {
     /// The TLS handshake failed mid-flight.  `into_source_stream()`
     /// recovers `S`; `ssl()` exposes the aborted session state (e.g.
     /// `verify_result`).
-    Handshake(tokio_boring::HandshakeError<S>),
+    Handshake(HandshakeError<S>),
 }
 
 impl<S> ConnectTypedError<S> {
@@ -383,9 +502,9 @@ impl<S> ConnectTypedError<S> {
                 match e.as_io_error() {
                     Some(io_err) => TransportError::Io(match io_err.raw_os_error() {
                         Some(errno) => io::Error::from_raw_os_error(errno),
-                        None => io::Error::new(io_err.kind(), format!("boring TLS handshake: {e}")),
+                        None => io::Error::new(io_err.kind(), format!("TLS handshake: {e}")),
                     }),
-                    None => TransportError::Tls(format!("boring TLS handshake: {e}")),
+                    None => TransportError::Tls(format!("TLS handshake: {e}")),
                 }
             }
         }
@@ -398,7 +517,10 @@ impl Transport for TlsLayer {
         match &self.backend {
             #[cfg(feature = "reality")]
             TlsBackend::Reality(r) => r.connect(inner).await,
+            #[cfg(boring)]
             TlsBackend::Boring(lazy) => lazy.connect(inner).await,
+            #[cfg(not(boring))]
+            TlsBackend::Rustls(r) => r.connect(inner).await,
         }
     }
 }

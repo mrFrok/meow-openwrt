@@ -300,6 +300,9 @@ async fn v3_relay_server(mut tcp: TcpStream, conn: &mut ServerConnection, passwo
     // offer ML-KEM, which keeps the v2 `!ch_offers_group` assertion
     // meaningful (it would also pass vacuously if the default stopped
     // offering it).
+    // (BoringSSL only: the rustls backend of big-endian builds has no
+    // ML-KEM group.)
+    #[cfg(boring)]
     assert!(
         ch_offers_group(&ch, GROUP_X25519_MLKEM768),
         "unpinned v3 ClientHello should offer X25519MLKEM768 by default"
