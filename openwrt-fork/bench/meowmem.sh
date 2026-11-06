@@ -5,7 +5,7 @@
 # redir off; provider dirs are symlinked, so the same rule-sets and proxies load.
 # Each binary runs in turn: SECS idle, then N parallel downloads through
 # mixed-port (if curl and URL are given). Prints RssAnon/RssFile in KB.
-# Usage: sh meowmem.sh <config-dir> <bin>... ; env: SECS=60 N=20 URL= ENVS=
+# Usage: sh meowmem.sh <config-dir> <bin>... ; env: SECS=60 N=20 URL= RATE=1M ENVS=
 # ENVS (e.g. "MIMALLOC_PURGE_DELAY=0") is applied to every binary.
 LC_ALL=C; export LC_ALL
 DIR=${1:?config dir}; shift
@@ -37,7 +37,7 @@ for bin in "$@"; do
 	idle=$(kb $pid RssAnon); lpeak=-; lend=-
 	if [ -n "$URL" ] && command -v curl >/dev/null && [ -n "$idle" ]; then
 		j=0; cp=""; while [ $j -lt "$N" ]; do
-			curl -s -o /dev/null -m 30 --limit-rate 1M -x http://127.0.0.1:17890 "$URL" & cp="$cp $!"; j=$((j+1))
+			curl -s -o /dev/null -m 30 --limit-rate ${RATE:-1M} -x http://127.0.0.1:17890 "$URL" & cp="$cp $!"; j=$((j+1))
 		done
 		lpeak=0; k=0
 		while [ $k -lt 30 ]; do sleep 1; k=$((k+1))

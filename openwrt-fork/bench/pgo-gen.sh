@@ -7,6 +7,7 @@
 #   PGO_USE=<merged .profdata>: build the optimised binary instead (same rustc,
 #   so the profile always matches; merge with rustup 1.96's llvm-tools
 #   llvm-profdata). PGO_USE=none: the plain baseline, same flags.
+#   FEATURES=<extra cargo features>, e.g. mimalloc.
 set -e
 : "${SDK:?set SDK=<openwrt sdk dir>}"
 cd "$(dirname "$0")/../.."
@@ -42,4 +43,4 @@ none) PGO_FLAG= ;;
 *) PGO_FLAG=-Cprofile-use=$PGO_USE ;;
 esac
 export RUSTFLAGS="-lssp_nonshared -Clink-arg=-fuse-ld=bfd -Ctarget-feature=+crt-static -Cforce-unwind-tables=no -Lnative=$SDK/staging_dir/toolchain-aarch64_cortex-a53_gcc-14.4.0_musl/lib -Zlocation-detail=none $PGO_FLAG"
-cargo +1.96.0 build --release -p meow-app --bin meow --no-default-features --features tiny --target aarch64-unknown-linux-musl --target-dir ${TGT:-/tmp/meow-pgo-target}
+cargo +1.96.0 build --release -p meow-app --bin meow --no-default-features --features tiny${FEATURES:+,$FEATURES} --target aarch64-unknown-linux-musl --target-dir ${TGT:-/tmp/meow-pgo-target}
