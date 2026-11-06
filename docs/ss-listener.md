@@ -148,7 +148,7 @@ Idle flows are evicted after 60 s
 (`meow_tunnel::udp::DEFAULT_UDP_IDLE`, the same constant SOCKS5-UDP uses;
 the per-listener `udp-timeout` knob only applies to TProxy UDP and TUN
 listeners, not SS). The flow table is capped at the listener's
-`max-connections` value (default 256; `0` disables both the TCP and UDP
+`max-connections` value (default by RAM: 256 on a 64 MB device, up to 16384; `0` disables both the TCP and UDP
 caps): each flow holds a 64 KiB reply buffer, a task, and an outbound
 socket, so without a cap any password holder could exhaust memory/FDs
 between idle sweeps. Datagrams for existing flows always pass; only *new*

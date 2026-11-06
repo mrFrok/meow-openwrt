@@ -378,7 +378,7 @@ impl Default for TunConfig {
             outbound_interface: None,
             dns_hijack: true,
             udp_timeout: std::time::Duration::from_secs(60),
-            max_connections: 256,
+            max_connections: default_max_connections(),
             stack: TunStack::Lwip,
         }
     }
@@ -415,6 +415,25 @@ pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net 
 
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
+/// Default for `max-connections` when the config leaves it out
+/// (meow-openwrt): one slot per 32 KiB of an eighth of MemTotal, between
+/// 256 and 16384 — 256 on a 64 MB router, 512 on 128 MB, 1024 on 256 MB,
+/// 4096 on 1 GB. A flow costs ~13 KiB idle and ~45 KiB streaming, so the
+/// cap bounds connection memory to roughly an eighth of RAM, while a
+/// household gateway on a bigger device does not queue new connections
+/// behind 256 long-lived ones. 256 where MemTotal is unknown.
+pub fn default_max_connections() -> usize {
+    auto_max_connections(meow_common::sysmem::mem_total())
+}
+
+fn auto_max_connections(mem_total: Option<u64>) -> usize {
+    mem_total.map_or(256, |m| {
+        usize::try_from(m / 8 / (32 * 1024))
+            .unwrap_or(usize::MAX)
+            .clamp(256, 16_384)
+    })
+}
+
 /// `dns.fake-ip-range`, which sets the default `inet4-address`.
 pub fn parse_tun_config(
     raw: Option<&raw::RawTun>,
@@ -426,7 +445,7 @@ pub fn parse_tun_config(
         // absent section still inherits `max-connections`, so callers
         // diffing parsed configs see the same value either way.
         return Ok(TunConfig {
-            max_connections: global_max_connections.unwrap_or(256),
+            max_connections: global_max_connections.unwrap_or_else(default_max_connections),
             inet4_address: default_tun_inet4_address(fake_ip_range),
             ..TunConfig::default()
         });
@@ -4599,7 +4618,7 @@ fn build_named_listeners(
     let mut result: Vec<NamedListener> = Vec::new();
     let mut used_ports: HashMap<u16, String> = HashMap::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let global_max_conns = raw.max_connections.unwrap_or(256);
+    let global_max_conns = raw.max_connections.unwrap_or_else(default_max_connections);
 
     let mut add = |name: &str,
                    spec: ListenerSpec,
@@ -9731,5 +9750,22 @@ mod default_geo_path_tests {
             existing_or_first(dir.path(), ASN),
             dir.path().join("GeoLite2-ASN.mmdb")
         );
+    }
+}
+
+#[cfg(test)]
+mod max_connections_default_tests {
+    use super::auto_max_connections;
+
+    #[test]
+    fn scales_with_memory_within_bounds() {
+        let mib = |m: u64| Some(m << 20);
+        assert_eq!(auto_max_connections(None), 256);
+        assert_eq!(auto_max_connections(mib(32)), 256, "floor");
+        assert_eq!(auto_max_connections(mib(64)), 256);
+        assert_eq!(auto_max_connections(mib(128)), 512);
+        assert_eq!(auto_max_connections(mib(256)), 1024);
+        assert_eq!(auto_max_connections(mib(1024)), 4096);
+        assert_eq!(auto_max_connections(mib(64 << 10)), 16_384, "ceiling");
     }
 }

@@ -54,7 +54,8 @@ async fn t1_no_tun_block_yields_default_disabled() {
     assert!(cfg.tun.auto_route, "auto-route defaults on");
     assert!(cfg.tun.dns_hijack, "dns-hijack defaults on");
     assert_eq!(
-        cfg.tun.max_connections, 256,
+        cfg.tun.max_connections,
+        meow_config::default_max_connections(),
         "TUN inherits the global max-connections default"
     );
 }
