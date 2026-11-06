@@ -112,6 +112,52 @@ pub fn build_rule_set(
     }
 }
 
+/// [`build_rule_set`] / [`build_rule_set_checked`] over borrowed entries
+/// streamed from the payload (text lines, YAML strings), so a load never
+/// holds an owned `String` per entry next to the set being built.
+pub fn build_rule_set_streamed<'e>(
+    behavior: RuleSetBehavior,
+    entries: impl Iterator<Item = &'e str>,
+    ctx: &ParserContext,
+    strict: bool,
+) -> Result<Box<dyn RuleSet>, String> {
+    match behavior {
+        RuleSetBehavior::Domain => {
+            let mut builder = DomainRuleSetBuilder::new();
+            for entry in entries {
+                if strict {
+                    builder.push_checked(entry)?;
+                } else {
+                    builder.push(entry);
+                }
+            }
+            Ok(Box::new(builder.build()))
+        }
+        RuleSetBehavior::IpCidr => {
+            let mut builder = IpCidrRuleSetBuilder::new();
+            for entry in entries {
+                if strict {
+                    builder.push_checked(entry)?;
+                } else {
+                    builder.push(entry);
+                }
+            }
+            Ok(Box::new(builder.build()))
+        }
+        RuleSetBehavior::Classical => {
+            let mut builder = ClassicalRuleSetBuilder::new(ctx);
+            for entry in entries {
+                if strict {
+                    builder.push_checked(entry)?;
+                } else {
+                    builder.push(entry);
+                }
+            }
+            Ok(Box::new(builder.build()))
+        }
+    }
+}
+
 /// Checked variant of [`build_rule_set`] (issue #533 `strict: true`): the
 /// first malformed entry is returned as an error instead of being
 /// warn-skipped, so a provider payload with corrupt lines fails the load

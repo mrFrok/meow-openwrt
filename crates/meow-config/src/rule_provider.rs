@@ -1631,20 +1631,26 @@ fn parse_bytes_to_ruleset_with_format(
     }
     let text = std::str::from_utf8(bytes).context("payload is not valid UTF-8")?;
     let format = explicit_format.unwrap_or(RuleSetFormat::Yaml);
-    let entries = match format {
-        RuleSetFormat::Yaml => parse_yaml_payload(text, strict)?,
-        RuleSetFormat::Text => parse_text_payload(text),
+    // Entries stream from the payload into the set builder: no per-entry
+    // `String` list (for 80k domains that list and its growth copies were
+    // ~5 MiB of the load peak).
+    let built = match format {
+        RuleSetFormat::Yaml => {
+            let root = parse_yaml_root(text)?;
+            let payload = yaml_payload(&root, strict)?;
+            meow_rules::build_rule_set_streamed(behavior, yaml_entries(payload), ctx, strict)
+        }
+        RuleSetFormat::Text => {
+            meow_rules::build_rule_set_streamed(behavior, text_entries(text), ctx, strict)
+        }
         RuleSetFormat::Mrs => unreachable!("handled above"),
     };
-    if strict {
-        return build_rule_set_checked(behavior, &entries, ctx)
-            .map(|rules| (rules, format))
-            .map_err(|e| anyhow!("rule-set entry error: {e}"));
-    }
-    Ok((build_rule_set(behavior, &entries, ctx), format))
+    built
+        .map(|rules| (rules, format))
+        .map_err(|e| anyhow!("rule-set entry error: {e}"))
 }
 
-fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
+fn parse_yaml_root(raw: &str) -> Result<serde_json::Value> {
     if !crate::yaml_within_depth(raw) {
         return Err(anyhow!("rule-set yaml exceeds the nesting-depth limit"));
     }
@@ -1653,34 +1659,38 @@ fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
     // untrusted remote input rejects the entire ruleset rather than
     // slipping part of it through (`reject_unsupported_tags` in the
     // shared ingest options backs this at the parser level).
-    let root: serde_json::Value =
-        crate::parse_yaml_value(raw).context("rule-set yaml parse error")?;
+    crate::parse_yaml_value(raw).context("rule-set yaml parse error")
+}
+
+/// The `payload` sequence; strict rejects a non-string item up front, so the
+/// streamed build never sees a malformed payload half-applied.
+fn yaml_payload(root: &serde_json::Value, strict: bool) -> Result<&[serde_json::Value]> {
     let payload = root
         .get("payload")
         .ok_or_else(|| anyhow!("rule-set yaml missing 'payload' key"))?
         .as_array()
         .ok_or_else(|| anyhow!("rule-set 'payload' is not a sequence"))?;
-    let mut entries = Vec::with_capacity(payload.len());
-    for (i, v) in payload.iter().enumerate() {
-        match v.as_str() {
-            Some(s) if !s.trim().is_empty() => entries.push(s.trim().to_string()),
-            // Non-string items are silently dropped leniently (mihomo
-            // parity); strict treats them as a malformed payload.
-            None if strict => {
-                return Err(anyhow!("rule-set 'payload' item {i} is not a string"));
-            }
-            _ => {}
+    if strict {
+        if let Some(i) = payload.iter().position(|v| !v.is_string()) {
+            return Err(anyhow!("rule-set 'payload' item {i} is not a string"));
         }
     }
-    Ok(entries)
+    Ok(payload)
 }
 
-fn parse_text_payload(raw: &str) -> Vec<String> {
+/// Non-empty string items, trimmed; non-strings are dropped (mihomo parity).
+fn yaml_entries(payload: &[serde_json::Value]) -> impl Iterator<Item = &str> {
+    payload
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn text_entries(raw: &str) -> impl Iterator<Item = &str> {
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(std::string::ToString::to_string)
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
