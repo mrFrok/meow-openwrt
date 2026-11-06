@@ -206,11 +206,17 @@ impl<'a> ConnectionGuard<'a> {
     /// including an API deletion or a cold routing reload.
     /// Dropping the future releases its remote stream; callers then return to
     /// the listener so the owned inbound stream is dropped as well.
-    pub async fn run_until_closed<F: std::future::Future>(&self, future: F) -> Option<F::Output> {
-        tokio::select! {
-            biased;
-            () = self.counters.closed() => None,
-            output = future => Some(output),
+    ///
+    /// A plain `fn` returning [`UntilClosed`], not `async fn`: an `async fn`
+    /// keeps `future` in its state machine's prefix next to the copy it
+    /// polls, doubling the frame of every connection task it wraps.
+    pub fn run_until_closed<'s, F: std::future::Future + 's>(
+        &'s self,
+        future: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> + 's {
+        UntilClosed {
+            closed: self.counters.closed(),
+            future,
         }
     }
 
@@ -227,6 +233,34 @@ impl<'a> ConnectionGuard<'a> {
     /// into relay progress callbacks so the hot loop never touches the map.
     pub fn counters(&self) -> &Arc<crate::statistics::ConnCounters> {
         &self.counters
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// [`ConnectionGuard::run_until_closed`]: polls the close signal first
+    /// (biased), then `future`, each stored once and pinned in place.
+    struct UntilClosed<C, F> {
+        #[pin]
+        closed: C,
+        #[pin]
+        future: F,
+    }
+}
+
+impl<C: std::future::Future<Output = ()>, F: std::future::Future> std::future::Future
+    for UntilClosed<C, F>
+{
+    type Output = Option<F::Output>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        if this.closed.poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        this.future.poll(cx).map(Some)
     }
 }
 
@@ -1212,8 +1246,8 @@ mod tests {
             }
         });
         for line in [
-            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using Proxy[DIRECT]",
-            "dogs.invalid:443 match MATCH(Auto) using Auto[DIRECT]",
+            "cats.invalid:443 match DomainSuffix(cats.invalid) using Proxy[DIRECT]",
+            "dogs.invalid:443 match Match(Auto) using Auto[DIRECT]",
         ] {
             assert!(logs.contains(line), "no {line:?} in:\n{logs}");
         }

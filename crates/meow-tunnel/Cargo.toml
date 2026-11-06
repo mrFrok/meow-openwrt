@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+pin-project-lite = { workspace = true }
 meow-common = { workspace = true }
 meow-dns = { workspace = true, default-features = false }
 meow-rules = { workspace = true }

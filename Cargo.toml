@@ -226,6 +226,7 @@ socket2 = { version = "0.5", features = ["all"] }
 # Futures
 futures = "0.3"
 futures-util = "0.3"
+pin-project-lite = "0.2"
 
 # Multiplexing (sing-mux yamux protocol; libp2p yamux is wire-compatible
 # with hashicorp/go-yamux used by sing-mux)

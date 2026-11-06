@@ -21,6 +21,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use futures_util::future::Either;
 use parking_lot::Mutex;
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
@@ -137,10 +138,14 @@ impl ConnNotes {
 
     /// Run `fut` with `notes` as the current connection's notes. `None` runs
     /// it unchanged, so a disabled connection pays nothing per poll.
-    pub async fn scope<F: Future>(notes: Option<Self>, fut: F) -> F::Output {
+    ///
+    /// A plain `fn`, not `async fn`: an `async fn` keeps its `fut` argument
+    /// in the state machine's prefix next to the awaited copy, doubling the
+    /// size of every connection task it wraps (~11 KiB per TCP flow).
+    pub fn scope<F: Future>(notes: Option<Self>, fut: F) -> impl Future<Output = F::Output> {
         match notes {
-            Some(notes) => CURRENT.scope(notes, fut).await,
-            None => fut.await,
+            Some(notes) => Either::Left(CURRENT.scope(notes, fut)),
+            None => Either::Right(fut),
         }
     }
 }
