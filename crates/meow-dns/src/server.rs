@@ -5,7 +5,8 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
@@ -92,13 +93,30 @@ impl DnsServer {
     /// with the old `run()`-binds-internally shape, a caller that spawned
     /// `run()` fire-and-forget had no way to distinguish "listening" from
     /// "bind failed, every query will be dropped".
+    ///
+    /// DNS over TCP (RFC 7766) is served on the same address as UDP, as
+    /// mihomo does: clients and forwarders (dnsmasq relays a TCP query to
+    /// its upstream over TCP) that pick TCP otherwise get REFUSED for every
+    /// name. UDP is the contract — a TCP bind failure is logged and the
+    /// server runs UDP-only rather than failing startup.
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
         let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
         let bound = socket.local_addr().unwrap_or(self.listen_addr);
-        info!("DNS server listening on {bound}");
+        let tcp = match TcpListener::bind(bound).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                warn!("DNS server: TCP bind on {bound} failed, serving UDP only: {e}");
+                None
+            }
+        };
+        info!(
+            "DNS server listening on {bound} ({})",
+            if tcp.is_some() { "udp+tcp" } else { "udp" }
+        );
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,
+            tcp,
             dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         })
     }
@@ -887,6 +905,9 @@ impl DnsServer {
 pub struct BoundDnsServer {
     resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
+    /// DNS-over-TCP listener on the same address; `None` for wrapped
+    /// external sockets and when the TCP bind failed.
+    tcp: Option<TcpListener>,
     /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
     /// already running. Exposed for stats/observability (issue #515).
     dropped: Arc<meow_common::atomic::AtomicU>,
@@ -907,6 +928,7 @@ impl BoundDnsServer {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         }
     }
@@ -917,6 +939,7 @@ impl BoundDnsServer {
         Self {
             resolver,
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
         }
     }
@@ -970,11 +993,33 @@ impl BoundDnsServer {
         let BoundDnsServer {
             resolver,
             socket,
+            tcp,
             dropped,
         } = self;
 
         let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
+        // The TCP accept loop runs inside this future (not a detached task),
+        // so aborting the serve task closes both listeners and — through the
+        // JoinSet it owns — every open TCP connection.
+        let tcp_loop = async {
+            match tcp {
+                Some(listener) => serve_tcp(listener, &resolver, &in_flight).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            r = Self::serve_udp(&resolver, socket, &dropped, &in_flight) => r,
+            () = tcp_loop => unreachable!("TCP accept loop never returns"),
+        }
+    }
+
+    async fn serve_udp(
+        resolver: &ResolverSlot,
+        socket: Arc<UdpSocket>,
+        dropped: &meow_common::atomic::AtomicU,
+        in_flight: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut buf = vec![0u8; 4096];
         // A persistent recv failure must not spin the loop or flood the log;
         // a transient one must not be delayed meaningfully.
@@ -1029,7 +1074,7 @@ impl BoundDnsServer {
 
             // Acquire the permit BEFORE copying the payload: under
             // saturation a dropped query must not pay the alloc either.
-            let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(in_flight).try_acquire_owned() else {
                 let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 // Power-of-two warn cadence: first drop is loud, sustained
                 // saturation stays bounded in the log.
@@ -1042,7 +1087,7 @@ impl BoundDnsServer {
             };
 
             let data = buf[..len].to_vec();
-            let resolver_slot = Arc::clone(&resolver);
+            let resolver_slot = Arc::clone(resolver);
             let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
             tokio::spawn(async move {
                 let _permit = permit;
@@ -1076,6 +1121,133 @@ impl BoundDnsServer {
                 }
             });
         }
+    }
+}
+
+/// Concurrent DNS-over-TCP connections; further accepts are closed at once.
+#[cfg(not(test))]
+const MAX_TCP_CONNS: usize = 64;
+#[cfg(test)]
+const MAX_TCP_CONNS: usize = 4;
+
+/// Idle bound on a DNS-over-TCP connection: the wait for the next query and
+/// for the rest of a started one (RFC 7766 §6.2.3 — servers may close idle
+/// connections after a few seconds).
+const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Accept DNS-over-TCP connections forever. Connection tasks live in a
+/// `JoinSet` owned by this future, so dropping it closes them all.
+async fn serve_tcp(
+    listener: TcpListener,
+    resolver: &ResolverSlot,
+    in_flight: &Arc<tokio::sync::Semaphore>,
+) {
+    let conns = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut accept_backoff = meow_common::ErrorBackoff::new();
+    loop {
+        tokio::select! {
+            // Reap finished connections so the set doesn't grow unbounded.
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(v) => {
+                        accept_backoff.succeeded();
+                        v
+                    }
+                    Err(e) => {
+                        if accept_backoff.failed(&e).await {
+                            error!("DNS TCP accept error: {e}");
+                        } else {
+                            debug!("DNS TCP accept error: {e}");
+                        }
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&conns).try_acquire_owned() else {
+                    debug!("DNS TCP: {MAX_TCP_CONNS} connections open, closing {peer}");
+                    continue;
+                };
+                let resolver = Arc::clone(resolver);
+                let in_flight = Arc::clone(in_flight);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = serve_tcp_conn(stream, &resolver, &in_flight).await {
+                        debug!("DNS TCP connection {peer}: {e}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Serve length-prefixed queries on one connection, in order, until the
+/// client closes it or it idles out.
+async fn serve_tcp_conn(
+    mut stream: TcpStream,
+    resolver: &ResolverSlot,
+    in_flight: &tokio::sync::Semaphore,
+) -> std::io::Result<()> {
+    let _ = stream.set_nodelay(true);
+    let mut buf = Vec::new();
+    loop {
+        let mut len = [0u8; 2];
+        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut len)).await {
+            Ok(Ok(_)) => {}
+            // Clean close between queries, or idle timeout.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        }
+        let len = usize::from(u16::from_be_bytes(len));
+        buf.resize(len, 0);
+        tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut buf))
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+
+        let local = {
+            let resolver_guard = resolver.read();
+            DnsServer::try_answer_local(&buf, &resolver_guard)
+        };
+        let response = match local {
+            LocalAnswer::Answer(r) => r,
+            // Same as UDP: an unanswerable query gets no reply. Over TCP
+            // that leaves the client waiting, so close instead.
+            LocalAnswer::Drop => return Ok(()),
+            LocalAnswer::Upstream => {
+                // Share the UDP in-flight budget; waiting (rather than
+                // dropping) is fine here — the connection itself is bounded.
+                let Ok(_permit) = in_flight.acquire().await else {
+                    return Ok(());
+                };
+                let resolver = Arc::clone(&resolver.read());
+                match AssertUnwindSafe(DnsServer::handle_query(&buf, &resolver))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        debug!("DNS query handling error: {e}");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        error!("DNS query task survived a panic");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let Ok(rlen) = u16::try_from(response.len()) else {
+            warn!(
+                "DNS TCP: {}-byte response exceeds 65535, closing",
+                response.len()
+            );
+            return Ok(());
+        };
+        let mut out = Vec::with_capacity(2 + response.len());
+        out.extend_from_slice(&rlen.to_be_bytes());
+        out.extend_from_slice(&response);
+        stream.write_all(&out).await?;
     }
 }
 
@@ -2793,6 +2965,102 @@ mod tests {
         let resp = answered(DnsServer::try_answer_local(&q, &resolver));
         assert_eq!(&resp[0..2], &[0x12, 0x34], "ID echoed");
         assert_eq!(&resp[resp.len() - 4..], &[10, 0, 0, 7], "hosts A record");
+    }
+
+    async fn tcp_exchange(stream: &mut tokio::net::TcpStream, query: &[u8]) -> Vec<u8> {
+        let mut framed = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(query);
+        stream.write_all(&framed).await.unwrap();
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut resp = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        stream.read_exact(&mut resp).await.unwrap();
+        resp
+    }
+
+    /// DNS over TCP on the UDP listen address (dnsmasq relays TCP queries
+    /// to its upstream over TCP): local answers, several queries on one
+    /// connection.
+    #[tokio::test]
+    async fn tcp_serves_local_answers_on_one_connection() {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "myhost.test",
+            crate::resolver::HostEntry::Addresses(vec![std::net::IpAddr::V4(Ipv4Addr::new(
+                10, 0, 0, 7,
+            ))]),
+        );
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec!["192.0.2.1:53".parse().unwrap()],
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        ));
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for id in [0x1111u16, 0x2222] {
+            let resp = tcp_exchange(&mut stream, &query_named(id, "myhost.test", 1)).await;
+            assert_eq!(&resp[0..2], &id.to_be_bytes(), "ID echoed");
+            assert_eq!(&resp[resp.len() - 4..], &[10, 0, 0, 7], "hosts A record");
+        }
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_forwards_upstream_queries() {
+        use hickory_proto::rr::rdata::TXT;
+        let answer = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            123,
+            RData::TXT(TXT::new(vec!["via tcp".to_string()])),
+        );
+        let resolver = Arc::new(
+            resolver_with_upstream_response(ResponseCode::NoError, Some(answer.clone())).await,
+        );
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let resp = tcp_exchange(&mut stream, &sample_query(9, u16::from(RecordType::TXT))).await;
+        let resp = Message::from_vec(&resp).unwrap();
+        assert_eq!(resp.metadata.id, 9);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers, vec![answer]);
+        serve.abort();
+    }
+
+    /// Aborting the serve task frees the TCP port too, with a connection
+    /// still open.
+    #[tokio::test]
+    async fn tcp_port_released_on_abort_with_open_connection() {
+        let bound = DnsServer::new(Arc::new(empty_resolver()), "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+        let _conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        serve.abort();
+        let _ = serve.await;
+        let rebind = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            rebind.is_ok(),
+            "TCP port must be released at abort: {:?}",
+            rebind.err()
+        );
     }
 
     #[test]
