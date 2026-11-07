@@ -31,6 +31,17 @@ use base64::Engine;
 use meow_config::ech_dns::preresolve_ech;
 #[cfg(feature = "vless")]
 use meow_config::load_config_from_str;
+
+/// Whether `name` parsed into a real node. meow-openwrt binds a named node
+/// that fails to parse to a dead placeholder (no address) rather than
+/// dropping it, so presence alone no longer means "accepted".
+fn parsed(config: &meow_config::Config, name: &str) -> bool {
+    config
+        .proxies
+        .get(name)
+        .is_some_and(|p| !p.addr().is_empty())
+}
+
 use serde_json::Value;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -212,7 +223,7 @@ proxies:
     // built-in proxies (DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS,
     // PASS-RULE).
     assert!(
-        !cfg.proxies.contains_key("bad-ech"),
+        !parsed(&cfg, "bad-ech"),
         "proxy with invalid ECH base64 must NOT register; got: {:?}",
         cfg.proxies.keys().collect::<Vec<_>>()
     );

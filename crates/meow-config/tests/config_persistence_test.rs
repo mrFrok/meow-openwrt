@@ -396,9 +396,11 @@ fn rebuild_from_raw_skips_invalid_proxy() {
         serde_json::Value::String("unknown_protocol".into()),
     );
     raw.proxies = Some(vec![bad_proxy]);
-    // Should not fail, just skip
+    // Should not fail. meow-openwrt keeps the name bound to a dead
+    // placeholder (mihomo's Compatible type) so references to it resolve.
     let proxies = rebuild_from_raw(&raw).unwrap().proxies;
-    assert!(!proxies.contains_key("bad"));
+    let bad = proxies.get("bad").expect("placeholder");
+    assert_eq!(bad.adapter_type(), meow_common::AdapterType::Compatible);
 }
 
 // ── RawConfig serialization tests ────────────────────────────────

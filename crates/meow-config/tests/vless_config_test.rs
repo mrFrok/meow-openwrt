@@ -30,6 +30,17 @@
 use std::sync::{Arc, Mutex};
 
 use meow_config::load_config_from_str;
+
+/// Whether `name` parsed into a real node. meow-openwrt binds a named node
+/// that fails to parse to a dead placeholder (no address) rather than
+/// dropping it, so presence alone no longer means "accepted".
+fn parsed(config: &meow_config::Config, name: &str) -> bool {
+    config
+        .proxies
+        .get(name)
+        .is_some_and(|p| !p.addr().is_empty())
+}
+
 use tracing_subscriber::fmt::MakeWriter;
 
 // ─── Warn-capture helper ─────────────────────────────────────────────────────
@@ -245,7 +256,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with unknown flow must be skipped (not registered)"
     );
 }
@@ -272,7 +283,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with xtls-rprx-direct flow must be skipped (deprecated — Class A)"
     );
 }
@@ -299,7 +310,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with xtls-rprx-splice flow must be skipped (deprecated — Class A)"
     );
 }
@@ -327,7 +338,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with reality-opts but no client-fingerprint must be skipped"
     );
 }
@@ -349,7 +360,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with reality-opts but tls=false must be skipped"
     );
 }
@@ -372,7 +383,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with invalid REALITY public key must be skipped"
     );
 }
@@ -396,7 +407,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with >8-byte REALITY short-id must be skipped"
     );
 }
@@ -564,7 +575,7 @@ proxies:
     let (result, _lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
     let config = result.expect("config loads: the bad node is dropped, not fatal");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "unquoted `short-id: 0012` resolves as the float 12.0 and the node is \
          rejected as `must be a hex string`"
     );
@@ -690,7 +701,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with vision + no TLS must be skipped (Vision without TLS is a no-op — Class A)"
     );
 }
@@ -716,7 +727,7 @@ proxies:
     let (result, lines) = with_warn_capture_async(load_config_from_str(&yaml)).await;
     let config = result.expect("invalid proxy must not fail the whole config");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "vision over {network} must be skipped"
     );
     assert!(
@@ -801,7 +812,7 @@ proxies:
     assert!(config.proxies.contains_key("enc-ws"));
     assert!(config.proxies.contains_key("enc-grpc"));
     assert!(
-        !config.proxies.contains_key("enc-plain"),
+        !parsed(&config, "enc-plain"),
         "vision + encryption over plain tcp stays rejected"
     );
 }
@@ -827,7 +838,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with non-none encryption must be skipped"
     );
 }
@@ -890,7 +901,7 @@ proxies:
     );
     #[cfg(not(feature = "vless-encryption"))]
     assert!(
-        !config.proxies.contains_key("vpn26"),
+        !parsed(&config, "vpn26"),
         "mlkem768x25519plus encryption must be skipped without the vless-encryption feature"
     );
 }
@@ -975,7 +986,7 @@ proxies:
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
     let config = result.expect("unknown mux protocol must not fail the whole config");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with unknown mux protocol must be skipped"
     );
     let warns = lines
@@ -1075,7 +1086,7 @@ proxies:
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
     let config = result.expect("invalid proxy must not fail the whole config");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "vision + sing-mux (h2mux default) node must be skipped"
     );
     assert!(
@@ -1105,7 +1116,7 @@ proxies:
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
     let config = result.expect("invalid proxy must not fail the whole config");
     assert!(
-        !config.proxies.contains_key("t"),
+        !parsed(&config, "t"),
         "trojan node with muxcool must be skipped"
     );
     assert!(
@@ -1186,7 +1197,7 @@ proxies:
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
     let config = result.expect("invalid proxy must not fail the whole config");
     assert!(
-        !config.proxies.contains_key("s"),
+        !parsed(&config, "s"),
         "ss node with muxcool must be skipped"
     );
     assert!(
@@ -1236,7 +1247,7 @@ async fn parse_vmess_mux_protocol_table() {
         match result {
             Err(e) => failures.push(format!("{label}: config must load, got error: {e}")),
             Ok(config) => {
-                if !config.proxies.contains_key("m") {
+                if !parsed(&config, "m") {
                     failures.push(format!("{label}: vmess proxy must be kept; {lines:?}"));
                 }
                 let mux_warns = lines
@@ -1406,7 +1417,7 @@ proxies:
         "smux + padding must load; {lines:?}"
     );
     assert!(
-        !config.proxies.contains_key("padded-muxcool"),
+        !parsed(&config, "padded-muxcool"),
         "muxcool + padding node must be skipped"
     );
     assert!(
@@ -1541,7 +1552,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with invalid uuid must be skipped"
     );
 }
@@ -1571,7 +1582,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("v"),
+        !parsed(&config, "v"),
         "proxy with server > 255 bytes must be skipped (Class A)"
     );
 }
@@ -1635,7 +1646,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-mode"),
+        !parsed(&config, "vless-xhttp-bad-mode"),
         "proxy with unsupported xhttp mode must be skipped"
     );
 }
@@ -1658,7 +1669,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-pad"),
+        !parsed(&config, "vless-xhttp-bad-pad"),
         "proxy with inverted padding range must be skipped"
     );
 }
@@ -1681,7 +1692,7 @@ proxies:
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
-        !config.proxies.contains_key("vless-xhttp-bad-pad-shape"),
+        !parsed(&config, "vless-xhttp-bad-pad-shape"),
         "proxy with invalid padding shape must be skipped"
     );
 }

@@ -250,6 +250,41 @@ pub(crate) fn placeholder_adapter_type(
     }
 }
 
+/// meow-openwrt: the placeholder type for any other named `proxies:` node that
+/// fails to parse — a protocol meow lacks (tuic, ssr, mieru, …), one this
+/// profile leaves out, or a bad field. Dropping it left `dialer-proxy` /
+/// `relay` / rule references dangling, and one such node stopped the core at
+/// boot (OpenClash's default.yaml: "dialer-proxy 'gost-relay-hop' not
+/// found"); mihomo has the node, here it is present and dead. Static
+/// `proxies:` only: provider payloads keep dropping bad nodes.
+pub(crate) fn static_placeholder_type(
+    config: &HashMap<String, serde_json::Value>,
+) -> Option<AdapterType> {
+    let named = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .is_some_and(|n| !n.is_empty());
+    named.then(|| declared_adapter_type(config.get("type").and_then(|v| v.as_str()).unwrap_or("")))
+}
+
+/// The registry type a placeholder shows for a node's `type:`; protocols meow
+/// has no adapter type for read as mihomo's `Compatible`.
+fn declared_adapter_type(kind: &str) -> AdapterType {
+    match kind {
+        "ss" => AdapterType::Shadowsocks,
+        "vmess" => AdapterType::Vmess,
+        "vless" => AdapterType::Vless,
+        "trojan" => AdapterType::Trojan,
+        "hysteria2" => AdapterType::Hysteria2,
+        "wireguard" => AdapterType::WireGuard,
+        "socks5" => AdapterType::Socks5,
+        "http" => AdapterType::Http,
+        "snell" => AdapterType::Snell,
+        "anytls" => AdapterType::Anytls,
+        _ => AdapterType::Compatible,
+    }
+}
+
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,

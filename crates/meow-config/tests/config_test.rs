@@ -1,5 +1,15 @@
 use meow_config::{load_config_from_str, ListenerSpec};
 
+/// Whether `name` parsed into a real node. meow-openwrt binds a named node
+/// that fails to parse to a dead placeholder (no address) rather than
+/// dropping it, so presence alone no longer means "accepted".
+fn parsed(config: &meow_config::Config, name: &str) -> bool {
+    config
+        .proxies
+        .get(name)
+        .is_some_and(|p| !p.addr().is_empty())
+}
+
 // Some tests use #[tokio::test] because ShadowsocksAdapter plugin startup
 // internally requires a tokio runtime (tokio::process::Command).
 
@@ -1289,7 +1299,7 @@ proxies:
 "#;
     // A string "true" must not be silently treated as disabled.
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("trojan-bad-mux"));
+    assert!(!parsed(&config, "trojan-bad-mux"));
 }
 
 #[tokio::test]
@@ -1304,7 +1314,7 @@ proxies:
     smux: true
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("trojan-scalar-mux"));
+    assert!(!parsed(&config, "trojan-scalar-mux"));
 }
 
 #[cfg(feature = "mux")]
@@ -1322,7 +1332,7 @@ proxies:
       protocol: h2mux
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(config.proxies.contains_key("trojan-mux-h2"));
+    assert!(parsed(&config, "trojan-mux-h2"));
 }
 
 #[tokio::test]
@@ -1335,7 +1345,7 @@ proxies:
     port: 443
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("wireguard-server"));
+    assert!(!parsed(&config, "wireguard-server"));
 }
 
 #[tokio::test]
@@ -1350,7 +1360,7 @@ proxies:
     cipher: auto
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(config.proxies.contains_key("vmess-test"));
+    assert!(parsed(&config, "vmess-test"));
 }
 
 #[tokio::test]
@@ -1366,7 +1376,7 @@ proxies:
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     assert!(
-        !config.proxies.contains_key("vmess-zero"),
+        !parsed(&config, "vmess-zero"),
         "cipher:zero must be rejected"
     );
 }
@@ -1586,7 +1596,7 @@ proxies:
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     // The proxy is skipped because the plugin binary doesn't exist
-    assert!(!config.proxies.contains_key("ss-missing-plugin"));
+    assert!(!parsed(&config, "ss-missing-plugin"));
 }
 
 #[tokio::test]
@@ -1606,7 +1616,7 @@ proxies:
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     // Skipped because plugin binary doesn't exist, but config parsing succeeds
-    assert!(!config.proxies.contains_key("ss-plugin-str"));
+    assert!(!parsed(&config, "ss-plugin-str"));
 }
 
 #[tokio::test]
@@ -1706,7 +1716,7 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
             case.name, case.server, case.plugin_block
         );
         let config = load_config_from_str(&yaml).await.unwrap();
-        let present = config.proxies.contains_key(case.name);
+        let present = parsed(&config, case.name);
         if present != case.expect_present {
             failures.push(format!(
                 "[{}] proxy `{}`: expected present={}, got present={}",
@@ -1791,7 +1801,7 @@ async fn test_proxy_parsing_ss_with_gost_plugin() {
             case.name, case.plugin_block
         );
         let config = load_config_from_str(&yaml).await.unwrap();
-        let present = config.proxies.contains_key(case.name);
+        let present = parsed(&config, case.name);
         if present != case.expect_present {
             failures.push(format!(
                 "[{}] proxy `{}`: expected present={}, got present={}",

@@ -2273,7 +2273,9 @@ fn insert_parsed_leaves(
                 // transport by editing the config, so `-t`, boot, `PUT /configs`
                 // and refreshes all read identically here.
                 Err(e) => {
-                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy)
+                        .or_else(|| proxy_parser::static_placeholder_type(raw_proxy))
+                    {
                         let name = raw_proxy
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -8546,7 +8548,9 @@ rules:
         let RebuildResult { proxies, rules, .. } =
             rebuild_from_raw(&raw).expect("lenient mode must tolerate bad entries");
         assert!(proxies.contains_key("ok"));
-        assert!(!proxies.contains_key("broken"));
+        // meow-openwrt: a named static node that fails stays as a dead
+        // placeholder (static_placeholder_type) instead of vanishing.
+        assert!(proxies.contains_key("broken"));
         assert!(proxies.contains_key("g-ok"));
         assert!(!proxies.contains_key("g-broken"));
         assert_eq!(rules.len(), 1);
