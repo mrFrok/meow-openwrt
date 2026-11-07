@@ -546,8 +546,35 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
     (
         "crates/meow-proxy/src/direct.rs",
         "Socket::new(",
+        2,
+        "routing-mark dial (applies meow_common::apply_outbound_interface_for_peer \
+         itself) and meow-openwrt's `interface-name` dial, which binds the device \
+         explicitly (SO_BINDTODEVICE) and sets the mark",
+    ),
+    // meow-openwrt: sockets that are not outbound proxy connections.
+    (
+        "crates/meow-common/src/nftset.rs",
+        "libc::socket(",
         1,
-        "routing-mark dial; applies meow_common::apply_outbound_interface_for_peer itself",
+        "NETLINK_NETFILTER socket for dns.nftset writes; never leaves the host",
+    ),
+    (
+        "crates/meow-proxy/src/wireguard/netlink.rs",
+        "libc::socket(",
+        1,
+        "rtnetlink/genetlink socket configuring the kernel WireGuard link",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v4(",
+        1,
+        "the tproxy listener's own listening socket (IP_TRANSPARENT), not a dial",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v6(",
+        1,
+        "the tproxy listener's own listening socket (IPV6_TRANSPARENT), not a dial",
     ),
     // Vendored anytls: its own protect helper and its server side.
     (
