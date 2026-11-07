@@ -13,6 +13,7 @@
 #          TGT       cargo target dir (default target/owrt-<arch>)
 #          OUT       where meow-<profile>-<arch> is copied (default dist)
 #          EXTRA_FEATURES  extra cargo features (experiments only)
+#          MEOW_PGO  0 = no profile-guided optimisation (lightweight/full)
 #          OPENWRT_MIRROR  SDK mirror bases, space-separated, tried in turn
 #                          (sha256 is checked either way)
 set -euo pipefail
@@ -125,6 +126,18 @@ FLAGS="$FLAGS -Lnative=$TC/lib -Clink-arg=-lssp_nonshared -Zlocation-detail=none
 case $ARCH in mips|mipsel) FLAGS="$FLAGS -Crelocation-model=static -Clink-arg=-lgcc" ;; esac
 # Size profiles drop panic messages (-Cpanic=immediate-abort); full keeps them.
 [ "$PROFILE" != full ] && FLAGS="$FLAGS -Zunstable-options -Cpanic=immediate-abort"
+# PGO: lightweight and full use the profile trained on a router of the arch
+# (openwrt-fork/pgo/README.md); tiny stays size-first. BPI-R4, 2026-11-08:
+# release builds: hy2 TCP +2-4 % down / +3-15 % up, CPU per Mbit -5..-10 %,
+# REALITY and DIRECT +1-2 %; +0.4-0.46 MB.
+# MEOW_PGO=0 builds without it.
+PGO_FILE=openwrt-fork/pgo/$ARCH.profdata.xz
+if [ "${MEOW_PGO:-1}" = 1 ] && [ "$PROFILE" != tiny ] && [ -f "$PGO_FILE" ]; then
+	mkdir -p "$TGT"
+	xz -dc "$PGO_FILE" > "$TGT/pgo.profdata"
+	FLAGS="$FLAGS -Cprofile-use=$PWD/$TGT/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch"
+	echo "PGO: $PGO_FILE"
+fi
 export RUSTFLAGS="$FLAGS"
 
 # restls and jls need BoringSSL, which big-endian targets do not build.
