@@ -207,7 +207,7 @@ impl<'a> ConnectionGuard<'a> {
     /// Dropping the future releases its remote stream; callers then return to
     /// the listener so the owned inbound stream is dropped as well.
     ///
-    /// A plain `fn` returning [`UntilClosed`], not `async fn`: an `async fn`
+    /// A plain `fn` returning `UntilClosed`, not `async fn`: an `async fn`
     /// keeps `future` in its state machine's prefix next to the copy it
     /// polls, doubling the frame of every connection task it wraps.
     pub fn run_until_closed<'s, F: std::future::Future + 's>(

@@ -8,7 +8,7 @@
 //!
 //! Routing: sockets bound to the link (`SO_BINDTODEVICE`) find a default
 //! route in the link's own table through an `oif` rule (priority
-//! [`RULE_PRIORITY`], ahead of the TUN rules at 9200). The link's encrypted
+//! `RULE_PRIORITY`, ahead of the TUN rules at 9200). The link's encrypted
 //! packets carry meow's routing mark (or [`WG_MARK`] with a rule back to
 //! the main table), so TUN / auto-redirect capture never takes them.
 //!

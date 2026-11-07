@@ -331,10 +331,7 @@ async fn a_config_file_names_the_controller_and_reloads() {
     let text = succeeds(bare_cli(&["--config", config, "reload"]), &["reload"]).await;
     assert_eq!(text, format!("reloaded {config}\n"));
     let rules = meow.run(&["rule", "list", "--filter", "example.org"]).await;
-    assert!(
-        rules.contains("DOMAIN-SUFFIX  example.org  Auto"),
-        "{rules}"
-    );
+    assert!(rules.contains("DomainSuffix  example.org  Auto"), "{rules}");
 
     // A config that does not parse is refused and the old one stays.
     let broken = meow.dir.path().join("broken.yaml");
@@ -379,10 +376,7 @@ async fn the_running_meow_is_found_without_options() {
     let text = succeeds(found(&["reload"]), &["reload"]).await;
     assert_eq!(text, format!("reloaded {}\n", config.display()));
     let rules = meow.run(&["rule", "list", "--filter", "example.org"]).await;
-    assert!(
-        rules.contains("DOMAIN-SUFFIX  example.org  Auto"),
-        "{rules}"
-    );
+    assert!(rules.contains("DomainSuffix  example.org  Auto"), "{rules}");
 
     // An address given by hand gets the secret meow published for it.
     let mut command = found(&["mode"]);
