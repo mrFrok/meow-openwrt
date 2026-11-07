@@ -1,0 +1,72 @@
+# meow-openwrt: lint and tests on every push and PR, no router builds
+# (those run on tags and by hand, see openwrt.yml). A subset of the
+# Regression Bar in CLAUDE.md: everything that needs no external peer
+# binary (sing-box, restls/jls/kcptun harnesses, v2ray-plugin, ssserver).
+name: tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "website/**", "openwrt-fork/research/**", "openwrt-fork/release-notes/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the version and adds rustfmt + clippy.
+      - name: Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          cache-on-failure: true
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (default, no-default, all features)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      - name: unit tests
+        run: cargo test --workspace --lib
+
+      - name: integration tests
+        run: |
+          cargo test --bin meow --bin meow-cli \
+            --test host_validation --test common_test --test dns_cache_test --test config_test \
+            --test tun_config_test --test sniffer_config_test --test dialer_proxy_group \
+            --test statistics_test --test rules_test --test api_test --test meow_cli_test \
+            --test raii_guard_test --test http_connection_close --test config_persistence_test \
+            --test trojan_integration --test vless_config_test --test vless_integration \
+            --test pre_resolve_test --test offline_config_test --test subscription_refresh_test \
+            --test tls_test --test boring_tls_test --test ws_test --test crate_invariants_test \
+            --test yaml_backend_test --test yaml_boundary_test
+          cargo test -p meow-api --test api_test
+          cargo test -p meow-dns --tests
+          cargo test -p meow-transport --features xhttp --test xhttp_test
+          cargo test -p meow-listener --all-features --lib udp_port_53
+          cargo test -p meow-config --no-default-features --features ss --lib

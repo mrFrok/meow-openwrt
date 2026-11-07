@@ -1,15 +1,14 @@
 # meow-openwrt: static meow for OpenWrt routers, 4 archs x 3 profiles, as
 # raw binaries plus .ipk (opkg) and .apk (apk-tools 3) packages.
 #
-# Push to `main` builds and keeps the files as workflow artifacts.
-# A tag `owrt-vX.Y.Z-N` also publishes them as a GitHub release.
+# A tag `owrt-vX.Y.Z-N` builds and publishes a GitHub release; a manual
+# run (workflow_dispatch) builds and keeps the files as artifacts. Pushes
+# to `main` only run the tests (tests.yml).
 name: openwrt
 
 on:
   push:
-    branches: [main]
     tags: ["owrt-v*"]
-    paths-ignore: ["**.md", "docs/**", "website/**", "openwrt-fork/research/**"]
   workflow_dispatch:
 
 concurrency:
