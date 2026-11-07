@@ -108,6 +108,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: openwrt-fork/release-notes
       - uses: actions/download-artifact@v5
         with:
           path: dist
@@ -118,5 +121,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The changelog is openwrt-fork/release-notes/<tag>.md when it
+          # exists; GitHub's commit list is the fallback.
+          notes=openwrt-fork/release-notes/$GITHUB_REF_NAME.md
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "meow-openwrt ${GITHUB_REF_NAME#owrt-v}" --generate-notes
+            --title "meow-openwrt ${GITHUB_REF_NAME#owrt-v}" "$@"
