@@ -284,6 +284,10 @@ pub struct NamedListener {
     /// `max-connections` field, falling back to the global `max-connections`.
     #[serde(default)]
     pub max_connections: usize,
+    /// mihomo `proxy:`: this listener's connections skip the rules and go to
+    /// the named proxy or group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
@@ -4775,6 +4779,7 @@ fn build_named_listeners(
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let global_max_conns = raw.max_connections.unwrap_or_else(default_max_connections);
 
+    let mut listener_proxies: Vec<(String, String)> = Vec::new();
     let mut add = |name: &str,
                    spec: ListenerSpec,
                    port: u16,
@@ -4802,6 +4807,7 @@ fn build_named_listeners(
             port,
             listen: listen.to_string(),
             max_connections,
+            proxy: None,
         });
         Ok(())
     };
@@ -4986,9 +4992,59 @@ fn build_named_listeners(
         }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(&raw_l.name, spec, port, &listen, max_connections)?;
+        if let Some(proxy) = raw_l
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            check_listener_proxy(raw, &raw_l.name, proxy)?;
+            listener_proxies.push((raw_l.name.clone(), proxy.to_string()));
+        }
+    }
+    for (name, proxy) in listener_proxies {
+        if let Some(l) = result.iter_mut().find(|l| l.name == name) {
+            l.proxy = Some(proxy);
+        }
     }
 
     Ok(result)
+}
+
+/// A listener's `proxy:` must name a proxy, a group or a built-in, as mihomo
+/// requires. Nodes from `proxy-providers` are only known once fetched, so with
+/// providers present an unknown name is a warning (it fails each dial
+/// instead) rather than an error.
+fn check_listener_proxy(raw: &raw::RawConfig, listener: &str, proxy: &str) -> anyhow::Result<()> {
+    const BUILTIN: &[&str] = &[
+        "DIRECT",
+        "REJECT",
+        "REJECT-DROP",
+        "PASS",
+        "COMPATIBLE",
+        "GLOBAL",
+    ];
+    let named = |v: &HashMap<String, serde_json::Value>| {
+        v.get("name").and_then(|n| n.as_str()) == Some(proxy)
+    };
+    let known = BUILTIN.contains(&proxy)
+        || raw.proxies.as_deref().unwrap_or(&[]).iter().any(named)
+        || raw
+            .proxy_groups
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|g| g.name == proxy);
+    if known {
+        return Ok(());
+    }
+    if raw.proxy_providers.as_ref().is_some_and(|p| !p.is_empty()) {
+        warn!(
+            "listeners[{listener}].proxy: '{proxy}' is not a static proxy or group;              it must come from a proxy-provider, or this listener's connections fail"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("listeners[{listener}].proxy: proxy or group '{proxy}' not found")
 }
 
 /// Build a runnable [`Config`] from an already-parsed raw document. This is
@@ -8536,6 +8592,28 @@ rules:
             err.to_string().contains("tcp-connect-timeout"),
             "unexpected: {err}"
         );
+    }
+
+    /// meow-openwrt: `listeners[].proxy` is carried to the named listener
+    /// and must name a known proxy or group.
+    #[test]
+    fn listener_proxy_is_parsed_and_checked() {
+        let yaml = |target: &str| {
+            format!(
+                "proxies:\n  - {{name: p1, type: socks5, server: 127.0.0.1, port: 1}}\n\
+                 proxy-groups:\n  - {{name: G, type: select, proxies: [p1]}}\n\
+                 listeners:\n  - {{name: fetch, type: mixed, port: 0, proxy: {target}}}\n"
+            )
+        };
+        for ok in ["G", "p1", "DIRECT"] {
+            let raw = parse_raw_yaml(&yaml(ok)).unwrap();
+            let named = resolve_named_listeners(&raw).unwrap();
+            let fetch = named.iter().find(|l| l.name == "fetch").unwrap();
+            assert_eq!(fetch.proxy.as_deref(), Some(ok));
+        }
+        let raw = parse_raw_yaml(&yaml("Proxy")).unwrap();
+        let err = resolve_named_listeners(&raw).unwrap_err().to_string();
+        assert!(err.contains("'Proxy' not found"), "{err}");
     }
 
     #[test]

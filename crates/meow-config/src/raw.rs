@@ -493,6 +493,10 @@ pub struct RawListener {
     pub name: String,
     #[serde(rename = "type")]
     pub listener_type: String,
+    /// mihomo `proxy:` — every connection this listener accepts skips the
+    /// rules and goes straight to this proxy or group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// Optional when `listen` is a `host:port` socket address. `0` (or omitted
     /// with no port in `listen`) means the OS assigns an ephemeral port at bind.
     #[serde(default)]

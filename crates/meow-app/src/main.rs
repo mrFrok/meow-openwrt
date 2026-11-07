@@ -1273,6 +1273,14 @@ async fn run(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
+    tunnel.set_listener_proxies(
+        config
+            .listeners
+            .named
+            .iter()
+            .filter_map(|l| Some((l.name.as_str().into(), l.proxy.as_deref()?.into())))
+            .collect(),
+    );
     tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
@@ -2034,6 +2042,7 @@ mod tests {
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
+            proxy: None,
         }];
         let err = meow_api::ensure_listeners_supported(&named, without_shadowsocks)
             .expect_err("ss listener must fail on a feature-less build");

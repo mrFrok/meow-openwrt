@@ -209,6 +209,7 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7894,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            proxy: None,
         },
         NamedListener {
             name: "mixed".into(),
@@ -216,6 +217,7 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7890,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            proxy: None,
         },
     ];
 

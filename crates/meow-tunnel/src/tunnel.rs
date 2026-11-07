@@ -162,6 +162,9 @@ pub struct TunnelInner {
     udp_flush: tokio::sync::watch::Sender<u64>,
     /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
     connection_notes: AtomicBool,
+    /// mihomo listener `proxy:`: listener name → proxy or group that its
+    /// connections go to without the rules (startup-time, like listeners).
+    listener_proxies: RwLock<HashMap<SmolStr, SmolStr>>,
     /// Whole-connection relay idle timeout in seconds — see
     /// [`Tunnel::set_tcp_idle_timeout`]. `0` disables the bound. Read once
     /// per relay setup; relays already in flight keep the bound they
@@ -521,6 +524,29 @@ impl TunnelInner {
         }
     }
 
+    /// mihomo's `SpecialProxy`: a connection carrying one (or accepted by a
+    /// listener with `proxy:`) skips mode and rules. `Some(None)` when the
+    /// named proxy is gone — the dial fails, as mihomo's "proxy not found".
+    fn special_proxy(&self, metadata: &Metadata) -> Option<Option<ResolvedTarget>> {
+        let name = if metadata.special_proxy.is_empty() {
+            self.listener_proxies.read().get(&metadata.in_name)?.clone()
+        } else {
+            metadata.special_proxy.clone()
+        };
+        let route = self.route();
+        let Some(proxy) = route.proxies.get(&name).cloned() else {
+            warn!("listener '{}': proxy '{name}' not found", metadata.in_name);
+            return Some(None);
+        };
+        conn_note!(Rule, "Listener {} → {name}", metadata.in_name);
+        Some(Some(ResolvedTarget {
+            adapter: proxy as Arc<dyn ProxyAdapter>,
+            rule_name: SmolStr::default(),
+            rule_payload: SmolStr::default(),
+            route,
+        }))
+    }
+
     /// Resolve which proxy to use for the given metadata.
     ///
     /// Rule matching returns borrowed adapter/payload text, so the rule engine
@@ -539,6 +565,9 @@ impl TunnelInner {
     /// on the blocking pool — keeping it synchronous here would stall the
     /// calling worker on hosts with large socket tables (issue #515).
     pub async fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
+        if let Some(target) = self.special_proxy(metadata) {
+            return target;
+        }
         let mode = *self.mode.read();
         match mode {
             TunnelMode::Direct => {
@@ -603,6 +632,9 @@ impl TunnelInner {
     /// UDP paths must keep calling `pre_resolve`: their NAT session key
     /// requires a resolved `dst_ip` regardless of what the rules demand.
     pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
+        if let Some(target) = self.special_proxy(metadata) {
+            return target;
+        }
         let mode = *self.mode.read();
         if mode != TunnelMode::Rule {
             return self.resolve_proxy(metadata).await;
@@ -1043,6 +1075,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
+                listener_proxies: RwLock::new(HashMap::new()),
                 tcp_idle_timeout: AtomicU32::new(0),
             }),
         }
@@ -1054,6 +1087,11 @@ impl Tunnel {
     /// and recently closed connections. Off by default; each recording
     /// connection allocates its note log. Headless statistics never record:
     /// nothing could read the notes.
+    /// Install the listeners' `proxy:` targets (listener name → proxy).
+    pub fn set_listener_proxies(&self, map: HashMap<SmolStr, SmolStr>) {
+        *self.inner.listener_proxies.write() = map;
+    }
+
     pub fn set_connection_notes(&self, enabled: bool) {
         self.inner
             .connection_notes
@@ -2055,6 +2093,72 @@ mod tests {
     /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /
     /// COMPATIBLE, and a rule targeting PASS skips silently to the next
     /// rule — upstream `continue GetRules` in `match()`.
+    /// meow-openwrt: a listener's `proxy:` sends its connections to that
+    /// proxy whatever the rules and mode say; a vanished name fails the dial.
+    #[tokio::test]
+    async fn listener_proxy_skips_rules() {
+        use meow_rules::final_rule::FinalRule;
+
+        let tunnel = test_tunnel();
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![Box::new(FinalRule::new("DIRECT"))],
+            Default::default(),
+        );
+        tunnel.set_listener_proxies(HashMap::from([
+            (SmolStr::new("fetch"), SmolStr::new("REJECT")),
+            (SmolStr::new("gone"), SmolStr::new("nope")),
+        ]));
+        let meta = |in_name: &str| Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            in_name: in_name.into(),
+            ..Default::default()
+        };
+        let inner = tunnel.inner();
+        assert_eq!(
+            inner
+                .resolve_proxy(&meta("fetch"))
+                .await
+                .unwrap()
+                .adapter
+                .name(),
+            "REJECT"
+        );
+        assert_eq!(
+            inner
+                .resolve_proxy_lazy(&mut meta("fetch"))
+                .await
+                .unwrap()
+                .adapter
+                .name(),
+            "REJECT"
+        );
+        assert_eq!(
+            inner
+                .resolve_proxy(&meta("mixed"))
+                .await
+                .unwrap()
+                .adapter
+                .name(),
+            "DIRECT"
+        );
+        assert!(inner.resolve_proxy(&meta("gone")).await.is_none());
+        tunnel.set_mode(TunnelMode::Direct);
+        assert_eq!(
+            inner
+                .resolve_proxy(&meta("fetch"))
+                .await
+                .unwrap()
+                .adapter
+                .name(),
+            "REJECT"
+        );
+    }
+
     #[tokio::test]
     async fn pass_builtin_skips_matched_rule() {
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
