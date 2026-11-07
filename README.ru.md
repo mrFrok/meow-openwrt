@@ -21,7 +21,8 @@ meow-openwrt — неофициальный форк [meow-rs](https://github.co
 | `meow` | tiny плюс Shadowsocks, AnyTLS, VMess, ShadowTLS | 7,2 МБ | 8,0 МБ | 9,7 МБ | 9,1 МБ |
 | `meow-full` | всё, что есть в meow-rs, вместе с logbook и traffic ledger | 10,2 МБ | 11,7 МБ | 14,8 МБ | 14,2 МБ |
 
-Размеры даны для статического бинарника после strip. На флеше он занимает
+Сборки для Cortex-A9 (`arm_cortex-a9*`) отличаются от armv7 меньше чем на
+0,1 МБ. Размеры даны для статического бинарника после strip. На флеше он занимает
 меньше: squashfs хранит `meow-tiny` примерно в 2,6 МБ, JFFS2 в 4,4 МБ, UBIFS
 с zlib примерно в 5,5 МБ.
 
@@ -133,6 +134,13 @@ Banana Pi BPI-R4 (MT7988A, aarch64), статические сборки musl б
 | lightweight | 5450 Мбит/с | 312 Мбит/с | 2030 Мбит/с | 5,1 МБ | 14,0 МБ |
 | full | 5660 Мбит/с | 323 Мбит/с | 2000 Мбит/с | 6,0 МБ | 16,2 МБ |
 
+Hysteria2 с версии 0.29.0-3 (UDP GSO/GRO, quiche с `-O3`), замер
+2026-11-07 с сервером на двух ядрах: tiny 496–513 Мбит/с на скачивание и
+385–467 на отдачу, около 1,2 ядра и меньше 8 МБ. Официальный клиент mihomo
+v1.19.33 на том же стенде: 665–686 на скачивание, 638–639 на отдачу, около
+1,75 ядра и 28–32 МБ. CPU на мегабит одинаковый, QUIC-драйвер meow
+работает в одном потоке.
+
 Методика и вся история размеров — в
 [openwrt-fork/BENCHMARKS.md](openwrt-fork/BENCHMARKS.md).
 
@@ -140,7 +148,8 @@ Banana Pi BPI-R4 (MT7988A, aarch64), статические сборки musl б
 
 - XHTTP работает в режимах `stream-one`, `stream-up` и `packet-up` (данные в
   теле, заголовках или cookie), проверено против Xray скриптом
-  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh). Узлы с
+  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh) и на живых узлах
+  Xray с REALITY. Узлы с
   `download-settings` или `x-padding-obfs-mode` загружаются недоступными.
 - Ключи конфига, которых нет в meow, например `tun.auto-detect-interface`,
   попадают в лог предупреждением и игнорируются.

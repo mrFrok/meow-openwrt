@@ -21,6 +21,7 @@ One package per profile. They conflict with each other, so install one.
 | `meow` | tiny plus Shadowsocks, AnyTLS, VMess, ShadowTLS | 7.2 MB | 8.0 MB | 9.7 MB | 9.1 MB |
 | `meow-full` | everything meow-rs ships, logbook and traffic ledger included | 10.2 MB | 11.7 MB | 14.8 MB | 14.2 MB |
 
+The Cortex-A9 builds (`arm_cortex-a9*`) are within 0.1 MB of armv7.
 Sizes are of the stripped static binary. Flash takes less than that: squashfs
 stores `meow-tiny` in about 2.6 MB, JFFS2 in 4.4 MB, UBIFS with zlib in about
 5.5 MB.
@@ -134,6 +135,13 @@ on the router itself, so it shows meow's cost and not the link speed.
 | lightweight | 5450 Mbit/s | 312 Mbit/s | 2030 Mbit/s | 5.1 MB | 14.0 MB |
 | full | 5660 Mbit/s | 323 Mbit/s | 2000 Mbit/s | 6.0 MB | 16.2 MB |
 
+Hysteria2 since 0.29.0-3 (UDP GSO/GRO, quiche at `-O3`), measured
+2026-11-07 against a server on two cores: tiny 496–513 Mbit/s down and
+385–467 up, at about 1.2 cores and under 8 MB. The official mihomo
+v1.19.33 client on the same bench: 665–686 down, 638–639 up, at about
+1.75 cores and 28–32 MB. CPU per Mbit is the same; meow's QUIC driver
+runs on one thread.
+
 Method and the full size history are in
 [openwrt-fork/BENCHMARKS.md](openwrt-fork/BENCHMARKS.md).
 
@@ -141,7 +149,8 @@ Method and the full size history are in
 
 - XHTTP runs `stream-one`, `stream-up` and `packet-up` (data in the body,
   headers or cookies), checked against Xray with
-  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh). Nodes with
+  [`xhttp-test.sh`](openwrt-fork/bench/xhttp-test.sh) and on live Xray
+  REALITY nodes. Nodes with
   `download-settings` or `x-padding-obfs-mode` load as unavailable.
 - Config keys meow does not implement, such as `tun.auto-detect-interface`,
   are logged as warnings and ignored.
