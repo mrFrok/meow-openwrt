@@ -11,6 +11,9 @@ use tracing::{debug, error, info, warn};
 
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
 const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
+/// Answer records per response: 8 AAAA (224 B) plus the header, the
+/// longest question (259 B) and an OPT record still fit 512 bytes.
+const MAX_ANSWERS: usize = 8;
 
 /// Hard bound on concurrent upstream-bound query tasks (issue #515).
 /// Queries decidable from local state (hosts, fake-IP, fresh cache) are
@@ -20,6 +23,34 @@ const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
 /// deterministically.
 #[cfg(not(test))]
 const MAX_IN_FLIGHT: usize = 512;
+
+/// The hosts entry's addresses of the queried family (A = 1, else AAAA).
+fn family_ips(all: &[std::net::IpAddr], qtype: u16) -> crate::cache::IpList {
+    all.iter()
+        .copied()
+        .filter(|ip| {
+            if qtype == 1 {
+                ip.is_ipv4()
+            } else {
+                ip.is_ipv6()
+            }
+        })
+        .collect()
+}
+
+/// Tell the answer hook (nftset, reverse table) about every address a
+/// client receives, so a client that picks the second one is covered too.
+fn notify_all(
+    resolver: &crate::Resolver,
+    domain: &str,
+    ips: &[std::net::IpAddr],
+    ttl: std::time::Duration,
+) {
+    for &ip in ips.iter().take(MAX_ANSWERS) {
+        crate::answer_hook::notify(resolver, domain, ip, ttl);
+    }
+}
+
 #[cfg(test)]
 const MAX_IN_FLIGHT: usize = 8;
 
@@ -220,30 +251,21 @@ impl DnsServer {
             // over the global ipv6 toggle. Only fall through to the
             // empty-answer short-circuit below when the hosts table has no
             // matching entry at all.
-            let ip = if qtype == 1 {
-                all_ips.iter().find(|ip| ip.is_ipv4()).copied()
+            let ips = family_ips(all_ips, qtype);
+            return Ok(if ips.is_empty() {
+                Self::build_noerror_empty(id, data, flags, question_len)
             } else {
-                all_ips.iter().find(|ip| ip.is_ipv6()).copied()
-            };
-            return Ok(match ip {
-                Some(addr) => {
-                    crate::answer_hook::notify(
-                        resolver,
-                        &domain,
-                        addr,
-                        std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
-                    );
-                    Self::build_response(
-                        id,
-                        data,
-                        flags,
-                        question_len,
-                        qtype,
-                        addr,
-                        DEFAULT_ANSWER_TTL_SECS,
-                    )
-                }
-                None => Self::build_noerror_empty(id, data, flags, question_len),
+                let ttl = std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS));
+                notify_all(resolver, &domain, &ips, ttl);
+                Self::build_response(
+                    id,
+                    data,
+                    flags,
+                    question_len,
+                    qtype,
+                    &ips,
+                    DEFAULT_ANSWER_TTL_SECS,
+                )
             });
         }
 
@@ -269,12 +291,12 @@ impl DnsServer {
         };
 
         Ok(match lookup {
-            AddressLookupResult::Answer(addr, ttl) => {
-                crate::answer_hook::notify(resolver, &domain, addr, ttl);
+            AddressLookupResult::Answer(addrs, ttl) => {
+                notify_all(resolver, &domain, &addrs, ttl);
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
-                Self::build_response(id, data, flags, question_len, qtype, addr, ttl_secs)
+                Self::build_response(id, data, flags, question_len, qtype, &addrs, ttl_secs)
             }
             AddressLookupResult::NoData => Self::build_noerror_empty(id, data, flags, question_len),
             AddressLookupResult::NxDomain => Self::build_nxdomain(id, data, flags, question_len),
@@ -351,30 +373,21 @@ impl DnsServer {
             // suppresses v6 first, which is correct for name resolution but
             // not on the wire.)
             if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
-                let ip = if qtype == 1 {
-                    all_ips.iter().find(|ip| ip.is_ipv4()).copied()
+                let ips = family_ips(all_ips, qtype);
+                LocalAnswer::Answer(if ips.is_empty() {
+                    Self::build_noerror_empty(id, data, flags, question_len)
                 } else {
-                    all_ips.iter().find(|ip| ip.is_ipv6()).copied()
-                };
-                LocalAnswer::Answer(match ip {
-                    Some(addr) => {
-                        crate::answer_hook::notify(
-                            resolver,
-                            &domain,
-                            addr,
-                            std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
-                        );
-                        Self::build_response(
-                            id,
-                            data,
-                            flags,
-                            question_len,
-                            qtype,
-                            addr,
-                            DEFAULT_ANSWER_TTL_SECS,
-                        )
-                    }
-                    None => Self::build_noerror_empty(id, data, flags, question_len),
+                    let ttl = std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS));
+                    notify_all(resolver, &domain, &ips, ttl);
+                    Self::build_response(
+                        id,
+                        data,
+                        flags,
+                        question_len,
+                        qtype,
+                        &ips,
+                        DEFAULT_ANSWER_TTL_SECS,
+                    )
                 })
             } else if qtype == 28 && !resolver.ipv6_enabled() {
                 LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
@@ -390,8 +403,8 @@ impl DnsServer {
                 match local {
                     crate::resolver::LocalLookup::Decided(lookup) => {
                         LocalAnswer::Answer(match lookup {
-                            AddressLookupResult::Answer(addr, ttl) => {
-                                crate::answer_hook::notify(resolver, &domain, addr, ttl);
+                            AddressLookupResult::Answer(addrs, ttl) => {
+                                notify_all(resolver, &domain, &addrs, ttl);
                                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
                                 Self::build_response(
                                     id,
@@ -399,7 +412,7 @@ impl DnsServer {
                                     flags,
                                     question_len,
                                     qtype,
-                                    addr,
+                                    &addrs,
                                     ttl_secs,
                                 )
                             }
@@ -720,39 +733,45 @@ impl DnsServer {
         flags: u16,
         question_len: usize,
         qtype: u16,
-        addr: std::net::IpAddr,
+        addrs: &[std::net::IpAddr],
         ttl_secs: u32,
     ) -> Vec<u8> {
         let arcount = u16::from_be_bytes([query[10], query[11]]);
         let mut response = Vec::with_capacity(512);
 
         let header_pos = response.len();
+        // Every address of the family, like mihomo, but no more than fits a
+        // 512-byte UDP answer (16 B per A, 28 B per AAAA record).
+        let addrs = &addrs[..addrs.len().min(MAX_ANSWERS)];
+        let ancount = u16::try_from(addrs.len()).unwrap_or(1);
 
         // Header
         response.extend_from_slice(&id.to_be_bytes()); // ID
         response.extend_from_slice(&Self::response_flags(flags));
         response.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
-        response.extend_from_slice(&[0x00, 0x01]); // ANCOUNT = 1
+        response.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
         response.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
         response.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0 (patched below)
 
         // Copy the question
         Self::copy_question(&mut response, query, question_len);
 
-        // Answer: pointer to name in question
-        response.extend_from_slice(&[0xc0, 0x0c]); // Name pointer to offset 12
-        response.extend_from_slice(&qtype.to_be_bytes()); // TYPE
-        response.extend_from_slice(&[0x00, 0x01]); // CLASS IN
-        response.extend_from_slice(&ttl_secs.to_be_bytes()); // TTL
+        for addr in addrs {
+            // Answer: pointer to name in question
+            response.extend_from_slice(&[0xc0, 0x0c]); // Name pointer to offset 12
+            response.extend_from_slice(&qtype.to_be_bytes()); // TYPE
+            response.extend_from_slice(&[0x00, 0x01]); // CLASS IN
+            response.extend_from_slice(&ttl_secs.to_be_bytes()); // TTL
 
-        match addr {
-            std::net::IpAddr::V4(v4) => {
-                response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
-                response.extend_from_slice(&v4.octets());
-            }
-            std::net::IpAddr::V6(v6) => {
-                response.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH
-                response.extend_from_slice(&v6.octets());
+            match addr {
+                std::net::IpAddr::V4(v4) => {
+                    response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+                    response.extend_from_slice(&v4.octets());
+                }
+                std::net::IpAddr::V6(v6) => {
+                    response.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH
+                    response.extend_from_slice(&v6.octets());
+                }
             }
         }
 
@@ -843,7 +862,7 @@ impl DnsServer {
             0x0100,
             Self::question_len_for_test(query),
             qtype,
-            addr,
+            &[addr],
             ttl_secs,
         )
     }
@@ -1814,6 +1833,41 @@ mod tests {
             "all header counts zero — no body follows"
         );
         assert_eq!(resp.len(), 12, "header-only response");
+    }
+
+    #[tokio::test]
+    async fn handle_query_answers_every_address_of_the_family() {
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData};
+        let ips = [[192, 0, 2, 1], [192, 0, 2, 2], [192, 0, 2, 3]];
+        let resolver = resolver_with_upstream_message(move |response| {
+            let name = Name::from_ascii("example.com.").unwrap();
+            for ip in ips {
+                response.add_answer(Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(ip))),
+                ));
+            }
+        })
+        .await;
+        // First answer from the upstream, the second from the cache: both
+        // carry all three records, like mihomo.
+        for id in [7, 8] {
+            let wire = DnsServer::handle_query(&sample_query(id, 1), &resolver)
+                .await
+                .unwrap();
+            let msg = Message::from_bytes(&wire).unwrap();
+            let got: Vec<_> = msg
+                .answers
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::A(a) => Some(a.octets()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got, ips, "query {id}");
+        }
     }
 
     #[tokio::test]

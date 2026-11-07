@@ -1,4 +1,6 @@
-use crate::cache::{DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, QueryFamilies};
+use crate::cache::{
+    DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, IpList as AnswerIps, QueryFamilies,
+};
 use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
 use crate::upstream::{HostOrIp, NameServerEntry, NameServerUrl};
@@ -429,7 +431,8 @@ async fn system_nameservers() -> Vec<SocketAddr> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum AddressLookupResult {
-    Answer(IpAddr, Duration),
+    /// Every address of the queried family (never empty), and their TTL.
+    Answer(AnswerIps, Duration),
     NoData,
     NxDomain,
     Failed,
@@ -1455,7 +1458,7 @@ impl Resolver {
     /// have no upstream TTL to honor.
     pub async fn lookup_ipv4_with_ttl(&self, host: &str) -> Option<(IpAddr, Duration)> {
         match self.lookup_ipv4_result(host).await {
-            AddressLookupResult::Answer(ip, ttl) => Some((ip, ttl)),
+            AddressLookupResult::Answer(ips, ttl) => Some((ips[0], ttl)),
             AddressLookupResult::NoData
             | AddressLookupResult::NxDomain
             | AddressLookupResult::Failed => None,
@@ -1470,14 +1473,12 @@ impl Resolver {
         if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
-                    return LocalLookup::Decided(
-                        ips.iter()
-                            .find(|ip| ip.is_ipv4())
-                            .copied()
-                            .map_or(AddressLookupResult::NoData, |ip| {
-                                AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
-                            }),
-                    );
+                    let ips: AnswerIps = ips.iter().copied().filter(IpAddr::is_ipv4).collect();
+                    return LocalLookup::Decided(if ips.is_empty() {
+                        AddressLookupResult::NoData
+                    } else {
+                        AddressLookupResult::Answer(ips, HOSTS_ANSWER_TTL)
+                    });
                 }
                 Some(HostsLookup::Alias(alias)) => {
                     return LocalLookup::Upstream(alias);
@@ -1492,7 +1493,7 @@ impl Resolver {
             if let Some(pool) = &self.fakeip_v4 {
                 if !self.skipper_bypasses(host) {
                     return LocalLookup::Decided(AddressLookupResult::Answer(
-                        pool.lookup(host),
+                        AnswerIps::from_slice(&[pool.lookup(host)]),
                         self.fakeip_ttl,
                     ));
                 }
@@ -1519,7 +1520,7 @@ impl Resolver {
     /// AAAA counterpart of [`Self::lookup_ipv4_with_ttl`] — same TTL contract.
     pub async fn lookup_ipv6_with_ttl(&self, host: &str) -> Option<(IpAddr, Duration)> {
         match self.lookup_ipv6_result(host).await {
-            AddressLookupResult::Answer(ip, ttl) => Some((ip, ttl)),
+            AddressLookupResult::Answer(ips, ttl) => Some((ips[0], ttl)),
             AddressLookupResult::NoData
             | AddressLookupResult::NxDomain
             | AddressLookupResult::Failed => None,
@@ -1536,14 +1537,12 @@ impl Resolver {
         if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
-                    return LocalLookup::Decided(
-                        ips.iter()
-                            .find(|ip| ip.is_ipv6())
-                            .copied()
-                            .map_or(AddressLookupResult::NoData, |ip| {
-                                AddressLookupResult::Answer(ip, HOSTS_ANSWER_TTL)
-                            }),
-                    );
+                    let ips: AnswerIps = ips.iter().copied().filter(IpAddr::is_ipv6).collect();
+                    return LocalLookup::Decided(if ips.is_empty() {
+                        AddressLookupResult::NoData
+                    } else {
+                        AddressLookupResult::Answer(ips, HOSTS_ANSWER_TTL)
+                    });
                 }
                 Some(HostsLookup::Alias(alias)) => {
                     return LocalLookup::Upstream(alias);
@@ -1559,7 +1558,7 @@ impl Resolver {
             if let Some(pool) = &self.fakeip_v6 {
                 if !self.skipper_bypasses(host) {
                     return LocalLookup::Decided(AddressLookupResult::Answer(
-                        pool.lookup(host),
+                        AnswerIps::from_slice(&[pool.lookup(host)]),
                         self.fakeip_ttl,
                     ));
                 }
@@ -1592,7 +1591,9 @@ impl Resolver {
             &cached.v6
         };
         match hit {
-            FamilyCacheHit::Answer(ips, ttl) => Some(AddressLookupResult::Answer(ips[0], *ttl)),
+            FamilyCacheHit::Answer(ips, ttl) => {
+                Some(AddressLookupResult::Answer(ips.clone(), *ttl))
+            }
             FamilyCacheHit::NoData => Some(AddressLookupResult::NoData),
             FamilyCacheHit::NxDomain => Some(AddressLookupResult::NxDomain),
             FamilyCacheHit::Miss => None,
@@ -1623,7 +1624,7 @@ impl Resolver {
             };
             match hit {
                 FamilyCacheHit::Answer(ips, ttl) => {
-                    return AddressLookupResult::Answer(ips[0], *ttl);
+                    return AddressLookupResult::Answer(ips.clone(), *ttl);
                 }
                 FamilyCacheHit::NoData => return AddressLookupResult::NoData,
                 FamilyCacheHit::NxDomain => return AddressLookupResult::NxDomain,
@@ -1649,7 +1650,9 @@ impl Resolver {
                     &cached.v6
                 };
                 return match hit {
-                    FamilyCacheHit::Answer(ips, ttl) => AddressLookupResult::Answer(ips[0], *ttl),
+                    FamilyCacheHit::Answer(ips, ttl) => {
+                        AddressLookupResult::Answer(ips.clone(), *ttl)
+                    }
                     FamilyCacheHit::NoData => AddressLookupResult::NoData,
                     FamilyCacheHit::NxDomain => AddressLookupResult::NxDomain,
                     FamilyCacheHit::Miss => AddressLookupResult::Failed,
@@ -1663,13 +1666,18 @@ impl Resolver {
             &set.v6
         };
         match answer {
-            Some(FamilyAnswer::Answer { ips, ttl }) => ips
-                .iter()
-                .copied()
-                .find(|ip| family.contains_ip(*ip))
-                .map_or(AddressLookupResult::NoData, |ip| {
-                    AddressLookupResult::Answer(ip, *ttl)
-                }),
+            Some(FamilyAnswer::Answer { ips, ttl }) => {
+                let ips: AnswerIps = ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| family.contains_ip(*ip))
+                    .collect();
+                if ips.is_empty() {
+                    AddressLookupResult::NoData
+                } else {
+                    AddressLookupResult::Answer(ips, *ttl)
+                }
+            }
             Some(FamilyAnswer::NoData(_)) => AddressLookupResult::NoData,
             Some(FamilyAnswer::NxDomain(_)) => AddressLookupResult::NxDomain,
             Some(FamilyAnswer::Failed) | None => AddressLookupResult::Failed,
@@ -2969,7 +2977,7 @@ mod tests {
 
         let result = resolver.lookup_ipv4_result("split.example").await;
         assert!(
-            matches!(result, AddressLookupResult::Answer(ip, _) if ip == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))),
+            matches!(result, AddressLookupResult::Answer(ref ips, _) if ips[0] == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))),
             "slow positive must win over fast NXDOMAIN, got {result:?}"
         );
     }
@@ -3011,7 +3019,7 @@ mod tests {
         );
         assert!(matches!(
             resolver.lookup_ipv4_result("nodata.example").await,
-            AddressLookupResult::Answer(IpAddr::V4(_), _)
+            AddressLookupResult::Answer(ref ips, _) if ips[0].is_ipv4()
         ));
         assert!(matches!(
             resolver.lookup_ipv6_result("nodata.example").await,
@@ -3023,7 +3031,7 @@ mod tests {
         ));
         assert!(matches!(
             resolver.lookup_ipv4_result("nodata.example").await,
-            AddressLookupResult::Answer(IpAddr::V4(_), _)
+            AddressLookupResult::Answer(ref ips, _) if ips[0].is_ipv4()
         ));
     }
 
@@ -3043,7 +3051,7 @@ mod tests {
 
         assert!(matches!(
             resolver.lookup_ipv4_result("fallback.example").await,
-            AddressLookupResult::Answer(IpAddr::V4(ip), _) if ip == fallback_ip
+            AddressLookupResult::Answer(ref ips, _) if ips[0] == IpAddr::V4(fallback_ip)
         ));
     }
 
