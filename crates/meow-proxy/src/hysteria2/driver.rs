@@ -118,6 +118,11 @@ struct StreamState {
     eof_pending: bool,
     eof_sent: bool,
     read_closed: bool,
+    /// Set while the driver holds data for a full `read_tx`: only then does
+    /// the reader's drain wake the driver (`read_notify`). Waking it on every
+    /// chunk the reader took ran a whole driver pass per 16 KiB, each a
+    /// cross-core hand-off on a busy download.
+    read_wanted: Arc<AtomicBool>,
 }
 
 struct WriteChunk {
@@ -155,6 +160,7 @@ impl StreamState {
             eof_pending: false,
             eof_sent: false,
             read_closed: false,
+            read_wanted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -438,17 +444,16 @@ fn handle_cmd(st: &mut State, conn: &mut super::QuicConn, cmd: Cmd) {
                 let _ = reply.send(Err(Error::Closed));
                 return;
             };
-            st.streams.insert(
-                id,
-                StreamState::new(
-                    read_tx,
-                    first_frame,
-                    fast_open,
-                    Arc::clone(&capacity),
-                    connected_tx,
-                    Arc::clone(&shutdown),
-                ),
+            let state = StreamState::new(
+                read_tx,
+                first_frame,
+                fast_open,
+                Arc::clone(&capacity),
+                connected_tx,
+                Arc::clone(&shutdown),
             );
+            let read_wanted = Arc::clone(&state.read_wanted);
+            st.streams.insert(id, state);
             let stream = DuplexStream::new(
                 id,
                 read_rx,
@@ -457,7 +462,8 @@ fn handle_cmd(st: &mut State, conn: &mut super::QuicConn, cmd: Cmd) {
                 capacity,
                 connected_rx,
                 shutdown,
-            );
+            )
+            .with_read_wanted(read_wanted);
             let _ = reply.send(Ok(stream));
         }
         Cmd::Write { id, data, permit } => {
@@ -545,9 +551,24 @@ fn pump_reads(st: &mut State, conn: &mut super::QuicConn, buf: &mut [u8]) {
                 continue;
             }
             loop {
-                match conn.stream_recv(id, buf) {
+                // Past the TCP response, read straight into the chunk the
+                // reader gets: one copy out of quiche instead of two
+                // (BPI-R4 hy2 download 484 -> 519-553 Mbit/s).
+                let direct = !s.expect_response && s.failure.is_none();
+                let mut chunk = Vec::new();
+                let got = if direct {
+                    chunk.reserve_exact(READ_CHUNK_BYTES);
+                    conn.stream_recv_buf(id, bytes::BufMut::limit(&mut chunk, READ_CHUNK_BYTES))
+                } else {
+                    conn.stream_recv(id, buf)
+                };
+                match got {
                     Ok((n, fin)) => {
-                        if n > 0 {
+                        if direct {
+                            if n > 0 {
+                                s.inbound_pending.push_back(chunk);
+                            }
+                        } else if n > 0 {
                             ingest(s, &buf[..n]);
                         }
                         if fin {
@@ -625,8 +646,23 @@ fn flush_pending(s: &mut StreamState) -> bool {
         match s.read_tx.try_send(ReadItem::Data(item)) {
             Ok(()) => {}
             Err(TrySendError::Full(ReadItem::Data(item))) => {
-                s.inbound_pending.push_front(item);
-                return false;
+                // Ask for a wake-up, then retry once: a drain that ran
+                // before the flag was set saw it clear and woke nobody, but
+                // it did free a slot.
+                s.read_wanted.store(true, Ordering::Release);
+                match s.read_tx.try_send(ReadItem::Data(item)) {
+                    Ok(()) => continue,
+                    Err(TrySendError::Full(ReadItem::Data(item))) => {
+                        s.inbound_pending.push_front(item);
+                        return false;
+                    }
+                    Err(TrySendError::Full(_)) => unreachable!("only Data is sent here"),
+                    Err(TrySendError::Closed(_)) => {
+                        s.inbound_pending.clear();
+                        s.read_closed = true;
+                        return true;
+                    }
+                }
             }
             Err(TrySendError::Full(_)) => unreachable!("only Data is sent here"),
             Err(TrySendError::Closed(_)) => {
@@ -640,7 +676,14 @@ fn flush_pending(s: &mut StreamState) -> bool {
         let terminal = s.failure.map_or(ReadItem::Eof, ReadItem::Err);
         match s.read_tx.try_send(terminal) {
             Ok(()) => s.eof_sent = true,
-            Err(TrySendError::Full(_)) => return false,
+            Err(TrySendError::Full(terminal)) => {
+                s.read_wanted.store(true, Ordering::Release);
+                match s.read_tx.try_send(terminal) {
+                    Ok(()) => s.eof_sent = true,
+                    Err(TrySendError::Full(_)) => return false,
+                    Err(TrySendError::Closed(_)) => s.read_closed = true,
+                }
+            }
             Err(TrySendError::Closed(_)) => s.read_closed = true,
         }
     }

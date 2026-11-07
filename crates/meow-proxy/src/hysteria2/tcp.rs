@@ -29,6 +29,9 @@ pub struct DuplexStream {
     read_done: bool,
     shutdown_sent: bool,
     shutdown: Arc<AtomicBool>,
+    /// quiche driver: wake it after a drain only when it asked (it holds
+    /// data for a full channel). `None` (quinn, tests): wake on every drain.
+    read_wanted: Option<Arc<AtomicBool>>,
 }
 
 impl DuplexStream {
@@ -53,7 +56,15 @@ impl DuplexStream {
             read_done: false,
             shutdown_sent: false,
             shutdown,
+            read_wanted: None,
         }
+    }
+
+    /// See `read_wanted`.
+    #[cfg_attr(not(hy2_quiche), allow(dead_code))]
+    pub(crate) fn with_read_wanted(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.read_wanted = Some(flag);
+        self
     }
 
     pub(crate) async fn wait_connected(&mut self) -> super::Result<()> {
@@ -95,8 +106,15 @@ impl AsyncRead for DuplexStream {
             Poll::Ready(Some(ReadItem::Data(v))) => {
                 this.leftover = v;
                 this.leftover_pos = 0;
-                // Free the driver to read more into this stream's channel.
-                this.read_notify.notify_one();
+                // Free the driver to read more into this stream's channel,
+                // if it is waiting for room.
+                if this
+                    .read_wanted
+                    .as_ref()
+                    .is_none_or(|w| w.swap(false, Ordering::AcqRel))
+                {
+                    this.read_notify.notify_one();
+                }
                 this.drain_leftover(buf);
                 Poll::Ready(Ok(()))
             }
