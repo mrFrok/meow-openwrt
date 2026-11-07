@@ -3551,13 +3551,17 @@ mod tests {
                 &registry,
                 false,
             ))
-            .expect("SNI-fragment entry builds (fragment is SNI, not a proxy tag)");
+            .expect(
+                "`#Proxy` entry builds (meow-openwrt: a dotless fragment is the proxy, as mihomo)",
+            );
         });
 
         let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        // meow-openwrt: `#Proxy` now names the proxy, so there is no SNI
+        // to mistake for one and no migration warning.
         assert!(
-            captured.contains("did you mean `?proxy=X`"),
-            "SNI matching a proxy name must warn; got: {captured}"
+            !captured.contains("did you mean `?proxy=X`"),
+            "a dotless fragment is a proxy tag, not SNI; got: {captured}"
         );
     }
 
@@ -3625,14 +3629,14 @@ mod tests {
                 &HashMap::new(),
                 None,
             ))
-            .expect("`#X` SNI entries still build — the warn is advisory");
+            .expect("`#X` proxy-tagged entries build");
         });
 
         let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
         assert_eq!(
             captured.matches("did you mean `?proxy=X`").count(),
-            3,
-            "nameserver + fallback + proxy-server-nameserver must each warn once; got: {captured}"
+            0,
+            "meow-openwrt: `#Proxy` is the proxy tag, nothing to warn about; got: {captured}"
         );
     }
 

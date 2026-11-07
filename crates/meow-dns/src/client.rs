@@ -192,6 +192,10 @@ pub enum ClientError {
     Timeout(Duration),
     #[error("invalid response: {0}")]
     Protocol(&'static str),
+    /// A DoH answer that is not `200`: the code and the status line (or the
+    /// HTTP/2 reason), so the cause shows in the log.
+    #[error("doh: status {0} ({1})")]
+    HttpStatus(u16, String),
     #[error("tls: {0}")]
     Tls(String),
     #[error("upstream returned rcode {0:?}")]
@@ -1932,7 +1936,11 @@ async fn doh_h2_exchange(
         .map_err(h2_error)?;
     let response = response.await.map_err(h2_error)?;
     if response.status() != http::StatusCode::OK {
-        return Err(ClientError::Protocol("doh: non-200 status"));
+        let status = response.status();
+        return Err(ClientError::HttpStatus(
+            status.as_u16(),
+            format!("HTTP/2 {status}"),
+        ));
     }
     let mut recv = response.into_body();
     let mut out = Vec::new();
@@ -2174,7 +2182,8 @@ where
             continue;
         }
         if status != 200 {
-            return Err(ClientError::Protocol("doh: non-200 status"));
+            let line: String = status_line.chars().take(80).collect();
+            return Err(ClientError::HttpStatus(status, line));
         }
         let mut head = DohHead {
             http11: version.eq_ignore_ascii_case("HTTP/1.1"),
@@ -2665,7 +2674,7 @@ mod tests {
         // Non-200 → Protocol error.
         assert!(matches!(
             doh_response(b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n").await,
-            Err(ClientError::Protocol("doh: non-200 status"))
+            Err(ClientError::HttpStatus(500, ref line)) if line == "HTTP/1.1 500 Nope"
         ));
 
         // Bad chunk size → Protocol error.

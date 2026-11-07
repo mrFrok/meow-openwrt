@@ -259,6 +259,22 @@ impl NameServerEntry {
                 });
             }
         }
+        // meow-openwrt: mihomo reads `#NAME` on tls:// / https:// as the
+        // proxy too (`https://dns.google/dns-query#PROXY`). A dotless
+        // fragment is a proxy or group name here as well; a dotted one stays
+        // meow's SNI override. Without this a config moved over from mihomo
+        // sent the proxy name as SNI and failed every TLS handshake.
+        if is_encrypted_form && query_proxy.is_none() {
+            if let Some(idx) = head.find('#') {
+                let frag = head[idx + 1..].trim();
+                if !frag.is_empty() && !frag.contains('.') {
+                    return Ok(Self {
+                        url: NameServerUrl::parse(&head[..idx])?,
+                        proxy: Some(frag.to_string()),
+                    });
+                }
+            }
+        }
         Ok(Self {
             url: NameServerUrl::parse(head)?,
             proxy: query_proxy,
@@ -1375,19 +1391,30 @@ mod tests {
     #[test]
     #[cfg(feature = "encrypted")]
     fn entry_tls_fragment_sni_without_proxy_unchanged() {
-        // `#dns.google` alone keeps its SNI meaning — the divergence from
-        // mihomo (which reads it as a proxy name) is documented, not
-        // silently flipped.
-        let e = NameServerEntry::parse("tls://8.8.8.8#PROXY").unwrap();
+        // A dotted `#dns.google` keeps its SNI meaning; a dotless `#PROXY`
+        // is a proxy name, as in mihomo (meow-openwrt).
+        let e = NameServerEntry::parse("tls://8.8.8.8#dns.google").unwrap();
         assert!(e.proxy.is_none());
         assert_eq!(
             e.url,
             NameServerUrl::Tls {
                 addr: ip4(8, 8, 8, 8),
                 port: 853,
-                sni: "PROXY".to_string(),
+                sni: "dns.google".to_string(),
             }
         );
+        let e = NameServerEntry::parse("tls://8.8.8.8#PROXY").unwrap();
+        assert_eq!(e.proxy.as_deref(), Some("PROXY"));
+        assert_eq!(
+            e.url,
+            NameServerUrl::Tls {
+                addr: ip4(8, 8, 8, 8),
+                port: 853,
+                sni: "8.8.8.8".to_string(),
+            }
+        );
+        let e = NameServerEntry::parse("https://dns.google/dns-query#Proxy").unwrap();
+        assert_eq!(e.proxy.as_deref(), Some("Proxy"));
     }
 
     #[test]

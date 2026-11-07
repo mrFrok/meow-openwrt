@@ -1076,6 +1076,27 @@ async fn doh_pool_framing_matrix() {
     }
 }
 
+/// meow-openwrt: dozens of sequential DoH queries on one keep-alive conn
+/// (chunked and Content-Length bodies) never desync the response parser.
+#[cfg(feature = "encrypted")]
+#[tokio::test]
+async fn doh_pool_many_sequential_queries_on_one_conn() {
+    for framing in [DohFraming::Chunked, DohFraming::ContentLength] {
+        let stub = start_doh_stub_with(framing).await;
+        let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+            .with_tls_additional_roots(stub.root.clone());
+        for i in 0..30 {
+            let name = format!("q{i}.example.com");
+            let msg = timeout(T, client.query(&name, RecordType::A))
+                .await
+                .expect("must not stall")
+                .unwrap_or_else(|e| panic!("query {i}: {e:?}"));
+            assert_example_answer(&msg);
+        }
+        assert_eq!(stub.accepts.load(Ordering::SeqCst), 1);
+    }
+}
+
 /// DoH dead-conn recovery, probe side (review M4): the upstream serves
 /// one poolable (`Content-Length` keep-alive) answer per conn then
 /// drops it, so the pooled conn is dead by the next checkout — the
