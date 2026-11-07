@@ -13,7 +13,8 @@
 #          TGT       cargo target dir (default target/owrt-<arch>)
 #          OUT       where meow-<profile>-<arch> is copied (default dist)
 #          EXTRA_FEATURES  extra cargo features (experiments only)
-#          OPENWRT_MIRROR  SDK mirror base (sha256 is checked either way)
+#          OPENWRT_MIRROR  SDK mirror bases, space-separated, tried in turn
+#                          (sha256 is checked either way)
 set -euo pipefail
 ARCH=${1:?arch}; PROFILE=${2:?profile}
 cd "$(dirname "$0")/../.."
@@ -62,12 +63,16 @@ TC_CACHE=${TC_CACHE:-$HOME/.cache/meow-owrt-tc}
 TCROOT=$TC_CACHE/$ARCH-$SDK_SHA
 if ! { [ -d "$TCROOT/host/lib" ] && ls -d "$TCROOT"/toolchain-* >/dev/null 2>&1; }; then
 	mkdir -p "$TCROOT"
-	# The download server drops long transfers now and then: resume.
+	# downloads.openwrt.org drops long transfers and sometimes crawls at
+	# ~100 KB/s (40 min per SDK on CI): take mirrors in turn, give up on one
+	# below 1 MB/s for 20 s, and resume the partial file on the next.
 	dl=$TC_CACHE/$SDK_FILE.part
-	for try in 1 2 3 4 5 6; do
-		curl -fsSL --retry 3 --retry-all-errors -C - -o "$dl" \
-			"${OPENWRT_MIRROR:-https://downloads.openwrt.org}/releases/$SDK_REL/targets/$SDK_TGT/$SDK_FILE" && break
-		echo "SDK download interrupted (try $try), resuming" >&2
+	set -- ${OPENWRT_MIRROR:-https://ftp.halifax.rwth-aachen.de/openwrt https://downloads.openwrt.org}
+	for try in 1 2 3 4 5 6 7 8; do
+		m=$(eval echo "\${$(( (try - 1) % $# + 1 ))}")
+		curl -fsSL --retry 2 --retry-all-errors --speed-limit 1000000 --speed-time 20 \
+			-C - -o "$dl" "$m/releases/$SDK_REL/targets/$SDK_TGT/$SDK_FILE" && break
+		echo "SDK download from $m interrupted (try $try), resuming" >&2
 	done
 	echo "$SDK_SHA  $dl" | sha256sum -c - || { rm -f "$dl"; exit 1; }
 	# Release SDK compilers run through their own loader in host/lib.

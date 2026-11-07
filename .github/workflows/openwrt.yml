@@ -43,12 +43,18 @@ jobs:
           rustc +1.96.0 -V
 
       # The SDK toolchain (only staging_dir/toolchain-* and host/lib are
-      # unpacked); the key is build.sh, which pins the SDK and its sha256.
+      # unpacked), keyed by the SDK sha256 build.sh pins for this arch, so
+      # other edits to build.sh keep the cache.
+      - name: SDK key
+        id: sdk
+        run: |
+          sha=$(grep -A1 -E "^[[:space:]]*${{ matrix.arch }}\)" openwrt-fork/ci/build.sh | grep -o 'SDK_SHA=[0-9a-f]*' | cut -d= -f2)
+          [ -n "$sha" ] && echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Cache OpenWrt toolchain
         uses: actions/cache@v5
         with:
           path: ~/.cache/meow-owrt-tc
-          key: owrt-tc-${{ matrix.arch }}-${{ hashFiles('openwrt-fork/ci/build.sh') }}
+          key: owrt-tc-${{ matrix.arch }}-${{ steps.sdk.outputs.sha }}
 
       # Registry, git deps and the target dir (BoringSSL's cmake build and
       # build-std's std are the slow parts; the final LTO link always reruns).
