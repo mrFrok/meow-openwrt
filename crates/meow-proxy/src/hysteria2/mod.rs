@@ -1,4 +1,6 @@
 mod auth;
+#[cfg(hy2_quiche)]
+mod bufpool;
 mod client;
 mod config;
 #[cfg(hy2_quiche)]
@@ -17,6 +19,10 @@ mod tls;
 mod udp;
 #[cfg(hy2_quiche)]
 mod udp_io;
+
+/// The hysteria2 QUIC connection: quiche with recycled stream buffers.
+#[cfg(hy2_quiche)]
+pub(crate) type QuicConn = quiche::Connection<bufpool::PoolFactory>;
 
 pub use client::ReconnectableClient;
 pub use config::{Config, ObfsConfig, ReceiveWindows};

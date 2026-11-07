@@ -57,7 +57,7 @@ impl Auth {
         })
     }
 
-    pub(super) fn poll(&mut self, conn: &mut quiche::Connection) -> Result<Option<bool>> {
+    pub(super) fn poll(&mut self, conn: &mut super::QuicConn) -> Result<Option<bool>> {
         if !send(conn, 2, SETTINGS, &mut self.settings_sent, false)?
             || !send(
                 conn,
@@ -90,7 +90,7 @@ impl Auth {
 
 #[cfg(hy2_quiche)]
 fn send(
-    conn: &mut quiche::Connection,
+    conn: &mut super::QuicConn,
     id: u64,
     bytes: &[u8],
     offset: &mut usize,

@@ -283,8 +283,8 @@ mod tests {
         }
     }
 
-    async fn flush(
-        conn: &mut quiche::Connection,
+    async fn flush<F: quiche::BufFactory>(
+        conn: &mut quiche::Connection<F>,
         socket: &UdpSocket,
     ) -> std::result::Result<(), String> {
         let mut out = [0u8; 1500];

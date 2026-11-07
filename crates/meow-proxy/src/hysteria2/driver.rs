@@ -230,7 +230,7 @@ pub(crate) async fn spawn(
     socket: UdpSocket,
     local: SocketAddr,
     peer: SocketAddr,
-    conn: quiche::Connection,
+    conn: super::QuicConn,
 ) -> Result<ConnHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
     let read_notify = Arc::new(Notify::new());
@@ -293,7 +293,7 @@ pub(crate) async fn spawn(
 
 async fn run(
     mut st: State,
-    mut conn: quiche::Connection,
+    mut conn: super::QuicConn,
     auth: AuthCtx,
     ready_tx: oneshot::Sender<Result<bool>>,
 ) {
@@ -421,7 +421,7 @@ async fn run(
     st.closed.store(true, Ordering::Relaxed);
 }
 
-fn handle_cmd(st: &mut State, conn: &mut quiche::Connection, cmd: Cmd) {
+fn handle_cmd(st: &mut State, conn: &mut super::QuicConn, cmd: Cmd) {
     match cmd {
         Cmd::OpenTcp {
             first_frame,
@@ -489,7 +489,7 @@ fn handle_cmd(st: &mut State, conn: &mut quiche::Connection, cmd: Cmd) {
     }
 }
 
-fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
+fn pump_writes(st: &mut State, conn: &mut super::QuicConn) {
     for (&id, s) in &mut st.streams {
         // Do NOT pre-check `stream_capacity`: a stream is not created until the
         // first `stream_send`, and capacity on an unopened stream is 0. Send
@@ -533,7 +533,7 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
     }
 }
 
-fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+fn pump_reads(st: &mut State, conn: &mut super::QuicConn, buf: &mut [u8]) {
     for s in st.streams.values_mut() {
         let _ = flush_pending(s);
     }
@@ -647,7 +647,7 @@ fn flush_pending(s: &mut StreamState) -> bool {
     true
 }
 
-fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+fn pump_datagrams(st: &mut State, conn: &mut super::QuicConn, buf: &mut [u8]) {
     while let Ok(n) = conn.dgram_recv(buf) {
         tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
@@ -676,13 +676,7 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
     }
 }
 
-fn send_udp(
-    st: &mut State,
-    conn: &mut quiche::Connection,
-    session_id: u32,
-    addr: &str,
-    data: &[u8],
-) {
+fn send_udp(st: &mut State, conn: &mut super::QuicConn, session_id: u32, addr: &str, data: &[u8]) {
     let max = conn.dgram_max_writable_len().unwrap_or(0);
     tracing::trace!(
         session_id,
@@ -726,7 +720,7 @@ fn send_udp(
 }
 
 fn send_one_udp(
-    conn: &mut quiche::Connection,
+    conn: &mut super::QuicConn,
     out: &mut Vec<u8>,
     h: proto::UdpHeader,
     addr: &str,
@@ -739,7 +733,7 @@ fn send_one_udp(
     }
 }
 
-fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
+fn cleanup_streams(st: &mut State, conn: &mut super::QuicConn) {
     let done: Vec<u64> = st
         .streams
         .iter()
@@ -763,7 +757,7 @@ fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
 /// Drain quiche's send queue to the socket, applying obfs and port-hopping.
 async fn flush_send(
     st: &mut State,
-    conn: &mut quiche::Connection,
+    conn: &mut super::QuicConn,
     out: &mut [u8],
 ) -> std::io::Result<()> {
     loop {
@@ -857,11 +851,7 @@ async fn flush_batch(st: &mut State) -> std::io::Result<()> {
 /// Feed the datagrams queued on the socket to quiche, at most
 /// [`RECV_BATCH`] reads of them (each read a GRO run of several when the
 /// kernel coalesced them), undoing obfs and port-hopping.
-fn recv_batch(
-    st: &mut State,
-    conn: &mut quiche::Connection,
-    buf: &mut [u8],
-) -> std::io::Result<()> {
+fn recv_batch(st: &mut State, conn: &mut super::QuicConn, buf: &mut [u8]) -> std::io::Result<()> {
     for _ in 0..RECV_BATCH {
         let read = if st.gro {
             udp_io::try_recv_gro(&st.socket, buf)

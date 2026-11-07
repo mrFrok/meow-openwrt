@@ -234,8 +234,14 @@ async fn connect_quiche(
         *b = rand::random();
     }
     let scid = quiche::ConnectionId::from_ref(&scid);
-    let conn = quiche::connect(Some(server_name), &scid, local, server_addr, &mut config)
-        .map_err(|e| Error::Quic(format!("connect start: {e}")))?;
+    let conn = quiche::connect_with_buffer_factory(
+        Some(server_name),
+        &scid,
+        local,
+        server_addr,
+        &mut config,
+    )
+    .map_err(|e| Error::Quic(format!("connect start: {e}")))?;
 
     driver::spawn(cfg, socket, local, server_addr, conn).await
 }
