@@ -25,6 +25,16 @@ codegen-units = 1
 panic = "abort"
 opt-level = "z"
 
+# meow-openwrt: quiche (the hysteria2 QUIC stack) at -O3 instead of -Oz:
+# hy2 TCP through the node +5-8 % down, ~6 % less CPU per Mbit on the
+# BPI-R4 (openwrt-fork/bench/tunbench.sh, server on two cores), for
+# +65 KB of the 6.8 MB aarch64 tiny binary.
+[profile.release.package.quiche]
+opt-level = 3
+
+[profile.release.package.ring]
+opt-level = 3
+
 # Profile for dhat heap profiling — keeps debug symbols, no strip, no LTO.
 [profile.dhat]
 inherits = "release"

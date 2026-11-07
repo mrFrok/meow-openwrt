@@ -137,6 +137,8 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
   `SRV_CPU=2,3 CLI_CPU=2` ↓ 160 Мбит/с у обоих (meow 0.65 %/Мбит, mihomo 0.73). Brutal (`down:`) не помогает.
   Клиент hy2 ↓ узким местом не является; честный замер ↓ выше ~150 Мбит/с на 4 ядрах BPI-R4 не получить.
 - **hy2 GSO/GRO (2026-11-07, fb22d41)**: раньше «без выигрыша» — его съедал musl malloc (quiche: 3 аллокации
+- hy2 2026-11-07, round 2. Stand fixed: the mihomo server now gets two cores (SRV_CPU=2,3, CLI_CPU=2); with one core it was the limit. BPI-R4, hy2 TCP down/up, Mbit/s: meow tiny (GSO) 472-477/412-431 at ~1.2 cores; + quiche -O3 496-513/385-467 (+65 KB, adopted); mihomo client 711/669-684 at 1.5-1.8 cores and 26-32 MB anon (meow 2-8 MB). CPU per Mbit is the same (0.22-0.25); the remaining gap is meow's single-task driver: next lever = separate recv/send I/O threads. Packet size is already 1452 with DPLPMTUD. ChaCha first: BoringSSL does it itself without AES hardware; the rustls backend (MIPS BE) now does too.
+- XHTTP on the real subscription (4 Xray REALITY nodes, router, 2026-11-07): stream-one, stream-up, packet-up and packet-up GET+header (4096, 1-5 ms) all pass delay and a 20 MB download / 5 MB upload. Down 93-146 Mbit/s (packet-up 45-113); up 39-55 (packet-up 7-34, GET+header ~6-7: the 1-5 ms gap caps it at ~11 Mbit/s by design).
   на принятый пакет, dhat). tunbench, mihomo-сервер, tiny aarch64, %CPU/Мбит: hy2 TCP ↓ 0.43→0.22–0.25
   (322→401–434 Мбит/с), ↑ 0.40→0.25; hy2 UDP ↑ 0.90→0.60. mihomo-клиент: 630/563 Мбит/с, 0.26/0.21 —
   по CPU паритет, скорость теперь режет одноядерный сервер стенда. mimalloc сверху: ↓ 585 Мбит/с, 0.19,

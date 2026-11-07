@@ -55,7 +55,37 @@ const SEND_BUFFER_LIMIT: usize = 16 * 1024;
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     static P: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
-    Arc::clone(P.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
+    Arc::clone(P.get_or_init(|| {
+        let mut p = rustls::crypto::ring::default_provider();
+        if !HAS_AES_HARDWARE {
+            prefer_chacha(&mut p.cipher_suites);
+        }
+        Arc::new(p)
+    }))
+}
+
+/// Whether AES-GCM runs on CPU instructions here. This backend serves the
+/// big-endian targets (MIPS), which have none: there ChaCha20-Poly1305 is
+/// several times faster in software, so it is offered first, as BoringSSL
+/// does on its own when `EVP_has_aes_hardware` is false. Servers honour the
+/// client's order in that case (Go's crypto/tls: `aesgcmPreferred`).
+const HAS_AES_HARDWARE: bool = cfg!(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+));
+
+/// Move the ChaCha20-Poly1305 suites ahead of the rest, keeping the order
+/// within each group.
+fn prefer_chacha(suites: &mut [rustls::SupportedCipherSuite]) {
+    suites.sort_by_key(|s| {
+        !matches!(
+            s.suite(),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+                | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        )
+    });
 }
 
 /// The Mozilla roots as a rustls store, parsed once.
@@ -472,5 +502,22 @@ mod tests {
         let mut c = TlsConfig::new("example.com");
         c.ech = Some(super::super::EchOpts::Config(vec![0]));
         assert!(RustlsInner::validate(&c).is_err());
+    }
+
+    #[test]
+    fn prefer_chacha_moves_chacha_first() {
+        let mut suites = rustls::crypto::ring::default_provider().cipher_suites;
+        assert_ne!(
+            suites[0].suite(),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        prefer_chacha(&mut suites);
+        assert_eq!(
+            suites[0].suite(),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        assert!(suites
+            .iter()
+            .any(|s| s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256));
     }
 }

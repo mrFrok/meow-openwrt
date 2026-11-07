@@ -124,12 +124,13 @@ export RUSTFLAGS="$FLAGS"
 
 # restls and jls need BoringSSL, which big-endian targets do not build.
 FEAT=$PROFILE; [ "$ARCH" = mips ] && [ "$PROFILE" = full ] && FEAT=full-be
-# EXTRA_FEATURES: comma list added for experiments (e.g. mimalloc); releases leave it empty.
+# EXTRA_FEATURES: comma list added for experiments (e.g. mimalloc); EXTRA_CARGO:
+# extra cargo args (e.g. --config profile overrides). Releases leave both empty.
 FEAT=$FEAT${EXTRA_FEATURES:+,$EXTRA_FEATURES}
 
 cargo +1.96.0 build -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
 	--release -p meow-app --bin meow --no-default-features --features "$FEAT" \
-	--target "$RT" --target-dir "$TGT"
+	--target "$RT" --target-dir "$TGT" ${EXTRA_CARGO:-}
 
 OUT=${OUT:-dist}; mkdir -p "$OUT"
 cp "$TGT/$RT/release/meow" "$OUT/meow-$PROFILE-$ARCH"
