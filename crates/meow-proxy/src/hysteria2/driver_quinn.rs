@@ -187,7 +187,11 @@ fn client_config(cfg: &Config) -> Result<quinn::ClientConfig> {
         .map_err(|e| Error::tls(format!("QUIC TLS config: {e}")))?;
     let mut client = quinn::ClientConfig::new(Arc::new(quic));
 
-    let w = resolve_windows(cfg.windows, meow_common::sysmem::mem_total());
+    let w = resolve_windows(
+        cfg.windows,
+        meow_common::sysmem::mem_total(),
+        cfg.connections,
+    );
     let varint = |v: u64| quinn::VarInt::from_u64(v).unwrap_or(quinn::VarInt::MAX);
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(MAX_IDLE_TIMEOUT.try_into().ok())

@@ -15,6 +15,9 @@ pub struct Config {
     /// QUIC flow-control windows (mihomo's `*-receive-window`); `None` picks
     /// the default.
     pub windows: ReceiveWindows,
+    /// Parallel QUIC connections to the server (meow extension); `0` and `1`
+    /// mean one. Streams and UDP sessions are spread over them round-robin.
+    pub connections: usize,
 }
 
 /// mihomo's `initial-/max-stream-receive-window` and

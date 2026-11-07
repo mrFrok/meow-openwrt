@@ -1427,7 +1427,8 @@ fn reject_unsupported_anytls_options(
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
 /// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`, and
-/// `fast-open`.
+/// `fast-open`; meow's own `connections` (parallel QUIC connections, 1-8,
+/// unset = one per CPU up to 4).
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1753,6 +1754,13 @@ fn parse_hysteria2(
         .unwrap_or(true);
     validate_hy2_alpn(name, config.get("alpn"))?;
     reject_unsupported_hy2_options(name, config)?;
+    let connections = match config.get("connections") {
+        None => 0,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=8) => n as usize,
+            _ => return Err(format!("hysteria2[{name}]: connections must be 1-8")),
+        },
+    };
     let window = |key: &str| {
         config
             .get(key)
@@ -1784,6 +1792,7 @@ fn parse_hysteria2(
         fingerprint,
         fast_open,
         windows,
+        connections,
     })
 }
 
@@ -5077,6 +5086,16 @@ tls: true
                  password: secret\n\
                  obfs: salamander\n",
                 "missing obfs-password",
+            ),
+            (
+                "connections out of range",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 connections: 9\n",
+                "connections must be 1-8",
             ),
             (
                 "mTLS client certificate (mihomo divergence: unsupported)",

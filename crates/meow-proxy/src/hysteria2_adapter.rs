@@ -53,6 +53,9 @@ pub struct Hy2Options {
     pub fingerprint: Option<String>,
     pub fast_open: bool,
     pub windows: crate::hysteria2::ReceiveWindows,
+    /// Parallel QUIC connections (`connections:`, meow extension); `0` is
+    /// automatic: one per CPU, at most 4.
+    pub connections: usize,
 }
 
 impl Hy2Options {
@@ -123,9 +126,20 @@ impl Hy2Options {
             pin_sha256: self.fingerprint.unwrap_or_default(),
             fast_open: self.fast_open,
             windows: self.windows,
+            connections: match self.connections {
+                0 => auto_connections(),
+                n => n,
+            },
         };
         Ok((addr, self.udp, cfg))
     }
+}
+
+/// One QUIC connection per CPU, at most 4: each has its own driver task, and
+/// one quiche connection tops out at one core (BPI-R4, 2026-11-08: hy2 TCP
+/// download ~530 Mbit/s on one connection, ~1 Gbit/s on four).
+fn auto_connections() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
 }
 
 pub struct Hy2Adapter {
@@ -460,6 +474,7 @@ mod tests {
             hop_interval: None,
             fingerprint: None,
             fast_open: true,
+            connections: 1,
             windows: Default::default(),
         }
     }

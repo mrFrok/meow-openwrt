@@ -32,12 +32,18 @@ pub(super) struct Windows {
 /// scales with RAM (MemTotal / 16, 4..=24 MiB): a client reading slower than
 /// the server sends parks a whole window in this process, and the stock
 /// 20-24 MiB per connection is a third of a 64 MB router (meow-openwrt;
-/// tunbench, 20 Mbit/s client: 29-33 MB anon). Initials never exceed their
-/// ceilings.
-pub(super) fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Windows {
+/// tunbench, 20 Mbit/s client: 29-33 MB anon). With `connections` parallel
+/// connections that budget is shared between them (floor 2 MiB each).
+/// Initials never exceed their ceilings.
+pub(super) fn resolve_windows(
+    cfg: super::ReceiveWindows,
+    mem_total: Option<u64>,
+    connections: usize,
+) -> Windows {
     let auto_conn = mem_total.map_or(MAX_CONN_WINDOW, |m| {
         (m / 16).clamp(MIN_AUTO_CONN_WINDOW, MAX_CONN_WINDOW)
     });
+    let auto_conn = (auto_conn / connections.max(1) as u64).max(MIN_AUTO_CONN_WINDOW / 2);
     let max_conn = cfg.max_conn.unwrap_or(auto_conn);
     let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW.min(max_conn));
     Windows {

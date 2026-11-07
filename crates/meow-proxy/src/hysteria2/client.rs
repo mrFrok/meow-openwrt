@@ -16,12 +16,22 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for `Config::connections`.
+pub const MAX_CONNECTIONS: usize = 8;
+
+/// A cached connection and the [`generation`](ReconnectableClient::generation)
+/// it was established under.
+type Slot = Mutex<Option<(Arc<ConnHandle>, Uint)>>;
 
 pub struct ReconnectableClient {
     cfg: Arc<Config>,
     /// The cached connection and the [`generation`](Self::generation) it
     /// was established under.
-    conn: Mutex<Option<(Arc<ConnHandle>, Uint)>>,
+    /// One slot per parallel QUIC connection (`Config::connections`); each
+    /// has its own driver task, so streams spread over cores.
+    slots: Box<[Slot]>,
+    /// Round-robin cursor over `slots`.
+    next: std::sync::atomic::AtomicUsize,
     /// Bumped by [`reset`](Self::reset); a connection from an older
     /// generation is never handed out again. Compared for equality only, so
     /// the mips32 `u32` wrap is harmless.
@@ -29,10 +39,17 @@ pub struct ReconnectableClient {
 }
 
 impl ReconnectableClient {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(mut cfg: Config) -> Self {
+        let n = cfg.connections.clamp(1, MAX_CONNECTIONS);
+        // The server's Brutal sender paces each connection at the rate the
+        // client declares, so the declared download is split between them.
+        if cfg.rx_bps > 0 {
+            cfg.rx_bps = (cfg.rx_bps / n as u64).max(1);
+        }
         Self {
             cfg: Arc::new(cfg),
-            conn: Mutex::new(None),
+            slots: (0..n).map(|_| Mutex::new(None)).collect(),
+            next: std::sync::atomic::AtomicUsize::new(0),
             generation: AtomicU::new(0),
         }
     }
@@ -54,22 +71,26 @@ impl ReconnectableClient {
     /// Returns whether a connection was dropped synchronously.
     pub fn reset(self: &Arc<Self>) -> bool {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.conn.try_lock() {
-            return guard.take().is_some();
+        let mut dropped = false;
+        for slot in 0..self.slots.len() {
+            if let Ok(mut guard) = self.slots[slot].try_lock() {
+                dropped |= guard.take().is_some();
+                continue;
+            }
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let client = Arc::clone(self);
+                runtime.spawn(async move {
+                    let mut guard = client.slots[slot].lock().await;
+                    if guard
+                        .as_ref()
+                        .is_some_and(|(_, generation)| *generation != client.generation())
+                    {
+                        guard.take();
+                    }
+                });
+            }
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let client = Arc::clone(self);
-            runtime.spawn(async move {
-                let mut guard = client.conn.lock().await;
-                if guard
-                    .as_ref()
-                    .is_some_and(|(_, generation)| *generation != client.generation())
-                {
-                    guard.take();
-                }
-            });
-        }
-        false
+        dropped
     }
 
     pub async fn tcp_connect(&self, target: &str) -> Result<DuplexStream> {
@@ -110,7 +131,8 @@ impl ReconnectableClient {
     }
 
     async fn handle(&self) -> Result<Arc<ConnHandle>> {
-        let mut guard = self.conn.lock().await;
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let mut guard = self.slots[slot].lock().await;
         if let Some((handle, generation)) = guard.as_ref() {
             if *generation == self.generation() && handle.is_active() {
                 return Ok(Arc::clone(handle));
@@ -380,5 +402,22 @@ mod tests {
             Error::Quic("second".into()),
         );
         assert!(matches!(acc, Some(Error::Quic(ref s)) if s == "second"));
+    }
+
+    #[test]
+    fn connections_are_clamped_and_split_the_declared_download() {
+        let client = |connections, rx_bps| {
+            ReconnectableClient::new(Config {
+                connections,
+                rx_bps,
+                ..Config::default()
+            })
+        };
+        let c = client(4, 100_000_000);
+        assert_eq!((c.slots.len(), c.cfg.rx_bps), (4, 25_000_000));
+        // 0 means one; the ceiling holds; an undeclared rate stays undeclared.
+        let c = client(0, 0);
+        assert_eq!((c.slots.len(), c.cfg.rx_bps), (1, 0));
+        assert_eq!(client(64, 0).slots.len(), MAX_CONNECTIONS);
     }
 }

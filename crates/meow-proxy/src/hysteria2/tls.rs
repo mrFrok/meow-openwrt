@@ -44,7 +44,11 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.set_application_protos(&[ALPN_H3])
         .map_err(|e| Error::tls(format!("quiche alpn: {e}")))?;
     quic.set_max_idle_timeout(u64::try_from(MAX_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-    let w = resolve_windows(config.windows, meow_common::sysmem::mem_total());
+    let w = resolve_windows(
+        config.windows,
+        meow_common::sysmem::mem_total(),
+        config.connections,
+    );
     quic.set_initial_max_data(w.initial_conn);
     quic.set_max_connection_window(w.max_conn);
     quic.set_initial_max_stream_data_bidi_local(w.initial_stream);
@@ -202,7 +206,7 @@ mod tests {
     #[test]
     fn windows_scale_with_ram_unless_configured() {
         const M: u64 = 1024 * 1024;
-        let auto = |mem| resolve_windows(super::super::ReceiveWindows::default(), mem);
+        let auto = |mem| resolve_windows(super::super::ReceiveWindows::default(), mem, 1);
         // 64 MB router: 4 MiB ceiling, initials clamped under it.
         assert_eq!(
             auto(Some(64 * M)),
@@ -233,11 +237,31 @@ mod tests {
             initial_stream: Some(M),
             ..Default::default()
         };
-        let w = resolve_windows(cfg, Some(64 * M));
+        let w = resolve_windows(cfg, Some(64 * M), 1);
         assert_eq!(
             (w.initial_stream, w.max_stream, w.max_conn),
             (M, 16 * M, 32 * M)
         );
+    }
+
+    #[test]
+    fn parallel_connections_share_the_window_budget() {
+        const M: u64 = 1024 * 1024;
+        let auto = |mem, n| resolve_windows(super::super::ReceiveWindows::default(), mem, n);
+        // 24 MiB ceiling over four connections: 6 MiB each, initials under it.
+        let w = auto(None, 4);
+        assert_eq!(
+            (w.max_conn, w.initial_conn, w.max_stream),
+            (6 * M, 6 * M, 6 * M)
+        );
+        // A 64 MB router's 4 MiB never drops below 2 MiB a connection.
+        assert_eq!(auto(Some(64 * M), 4).max_conn, 2 * M);
+        // A configured window is per connection and is not split.
+        let cfg = super::super::ReceiveWindows {
+            max_conn: Some(32 * M),
+            ..Default::default()
+        };
+        assert_eq!(resolve_windows(cfg, None, 4).max_conn, 32 * M);
     }
 
     #[test]
