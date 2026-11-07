@@ -711,6 +711,9 @@ pub struct RawProxyProvider {
     pub provider_type: String,
     pub url: Option<String>,
     pub path: Option<String>,
+    /// mihomo `type: inline` nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<serde_json::Value>>,
     pub interval: Option<u64>,
     pub filter: Option<String>,
     pub exclude_filter: Option<String>,

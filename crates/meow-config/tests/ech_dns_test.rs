@@ -35,6 +35,7 @@ use meow_config::load_config_from_str;
 /// Whether `name` parsed into a real node. meow-openwrt binds a named node
 /// that fails to parse to a dead placeholder (no address) rather than
 /// dropping it, so presence alone no longer means "accepted".
+#[allow(dead_code, reason = "its callers are feature-gated")]
 fn parsed(config: &meow_config::Config, name: &str) -> bool {
     config
         .proxies

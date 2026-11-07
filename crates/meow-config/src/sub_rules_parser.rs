@@ -116,10 +116,41 @@ pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
+    if let Some((_, block)) = split_conditional(rest) {
+        return Some(block.to_string());
+    }
     // Trailing comma-separated fields are rejected at rule-parse time
     // (issue #625); for reference-graph building we only need the first
     // field to name the would-be target in the undefined-block error.
     Some(rest.split(',').next()?.trim().to_string())
+}
+
+/// mihomo's `SUB-RULE,(<cond>),<block>`: `rest` (after `SUB-RULE,`) opens
+/// with a parenthesised condition; the block is the field after its closing
+/// parenthesis. `None` for the bare `SUB-RULE,<block>` form.
+pub(crate) fn split_conditional(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let block = rest[i + 1..].trim().strip_prefix(',')?.trim();
+                    if block.is_empty() || block.contains(',') {
+                        return None;
+                    }
+                    return Some((&rest[..=i], block));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// DFS-based topological sort with cycle detection.  Returns the order in
@@ -198,6 +229,20 @@ pub fn build_sub_rule_rule(
     Ok(Box::new(SubRuleRule::new(block_name, Arc::clone(block))))
 }
 
+/// [`build_sub_rule_rule`] for mihomo's `SUB-RULE,(<cond>),<block>`.
+pub fn build_conditional_sub_rule(
+    block_name: &str,
+    cond: Box<dyn Rule>,
+    resolved: &SubRuleBlocks,
+) -> Result<Box<dyn Rule>, String> {
+    let block = resolved
+        .get(block_name)
+        .ok_or_else(|| format!("sub-rule '{block_name}' not defined"))?;
+    Ok(Box::new(
+        SubRuleRule::new(block_name, Arc::clone(block)).with_condition(cond),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +271,16 @@ mod tests {
             parse_sub_rule_reference("  sub-rule , FOO  "),
             Some("FOO".into())
         );
+        assert_eq!(
+            parse_sub_rule_reference("SUB-RULE,(OR,((NETWORK,TCP),(NETWORK,UDP))),blk"),
+            Some("blk".into())
+        );
+        assert_eq!(
+            split_conditional("(AND,((NETWORK,UDP))), blk"),
+            Some(("(AND,((NETWORK,UDP)))", "blk"))
+        );
+        assert_eq!(split_conditional("(NETWORK,UDP),blk,junk"), None);
+        assert_eq!(split_conditional("blk"), None);
         assert_eq!(parse_sub_rule_reference("DOMAIN,example.com,DIRECT"), None);
         assert_eq!(parse_sub_rule_reference(""), None);
         assert_eq!(parse_sub_rule_reference("# SUB-RULE,X"), None);

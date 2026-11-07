@@ -6020,6 +6020,7 @@ tls: true
         std::fs::write(path, entries).unwrap();
         let raw = crate::raw::RawProxyProvider {
             provider_type: "file".to_string(),
+            payload: None,
             url: None,
             path: Some(path.to_str().unwrap().to_string()),
             interval: None,

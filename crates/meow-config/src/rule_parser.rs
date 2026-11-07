@@ -5,7 +5,9 @@ use meow_common::{Rule, RuleType};
 use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetBehavior, RuleSetRule};
 use tracing::warn;
 
-use crate::sub_rules_parser::{build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks};
+use crate::sub_rules_parser::{
+    build_conditional_sub_rule, build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks,
+};
 
 /// Parse rules with no rule-providers or sub-rule blocks available.
 ///
@@ -123,6 +125,18 @@ pub fn parse_one_rule_or_subrule(
             .map(|(_, r)| r)
             .unwrap_or_default()
             .trim();
+        // mihomo's form: `SUB-RULE,(<cond>),<block>` enters the block only
+        // when the condition matches (parsed as a one-child AND, which is
+        // exactly mihomo's `parsePayload("(" + payload + ")")`).
+        if let Some((cond, block)) = crate::sub_rules_parser::split_conditional(rest) {
+            let cond = meow_rules::parse_rule_with_rule_sets(
+                &format!("AND,({cond}),{block}"),
+                ctx,
+                providers,
+            )
+            .map_err(|e| format!("SUB-RULE condition {cond}: {e}"))?;
+            return build_conditional_sub_rule(block, cond, sub_rules);
+        }
         if rest.contains(',') {
             return Err(format!(
                 "SUB-RULE takes exactly <block-name> — trailing fields are \
@@ -220,8 +234,8 @@ mod tests {
 
         for line in [
             "SUB-RULE,blk,junk",
-            "SUB-RULE,(DOMAIN,a),blk",
             "SUB-RULE,blk,",
+            "SUB-RULE,(NETWORK,UDP),blk,x",
         ] {
             let err =
                 parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules)
@@ -232,6 +246,41 @@ mod tests {
                 "{line}: unexpected error {err}"
             );
         }
+    }
+
+    /// meow-openwrt: mihomo's `SUB-RULE,(<cond>),<block>` enters the block
+    /// only when the condition matches (OpenClash's default.yaml uses it).
+    #[test]
+    fn conditional_sub_rule_gates_the_block() {
+        use crate::sub_rules_parser::SubRuleBlocks;
+        use meow_common::{Metadata, Network, RuleMatchHelper};
+        let ctx = ParserContext::default();
+        let inner = meow_rules::parse_rule("MATCH,TARGET", &ctx).unwrap();
+        let sub_rules: SubRuleBlocks = HashMap::from([("blk".to_string(), Arc::new(vec![inner]))]);
+        for line in [
+            "SUB-RULE,(NETWORK,UDP),blk",
+            "SUB-RULE,(AND,((NETWORK,UDP))),blk",
+            "SUB-RULE,(OR,((NETWORK,UDP),(DST-PORT,1))),blk",
+        ] {
+            let rule = parse_one_rule_or_subrule(line, &providers(), &ctx, &sub_rules)
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+            let mut md = Metadata {
+                network: Network::Udp,
+                ..Metadata::default()
+            };
+            assert!(rule.match_metadata(&md, &RuleMatchHelper), "{line}: udp");
+            md.network = Network::Tcp;
+            assert!(!rule.match_metadata(&md, &RuleMatchHelper), "{line}: tcp");
+        }
+        let err = parse_one_rule_or_subrule(
+            "SUB-RULE,(NETWORK,UDP),nope",
+            &providers(),
+            &ctx,
+            &sub_rules,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("not defined"), "{err}");
     }
 
     /// Dead domain payloads can never equal/match the normalized

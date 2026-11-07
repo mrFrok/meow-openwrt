@@ -5082,6 +5082,7 @@ mod tests {
         std::fs::write(&path, "proxies: []\n").unwrap();
         let raw = RawProxyProvider {
             provider_type: "file".to_string(),
+            payload: None,
             url: None,
             path: Some("p.yaml".to_string()),
             interval: Some(1),

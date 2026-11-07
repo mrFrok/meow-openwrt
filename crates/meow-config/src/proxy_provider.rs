@@ -224,6 +224,10 @@ fn split_exclude_types(raw: Option<&[String]>) -> Vec<String> {
 
 enum Vehicle {
     File(PathBuf),
+    /// mihomo `type: inline`: the nodes sit in the provider's `payload:`,
+    /// kept here as the `proxies:` document the parser reads. Local,
+    /// operator-authored content, handled like a `file:` payload.
+    Inline(String),
     Http {
         url: String,
         /// `None` = fetch to memory only (no containment root available for
@@ -300,6 +304,11 @@ impl ProxyProvider {
                     (None, None) => None,
                 };
                 (Vehicle::Http { url, cache_path }, "HTTP")
+            }
+            "inline" => {
+                let payload = raw.payload.clone().unwrap_or_default();
+                let doc = serde_json::json!({ "proxies": payload }).to_string();
+                (Vehicle::Inline(doc), "Inline")
             }
             t => return Err(format!("unknown proxy-provider type '{t}'")),
         };
@@ -529,6 +538,7 @@ impl ProxyProvider {
                         self.name, path, e
                     )
                 }),
+            Vehicle::Inline(doc) => Ok((doc.clone(), None)),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
                     registry,
@@ -595,7 +605,7 @@ impl ProxyProvider {
                     .await
                     .map(|text| (text, Source::Cache))
             }
-            Vehicle::File(_) => Err(e),
+            Vehicle::File(_) | Vehicle::Inline(_) => Err(e),
         }
     }
 
@@ -831,7 +841,7 @@ impl ProxyProvider {
     /// the only vehicle whose payload is operator-authored, and the only
     /// one the synchronous materialize path can validate before commit.
     pub(crate) fn is_file_vehicle(&self) -> bool {
-        matches!(self.vehicle, Vehicle::File(_))
+        matches!(self.vehicle, Vehicle::File(_) | Vehicle::Inline(_))
     }
 
     /// The startup fetch for a provider without a usable cache. `Err` only
@@ -1498,7 +1508,7 @@ pub async fn load_proxy_providers_within(
                 continue;
             }
         };
-        if matches!(provider.vehicle, Vehicle::File(_)) {
+        if provider.is_file_vehicle() {
             // A `file:` payload is local, operator-authored content — it
             // must read identically under `-t` and at boot, so it loads
             // before the offline short-circuit below (mirroring the
@@ -1802,6 +1812,7 @@ mod tests {
     fn raw_file_provider(path: &str) -> RawProxyProvider {
         RawProxyProvider {
             provider_type: "file".to_string(),
+            payload: None,
             url: None,
             path: Some(path.to_string()),
             interval: None,
@@ -1833,6 +1844,25 @@ mod tests {
         assert_eq!(p.name, "test");
         assert_eq!(p.vehicle_type, "File");
         assert!(p.header.is_empty());
+    }
+
+    /// meow-openwrt: mihomo `type: inline` serves its `payload:` nodes, needs
+    /// no cache directory and counts as local content.
+    #[tokio::test]
+    async fn inline_provider_serves_its_payload() {
+        let mut raw = raw_file_provider("unused");
+        raw.provider_type = "inline".to_string();
+        raw.path = None;
+        raw.payload = Some(vec![serde_json::json!({
+            "name": "ss1", "type": "ss", "server": "127.0.0.1", "port": 443,
+            "cipher": "chacha20-ietf-poly1305", "password": "password",
+        })]);
+        let p = ProxyProvider::new("inl", &raw, None, true, false, Default::default()).unwrap();
+        assert_eq!(p.vehicle_type, "Inline");
+        assert!(p.is_file_vehicle());
+        p.initial_load(false).await.unwrap();
+        let names: Vec<String> = p.proxies().iter().map(|n| n.name().to_string()).collect();
+        assert_eq!(names, ["ss1"]);
     }
 
     #[test]
@@ -1869,6 +1899,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raw = RawProxyProvider {
             provider_type: "http".to_string(),
+            payload: None,
             url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
             path: Some("/etc/cron.d/pwned".to_string()),
             interval: None,
@@ -1920,6 +1951,7 @@ mod tests {
             "h".to_string(),
             RawProxyProvider {
                 provider_type: "http".to_string(),
+                payload: None,
                 url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
                 path: None, // implicit cache location from the name
                 interval: None,
@@ -1948,6 +1980,7 @@ mod tests {
         );
         let raw = RawProxyProvider {
             provider_type: "http".to_string(),
+            payload: None,
             url: Some("https://example.com/proxies.yaml".to_string()),
             path: None,
             interval: None,
@@ -1985,6 +2018,7 @@ mod tests {
         );
         let raw = RawProxyProvider {
             provider_type: "http".to_string(),
+            payload: None,
             url: Some("https://example.com/proxies.yaml".to_string()),
             path: None,
             interval: None,
@@ -3172,6 +3206,7 @@ header:
     fn raw_http_provider(url: &str, proxy: Option<&str>) -> RawProxyProvider {
         RawProxyProvider {
             provider_type: "http".to_string(),
+            payload: None,
             url: Some(url.to_string()),
             path: None,
             interval: None,

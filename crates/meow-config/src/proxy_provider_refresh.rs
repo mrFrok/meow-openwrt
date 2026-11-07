@@ -298,6 +298,7 @@ mod tests {
     fn raw_provider(interval: Option<u64>) -> RawProxyProvider {
         RawProxyProvider {
             provider_type: "http".to_string(),
+            payload: None,
             url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
             path: None,
             interval,

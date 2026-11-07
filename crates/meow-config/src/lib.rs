@@ -4447,6 +4447,24 @@ pub(crate) fn resolve_listener_bind(
 /// the caller (which has the listener name in scope). `Shadowsocks` returns
 /// a placeholder spec; `build_named_listeners`
 /// completes it via `build_ss_listener_spec`.
+/// mihomo `listeners:` types meow has no inbound for (server-side protocols,
+/// and `tun`, which meow configures from the top-level `tun:` section).
+const SERVER_ONLY_INBOUNDS: &[&str] = &[
+    "snell",
+    "vmess",
+    "vless",
+    "trojan",
+    "tuic",
+    "hysteria2",
+    "hysteria2-realm",
+    "tunnel",
+    "anytls",
+    "mieru",
+    "sudoku",
+    "trusttunnel",
+    "tun",
+];
+
 fn parse_listener_spec(
     raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
@@ -4454,7 +4472,8 @@ fn parse_listener_spec(
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
-        "socks5" => Ok(ListenerSpec::Socks5),
+        // `socks` is mihomo's spelling (SOCKS4/4a/5 inbound).
+        "socks5" | "socks" => Ok(ListenerSpec::Socks5),
         // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
         // rules — the deployer's REDIRECT rules steer traffic here.
         "redir" => Ok(ListenerSpec::TProxy {
@@ -4879,6 +4898,18 @@ fn build_named_listeners(
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let kind = raw_l.listener_type.to_ascii_lowercase();
+        if SERVER_ONLY_INBOUNDS.contains(&kind.as_str()) {
+            // meow-openwrt: a server-side mihomo inbound meow does not
+            // implement. It routes nothing for the router's clients, so the
+            // rest of the config should still start (OpenClash/nikki
+            // templates carry them).
+            warn!(
+                "listeners[{}]: inbound type '{kind}' is not supported by meow; skipped",
+                raw_l.name
+            );
+            continue;
+        }
         let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
