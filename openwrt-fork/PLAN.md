@@ -44,7 +44,7 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 3. Периодический health-check proxy-provider — `meow-config/src/proxy_provider.rs:310` + `meow-tunnel/src/health_check.rs`.
 4. REST API: скрипт сверки ответов с mihomo (`PUT /configs?force=true`, `/proxies/{g}`, `/group/{g}/delay`,
    `PUT /providers/rules/{n}`, `/logs?level=`).
-5. QUIC-сниффер, `tun.auto-redirect` — позже, по необходимости.
+5. ✅ QUIC-сниффер (`meow-listener/src/sniffer_quic.rs`, TUN UDP; SNI из Initial, v1/v2, ClientHello по нескольким пакетам; upstream PR #887) и `tun.auto-redirect` (этап 5).
 
 ## Этап 2 — урезание лишнего (аналог Go-этапа II: теги → cargo features)
 - В meow уже есть тонкие фичи (`docs/specs/cargo-feature-flags.md`: протоколы, транспорты, листенеры, `dns-server`,
@@ -93,6 +93,10 @@ deps `mlw-meowdeps-*`, наш Go-форк как эталон поведения
 - UDP: пакетный приём/отправка (recvmmsg/sendmmsg, GSO/GRO) в TUN/lwIP и в Hysteria2 (наш Go-опыт: −26% CPU/Мбит).
 - TUN (lwIP) vs tproxy vs redirect; ChaCha20 vs AES-GCM на mt7621 (через волонтёров); tokio worker-потоки по ядрам
   (`meow-app/src/main.rs:512,540`), `current_thread` для 1 ядра.
+  Проверено 2026-11-08 (BPI-R4, meow на одном ядре, tiny, по 2 прогона): `current_thread` против многопоточного с одним
+  worker — DIRECT 5000-5010 / 5980 против 5040-5050 / 6210-6220 Мбит/с (отдача −4 %), REALITY и hy2 в пределах шума
+  (hy2 отдача 509-510 против 499-502), памяти −60 КБ. Не берём; на MIPS (дорогие ll/sc) возможна другая картина —
+  проверять только с волонтёром.
 
 ## Этап 5 — быстрый путь DIRECT (Go-этап V)
 - **Сделано (2026-11-03): `dns.nftset`** (docs/nftset.md) — ядро кладёт IP ответов «не-DIRECT» доменов в nft-набор;
