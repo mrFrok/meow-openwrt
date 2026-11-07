@@ -438,10 +438,76 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
 }
 
+/// The system resolver file mihomo's `system` reads.
+const SYSTEM_RESOLV: &str = "/etc/resolv.conf";
+/// Where OpenWrt's netifd writes the servers a DHCP/PPP lease handed out.
+const DHCP_RESOLV: &str = "/tmp/resolv.conf.d/resolv.conf.auto";
+
+/// mihomo's system resolver entries, expanded to the servers they stand
+/// for: `system` / `system://` → `/etc/resolv.conf` (dnsmasq on OpenWrt,
+/// which also answers `.lan`), `dhcp://<iface>` → the lease servers
+/// netifd recorded, or `/etc/resolv.conf` without that file. OpenClash and
+/// nikki configs put these in `nameserver-policy` (`+.lan: system`); left
+/// alone they parse as a hostname or an unknown scheme and the entry dies.
+fn expand_system_nameservers<S: AsRef<str>>(servers: &[S]) -> Vec<String> {
+    expand_system_nameservers_from(servers, |path| std::fs::read_to_string(path).ok())
+}
+
+fn expand_system_nameservers_from<S: AsRef<str>>(
+    servers: &[S],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(servers.len());
+    for s in servers {
+        let t = s.as_ref().trim();
+        let files: &[&str] = if t.eq_ignore_ascii_case("system") || t.starts_with("system://") {
+            &[SYSTEM_RESOLV]
+        } else if t.starts_with("dhcp://") {
+            &[DHCP_RESOLV, SYSTEM_RESOLV]
+        } else {
+            out.push(s.as_ref().to_owned());
+            continue;
+        };
+        let found = files.iter().find_map(|f| {
+            read(f)
+                .map(|text| resolv_nameservers(&text))
+                .filter(|v| !v.is_empty())
+        });
+        match found {
+            Some(list) => {
+                tracing::info!("nameserver '{t}': using the system's {}", list.join(", "));
+                out.extend(list);
+            }
+            None => warn!(
+                "nameserver '{t}': no nameserver in {}; skipping",
+                files.join(" or ")
+            ),
+        }
+    }
+    out
+}
+
+/// The `nameserver` lines of a resolv.conf, as `udp://` URLs (IPv6 in
+/// brackets, zone ids dropped).
+fn resolv_nameservers(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next()? == "nameserver").then_some(())?;
+            let addr = words.next()?.split('%').next()?;
+            let ip: std::net::IpAddr = addr.parse().ok()?;
+            Some(match ip {
+                std::net::IpAddr::V4(v4) => format!("udp://{v4}:53"),
+                std::net::IpAddr::V6(v6) => format!("udp://[{v6}]:53"),
+            })
+        })
+        .collect()
+}
+
 /// Parse nameserver strings into `NameServerEntry`s — every entry must
 /// parse or load fails. No silent warn-and-drop.
 fn parse_nameserver_entries(servers: &[String]) -> Result<Vec<NameServerEntry>, anyhow::Error> {
-    servers
+    expand_system_nameservers(servers)
         .iter()
         .map(|s| {
             NameServerEntry::parse(s)
@@ -779,7 +845,7 @@ async fn build_policy_resolvers(
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     strict: bool,
 ) -> Result<Vec<Arc<meow_dns::DnsClient>>, anyhow::Error> {
-    let url_strs = value.as_urls();
+    let url_strs = expand_system_nameservers(&value.as_urls());
     let empty_resolved = HashMap::new();
     let mut resolvers = Vec::new();
     for url_str in &url_strs {
@@ -3694,5 +3760,48 @@ mod fakeip_cap_tests {
         assert_eq!(fakeip_memory_cap(&p24, mib(64)), 256);
         let v6: ipnet::IpNet = "fdfe:dcba:9876::/64".parse().unwrap();
         assert_eq!(fakeip_memory_cap(&v6, None), 1 << 20);
+    }
+}
+
+#[cfg(test)]
+mod system_nameserver_tests {
+    use super::*;
+
+    #[test]
+    fn system_and_dhcp_nameservers_expand_from_resolv_files() {
+        let read = |path: &str| match path {
+            SYSTEM_RESOLV => Some("search lan\nnameserver 127.0.0.1\nnameserver ::1\n".to_string()),
+            DHCP_RESOLV => {
+                Some("# Interface wan\nnameserver 192.0.2.53\nnameserver fe80::1%wan\n".to_string())
+            }
+            _ => None,
+        };
+        let got = expand_system_nameservers_from(
+            &["system", "dhcp://eth1", "tls://1.1.1.1", "system://"],
+            read,
+        );
+        assert_eq!(
+            got,
+            [
+                "udp://127.0.0.1:53",
+                "udp://[::1]:53",
+                "udp://192.0.2.53:53",
+                "udp://[fe80::1]:53",
+                "tls://1.1.1.1",
+                "udp://127.0.0.1:53",
+                "udp://[::1]:53",
+            ]
+        );
+        assert!(
+            parse_nameserver_urls(&got.iter().map(ToString::to_string).collect::<Vec<_>>()).is_ok()
+        );
+        // No lease file: dhcp:// falls back to the system resolver; nothing at all: skipped.
+        let only_system =
+            |path: &str| (path == SYSTEM_RESOLV).then(|| "nameserver 10.0.0.1".to_string());
+        assert_eq!(
+            expand_system_nameservers_from(&["dhcp://br-lan"], only_system),
+            ["udp://10.0.0.1:53"]
+        );
+        assert!(expand_system_nameservers_from(&["system"], |_| None).is_empty());
     }
 }
