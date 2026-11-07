@@ -1343,3 +1343,113 @@ async fn tls_pool_disabled_pays_full_price() {
         "a pool-disabled client must dial once per query"
     );
 }
+
+/// A DoH server that speaks only HTTP/2 (ALPN `h2` or a fatal alert), as
+/// some public resolvers do: they drop HTTP/1.1 outright. The client must
+/// negotiate h2 and keep one multiplexed session for every query.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+async fn start_doh_h2_only_stub() -> DohStub {
+    let ck = rcgen::generate_simple_self_signed(vec!["doh-stub.test".to_string()]).unwrap();
+    let cert = boring::x509::X509::from_der(ck.cert.der()).unwrap();
+    let key = boring::pkey::PKey::private_key_from_der(&ck.key_pair.serialize_der()).unwrap();
+    let mut builder =
+        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();
+    builder.set_certificate(&cert).unwrap();
+    builder.set_private_key(&key).unwrap();
+    builder.set_alpn_select_callback(|_, offered| {
+        boring::ssl::select_next_proto(b"\x02h2", offered)
+            .ok_or(boring::ssl::AlpnError::ALERT_FATAL)
+    });
+    let acceptor = builder.build();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server_accepts = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                    return;
+                };
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                while let Some(Ok((req, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let ok = req.method() == http::Method::POST
+                            && req.uri().path() == "/dns-query"
+                            && req
+                                .headers()
+                                .get("content-type")
+                                .map(http::HeaderValue::as_bytes)
+                                == Some(b"application/dns-message".as_slice());
+                        let mut body = req.into_body();
+                        let mut wire = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            wire.extend_from_slice(&chunk);
+                        }
+                        let Some(answer) = Message::from_bytes(&wire)
+                            .ok()
+                            .filter(|_| ok)
+                            .and_then(|m| answer_for(&m).to_bytes().ok())
+                        else {
+                            let resp = http::Response::builder().status(400).body(()).unwrap();
+                            let _ = respond.send_response(resp, true);
+                            return;
+                        };
+                        let resp = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/dns-message")
+                            .body(())
+                            .unwrap();
+                        if let Ok(mut tx) = respond.send_response(resp, false) {
+                            let _ = tx.send_data(bytes::Bytes::from(answer), true);
+                        }
+                    });
+                }
+            });
+        }
+    });
+    DohStub {
+        addr,
+        root: ck.cert.der().to_vec(),
+        accepts,
+    }
+}
+
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_only_server_shares_one_session() {
+    let stub = start_doh_h2_only_stub().await;
+    let client = Arc::new(
+        DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+            .with_tls_additional_roots(stub.root.clone()),
+    );
+    for name in ["a.example.com", "b.example.com"] {
+        let msg = timeout(T, client.query(name, RecordType::A))
+            .await
+            .expect("must not stall")
+            .expect("h2-only DoH query must succeed");
+        assert_example_answer(&msg);
+    }
+    let concurrent = (0..4).map(|i| {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .query(&format!("c{i}.example.com"), RecordType::A)
+                .await
+        })
+    });
+    for task in concurrent {
+        let msg = timeout(T, task).await.unwrap().unwrap().unwrap();
+        assert_example_answer(&msg);
+    }
+    assert_eq!(
+        stub.accepts.load(Ordering::SeqCst),
+        1,
+        "every query must ride the one negotiated h2 session"
+    );
+}

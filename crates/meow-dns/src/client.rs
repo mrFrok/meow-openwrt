@@ -284,6 +284,11 @@ pub struct DnsClient {
     /// full dial + handshake.
     #[cfg(feature = "encrypted")]
     tls_pool_disabled: bool,
+    /// The HTTP/2 session of a DoH upstream that negotiated `h2`: one
+    /// multiplexed connection carries every query, so it is shared
+    /// instead of checked out. Retired with the TLS pool's generation.
+    #[cfg(feature = "encrypted")]
+    doh_h2: AsyncMutex<Option<DohH2>>,
     /// Pooled conns rejected by the pre-checkout liveness probe —
     /// test/debug instrumentation separating "the probe caught the dead
     /// conn" from "the exchange-time EOF did": identical at accept-count
@@ -591,6 +596,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "encrypted")]
+            doh_h2: AsyncMutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -611,6 +618,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "encrypted")]
+            doh_h2: AsyncMutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -631,6 +640,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "encrypted")]
+            doh_h2: AsyncMutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -655,6 +666,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "encrypted")]
+            doh_h2: AsyncMutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -680,6 +693,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "encrypted")]
+            doh_h2: AsyncMutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1250,9 +1265,11 @@ impl DnsClient {
     /// query took before pooling.
     #[cfg(feature = "encrypted")]
     async fn tls_dial_handshake(&self) -> Result<TlsConn, ClientError> {
-        let (sni, alpn) = match &self.transport {
-            Transport::Dot { sni, .. } => (sni.as_ref(), "dot"),
-            Transport::Doh { sni, .. } => (sni.as_ref(), "http/1.1"),
+        // DoH offers h2 first, like Go's net/http (mihomo): some DoH
+        // servers drop HTTP/1.1 outright.
+        let (sni, alpn): (&str, &[&str]) = match &self.transport {
+            Transport::Dot { sni, .. } => (sni.as_ref(), &["dot"]),
+            Transport::Doh { sni, .. } => (sni.as_ref(), &["h2", "http/1.1"]),
             _ => unreachable!("tls_dial_handshake on a non-TLS transport"),
         };
         let conn = self.dial_tls_inner().await?;
@@ -1317,6 +1334,26 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
+        if let Transport::Doh { sni, path, .. } = &self.transport {
+            if let Some(send) = self.doh_h2_session().await {
+                let budget = self.timeout / 2;
+                let attempt = doh_h2_exchange(send, sni, path, wire);
+                match tokio::time::timeout(budget, attempt).await {
+                    Ok(Ok(body)) => return decode_validated_response(&body, expected),
+                    Ok(Err(ClientError::Io(err))) => tracing::debug!(
+                        upstream = %self.upstream_label(),
+                        error = %err,
+                        "dns doh h2: session failed; dialing fresh"
+                    ),
+                    Ok(Err(err)) => return Err(err),
+                    Err(_elapsed) => tracing::debug!(
+                        upstream = %self.upstream_label(),
+                        "dns doh h2: session missed its deadline; dialing fresh"
+                    ),
+                }
+                *self.doh_h2.lock().await = None;
+            }
+        }
         if !self.tls_pool_disabled {
             if let Some(mut pooled) = self.tls_pool.take().await {
                 // `Some(budget)` only for a conn that is both alive at
@@ -1394,6 +1431,22 @@ impl DnsClient {
         // a reset racing the dial must retire this conn too (issue #695).
         let generation = self.tls_pool.generation();
         let mut stream = self.tls_dial_handshake().await?;
+        if let Transport::Doh { sni, path, .. } = &self.transport {
+            if meow_transport::tls::selected_alpn(&stream) == Some(b"h2".as_slice()) {
+                let (send, conn) = h2::client::handshake(stream).await.map_err(h2_error)?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                if !self.tls_pool_disabled {
+                    *self.doh_h2.lock().await = Some(DohH2 {
+                        send: send.clone(),
+                        generation,
+                    });
+                }
+                let body = doh_h2_exchange(send, sni, path, wire).await?;
+                return decode_validated_response(&body, expected);
+            }
+        }
         let started = Instant::now();
         let (response, reusable) = self
             .tls_message_exchange(&mut stream, wire, expected)
@@ -1408,6 +1461,21 @@ impl DnsClient {
                 .await;
         }
         Ok(response)
+    }
+
+    /// The live HTTP/2 session of this DoH upstream, if one was negotiated
+    /// and no pool reset retired it since.
+    #[cfg(feature = "encrypted")]
+    async fn doh_h2_session(&self) -> Option<h2::client::SendRequest<bytes::Bytes>> {
+        let mut slot = self.doh_h2.lock().await;
+        match slot.as_ref() {
+            Some(s) if s.generation == self.tls_pool.generation() => Some(s.send.clone()),
+            Some(_) => {
+                *slot = None;
+                None
+            }
+            None => None,
+        }
     }
 
     async fn exchange(
@@ -1830,6 +1898,55 @@ async fn doh_http_exchange(
     read_http_response(stream).await
 }
 
+/// A DoH upstream's negotiated HTTP/2 session (see `DnsClient::doh_h2`).
+#[cfg(feature = "encrypted")]
+struct DohH2 {
+    send: h2::client::SendRequest<bytes::Bytes>,
+    generation: PoolGeneration,
+}
+
+/// An h2 failure is a transport failure: a dead or reset session must hit
+/// the `Io` retry path and be redialed, like a stale HTTP/1.1 conn.
+#[cfg(feature = "encrypted")]
+fn h2_error(e: h2::Error) -> ClientError {
+    ClientError::Io(io::Error::other(e))
+}
+
+/// One RFC 8484 POST on an HTTP/2 session; returns the DNS body.
+#[cfg(feature = "encrypted")]
+async fn doh_h2_exchange(
+    send: h2::client::SendRequest<bytes::Bytes>,
+    sni: &str,
+    path: &str,
+    wire: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    let mut send = send.ready().await.map_err(h2_error)?;
+    let request = http::Request::post(format!("https://{sni}{path}"))
+        .header("accept", "application/dns-message")
+        .header("content-type", "application/dns-message")
+        .header("content-length", wire.len())
+        .body(())
+        .map_err(|_| ClientError::Protocol("doh: bad request target"))?;
+    let (response, mut body) = send.send_request(request, false).map_err(h2_error)?;
+    body.send_data(bytes::Bytes::copy_from_slice(wire), true)
+        .map_err(h2_error)?;
+    let response = response.await.map_err(h2_error)?;
+    if response.status() != http::StatusCode::OK {
+        return Err(ClientError::Protocol("doh: non-200 status"));
+    }
+    let mut recv = response.into_body();
+    let mut out = Vec::new();
+    while let Some(chunk) = recv.data().await {
+        let chunk = chunk.map_err(h2_error)?;
+        let _ = recv.flow_control().release_capacity(chunk.len());
+        if out.len() + chunk.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 /// Incremental reader for one HTTP/1.1 DoH response. Reads run just ahead
 /// of the parser and stop at message boundaries, so a keep-alive peer is
 /// never asked for bytes it will never send; every byte read counts
@@ -2215,9 +2332,9 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// [`DnsClient::with_tls_additional_roots`] hook fills it so in-process
 /// upstreams can present self-signed chains.
 #[cfg(feature = "encrypted")]
-fn tls_layer(sni: &str, alpn: &str, extra_roots: &[Vec<u8>]) -> Result<TlsLayer, ClientError> {
+fn tls_layer(sni: &str, alpn: &[&str], extra_roots: &[Vec<u8>]) -> Result<TlsLayer, ClientError> {
     let config = TlsConfig {
-        alpn: vec![alpn.to_owned()],
+        alpn: alpn.iter().map(|&p| p.to_owned()).collect(),
         additional_roots: extra_roots.to_vec(),
         ..TlsConfig::new(sni)
     };
