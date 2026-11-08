@@ -79,7 +79,7 @@ trusttunnel-h3 = [
     "trusttunnel",
     "dep:quiche",
     "dep:boring",
-    "dep:webpki-root-certs",
+    "meow-transport/tls",
 ]
 # sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess. Pulls h2 + yamux +
 # tokio-util/compat — opt-out in `minimal` builds (ADR-0007 binary-size caps).

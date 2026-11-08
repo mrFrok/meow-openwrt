@@ -57,7 +57,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
-| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping, bandwidth hints. |
+| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
@@ -79,9 +79,11 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
-| `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
+| `dns:` — DoQ (`quic://`) | ✓ | RFC 9250 on quiche, behind the `dns-quic` feature (in `full`). Without the feature it is a hard error naming it. |
+| `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
+| `dns:` — `nameserver-policy-exclusive` | ✓ | meow-rs opt-in for upstream's ordering: a policy match is terminal — no `fallback-filter` domain/IP gate, no main/`fallback:` tiers. Off by default (meow's default tiers defer to `fallback-filter`). |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
@@ -105,7 +107,9 @@ These fields parse without error but behave differently from Go mihomo:
 | `authentication: ["user:"]` (empty password) | Accepted silently | Accepted; warn-once | B |
 | `skip-auth-prefixes` | Defaults to `[]` | Always includes `127.0.0.1/32` + `::1/128` | A |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
-| `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
+| `dns.nameserver: quic://...` | Supported | Supported (same scheme, same 853 default) when built with `dns-quic`; otherwise a hard error naming the feature | — |
+| `dns.nameserver: https://…#h3=true` (params in the fragment) | Supported | Hard error with the fix spelled out — `#` is SNI in meow-rs, so parameters belong in `?h3=true` | A |
+| `dns.prefer-h3` on a build without `dns-quic` | n/a | Hard load error, never a silent downgrade to HTTP/1.1 | A |
 | `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
 | `dns.nameserver: tls://…#NAME` / `https://…#NAME` | `#` is SNI | Same — `#` is SNI. When `NAME` matches a configured proxy, a warning points out the routing intent was probably `?proxy=NAME` (lowercase `proxy` only), the spelling that tunnels the exchange through that adapter (`tls://8.8.8.8#dns.google?proxy=JP` for SNI + proxy together). | — |
 | `dns.nameserver: udp/tcp entry with ?…` | Accepted — `url.Parse` keeps the query and it is silently ignored (semantic drift, not a rejection) | Hard error (`InvalidParams`) — `?` sections exist only on `tls://`/`https://`; plain entries keep `#PROXY`. | A |
@@ -625,7 +629,7 @@ tools built for Go mihomo will ignore them.
 | Prometheus metrics | `GET /metrics` | Native scrape endpoint; Go mihomo has no equivalent (M1.H-2) |
 | Subscription management API | `GET\|POST /api/subscriptions`, `DELETE /api/subscriptions/{name}`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
-| Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
+| Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]`, `POST /rules/append`, `POST /rules/reorder` | Runtime rule editing; `PATCH /rules/disable` and `GET/PUT/DELETE /storage/{key}` match upstream |
 | Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
 | Traffic ledger | `GET\|DELETE /traffic/ledger`, `traffic-ledger: {enable: true, hosts: true, apps: true}` | Per-day traffic by host, app, policy and interface, kept 62 days in `<home>/traffic/traffic.db`; not in `minimal` builds ([ADR-0015](adr/0015-traffic-ledger.md)) |
 | Inbound socket keepalive + relay idle bound | `tcp-keepalive`, `tcp-keepalive-idle`/`interval`/`probes`, `tcp-idle-timeout` | `SO_KEEPALIVE` + timing on every accepted inbound socket, and an opt-in whole-connection idle bound that reaps relays silent in both directions for `tcp-idle-timeout` seconds (off when absent or `0` — kernel keepalive probes are not relay bytes, so a live-but-silent flow like IMAP `IDLE` is still reaped once opted in); keepalive is a listener-startup snapshot, the idle bound is applied by `PUT /configs` to relays started after the commit |

@@ -10,7 +10,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use meow_common::logbook::{self, Level};
-use meow_common::TunnelMode;
+use meow_common::{TunnelMode, EPOCH_RFC3339};
 use meow_config::{
     proxy_provider::ProxyProvider,
     raw::{RawAutoRoute, RawConfig, RawProxyGroup, RawSubscription, RawTun},
@@ -108,6 +108,8 @@ pub struct AppState {
     /// after spawning the server; `PUT /configs` hot-swaps the resolver
     /// slot or rebinds the socket on a `dns.listen` change (issue #514).
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
+    /// `/storage/{key}`, opened on first use (`crate::storage`).
+    pub ui_storage: crate::storage::UiStorageSlot,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -190,20 +192,17 @@ async fn require_auth_ws(
 /// mihomo decodes request bodies as JSON whatever their `Content-Type`
 /// (`render.DecodeJSON`), and dashboards rely on it: some send a selection
 /// PUT as `text/plain` or with no type at all. axum's `Json` extractor
-/// answers those with 415, so a body without a type, or typed as plain
-/// text, is relabelled JSON before it reaches a handler. Other types
-/// (YAML, multipart) are left alone.
+/// answers anything but a JSON media type with 415, so every body that is
+/// not typed JSON (absent, empty, unreadable or any other media type) is
+/// relabelled `application/json` before it reaches a handler. No handler
+/// reads the request type, so this only turns 415s into what mihomo does.
 async fn assume_json_body(mut req: Request) -> Request {
     let relabel = match req.headers().get(header::CONTENT_TYPE) {
         None => !matches!(
             *req.method(),
             axum::http::Method::GET | axum::http::Method::HEAD
         ),
-        Some(v) => v.to_str().is_ok_and(|t| {
-            t.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/plain")
-        }),
+        Some(v) => !v.to_str().is_ok_and(is_json_media_type),
     };
     if relabel {
         req.headers_mut().insert(
@@ -212,6 +211,23 @@ async fn assume_json_body(mut req: Request) -> Request {
         );
     }
     req
+}
+
+/// `application/json` or a `+json` suffix type, parameters ignored, as
+/// axum's `Json` accepts them.
+fn is_json_media_type(t: &str) -> bool {
+    let media = t.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = media.split_once('/') else {
+        return false;
+    };
+    ty.eq_ignore_ascii_case("application")
+        && (sub.eq_ignore_ascii_case("json")
+            || sub
+                .len()
+                .checked_sub(5)
+                .filter(|&n| n > 0)
+                .and_then(|n| sub.get(n..))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case("+json")))
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -234,6 +250,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/rules",
             get(get_rules).post(replace_rules).put(update_rule_at_index),
         )
+        .route("/rules/append", post(append_rule))
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
@@ -602,12 +619,12 @@ struct RuleInfo<'a> {
 struct RuleExtra {
     disabled: bool,
     hit_count: u64,
-    hit_at: String,
+    /// `Cow` so the never-hit epoch answer stays one shared constant
+    /// instead of an allocation per rule.
+    hit_at: std::borrow::Cow<'static, str>,
     miss_count: u64,
     miss_at: &'static str,
 }
-
-const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Serialize)]
 struct RulesResponse<'a> {
@@ -629,12 +646,14 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
                 rule_type: r.rule_type().mihomo_name(),
                 payload: r.payload(),
                 proxy: r.adapter(),
-                size: -1,
+                size: r.size(),
                 extra: RuleExtra {
                     disabled: stat.disabled,
                     hit_count: stat.hits,
                     hit_at: unix_rfc3339(u64::from(stat.hit_at))
-                        .unwrap_or_else(|| EPOCH_RFC3339.to_string()),
+                        .map_or(std::borrow::Cow::Borrowed(EPOCH_RFC3339), |s| {
+                            std::borrow::Cow::Owned(s)
+                        }),
                     miss_count: 0,
                     miss_at: EPOCH_RFC3339,
                 },
@@ -645,22 +664,30 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// `PATCH /rules/disable` — mihomo's `disableRules`: a JSON object of rule
-/// index → disabled. Indexes past the end are skipped; the switches live
-/// with the current rule list and reset when it is rebuilt, as upstream.
+/// index → disabled. Indexes past the end are skipped. A switch follows
+/// its rule across rebuilds (config commits, subscription refreshes) by
+/// type, payload and target.
 ///
 /// The body is read as JSON whatever its `Content-Type`, as upstream's
 /// `render.DecodeJSON` does — panels do not all send the header.
 async fn disable_rules(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
-    let Ok(body) = serde_json::from_slice::<HashMap<String, bool>>(&body) else {
+    // The rule-mutation lane every sibling handler takes: `update_rules`
+    // /`update_routing` compute `RuleStats::carried` from a snapshot taken
+    // before their route write, so a disable landing between the snapshot
+    // and the install would be silently reverted despite answering 204.
+    let _mutation = CONFIG_MUTATION.lock().await;
+    // Decoded whole before anything applies, as upstream's `map[int]bool`:
+    // a bad key fails the request with nothing changed; an index outside
+    // the list (negative included) is skipped. `null` decodes to the nil
+    // map upstream — an empty patch, 204; `{"0":null}` is a `false`.
+    let Ok(body) = serde_json::from_slice::<Option<HashMap<i64, Option<bool>>>>(&body) else {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     };
-    let route = state.tunnel.route_snapshot();
-    for (index, disabled) in body {
-        let Ok(index) = index.parse::<usize>() else {
-            return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
-        };
-        route.rule_stats.set_disabled(index, disabled);
-    }
+    state
+        .tunnel
+        .set_rules_disabled(body.unwrap_or_default().into_iter().filter_map(
+            |(index, disabled)| Some((usize::try_from(index).ok()?, disabled.unwrap_or(false))),
+        ));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -864,8 +891,19 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
         routing_mark: raw.routing_mark.unwrap_or(0),
-        unified_delay: raw.unified_delay.unwrap_or(false),
-        sniffing: raw.sniffer.as_ref().and_then(|s| s.enable).unwrap_or(false),
+        // The live setting, as mihomo reports `UnifiedDelay.Load()`.
+        unified_delay: meow_proxy::health::unified_delay(),
+        // The field echoes the committed config's intent: `sniffer.enable`
+        // when the block is present, else the deprecated `tproxy-sni`
+        // alias that synthesises an enabled sniffer. Read directly from
+        // `raw` — re-running `sniffer_config_from_raw` per poll would
+        // re-emit that parser's deprecation/force-dns-mapping warns on
+        // every dashboard GET.
+        sniffing: raw
+            .sniffer
+            .as_ref()
+            .and_then(|s| s.enable)
+            .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
@@ -879,7 +917,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
 /// it carries are merged over the committed section and the rest keep
 /// their value, `enable` included (mihomo reads an omitted `enable` as
 /// `false`). Any other key is ignored, mihomo's upstream-only ones
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) included.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …)
+/// included.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct TunFields {
@@ -890,7 +929,7 @@ struct TunFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inet4_address: Option<String>,
+    inet4_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inet6_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -901,6 +940,12 @@ struct TunFields {
     dns_hijack: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     udp_timeout: Option<u64>,
+    /// `stack` is free-form like `RawTun`'s: `system`/`mixed` select the
+    /// kernel TCP stack, anything else commits verbatim and warns at
+    /// parse — the same contract the `tun:` file section gets, rather
+    /// than a 400 for the whole PATCH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stack: Option<serde_json::Value>,
 }
 
 impl TunFields {
@@ -912,12 +957,13 @@ impl TunFields {
             enable: Some(running),
             device: tun.device,
             mtu: tun.mtu,
-            inet4_address: tun.inet4_address,
+            inet4_address: reported_inet4(tun.inet4_address),
             inet6_address: tun.inet6_address,
             auto_route: tun.auto_route,
             outbound_interface: tun.outbound_interface,
             dns_hijack: tun.dns_hijack,
             udp_timeout: tun.udp_timeout,
+            stack: tun.stack,
         }
     }
 
@@ -939,7 +985,28 @@ impl TunFields {
         merge(&mut tun.outbound_interface, self.outbound_interface);
         merge(&mut tun.dns_hijack, self.dns_hijack);
         merge(&mut tun.udp_timeout, self.udp_timeout);
+        merge(&mut tun.stack, self.stack);
     }
+}
+
+/// `GET /configs`'s `tun.inet4-address` is a plain CIDR string — or absent
+/// — no matter which spelling the committed `tun:` section uses: `RawTun`
+/// keeps the user's form, which may be mihomo's list (`[]netip.Prefix`).
+/// Reporting the first list entry — the one `parse_tun_config` assigns the
+/// device — restores the `string | absent` contract list-typed clients
+/// broke on; `[]` and `null` report absent, while `""` reports `""`,
+/// exactly as the `Option<String>` field behaved before.
+/// A client that echoes the report back through `PATCH /configs` commits
+/// the string spelling — the parsed address is identical, so the
+/// reconcile's parsed-`TunConfig` diff does not restart the listener.
+/// `inet6-address` keeps echoing its committed form: a raw `Value` there
+/// is its shipped contract, not a regression.
+fn reported_inet4(raw: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let first = match raw {
+        Some(serde_json::Value::Array(entries)) => entries.into_iter().next(),
+        other => other,
+    };
+    first.filter(serde_json::Value::is_string)
 }
 
 #[derive(Deserialize)]
@@ -985,6 +1052,25 @@ async fn update_configs(
                     Json(serde_json::json!({ "message": format!("tun config error: {e}") })),
                 )
                     .into_response();
+            }
+            // A merged section that differs and stays enabled runs the
+            // reconcile's stop → spawn — the same spawn-side sniffer
+            // parse `PUT /configs` gates at admission (review #887). A
+            // committed `sniffer:` the parser rejects (only a forced
+            // earlier PUT can have committed one) would otherwise tear
+            // the running listener down here and answer 500; reject the
+            // PATCH instead and keep the listener up. A disable or
+            // no-change patch never spawns, so it is not gated.
+            if tun.enable && raw.tun.as_ref() != Some(&tun) {
+                if let Err(e) = meow_config::sniffer_config_from_raw(&raw) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({ "message": format!("sniffer config error: {e}") }),
+                        ),
+                    )
+                        .into_response();
+                }
             }
             (raw.tun.as_ref() != Some(&tun)).then_some(tun)
         }
@@ -1614,6 +1700,41 @@ async fn commit_raw_candidate(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    // The `PUT /configs` admission gates, conditionally (review #887): a
+    // caller that rewrites a `tun:`-reconcile input fires the restart in
+    // `swap_config_and_reconcile_tun` below, whose spawn re-parses `tun:`
+    // and `sniffer:` — a section that fails must be rejected here, before
+    // `stop_tun` can tear a healthy listener down. The tuple is the
+    // fast-path's plus the DNS inputs `fake_ip_changed` watches — a
+    // rebuilt resolver whose fake-IP pool moved restarts too. Today's
+    // callers only touch proxies/groups/rules/subscriptions, so it always
+    // compares equal and the gate never fires — including when a forced
+    // PUT committed an invalid section (mutations that cannot restart
+    // must not be blocked by it).
+    let restarts_tun = {
+        let committed = state.raw_config.read();
+        candidate.tun.as_ref().is_some_and(|t| t.enable)
+            && (committed.tun != candidate.tun
+                || committed.max_connections != candidate.max_connections
+                || committed.sniffer != candidate.sniffer
+                || committed.tproxy_sni != candidate.tproxy_sni
+                || committed.fake_ip_range() != candidate.fake_ip_range()
+                || !dns_inputs_equal(&committed, &candidate))
+    };
+    if restarts_tun {
+        meow_config::parse_tun_config(
+            candidate.tun.as_ref(),
+            candidate.max_connections,
+            candidate.fake_ip_range(),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("tun config error: {e}")))?;
+        meow_config::sniffer_config_from_raw(&candidate).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("sniffer config error: {e}"),
+            )
+        })?;
+    }
     let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
@@ -2647,6 +2768,19 @@ async fn replace_rules(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here — first bad line wins, all-or-nothing.
+        for line in &body.rules {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("rule '{trimmed}' failed to parse: {e}"),
+                    ));
+                }
+            }
+        }
         raw.rules = Some(body.rules);
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
@@ -2669,6 +2803,17 @@ async fn update_rule_at_index(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here instead of answering 204 to a no-op.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
         let rules = raw.rules.get_or_insert_with(Vec::new);
         if body.index >= rules.len() {
             return Err((StatusCode::BAD_REQUEST, "index out of range".into()));
@@ -2680,6 +2825,68 @@ async fn update_rule_at_index(
     let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
     commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AppendRuleRequest {
+    rule: String,
+}
+
+/// `POST /rules/append` (meow): add one line after the config's rules.
+async fn append_rule(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AppendRuleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _mutation = CONFIG_MUTATION.lock().await;
+    let snapshot = {
+        let mut raw = state.raw_config.read().clone();
+        // `parse_rules_full` warns and skips a line that fails — an append
+        // would answer 204 while the rule never lands (a logic rule's
+        // display payload, e.g. `((T,p) && (T,p))`, is one such line).
+        // Dry-parse first so the caller hears about it; comments and blank
+        // lines parse as nothing by config-file convention and pass.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
+        raw.rules.get_or_insert_with(Vec::new).push(body.rule);
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
+        raw
+    };
+    commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Dry-run one `rules:` line through [`meow_config::rule_parser`]'s
+/// per-line path against the inputs the commit's rebuild will use — the
+/// live rule-provider sets and the config's sub-rule blocks. The geo
+/// context carries empty indexes, the same stand-in the offline `-t`
+/// validation uses: a GEOIP/IP-ASN line still parses, and were the real
+/// MMDB unreadable the rebuild's own context load would fail the commit
+/// anyway.
+fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<(), String> {
+    let providers = meow_config::rule_provider::live_ruleset_map(&state.rule_providers.read());
+    let ctx = meow_rules::ParserContext {
+        geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+        asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+        geosite: None,
+    };
+    let sub_rules = match raw.sub_rules.as_ref() {
+        // A committed `sub-rules:` section always parses — on defect the
+        // rebuild errors louder than this check, so an empty map stands in.
+        Some(map) if !map.is_empty() => {
+            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx)
+                .unwrap_or_default()
+        }
+        _ => Default::default(),
+    };
+    meow_config::rule_parser::parse_one_rule_or_subrule(line, &providers, &ctx, &sub_rules)
+        .map(|_| ())
 }
 
 async fn delete_rule(
@@ -3027,8 +3234,10 @@ async fn get_chain_health(
 /// Returns `Ok(Some(handle))` on success — the [`TunHandle`] carries the
 /// lwIP core's done signal so `stop_tun` can await real teardown
 /// (issue #514) — `Ok(None)` when `tun.enable` is false, or `Err(msg)`
-/// when startup fails (permission denied, device-name conflict, timeout,
-/// or the `listener-tun` feature is not compiled in).
+/// when startup fails: an unparsable `tun:` or `sniffer:` section (the
+/// listener carries the parsed `SnifferConfig`; review #887), permission
+/// denied, device-name conflict, timeout, or the `listener-tun` feature
+/// not compiled in.
 ///
 /// `binding` is the global-route binding the mutation pre-installed for
 /// `raw` ([`preinstall_global_route_binding`], issue #695); the listener
@@ -3069,6 +3278,16 @@ async fn spawn_tun_from_raw(
         }
         Err(e) => warn!("tun: sniffer config ignored: {e}"),
     }
+    // A broken `sniffer:` section is a parse error like `tun:`'s above,
+    // not a warn-and-continue — silently spawning a snifferless TUN while
+    // the API still reports success hides the defect (review #887).
+    let sniffer_cfg = match meow_config::sniffer_config_from_raw(raw) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!("sniffer config parse error: {e}"));
+        }
+    };
+    listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(sniffer_cfg)));
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
     }
@@ -3196,24 +3415,32 @@ async fn swap_config_and_reconcile_tun(
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
         // any real listener-parameter change (`mtu`, `auto-route`,
-        // `dns-hijack`, addresses, inherited `max-connections`, …)
-        // restarts a running listener while no-op respellings
-        // (`auto-route: true` vs `fake-ip`, explicit defaults) and
-        // warn-only ignored fields (`stack`, `strict-route`, …) do not.
+        // `dns-hijack`, addresses, `stack`, inherited `max-connections`,
+        // …) restarts a running listener while no-op respellings
+        // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
+        // spellings that parse to the same `TunStack`) and warn-only
+        // ignored fields (`strict-route`, `auto-detect-interface`, …)
+        // do not.
         // When either side fails to parse, fall back to the raw diff —
         // a broken candidate stays conservative: restart → spawn fails
         // → `enable` rolls back.
         let tun_changed = if guard.tun == candidate.tun
             && guard.max_connections == candidate.max_connections
-            // The TUN carries the sniffer it was spawned with.
+            // The TUN carries the sniffer it was spawned with — and the
+            // deprecated `tproxy-sni` alias feeds the same parse, so it
+            // belongs to this tuple too: an alias flip is a real sniffer
+            // change (synthesised-enable ↔ default-disabled) that must
+            // reach the slow path (review #887).
             && guard.sniffer == candidate.sniffer
+            && guard.tproxy_sni == candidate.tproxy_sni
             // The default device address derives from it.
             && guard.fake_ip_range() == candidate.fake_ip_range()
         {
             // Fast path: identical raw sections cannot differ
             // semantically — and skipping the parse avoids re-warn!ing
-            // on upstream-only fields (`stack:`, `strict-route:`, …) on
-            // every commit that never touched `tun:`.
+            // on every commit that never touched `tun:` (upstream-only
+            // fields like `strict-route:` and `stack:`'s warn-and-fall-
+            // back spellings all warn at parse).
             false
         } else {
             match (
@@ -3228,7 +3455,25 @@ async fn swap_config_and_reconcile_tun(
                     candidate.fake_ip_range(),
                 ),
             ) {
-                (Ok(o), Ok(n)) => o != n,
+                // The TUN also carries the sniffer it was spawned with:
+                // a sniffer-only diff must restart it too — compared
+                // semantically, like `TunConfig`, so a no-op respelling
+                // does not (review #887).
+                (Ok(o), Ok(n)) => {
+                    o != n
+                        || match (
+                            meow_config::sniffer_config_from_raw(&guard),
+                            meow_config::sniffer_config_from_raw(&candidate),
+                        ) {
+                            // A disabled sniffer's remaining fields are
+                            // dead config — `enable: false` with a
+                            // different timeout or port list is the same
+                            // off state, not a restart-worthy change
+                            // (review #887).
+                            (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
+                            _ => guard.sniffer != candidate.sniffer,
+                        }
+                }
                 // Raw sections already known to differ — a broken
                 // candidate stays conservative: restart → spawn fails
                 // → `enable` rolls back.
@@ -3254,6 +3499,8 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        // Commit point: a rejected candidate never reaches here.
+        meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -3790,6 +4037,27 @@ async fn put_configs(
             forced.push(format!("tun config error: {e}"));
         } else {
             return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
+        }
+    }
+
+    // Same admission contract for `sniffer:` (review #887): the TUN
+    // carries the parsed `SnifferConfig` it was spawned with, and a
+    // section `spawn_tun_from_raw` cannot parse fails the same restart a
+    // sniffer diff triggers — tearing a healthy listener down on a 204
+    // exactly as an unparsable `tun:` did before the gate above. `force`
+    // degrades the same way; the restart's rollback still prevents a
+    // false `enable`. The rebuild never sees this section either, so it
+    // must gate here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted.
+    if let Err(e) = meow_config::sniffer_config_from_raw(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite sniffer config error: {e}");
+            forced.push(format!("sniffer config error: {e}"));
+        } else {
+            return reload_rejected(
+                StatusCode::BAD_REQUEST,
+                &format!("sniffer config error: {e}"),
+            );
         }
     }
 
@@ -4497,16 +4765,18 @@ async fn refresh_provider(
     };
     match provider.refresh().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+        // Fetch/parser errors can include private URLs, headers or payloads.
+        Err(_) => msg_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message": e})),
-        )
-            .into_response(),
+            "Proxy provider refresh failed; the last valid proxies are unchanged",
+        ),
     }
 }
 
-/// Trigger a health check for all proxies in the named provider.
-/// Accepts the same `url` and `timeout` query params as `GET /proxies/:name/delay`.
+/// Trigger a health check for all proxies in the named provider, using the
+/// provider's own `health-check` url/timeout/expected-status. Query params
+/// are not accepted — per-proxy overrides live on
+/// `/providers/proxies/{provider}/{name}/healthcheck`.
 async fn provider_healthcheck(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -4516,7 +4786,15 @@ async fn provider_healthcheck(
         None => return msg_err(StatusCode::NOT_FOUND, "resource not found"),
     };
 
-    let Some(health) = provider.health_check.as_ref() else {
+    // mihomo's `execute` skips an empty testUrl ("Health Check has been
+    // skipped due to testUrl is empty") — no block or no url both answer
+    // 204 without probing. `enable` deliberately does not gate this: a
+    // manual request is not the periodic sweep it disables.
+    let Some(health) = provider
+        .health_check
+        .as_ref()
+        .filter(|hc| !hc.url.is_empty())
+    else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let timeout = Duration::from_millis(health.timeout.max(1));
@@ -4671,22 +4949,27 @@ async fn get_rule_provider(
 async fn refresh_rule_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> StatusCode {
+) -> Response {
     let provider = {
         let providers = state.rule_providers.read();
         providers.get(&name).cloned()
     };
     let Some(p) = provider else {
-        return StatusCode::NOT_FOUND;
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // The provider re-parses in its own load-time ParserContext, so a
     // classical payload with GEOIP/GEOSITE entries survives the refresh
     // (issue #533 review).
     match p.refresh().await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(e) => {
-            tracing::warn!(provider = %name, "rule-provider refresh failed: {:#}", e);
-            StatusCode::SERVICE_UNAVAILABLE
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Keep the existing last-good owner; only the response changes. Do
+        // not echo the error chain, which may contain a private URL/payload.
+        Err(_) => {
+            tracing::warn!(provider = %name, "rule-provider refresh failed");
+            msg_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Rule provider refresh failed; the last valid rules are unchanged",
+            )
         }
     }
 }
@@ -5373,6 +5656,7 @@ mod outbound_flush_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 
@@ -5517,6 +5801,7 @@ mod global_route_binding_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 

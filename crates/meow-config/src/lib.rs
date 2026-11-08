@@ -328,11 +328,12 @@ pub struct TunConfig {
     pub stack: TunStack,
 }
 
-/// `tun.stack` (meow-openwrt). `system` and `mixed` hand TCP to the host
+/// `tun.stack`. `system` and `mixed` hand TCP to the host
 /// kernel's stack, as mihomo's system stack does (Linux; elsewhere the
-/// listener falls back to lwIP); anything else (`gvisor`, `lwip`, unset)
-/// keeps the userspace lwIP stack. Under `system` UDP is handled in the
-/// pump (fragments and ICMP still go to lwIP).
+/// listener falls back to lwIP); anything else (`gvisor`, `mips`, `lwip`,
+/// unset) keeps the userspace lwIP stack. Under `system` UDP is handled
+/// in the pump (UDP fragments and ICMP still go to lwIP; fragmented TCP
+/// is dropped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunStack {
     #[default]
@@ -616,7 +617,7 @@ pub fn parse_tun_config(
         ));
     }
 
-    let inet4_address = match r.inet4_address.as_deref() {
+    let inet4_address = match first_cidr("inet4-address", "IPv4", r.inet4_address.as_ref())? {
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
@@ -721,6 +722,10 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
             warn!("tun.stack: gvisor is not available; using the userspace (lwip) stack");
             TunStack::Lwip
         }
+        Some("mips") => {
+            warn!("tun.stack: mips (mihomo's own stack) is not available; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
         Some("lwip" | "") => TunStack::Lwip,
         _ => {
             warn!("tun.stack: unknown value {value}; using the userspace (lwip) stack");
@@ -729,19 +734,33 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
     }
 }
 
-/// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
-/// list form. The device takes a single IPv6 address, so of a list only
-/// the first entry is used; an empty list or empty string is "unset".
-fn parse_inet6_address(
-    raw: Option<&serde_json::Value>,
-) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+/// The CIDR string of a `tun.inet{4,6}-address`: a string or mihomo's list
+/// form (`[]netip.Prefix`), of which the first entry is used — with a
+/// warning when there are more — since the device takes a single address.
+/// `''` and `[]` are "unset". A `Value::Null` is an error, not unset:
+/// YAML `null` lands in the `None` arm (the `Option` layer's `visit_none`),
+/// so only a non-finite float (`.nan`, `.inf`, `1e999`) — which
+/// `serde_json::Value` maps to `Null` — reaches it, and those were a hard
+/// error when `inet4-address` was `Option<String>` (the spelling reached
+/// the CIDR parse as text).
+fn first_cidr<'a>(
+    key: &str,
+    family: &str,
+    raw: Option<&'a serde_json::Value>,
+) -> Result<Option<&'a str>, anyhow::Error> {
     let cidr = match raw {
-        None | Some(serde_json::Value::Null) => return Ok(None),
+        None => return Ok(None),
+        Some(serde_json::Value::Null) => {
+            return Err(anyhow::anyhow!(
+                "tun.{key}: expected a CIDR string or a list of them, got a \
+                 non-finite number (e.g. .nan, .inf)"
+            ));
+        }
         Some(serde_json::Value::String(s)) => s.as_str(),
         Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {
                 warn!(
-                    "tun.inet6-address: {} entries given; meow-rs assigns one IPv6 \
+                    "tun.{key}: {} entries given; meow-rs assigns one {family} \
                      address to the device — only the first is used",
                     entries.len()
                 );
@@ -751,20 +770,26 @@ fn parse_inet6_address(
                 Some(serde_json::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
-                        "tun.inet6-address: expected a CIDR string, got {other:?}"
+                        "tun.{key}: expected a CIDR string, got {other:?}"
                     ));
                 }
             }
         }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "tun.inet6-address: expected a CIDR string or a list of them, got {other:?}"
+                "tun.{key}: expected a CIDR string or a list of them, got {other:?}"
             ));
         }
     };
-    if cidr.is_empty() {
+    Ok((!cidr.is_empty()).then_some(cidr))
+}
+
+fn parse_inet6_address(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+    let Some(cidr) = first_cidr("inet6-address", "IPv6", raw)? else {
         return Ok(None);
-    }
+    };
     cidr.parse::<ipnet::Ipv6Net>()
         .map(Some)
         .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
@@ -3457,12 +3482,11 @@ fn parse_sniffer_config(
                             quic_ports = proto.ports.clone().unwrap_or_else(|| vec![443]);
                         }
                         // An unrecognized key is a typo'd/dead declaration —
-                        // a defect under strict (issue #533 review), unlike
-                        // the valid-but-unimplemented `QUIC` Class-B shim.
+                        // a defect under strict (issue #533 review).
                         other if strict => {
                             anyhow::bail!(
                                 "sniffer.sniff.{other}: unknown protocol (strict mode); \
-                                 supported: TLS, HTTP"
+                                 supported: TLS, HTTP, QUIC"
                             );
                         }
                         other => {
@@ -3495,6 +3519,27 @@ fn parse_sniffer_config(
                 }
             }
 
+            // Canonical order for the semantic `SnifferConfig` diff the
+            // TUN reconcile runs on a config change: the runtime dedups
+            // every list into a `HashMap`/`DomainTrie` anyway, so
+            // `[443, 8443]` and `[8443, 443]` are the same config — sort
+            // + dedup keeps a port-or-domain respelling from restarting
+            // the listener (review #887).
+            for ports in [&mut tls_ports, &mut http_ports, &mut quic_ports] {
+                ports.sort_unstable();
+                ports.dedup();
+            }
+            let normalize_domains = |list: &Option<Vec<String>>| {
+                let mut v: Vec<SmolStr> = list
+                    .iter()
+                    .flatten()
+                    .map(|s| SmolStr::from(s.as_str()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+
             Ok(SnifferConfig {
                 enable,
                 timeout: std::time::Duration::from_millis(timeout_ms),
@@ -3503,18 +3548,8 @@ fn parse_sniffer_config(
                 tls_ports,
                 http_ports,
                 quic_ports,
-                skip_domain: rs
-                    .skip_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
-                force_domain: rs
-                    .force_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
+                skip_domain: normalize_domains(&rs.skip_domain),
+                force_domain: normalize_domains(&rs.force_domain),
             })
         }
         None if has_tproxy_sni => {

@@ -8,6 +8,248 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
+  names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
+  `PATCH /rules/disable` switches rules off, the switch following its rule
+  across reloads; `GET/PUT/DELETE /storage/{key}` keeps dashboard settings
+  (zashboard's sync); `POST /rules/append`. Rule lines in mihomo's API
+  spelling (`DomainSuffix,a.com,DIRECT`) parse through `/rules`.
+- **`support-x25519mlkem768: true`** — REALITY now offers an
+  X25519MLKEM768 key share (its own X25519 key) ahead of X25519, which
+  Xray REALITY servers >= 26.9.8 require; the REALITY ClientVer is a
+  current Xray release, so servers with a `minClientVer` floor accept it.
+- **`unified-delay: true`** — mihomo's global switch, re-applied on
+  every config load and reported by `GET /configs`. A delay probe then
+  sends two keep-alive `HEAD` requests on one connection and reports
+  only the second: one round trip through the proxy instead of
+  dial + proxy/TLS handshakes + request. A second request that fails
+  in transport keeps the full first measurement, as upstream does.
+- **`dns.nameserver-policy-exclusive: true`** — a `nameserver-policy`
+  match then owns the query end-to-end: its nameservers answer, or the
+  query fails, with no `fallback-filter` domain gate, no
+  `ipcidr`/geoip rejection of its answers and no main/`fallback:`
+  escalation — mihomo's `ipExchange` ordering, where a `matchPolicy`
+  hit returns before every fallback check. `direct-nameserver`
+  inherits the flag when `direct-nameserver-follow-policy` is on.
+  Default `false` keeps the tiered behaviour.
+- **`meow convert-ruleset <domain|ipcidr> mrs <source.mrs> [out.txt]`** —
+  the `.mrs` → text direction of mihomo's `convert-ruleset`, e.g. for
+  inspecting or hand-editing the `.mrs` rule-providers OpenWrt frontends
+  ship. The text matches upstream's dump: a domain stored as both
+  apex and subdomains collapses to one `+.domain` line, a suffix-only
+  entry stays `.domain`, `ipcidr` ranges split into aligned CIDRs.
+  Output goes through a unique `.pid.n.tmp` scratch renamed into place —
+  never a truncated half-file, never a clobbered source behind a `..`
+  path, a symlink, or a hard link — and decode failures name the file
+  that failed. Keys that aren't valid UTF-8 are skipped with a count
+  printed as a warning.
+- **Scheduled `proxy-providers:` `health-check:` sweeps** — a provider
+  with `enable: true` and a `url` now probes its members every
+  `interval` (seconds, `0`→`300`; `timeout` in ms, `0`→`5000`), the same
+  sweep `GET /providers/proxies/{name}/healthcheck` runs on demand. The
+  first probe lands when the payload does — a commit between ticks wakes
+  the loop like upstream's `setProxies` → `hc.check()` instead of
+  waiting out the interval. An absent/empty `url` means no probes at all
+  (upstream zeroes the interval there), and upstream's `lazy` —
+  skipping sweeps while the provider is idle — is **not** honoured: meow
+  tracks no per-provider last-touch, so an explicit `lazy: true` warns
+  at load (same precedent as group `lazy`, #555). `expected-status`
+  validates at load whenever the block is present, and a block with
+  `enable` absent or `false` still feeds the manual endpoint and the
+  `testUrl`/`expectedStatus` API echo.
+- **`SAFE_PATHS` / `SKIP_SAFE_PATH_CHECK` environment variables** —
+  mihomo's escape hatches around the provider path-containment guard.
+  `SAFE_PATHS` is a `PATH`-style list of extra roots provider `path:`
+  values may live under besides the provider cache directory (entries
+  are trimmed, relative ones ignored); `SKIP_SAFE_PATH_CHECK` parses
+  like Go's `strconv.ParseBool` and, when truthy, downgrades a
+  containment failure to a loud `warn!` instead of rejecting the path.
+- **`RULE-SET` inside `AND`/`OR`/`NOT` logic rules** —
+  `AND,((NETWORK,udp),(RULE-SET,cn)),ProxyUDP` now resolves the provider
+  reference inside the group, as mihomo does — the same provider map the
+  top-level `RULE-SET` arm already used, plus the `src`-on-domain warn
+  the top level had. In a rule-provider's own payload `RULE-SET` is
+  still rejected eagerly — stricter than upstream, which resolves the
+  name lazily at match time and tolerates cycles.
+- **`tun.stack: system`** — on Linux the TUN's TCP is terminated by the
+  host kernel instead of lwIP: the packet pump rewrites each connection
+  to a kernel listener on the device address (an in-device NAT, as
+  mihomo's `system` stack does), translating TSO/GRO aggregates whole, so
+  a DIRECT relay splices and TCP throughput per CPU multiplies. UDP is
+  parsed and built in the pump rather than by a userspace stack;
+  UDP fragments, IPv6 extension headers and ICMP stay on lwIP
+  (fragmented TCP is dropped). `mixed` maps to `system` with a warning
+  (its UDP is not gVisor's here); `gvisor`, `mips` and non-Linux
+  `system` fall back to `lwip` with a warning.
+- **`sniff.QUIC` on TUN UDP flows** — the `sniffer:` block's `QUIC`
+  protocol key now names a TUN UDP flow from the SNI inside the
+  client's Initial packets (QUIC v1 and v2; draft-29 is not read),
+  applying `skip-domain`/`force-domain`/`override-destination` the same
+  way a TCP sniff does. Initials derive their keys from the client
+  DCID alone (RFC 9001 §5.2), so the packet opens on-path: a UDP flow
+  to a `QUIC` port holds back its first datagrams — at most
+  `sniffer.timeout` and four packets, a tighter budget than upstream's
+  ~3-second unbounded hold — until an Initial yields the name, then
+  dials and forwards them upstream first. TCP flows on the same
+  listeners keep the existing TLS/HTTP sniff; non-TUN inbounds carry
+  no sniffed UDP.
+
+### Changed
+
+- **meow-rules public API:** `MrsError::WrongFormat` carries the
+  expected magic (`'MRS!'` vs `'MRS\x01'`) instead of being a unit
+  variant, and `UpstreamRuleSetReader::for_each_domain` returns
+  `Result<usize>` — the number of non-UTF-8 keys skipped during the
+  walk. meow-common gains `sweep_scratch_siblings_excluding`, a
+  keep-file variant of the stale-scratch sweep.
+- **A `proxy-providers:` `health-check:` block whose `enable:` is absent
+  or not `true` now logs a `warn!` naming the provider.** mihomo's
+  `Enable` has no schema default, so a bare block runs no periodic
+  sweep — but the block is no longer dropped: its `url`/`timeout`/
+  `expected-status` still drive `GET /providers/proxies/{name}/
+  healthcheck` and the `testUrl`/`expectedStatus` API echo, as upstream's
+  unconditionally built `HealthCheck` does. An `enable: true` block with
+  no `url` warns too (no probes upstream either).
+- **Hysteria 2 sends far fewer ACK-only packets on downloads.** The
+  connection driver flushed after every receive wakeup, answering a
+  network-paced stream with one small ACK-only datagram per 2-3
+  received packets — in a local profile that was ~70% of the driver's
+  busy time. Flushes that would carry only an ACK are now held until
+  eight datagrams have been accepted or the first unacknowledged one is
+  200 µs old — a dedicated timer enforces the deadline, and any wakeup
+  carrying commands, quiche timeouts, or freshly queued stream frames
+  still flushes at once — and never while an application command
+  arrived within the last millisecond, so an ACK can still ride on
+  upstream data. Wakeups that delivered no payload — the bare-ACK
+  traffic an upload receives — neither start nor keep a hold alive:
+  one arriving mid-hold ends it rather than waiting out the deadline
+  (read-progress wakeups still may), so an upload's own stream data
+  never waits on it.
+
+### Fixed
+
+- **Hysteria 2 UDP relay no longer collapses under load.** A full
+  driver queue reported `Closed`, so the tunnel tore the association
+  down and re-dialled per datagram — a fresh server-side socket and
+  source port mid-flow that connected UDP peers (iperf3, QUIC, games)
+  then ignore. Congestion, oversized payloads and malformed fragment
+  sets are now dropped as a UDP link would, counted and logged at
+  powers of two. The QUIC layer also runs BBRv2 — quiche's default
+  CUBIC shrank its window on datagram loss — and probes the path MTU
+  at a 1452-byte send cap, matching quic-go, instead of splitting
+  large datagrams across two 1200-byte packets. The congestion
+  control is connection-level, so TCP upload through the node moves
+  off CUBIC with it; and a node that sets `up:` now warns at load
+  that the field is ignored — quiche has no Brutal, the upload
+  congestion control a bandwidth hint would select.
+- VLESS `xhttp-opts.mode: auto` resolves like Xray's client —
+  `stream-one` under REALITY without `download-settings` — so nodes
+  carrying it (3x-ui subscriptions ship it verbatim) load instead of
+  being dropped; resolutions to the unimplemented `stream-up` /
+  `packet-up` are refused naming the resolved mode, and an empty
+  `mode: ''` counts as `auto`.
+- A DNS upstream named by an IPv6 or IPv4-mapped address is now dialed
+  from a socket of the peer's address family: a native `2001:db8::53`
+  nameserver previously got an IPv4-bound UDP socket and failed at
+  `connect()`, and a `[::ffff:8.8.8.8]` entry is canonicalised to plain
+  IPv4 for `udp://`, `tcp://`, `tls://` and `https://` alike, including
+  `?proxy=` forwards. A custom `SocketFactory` whose `bind_udp` returns
+  a single-family socket must now override `bind_udp_for_peer`; the
+  default `bind_udp_for_peer` method rejects a family-mismatched
+  pairing with `AddrNotAvailable` up front.
+- `tun.inet4-address` accepts mihomo's list form (`[198.18.0.1/30]`, the
+  only form mihomo itself accepts) — the first entry is used, with a
+  warning when there are more — in the config and in `PATCH /configs`.
+- API: request bodies decode as JSON whatever their `Content-Type`, as
+  mihomo does — dashboards that PUT a selection as `text/plain` or untyped
+  no longer get 415.
+- **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
+  termination signals even while an upstream write is pending** (extends
+  #893): `write_packet` races the idle timeout, outbound-session flush and
+  reply-reader exit everywhere it is awaited, so a stalled upstream can no
+  longer pin a flow. A full TUN reply queue drops the reply with a debug
+  log instead of parking the flow, and a short upstream write retires the
+  flow without a partial retry on every path.
+
+- **Dial errors name the node behind a group.** A failed dial through a
+  proxy group logged only the rule's target (`dial error: …`), which hides
+  which member failed. The line now reads `dial error using Proxy → HK-01:
+  …`, naming the member the dial itself went through (a concurrent dial
+  moving a round-robin group on does not change it); a leaf target is
+  named once.
+- **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
+  header — the request shape every browser sends a plain-HTTP proxy —
+  was refused with 400 by the #734 hostname gate, which only looked at
+  the request target's (empty) authority. The listener now takes the
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured (a `:0`
+  port names no socket and is refused), and a non-hostname or duplicated
+  `Host` value is refused with 400 like any bad authority.
+- **A sniffed name no longer outvotes an explicit destination.** With
+  `sniffer.enable: true` and `override-destination: false`, a request
+  like `GET http://evil.com/` carrying `Host: good.example` landed the
+  sniffed name in `sniff_host`: DOMAIN rules matched `good.example` and
+  let the flow fall to `MATCH`, while the dial still went to `evil.com` —
+  a `DOMAIN,evil.com,REJECT` rule was bypassed. A sniffed name is now
+  adopted only when the destination carries no routing name of its own —
+  an empty host or an IP literal; an explicit domain authority (CONNECT
+  target, absolute-form URI, SOCKS5 domain) always wins. Two opt-ins
+  override the priority: `override-destination: true` rewrites the
+  destination with the sniffed name, keeping rules and dial consistent,
+  and a `force-domain` entry matching the destination adopts the sniffed
+  name into `sniff_host` anyway — the CDN-front contract, routing by the
+  name on the wire while dialing the authority.
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
+  made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
+  is an `inet_aton` address form a libc dial path would fold into an IP —
+  not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
+  least one byte must be non-numeric (`-`/`_` count, so `123-456` still
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a leading or
+  trailing dot (`.x.com`, `x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com`
+  compares verbatim and can never equal a host) can never match the
+  normalized rule host it is compared against, a `DOMAIN-WILDCARD`
+  payload with a literal `+` (its matcher globs `*` only, so `+.x.com`
+  is dead there too) or a dead literal label (`*.foo.`, `a..b`) anchors
+  a match no host satisfies, and a `DOMAIN-KEYWORD` needle containing
+  `..` names a substring no host holds — while an all-dots or
+  prefix-only key (`"."`, `"+."`) is refused by the trie outright.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, sniffer `skip-domain`/`force-domain`, and `rules:`
+  domain payloads now warn naming the entry in lenient mode and hard
+  error in strict mode; a flagged entry that still loads matches
+  exactly as before — the check changes the load outcome (lenient
+  warning vs strict refusal), not what the entry matches.
+  `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
+  a normalized host is not decidable by label inspection.
+- **UDP to a loopback destination works under TUN global route scope.**
+  With `tun.auto-route: true` (or `global`) meow binds its own sockets to
+  the physical interface against routing loops, and decided that for UDP
+  by the socket's wildcard *local* address — so every UDP socket was
+  bound, and DIRECT UDP to `127.0.0.1` / `::1` (or a name resolving to
+  one) failed (`WSAEADDRNOTAVAIL` on Windows), as did UDP to a proxy
+  server or chained hop on loopback (Shadowsocks, SOCKS5, Hysteria2,
+  TrustTunnel QUIC, kcptun, dialer-proxy). The binding is now decided by
+  the destination: loopback peers are left unbound on Linux, macOS and
+  Windows (Linux bound loopback TCP too), everything else — LAN,
+  link-local and multicast included — keeps it. IPv4-mapped destinations
+  get an IPv4 socket; native IPv6 keeps its scope id.
+
 ## [0.29.0] - 2026-11-05
 
 ### Added

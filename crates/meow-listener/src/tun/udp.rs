@@ -30,7 +30,7 @@ use meow_common::{ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
 use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep_until, Instant};
 use tracing::{debug, info, warn};
 
 /// One datagram payload cap. UDP over IPv4 tops out below 64 KiB.
@@ -121,12 +121,84 @@ fn activity_ms() -> Uint {
 }
 
 /// Live flow-table entry. `last_activity` is stamped by the reader loop on
-/// every client datagram AND by the flow task on every upstream reply —
-/// a reply-mostly flow (e.g. a QUIC download mid-stream) must not look
-/// idle to the LRU eviction at `MAX_FLOWS`.
+/// every client datagram AND by the flow task on each upstream reply it
+/// successfully enqueues — a reply-mostly flow (e.g. a QUIC download
+/// mid-stream) must not look idle to the LRU eviction at `MAX_FLOWS`.
+/// A reply dropped on a full queue does not stamp.
 struct FlowEntry {
     tx: mpsc::Sender<Vec<u8>>,
     last_activity: Arc<AtomicU>,
+}
+
+/// One loop's flow table bundled with its share of the shared occupancy
+/// gauge (`TunReady::Ready.udp_flows`, issue #515): every mutation applies
+/// its gauge delta here so the two can never drift, and `Drop` returns the
+/// remaining count even when the loop's future is aborted mid-park
+/// (listener shutdown) — a tail `fetch_sub` never ran in that case and
+/// the gauge kept a dead loop's flows.
+struct FlowTable {
+    map: HashMap<FlowKey, FlowEntry>,
+    gauge: Arc<AtomicUsize>,
+}
+
+impl FlowTable {
+    fn new(gauge: Arc<AtomicUsize>) -> Self {
+        Self {
+            map: HashMap::new(),
+            gauge,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn get(&self, key: &FlowKey) -> Option<&FlowEntry> {
+        self.map.get(key)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&FlowKey, &FlowEntry)> {
+        self.map.iter()
+    }
+
+    /// A fresh key is the only growth: replacing an entry keeps the
+    /// count rather than leaking one.
+    fn insert(&mut self, key: FlowKey, entry: FlowEntry) {
+        if self.map.insert(key, entry).is_none() {
+            self.gauge.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove(&mut self, key: &FlowKey) {
+        if self.map.remove(key).is_some() {
+            self.sub(1);
+        }
+    }
+
+    /// `map.retain` plus the gauge delta of however many entries it shed.
+    fn retain(&mut self, f: impl FnMut(&FlowKey, &mut FlowEntry) -> bool) {
+        let before = self.map.len();
+        self.map.retain(f);
+        self.sub(before - self.map.len());
+    }
+
+    /// Saturating subtract: a delta missed by a future change must never
+    /// wrap the shared gauge to `usize::MAX`.
+    fn sub(&self, n: usize) {
+        let _ = self
+            .gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
+}
+
+impl Drop for FlowTable {
+    fn drop(&mut self) {
+        // The loop may end without draining (aborted while parked on
+        // `incoming.next()`): give this table's share back either way.
+        self.sub(self.map.len());
+    }
 }
 
 #[allow(
@@ -164,16 +236,26 @@ pub(super) async fn run_udp(
         UdpIo::Direct { incoming, replies } => (replies, Incoming::Direct(incoming)),
     };
 
-    // Flow table, touched only by this loop. A flow task signals its own
-    // death by closing its queue; the entry is evicted lazily — on the next
-    // datagram for the tuple, by the periodic sweep, or by LRU eviction
-    // when the table reaches MAX_FLOWS (issue #515).
-    let mut flows: HashMap<FlowKey, FlowEntry> = HashMap::new();
+    // Flow table, touched only by this loop — its `Drop` returns the
+    // gauge share however this future ends. A flow task signals its own
+    // death by closing its queue; the entry is evicted lazily — on the
+    // next datagram for the tuple, by the periodic sweep, or by LRU
+    // eviction when the table reaches MAX_FLOWS (issue #515).
+    let mut flows = FlowTable::new(live_flows);
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
-    let hijack_dropped = AtomicU::new(0);
+    let hijack_dropped = Arc::new(AtomicU::new(0));
 
     while let Some((data, src, dst)) = incoming.next().await {
+        // The TCP NAT's trust boundary holds for UDP too: the peer
+        // addresses are assigned to nothing, so a datagram claiming one
+        // as its source is forged (a LAN peer forwarded in under loose
+        // rp_filter) and must not mint a flow — its replies would only
+        // route back into the device and die on `is_looping_dst` anyway.
+        if tun_net.nat.is_some_and(|a| a.is_peer(src.ip())) {
+            debug!("tun UDP: dropping datagram forged from NAT peer {src} -> {dst}");
+            continue;
+        }
         if dns_hijack && dst.port() == 53 {
             let resolver = tunnel.resolver();
             debug!(
@@ -199,6 +281,7 @@ pub(super) async fn run_udp(
             match Arc::clone(&hijack_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let reply_tx = reply_tx.clone();
+                    let hijack_dropped = Arc::clone(&hijack_dropped);
                     tokio::spawn(async move {
                         let _permit = permit;
                         // Panic guard — parity with the serve loop in
@@ -214,7 +297,14 @@ pub(super) async fn run_udp(
                                     response.len(),
                                     hex_prefix(&response, 48),
                                 );
-                                let _ = reply_tx.send((response, dst, src)).await;
+                                match reply_tx.try_send((response, dst, src)) {
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        note_hijack_drop(&hijack_dropped);
+                                    }
+                                    // A closed queue means the stack writer is gone (listener
+                                    // shutdown); the task ends here either way.
+                                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                }
                             }
                             Ok(Err(e)) => {
                                 debug!("tun dns-hijack: unanswerable query from {src}: {e}");
@@ -238,8 +328,9 @@ pub(super) async fn run_udp(
         sweep_countdown -= 1;
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
+            // `FlowTable` applies the gauge delta of whatever it sheds —
+            // and on `Drop` for whatever is left.
             flows.retain(|_, e| !e.tx.is_closed());
-            live_flows.store(flows.len(), Ordering::Relaxed);
         }
 
         let key = (src, dst);
@@ -254,7 +345,6 @@ pub(super) async fn run_udp(
                     // through to re-create the flow with this datagram.
                     Err(mpsc::error::TrySendError::Closed(data)) => {
                         flows.remove(&key);
-                        live_flows.store(flows.len(), Ordering::Relaxed);
                         data
                     }
                 }
@@ -300,7 +390,6 @@ pub(super) async fn run_udp(
                 last_activity: Arc::clone(&last_activity),
             },
         );
-        live_flows.store(flows.len(), Ordering::Relaxed);
         tokio::spawn(flow_task(
             tunnel.clone(),
             FlowSpec {
@@ -314,7 +403,8 @@ pub(super) async fn run_udp(
             },
         ));
     }
-    live_flows.store(0, Ordering::Relaxed);
+    // `flows` drops here, returning this table's share of the gauge —
+    // also when the future is aborted mid-loop and never reaches this line.
 }
 
 /// Per-flow state handed to the spawned flow task.
@@ -349,8 +439,9 @@ fn note_hijack_drop(counter: &AtomicU) {
 /// reports itself — then, if the table is still at `MAX_FLOWS`, the
 /// least-recently-active live flow is evicted. Dropping the evicted
 /// sender closes that flow's queue; its task exits through the ordinary
-/// `rx.recv() == None` shutdown path.
-fn evict_for_admission(flows: &mut HashMap<FlowKey, FlowEntry>) {
+/// `rx.recv() == None` shutdown path. The gauge deltas ride along inside
+/// [`FlowTable`]'s `retain`/`remove`.
+fn evict_for_admission(flows: &mut FlowTable) {
     flows.retain(|_, e| !e.tx.is_closed());
     if flows.len() >= MAX_FLOWS {
         // Oldest = largest age; ages stay correct across a u32 stamp wrap.
@@ -375,8 +466,10 @@ async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
 
 /// Route the flow, dial the outbound, then pump datagrams both ways until
 /// `udp_timeout` passes with no traffic in either direction. `last_activity`
-/// is the table entry's shared stamp — every upstream reply refreshes it so
-/// a reply-mostly flow is not mistaken for idle by LRU eviction.
+/// is the table entry's shared stamp — upstream replies it successfully
+/// enqueues onto `reply_tx` refresh it so a reply-mostly flow is not
+/// mistaken for idle by LRU eviction (a reply dropped on a full queue does
+/// not stamp).
 async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let FlowSpec {
         mut rx,
@@ -425,11 +518,25 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         }
     }
 
+    // Routing or dial failures below return before `held` is flushed to
+    // the conn: say so when that drops datagrams — the client sent its
+    // Initials and otherwise waits out its idle timeout for answers that
+    // were never forwarded.
+    let drop_held = |held: &[Vec<u8>]| {
+        if !held.is_empty() {
+            debug!(
+                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
+                held.len()
+            );
+        }
+    };
+
     let inner = tunnel.inner();
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
         meow_tunnel::PreHandleVerdict::Drop
     ) {
+        drop_held(&held);
         return Err("unmapped fake-ip destination".into());
     }
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
@@ -438,6 +545,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     inner.pre_resolve(&mut metadata).await;
     inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
+        drop_held(&held);
         return Err(format!(
             "dst_ip not resolved for {}",
             metadata.remote_address()
@@ -453,6 +561,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         route: _route,
     }) = inner.resolve_proxy(&metadata).await
     else {
+        drop_held(&held);
         return Err(format!(
             "no matching rule for {}",
             metadata.remote_address()
@@ -469,12 +578,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // Taken before the dial so a flush landing mid-dial still ends the flow
     // (issue #695): its socket may predate the new outbound binding.
     let mut flush = inner.udp_flush_watch();
-    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = std::sync::Arc::from(
-        inner
-            .dial_udp(proxy.as_ref(), &metadata)
-            .await
-            .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
-    );
+    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> =
+        match inner.dial_udp(proxy.as_ref(), &metadata).await {
+            Ok(conn) => std::sync::Arc::from(conn),
+            Err(e) => {
+                drop_held(&held);
+                return Err(format!("dial_udp via {}: {e}", proxy.name()));
+            }
+        };
     // `_route` exists to pin the route-table generation across the dial
     // only — a long-lived flow must not keep its dial-time generation
     // alive across config reloads.
@@ -511,45 +622,109 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // replies, and the idle deadline. Reply source addresses are not
     // rewritten: the tun flow is locked to one (src, dst) tuple, so every
     // reply is delivered as coming from `dst`.
-    for data in held {
-        conn.write_packet(&data, &dst_addr)
-            .await
-            .map_err(|e| format!("upstream write {dst_addr}: {e}"))?;
-    }
-
-    let idle = sleep(udp_timeout);
+    let idle = sleep_until(next_deadline(udp_timeout));
     tokio::pin!(idle);
-    let result = loop {
-        tokio::select! {
-            () = &mut idle => break Ok(()), // idle-timeout eviction
-            // Outbound sessions flushed (issue #695): end the flow; the
-            // client's next datagram opens a fresh one with a fresh dial.
-            () = flush.flushed() => break Ok(()),
-            queued = rx.recv() => match queued {
-                Some(data) => {
-                    if let Err(e) = conn.write_packet(&data, &dst_addr).await {
-                        break Err(format!("upstream write {dst_addr}: {e}"));
-                    }
-                    idle.as_mut().reset(Instant::now() + udp_timeout);
-                }
-                None => break Ok(()), // reader loop gone — listener shutdown
-            },
-            received = up_rx.recv() => match received {
-                Some(data) => {
-                    if reply_tx.send((data, dst, src)).await.is_err() {
-                        break Ok(()); // stack writer gone — listener shutdown
-                    }
-                    last_activity.store(activity_ms(), Ordering::Relaxed);
-                    idle.as_mut().reset(Instant::now() + udp_timeout);
-                }
-                // The reader task exited — it owns the only `up_tx`. The
-                // borrow-await keeps the handle usable for the abort below.
-                None => break Err(match (&mut reply_task).await {
+    let result = 'flow: {
+        // The held Initials go upstream first — through the same nested
+        // select! the steady-state loop below uses: a stream-framed conn
+        // (Trojan/VLESS UoT) can park write_packet for up to
+        // `connection_timeout`, and idle expiry, a config-reload flush or
+        // a dead reply reader must still be able to end the flow.
+        for data in held {
+            let write_result = tokio::select! {
+                () = &mut idle => break 'flow Ok(()), // idle-timeout during write
+                () = flush.flushed() => break 'flow Ok(()), // flush during write
+                done = &mut reply_task => break 'flow Err(match done {
                     Ok(Err(e)) => e,
                     Ok(Ok(())) => "downstream reader exited".into(),
                     Err(e) => format!("downstream reader task: {e}"),
                 }),
-            },
+                r = conn.write_packet(&data, &dst_addr) => r,
+            };
+            match write_result {
+                Ok(n) if n == data.len() => {
+                    idle.as_mut().reset(next_deadline(udp_timeout));
+                }
+                Ok(n) => {
+                    break 'flow Err(format!(
+                        "upstream write {dst_addr}: short write {n}/{}",
+                        data.len()
+                    ));
+                }
+                Err(e) => {
+                    break 'flow Err(format!("upstream write {dst_addr}: {e}"));
+                }
+            }
+        }
+        loop {
+            tokio::select! {
+                () = &mut idle => break Ok(()), // idle-timeout eviction
+                // Outbound sessions flushed (issue #695): end the flow; the
+                // client's next datagram opens a fresh one with a fresh dial.
+                () = flush.flushed() => break Ok(()),
+                queued = rx.recv() => match queued {
+                    Some(data) => {
+                        // Drive write_packet in a nested select! so idle
+                        // expiry, flush and a dead reply reader can cancel
+                        // a blocked write (PR #893 pattern: write_packet
+                        // must not park the flow's termination signals).
+                        let write_result = tokio::select! {
+                            () = &mut idle => break Ok(()), // idle-timeout during write
+                            () = flush.flushed() => break Ok(()), // flush during write
+                            done = &mut reply_task => break Err(match done {
+                                Ok(Err(e)) => e,
+                                Ok(Ok(())) => "downstream reader exited".into(),
+                                Err(e) => format!("downstream reader task: {e}"),
+                            }),
+                            r = conn.write_packet(&data, &dst_addr) => r,
+                        };
+                        match write_result {
+                            Ok(n) if n == data.len() => {
+                                idle.as_mut().reset(next_deadline(udp_timeout));
+                            }
+                            Ok(n) => {
+                                break Err(format!(
+                                    "upstream write {dst_addr}: short write {n}/{}",
+                                    data.len()
+                                ));
+                            }
+                            Err(e) => {
+                                break Err(format!("upstream write {dst_addr}: {e}"));
+                            }
+                        }
+                    }
+                    None => break Ok(()), // reader loop gone — listener shutdown
+                },
+                received = up_rx.recv() => match received {
+                    Some(data) => {
+                        // UDP drop semantics on backpressure: a full reply queue
+                        // drops the datagram rather than parking the flow (and
+                        // its idle timer) on a slow lwIP stack writer — same
+                        // policy as tproxy (which already used try_send).
+                        match reply_tx.try_send((data, dst, src)) {
+                            Ok(()) => {
+                                last_activity.store(activity_ms(), Ordering::Relaxed);
+                                idle.as_mut().reset(next_deadline(udp_timeout));
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Drop this reply; the client will retransmit if
+                                // it needs the data.
+                                debug!("tun UDP reply queue full: dropping reply to {src} (from {dst})");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                break Ok(()); // stack writer gone — listener shutdown
+                            }
+                        }
+                    }
+                    // The reader task exited — it owns the only `up_tx`. The
+                    // borrow-await keeps the handle usable for the abort below.
+                    None => break Err(match (&mut reply_task).await {
+                        Ok(Err(e)) => e,
+                        Ok(Ok(())) => "downstream reader exited".into(),
+                        Err(e) => format!("downstream reader task: {e}"),
+                    }),
+                },
+            }
         }
     };
 
@@ -558,12 +733,25 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     result
 }
 
+/// `Instant + Duration` panics when the deadline leaves the
+/// representable range — clamp absurd `udp-timeout` values to a
+/// far-future deadline instead of crashing the flow task.
+fn next_deadline(udp_timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(udp_timeout)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400 * 30))
+}
+
 /// The subnets assigned to the TUN device: `inet4-address`, plus
 /// `inet6-address` when the device carries IPv6 (global route scope).
+/// `nat` is the system stack's peer set (`tun.stack: system`), filled in
+/// once the stack binds — the forged-source drop in [`run_udp`]; `None`
+/// under the plain lwIP stack, where no NAT peer exists.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TunNets {
     pub(super) v4: Ipv4Net,
     pub(super) v6: Option<Ipv6Net>,
+    pub(super) nat: Option<super::system::NatAddrs>,
 }
 
 /// True when a dial to `dst` could only route back into the TUN device —
@@ -583,8 +771,7 @@ pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: TunNets) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{evict_for_admission, is_looping_dst, FlowEntry, TunNets, MAX_FLOWS};
-    use std::collections::HashMap;
+    use super::{evict_for_admission, is_looping_dst, FlowEntry, FlowTable, TunNets, MAX_FLOWS};
     use std::net::{IpAddr, SocketAddr};
 
     /// Build a flow table holding `live` live entries plus `dead` entries
@@ -595,11 +782,8 @@ mod tests {
     fn seeded_table(
         live: usize,
         dead: usize,
-    ) -> (
-        HashMap<super::FlowKey, FlowEntry>,
-        Vec<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    ) {
-        let mut flows = HashMap::new();
+    ) -> (FlowTable, Vec<tokio::sync::mpsc::Receiver<Vec<u8>>>) {
+        let mut flows = FlowTable::new(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let mut keepers = Vec::new();
         let total = live + dead;
         let now = super::activity_ms();
@@ -638,7 +822,7 @@ mod tests {
         evict_for_admission(&mut flows);
         assert_eq!(flows.len(), MAX_FLOWS - 1);
         assert!(
-            !flows.contains_key(&oldest_key),
+            flows.get(&oldest_key).is_none(),
             "the least-recently-active live flow must be the victim"
         );
         // A live flow whose shared stamp is refreshed by an upstream reply
@@ -654,9 +838,9 @@ mod tests {
             .last_activity
             .store(super::activity_ms(), std::sync::atomic::Ordering::Relaxed);
         evict_for_admission(&mut flows);
-        assert!(flows.contains_key(&oldest_key), "refreshed flow survives");
+        assert!(flows.get(&oldest_key).is_some(), "refreshed flow survives");
         assert!(
-            !flows.contains_key(&next_oldest_key),
+            flows.get(&next_oldest_key).is_none(),
             "the new least-recently-active flow is evicted instead"
         );
     }
@@ -678,6 +862,146 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    /// The system stack runs two `run_udp` loops (direct + lwIP
+    /// leftovers) on one gauge: each applies only its own table's deltas,
+    /// so readers see the sum, and a loop that exits gives its share back.
+    #[tokio::test]
+    async fn shared_gauge_sums_both_flow_tables() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let spawn = || {
+            let (tx, incoming) = tokio::sync::mpsc::channel(4);
+            let (replies, _rx) = tokio::sync::mpsc::channel(4);
+            let task = tokio::spawn(super::run_udp(
+                crate::test_rule_tunnel(),
+                super::UdpIo::Direct { incoming, replies },
+                false,
+                Duration::from_secs(60),
+                "tun".to_string(),
+                net(),
+                Arc::clone(&gauge),
+                None,
+            ));
+            (tx, task)
+        };
+        let (tx1, t1) = spawn();
+        let (tx2, t2) = spawn();
+
+        let pkt = |port: u16| {
+            (
+                b"x".to_vec(),
+                SocketAddr::from(([10, 0, 0, 1], port)),
+                SocketAddr::from(([8, 8, 8, 8], 53)),
+            )
+        };
+        tx1.send(pkt(1)).await.unwrap();
+        tx2.send(pkt(2)).await.unwrap();
+
+        async fn wait_gauge(gauge: &AtomicUsize, want: usize) {
+            let polled = tokio::time::timeout(Duration::from_secs(5), async {
+                while gauge.load(Ordering::Relaxed) != want {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(polled.is_ok(), "gauge never reached {want}");
+        }
+        wait_gauge(&gauge, 2).await;
+
+        // Each loop returns only its own table's count on exit.
+        drop(tx1);
+        t1.await.unwrap();
+        wait_gauge(&gauge, 1).await;
+
+        // An aborted loop (listener shutdown) returns its share too —
+        // `FlowTable`'s `Drop`, not a tail statement, gives it back.
+        let (tx3, t3) = spawn();
+        tx3.send(pkt(3)).await.unwrap();
+        wait_gauge(&gauge, 2).await;
+        t3.abort();
+        let _ = t3.await;
+        wait_gauge(&gauge, 1).await;
+
+        drop(tx2);
+        t2.await.unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    /// The TCP NAT's trust boundary holds on the UDP side too
+    /// (`system.rs`): the peer addresses are assigned to nothing, so a
+    /// datagram claiming one as its source is forged and must not mint
+    /// a flow — however it arrived (direct pump, or lwIP behind the
+    /// fragments / extension headers the direct path does not carry).
+    #[tokio::test]
+    async fn udp_forged_nat_peer_source_mints_no_flow() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let net = TunNets {
+            v4: "172.31.0.1/30".parse().unwrap(),
+            v6: Some("fdfe:dcba:9876::1/126".parse().unwrap()),
+            nat: Some(crate::tun::system::NatAddrs {
+                a4: "172.31.0.1".parse().unwrap(),
+                b4: "172.31.0.2".parse().unwrap(),
+                port4: 40000,
+                v6: Some((
+                    "fdfe:dcba:9876::1".parse().unwrap(),
+                    "fdfe:dcba:9876::2".parse().unwrap(),
+                    40001,
+                )),
+            }),
+        };
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let (tx, incoming) = tokio::sync::mpsc::channel(4);
+        let (replies, _rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(super::run_udp(
+            crate::test_rule_tunnel(),
+            super::UdpIo::Direct { incoming, replies },
+            false,
+            Duration::from_secs(60),
+            "tun".to_string(),
+            net,
+            Arc::clone(&gauge),
+            None,
+        ));
+
+        let pkt = |src: SocketAddr| (b"x".to_vec(), src, SocketAddr::from(([8, 8, 8, 8], 1234)));
+        // Forged peer sources, v4 and v6. The channel is FIFO, so the
+        // legit datagram below is always processed after them.
+        tx.send(pkt("172.31.0.2:1234".parse().unwrap()))
+            .await
+            .unwrap();
+        tx.send(pkt("[fdfe:dcba:9876::2]:1234".parse().unwrap()))
+            .await
+            .unwrap();
+        // The device's own address is a legal client source and mints
+        // the loop's one and only flow — had a forged datagram minted
+        // one too, the gauge would land above 1.
+        tx.send(pkt("192.168.1.10:5000".parse().unwrap()))
+            .await
+            .unwrap();
+        let polled = tokio::time::timeout(Duration::from_secs(5), async {
+            while gauge.load(Ordering::Relaxed) < 1 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(polled.is_ok(), "the legit flow never minted");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            1,
+            "a forged peer-sourced datagram must not mint a flow"
+        );
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -711,6 +1035,7 @@ mod tests {
         TunNets {
             v4: "198.18.0.1/30".parse().unwrap(),
             v6: None,
+            nat: None,
         }
     }
 

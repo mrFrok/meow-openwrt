@@ -87,12 +87,29 @@ const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
 
+/// Shared empty provider map for `parse_rule` — `HashMap::new` is not
+/// `const`, so a `OnceLock` builds it once instead of per line parsed.
+static NO_RULE_SETS: std::sync::OnceLock<RuleSets> = std::sync::OnceLock::new();
+
+/// Parse a rule line with **no rule-provider scope**: a `RULE-SET` entry
+/// (top-level or inside a logic group) always fails as unknown-provider.
+/// That is the scope provider payloads get — deliberately stricter than
+/// mihomo, whose `RULE-SET` parses anywhere and resolves the name lazily
+/// through `tunnel.RuleProviders()` at match time (a payload may even
+/// reference a provider declared later, and references may cycle — the
+/// recursion just never matches). Eager resolution against a scoped map
+/// keeps a payload self-contained and makes cycles impossible (Class B,
+/// ADR-0002). Config `rules:` blocks that must resolve `RULE-SET` use
+/// [`parse_rule_with_rule_sets`].
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
-    parse_rule_depth(line, ctx, &RuleSets::new(), 0)
+    parse_rule_depth(line, ctx, NO_RULE_SETS.get_or_init(RuleSets::new), 0)
 }
 
 /// [`parse_rule`] that also resolves `RULE-SET,<name>` — at the top level
 /// and inside `AND`/`OR`/`NOT` groups (mihomo parity) — against `rule_sets`.
+/// `rule_sets` is the only scope `RULE-SET` resolves against; it is for
+/// the top-level `rules:` block, never for a provider's own payload (see
+/// [`parse_rule`]).
 pub fn parse_rule_with_rule_sets(
     line: &str,
     ctx: &ParserContext,
@@ -125,7 +142,13 @@ fn parse_rule_depth(
         return Err(format!("invalid rule: {line}"));
     }
 
+    // mihomo's API spelling (`GET /rules` reports `DomainSuffix`) maps to
+    // the config grammar, so dashboard and bundled-UI round-trips parse.
     let rule_type = parts[0].trim();
+    let rule_type: &str = match meow_common::RuleType::from_mihomo_name(rule_type) {
+        Some(t) => t.as_str(),
+        None => rule_type,
+    };
 
     // MATCH only needs adapter
     if rule_type == "MATCH" {
@@ -384,6 +407,11 @@ fn parse_logic_rule(
         // groups recurse through here, so the check covers any depth.
         let mut fields = g.splitn(3, ',');
         let first = fields.next().map_or("", str::trim);
+        // The guards below compare the config grammar's names, so a mihomo
+        // API spelling must translate first, the same way `parse_rule_depth`
+        // does — otherwise `(Match,X)` parses an always-true inner leg and
+        // `(DomainRegex,a,b)` silently truncates its payload.
+        let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
         if first == "MATCH" {
             return Err(format!(
                 "{rule_type} rule: MATCH is not allowed inside logic groups"
@@ -471,28 +499,39 @@ fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
     Ok(groups)
 }
 
+/// Adapter slot filler spliced into logic sub-rules by
+/// [`splice_inner_adapter`]. The owning logic/rule-set wrapper carries
+/// the real adapter; the placeholder is discarded at match time.
+/// `pub(crate)` so warn paths can recognise the sentinel instead of
+/// printing it where a user-written adapter name would go.
+pub(crate) const LOGIC_INNER_PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
+
 /// Splice a placeholder adapter into `TYPE,PAYLOAD[,extra]` so the inner rule
 /// satisfies `parse_rule`'s `TYPE,PAYLOAD,ADAPTER[,extra]` shape. The owning
 /// logic/rule-set wrapper carries the real adapter; the placeholder is
 /// discarded at match time.
 fn splice_inner_adapter(entry: &str) -> String {
-    const PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
     // Logic sub-rules carry their own parenthesised payload that must not be
     // split on commas — their "adapter" slot is appended at the end.
     if let Some((ty, _)) = entry.split_once(',') {
         let upper = ty.trim().to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return format!("{entry},{PLACEHOLDER}");
+            return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
     let parts: Vec<&str> = entry.splitn(3, ',').collect();
     match parts.as_slice() {
-        [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
+        [ty, payload] => format!(
+            "{},{},{}",
+            ty.trim(),
+            payload.trim(),
+            LOGIC_INNER_PLACEHOLDER
+        ),
         [ty, payload, rest] => format!(
             "{},{},{},{}",
             ty.trim(),
             payload.trim(),
-            PLACEHOLDER,
+            LOGIC_INNER_PLACEHOLDER,
             rest.trim()
         ),
         _ => entry.to_string(),
@@ -804,6 +843,19 @@ mod tests {
         // an empty keyword (match-all) without the guard, while a bare
         // `(DOMAIN-KEYWORD)` errors downstream on `< 2 parts` either way.
         assert!(parse_rule("OR,((DOMAIN-KEYWORD,),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+    }
+
+    /// The inner-leg guards compare the config grammar's names, so the
+    /// mihomo API spellings `GET /rules` reports must trip them too —
+    /// `(Match,X)` is still an always-true `FinalRule` leg, and
+    /// `(DomainRegex,a,b)` still carries a comma the grammar cannot
+    /// represent (issue #882 review).
+    #[test]
+    fn test_parse_logic_rejects_inner_mihomo_spellings() {
+        assert!(parse_rule("OR,((Match,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        assert!(parse_rule("AND,((DomainRegex,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma-free mihomo-spelled regex leg still parses.
+        assert!(parse_rule("AND,((DomainRegex,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
     }
 
     /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.

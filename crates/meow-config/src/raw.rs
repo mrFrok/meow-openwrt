@@ -33,15 +33,6 @@ pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(St
     pairs
 }
 
-/// mihomo writes some single-value keys as a list (`tun.inet4-address:
-/// [198.18.0.1/30]`); take the first entry (meow-openwrt).
-fn deserialize_string_or_first<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(deserialize_string_or_seq(deserializer)?.and_then(|v| v.into_iter().next()))
-}
-
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -246,7 +237,7 @@ pub struct RawConfig {
     pub redir_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
-    /// mihomo `unified-delay` (meow-openwrt): delay probes report the second
+    /// mihomo `unified-delay`: delay probes report the second
     /// request on a warm connection, without the dial/handshake cost.
     pub unified_delay: Option<bool>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
@@ -405,9 +396,9 @@ pub type RawHosts = IndexMap<String, HostsValue>;
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///
 /// Only the fields meow-rs implements are typed; upstream-only fields
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) are accepted and
-/// produce a `warn!` (Class B per ADR-0002, forward-compat), never a parse
-/// error — the same policy as [`RawGeoDataConfig`] and #328.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …) are
+/// accepted and produce a `warn!` (Class B per ADR-0002, forward-compat),
+/// never a parse error — the same policy as [`RawGeoDataConfig`] and #328.
 ///
 /// `PartialEq` backs the config-commit TUN reconcile: the primary diff
 /// compares the parsed [`crate::TunConfig`]s, and this raw equality is the
@@ -427,10 +418,9 @@ pub struct RawTun {
     /// userspace stack's minimum, RFC 8200 §5).
     pub mtu: Option<u16>,
     /// CIDR assigned to the device. Default: the first /30 of
-    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
-    /// A string, or mihomo's list form (the first entry is used).
-    #[serde(default, deserialize_with = "deserialize_string_or_first")]
-    pub inet4_address: Option<String>,
+    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo. A string, or
+    /// mihomo's list form (`[]netip.Prefix`; only the first entry is used).
+    pub inet4_address: Option<serde_json::Value>,
     /// Route installation on startup. Accepts the mihomo boolean
     /// (`true` = capture all traffic where supported, `false` = off) plus
     /// the #375 mode strings `fake-ip` and `global`. Default true.
@@ -450,8 +440,11 @@ pub struct RawTun {
     /// global route scope into IPv6 capture (#375); ignored with a
     /// warning in every other mode. Default: none (IPv4 only).
     pub inet6_address: Option<serde_json::Value>,
-    // Upstream-only fields accepted for forward-compat; warn and ignore.
+    /// `stack` — which stack terminates the device's TCP: `system`/`mixed`
+    /// hand it to the host kernel (Linux; lwIP elsewhere), anything else
+    /// keeps lwIP. Free-form JSON: non-string values warn and keep lwIP.
     pub stack: Option<serde_json::Value>,
+    // Upstream-only fields accepted for forward-compat; warn and ignore.
     pub strict_route: Option<serde_json::Value>,
     pub auto_detect_interface: Option<serde_json::Value>,
     pub endpoint_independent_nat: Option<serde_json::Value>,
@@ -611,8 +604,30 @@ pub struct RawDns {
     /// value is a single server URL or a list of URLs. **Document order is
     /// the lookup priority** — see [`RawNameserverPolicy`].
     pub nameserver_policy: Option<RawNameserverPolicy>,
+    /// Confine queries matching a `nameserver-policy` key to that entry's
+    /// nameservers: their answer is used as-is — or the query fails —
+    /// instead of escalating through the `fallback-filter` domain gate,
+    /// its `ipcidr`/geoip rejection, or the main/`fallback:` tiers
+    /// (mihomo `ipExchange` parity, which returns right after a
+    /// `matchPolicy` hit). A matched domain therefore also bypasses the
+    /// fallback-filter's poisoned-answer checks — confining a zone to a
+    /// private upstream means trusting that upstream's answers. The flag
+    /// is policy-wide (per-key exclusivity is not offered) and also
+    /// constrains `direct-nameserver` lookups when
+    /// `direct-nameserver-follow-policy` is on. Defaults to false.
+    pub nameserver_policy_exclusive: Option<bool>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
+    /// mihomo `prefer-h3`: every `https://` nameserver prefers HTTP/3 and
+    /// falls back to HTTP/1.1 when the QUIC exchange fails. A per-entry
+    /// `?h3=true` overrides it (HTTP/3 only), `?h3=false` turns it off, and
+    /// `?h3=prefer` opts a single entry in without the global flag.
+    ///
+    /// Requires a build with the `dns-quic` feature (meow-config forwards it
+    /// to `meow-dns/quic-dns`); without it, a config
+    /// that asks for HTTP/3 is a hard load error rather than a silent
+    /// downgrade (ADR-0002 Class A).
+    pub prefer_h3: Option<bool>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.

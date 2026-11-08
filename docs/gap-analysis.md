@@ -231,6 +231,13 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 | CORS                         | Yes | Yes | OK (permissive) |
 | `/ui` static                 | Yes | Yes | OK |
 
+> **Since landed** (this table keeps the 2026-04-11 baseline): `/logs`,
+> `/memory`, `/proxies/:name/delay`, `/group/:name/delay`,
+> `DELETE /connections` (bulk), `PUT /configs`, `/cache/dns/flush`,
+> `GET /dns/query`, and the `/providers/proxies*` + `/providers/rules*`
+> rows are all implemented — [mihomo-api-compatibility.md](mihomo-api-compatibility.md)
+> is the current endpoint matrix.
+
 ### Non-standard endpoints (meow-rs additions)
 
 These are unique to this port; document them for API consumers:
@@ -265,7 +272,7 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `hosts` | Static /etc/hosts-style map |
 | `profile` | `store-selected`, `store-fake-ip`, tracing flags |
 | `experimental` | Various flags (`sniff-tls-sni`, etc.) |
-| `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction) |
+| `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction), plus `sniff.QUIC` on TUN UDP flows (SNI from client Initials, v1/v2) |
 | `geodata-mode`, `geo-auto-update`, `geodata-loader` | GeoIP/GeoSite DB management |
 | `global-client-fingerprint` | Reality/uTLS fingerprint |
 | `global-ua` | User-Agent override for subscription fetch |

@@ -83,6 +83,9 @@ gost-plugin = ["ss", "meow-config/gost-plugin", "meow-proxy/gost-plugin"]
 # DNS
 dns-server = ["meow-dns/dns-server"]
 dns-encrypted = ["meow-dns/encrypted"]
+# DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3` / `?h3=`).
+# In the `full` bundle; `minimal` leaves quiche out (ADR-0007 size caps).
+dns-quic = ["meow-config/dns-quic", "meow-dns/quic-dns"]
 
 # Listener features — forwarded to meow-listener
 listener-http = ["meow-listener/listener-http"]
@@ -117,7 +120,7 @@ tiny = [
 ]
 # meow-openwrt mid profile: `tiny` plus the other protocols subscriptions use.
 lightweight = ["tiny", "ss", "anytls", "vmess", "shadow-tls"]
-full = ["full-be", "restls", "jls"]
+full = ["full-be", "restls", "jls", "dns-quic"]
 # `full` without what needs BoringSSL (restls, jls): the big-endian MIPS
 # build of the full profile, on rustls + quinn (openwrt-fork/ci/build.sh).
 full-be = [
@@ -164,6 +167,7 @@ libc = "0.2"
 log = "0.4"
 dhat = { workspace = true, optional = true }
 mimalloc = { workspace = true, optional = true }
+same-file = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2.5"
@@ -173,6 +177,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tempfile = "3"
+zstd = { workspace = true }
 serde-saphyr = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }

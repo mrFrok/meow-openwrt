@@ -328,6 +328,21 @@ fn check_target(probe: &dyn TargetProbe, m: &CompiledMatchResult<'_>) -> TargetC
     }
 }
 
+/// Trace line for a [`TargetCheck::Pass`] skip: a PASS-adapter match reads
+/// as upstream's "match Pass rule", while a disabled rule — also `Pass` —
+/// gets its own wording so the log cannot conflate the two skips.
+fn note_pass_skip(probe: &dyn TargetProbe, m: &CompiledMatchResult<'_>) {
+    if probe.rule_enabled(m.rule_index) {
+        debug!("{} match Pass rule", m.adapter_name);
+    } else {
+        debug!(
+            "{} match disabled rule #{}",
+            m.adapter_name,
+            m.rule_index + 1
+        );
+    }
+}
+
 /// One borrowed result from a compiled rule-set match.
 #[derive(Clone, Copy)]
 pub struct CompiledMatchResult<'a> {
@@ -353,6 +368,14 @@ impl CompiledRuleSet {
     }
 
     pub fn build(rules: &[Box<dyn Rule>]) -> Self {
+        Self::build_masked(rules, |_| false)
+    }
+
+    /// [`Self::build`] with the rules `disabled` reports (`PATCH
+    /// /rules/disable`) left out before the prune passes: a duplicate or a
+    /// rule shadowed by a disabled one then keeps its slot and matches, as
+    /// upstream's per-rule wrappers do.
+    pub fn build_masked(rules: &[Box<dyn Rule>], disabled: impl Fn(usize) -> bool) -> Self {
         let mut slots = Vec::with_capacity(rules.len());
         let mut adapter_names = Vec::new();
         let mut adapter_lookup = HashMap::new();
@@ -382,6 +405,10 @@ impl CompiledRuleSet {
             let payload = rule.payload();
             let mut demands_ip = rule.should_resolve_ip();
             let mut demands_process = rule.should_find_process();
+
+            if disabled(rule_index) {
+                continue;
+            }
 
             // Constant-false pruning: drop rules that can never match, so
             // they neither occupy scan slots nor force metadata enrichment.
@@ -659,7 +686,7 @@ impl CompiledRuleSet {
             let m = self.static_match(slot, rules);
             match check_target(probe, &m) {
                 TargetCheck::Usable => return Some(m),
-                TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                TargetCheck::Pass => note_pass_skip(probe, &m),
                 TargetCheck::Missing => on_missing(m),
             }
             tail_start += 1;
@@ -772,7 +799,7 @@ impl CompiledRuleSet {
                         TargetCheck::Usable => {
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
-                        TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                        TargetCheck::Pass => note_pass_skip(probe, &m),
                         TargetCheck::Missing => on_missing(m),
                     }
                     tail_start += 1;
@@ -948,7 +975,7 @@ impl CompiledRuleSet {
                     // A PASS-typed target silently skips the rule — the
                     // match loop's `continue GetRules` upstream. Distinct
                     // from `Missing`: never warned, never buffered.
-                    TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                    TargetCheck::Pass => note_pass_skip(probe, &m),
                     TargetCheck::Missing => on_missing(m),
                 }
             }
@@ -3265,8 +3292,10 @@ mod tests {
     }
 
     /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines.
+    /// in this binary don't see each other's lines; see
+    /// [`crate::install_capture_fallback`] for the process-wide part.
     fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        crate::install_capture_fallback();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -3574,6 +3603,31 @@ mod tests {
     /// `PATCH /rules/disable`: a disabled rule is skipped like a PASS
     /// target, in the linear scan and in the indexed plan's trie-hit arm,
     /// and a later rule for the same domain still matches.
+    #[test]
+    fn disabling_a_rule_keeps_its_pruned_duplicate() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let meta = Metadata {
+            host: "a.example.com".into(),
+            ..Default::default()
+        };
+        let probe = |_: &str| true;
+        let set = CompiledRuleSet::build_masked(&rules, |i| i == 0);
+        let m = set.match_rules(&meta, &rules, &probe).unwrap();
+        assert_eq!((m.adapter_name, m.rule_index), ("PROXY", 1));
+        // Disabling MATCH revives the dead tail behind it.
+        let tail: Vec<Box<dyn Rule>> = vec![
+            Box::new(FinalRule::new("DIRECT")),
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+        ];
+        let set = CompiledRuleSet::build_masked(&tail, |i| i == 0);
+        let m = set.match_rules(&meta, &tail, &probe).unwrap();
+        assert_eq!(m.adapter_name, "PROXY");
+    }
+
     #[test]
     fn disabled_rule_is_skipped_in_both_plans() {
         struct Disabled(usize);

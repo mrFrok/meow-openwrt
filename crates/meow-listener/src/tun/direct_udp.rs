@@ -1,4 +1,4 @@
-//! UDP straight off and onto the device for the system stack (meow-openwrt):
+//! UDP straight off and onto the device for the system stack:
 //! the inbound pump parses each datagram's IP/UDP headers and hands the
 //! payload to the UDP flow table; the outbound pump builds the reply's
 //! headers in one reusable buffer. lwIP is not involved — it saved a

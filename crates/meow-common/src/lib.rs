@@ -13,6 +13,12 @@
 /// representable on every supported platform.
 pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
+/// RFC 3339 rendering of the Unix epoch — the "never happened" timestamp
+/// the API reports for unset times (e.g. a never-hit rule's `hitAt`).
+/// Deliberately the Unix epoch, not mihomo's `"0001-01-01T00:00:00Z"`
+/// (Go's zero `time.Time`) — see the compat doc.
+pub const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
+
 pub mod adapter;
 pub mod adapter_type;
 pub mod atomic;
@@ -62,7 +68,7 @@ pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;
 pub use error::{MeowError, Result};
-pub use fs_util::{sweep_scratch_siblings, SCRATCH_STALE_AGE};
+pub use fs_util::{sweep_scratch_siblings, sweep_scratch_siblings_excluding, SCRATCH_STALE_AGE};
 pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir};
 pub use metadata::{is_valid_host, metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;

@@ -79,6 +79,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -118,6 +119,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -160,6 +162,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -303,6 +306,7 @@ async fn external_ui_serves_static_directory() {
         external_ui: Some(dir.path().to_path_buf()),
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     });
     let app = create_router(state);
 
@@ -684,6 +688,78 @@ rules: ['MATCH,PROXY']
     assert_eq!(beta["provider-name"], "beta");
 }
 
+/// `enable` gates only the scheduled sweep: the manual
+/// `/providers/proxies/{name}/healthcheck` probes with the block's url
+/// either way (mihomo `execute` ignores `Enable`), while a block with no
+/// url — like a missing block — answers 204 without probing anything
+/// (upstream's empty-testUrl skip).
+#[tokio::test]
+async fn provider_healthcheck_ignores_enable_and_skips_empty_url() {
+    let relay = spawn_socks5_relay().await;
+    let origin = spawn_sub_origin("").await;
+    let nodes = socks5_nodes(&["hk-01"], relay);
+    let config = format!(
+        "mode: rule
+proxies:
+  - {{name: home, type: socks5, server: 127.0.0.1, port: 1}}
+proxy-providers:
+  disabled-hc:
+    type: file
+    path: {{dir}}/disabled-hc.yaml
+    health-check:
+      enable: false
+      url: http://{origin}/generate_204
+      timeout: 5000
+  no-url:
+    type: file
+    path: {{dir}}/no-url.yaml
+    health-check:
+      enable: true
+proxy-groups:
+  - {{name: PROXY, type: select, proxies: [home], use: [disabled-hc, no-url]}}
+rules: ['MATCH,PROXY']
+"
+    );
+    let state = state_with_file_providers(
+        &config,
+        &[("disabled-hc", nodes.as_str()), ("no-url", nodes.as_str())],
+    )
+    .await;
+    let node = |name: &str| {
+        let provider = Arc::clone(state.proxy_providers.get(name).unwrap().value());
+        provider
+            .proxies()
+            .into_iter()
+            .find(|proxy| proxy.name() == "hk-01")
+            .unwrap()
+    };
+    let disabled_node = node("disabled-hc");
+    assert!(
+        disabled_node.delay_history().is_empty(),
+        "enable: false spawns no sweep — nothing may have probed yet"
+    );
+
+    // A manual request probes anyway: `enable` disables the timer, not
+    // the endpoint.
+    let (status, _) = get_json(&state, "/providers/proxies/disabled-hc/healthcheck").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        disabled_node.delay_history().len(),
+        1,
+        "the manual probe records on the member's own ProxyHealth"
+    );
+
+    // No url: 204 without probing (upstream `execute` skips an empty
+    // testUrl); `enable: true` does not conjure a probe target.
+    let no_url_node = node("no-url");
+    let (status, _) = get_json(&state, "/providers/proxies/no-url/healthcheck").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        no_url_node.delay_history().is_empty(),
+        "an empty url must probe nothing"
+    );
+}
+
 /// mihomo reports `hidden` and `icon` on every group (`false` / `""` when
 /// unset) and on no leaf proxy. Clash Party leaves hidden groups out of its
 /// list and draws the icon on the group's header.
@@ -1016,6 +1092,66 @@ async fn disable_rules_sets_extra_disabled() {
     assert_eq!(rules[1]["extra"]["disabled"], true);
     assert_eq!(rules[1]["extra"]["hitCount"], 0);
     assert_eq!(rules[1]["extra"]["hitAt"], "1970-01-01T00:00:00Z");
+}
+
+/// The lines a client rebuilds from `GET /rules` (mihomo names:
+/// `Domain,example.com,DIRECT`) parse back; a negative index is skipped as
+/// upstream's `map[int]bool` does; the disabled switch survives the commit.
+#[tokio::test]
+async fn rules_round_trip_keeps_disabled_switch() {
+    let state = test_state_default();
+    let send = |method: &str, uri: &str, body: String| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    let rules = || async {
+        let resp = send("GET", "/rules", String::new()).await.unwrap();
+        body_json(resp).await["rules"].as_array().unwrap().clone()
+    };
+    let resp = send("PATCH", "/rules/disable", r#"{"-1":true,"0":true}"#.into());
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let lines: Vec<String> = rules()
+        .await
+        .iter()
+        .map(|r| {
+            let (t, p, x) = (&r["type"], &r["payload"], &r["proxy"]);
+            let (t, p, x) = (
+                t.as_str().unwrap(),
+                p.as_str().unwrap(),
+                x.as_str().unwrap(),
+            );
+            if p.is_empty() {
+                format!("{t},{x}")
+            } else {
+                format!("{t},{p},{x}")
+            }
+        })
+        .collect();
+    assert_eq!(lines[0], "Domain,example.com,DIRECT");
+    let resp = send(
+        "POST",
+        "/rules",
+        serde_json::json!({ "rules": lines }).to_string(),
+    );
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let resp = send(
+        "POST",
+        "/rules/append",
+        r#"{"rule":"DomainSuffix,a.org,DIRECT"}"#.into(),
+    );
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let after = rules().await;
+    assert_eq!(after.len(), 3);
+    assert_eq!(after[0]["type"], "Domain");
+    assert_eq!(after[0]["extra"]["disabled"], true);
+    assert_eq!(after[1]["extra"]["disabled"], false);
+    assert_eq!(after[2]["type"], "DomainSuffix");
 }
 
 #[tokio::test]
@@ -2460,7 +2596,17 @@ async fn put_proxy_selector_switch_without_json_content_type() {
         ..Default::default()
     }]);
     let state = test_state(raw);
-    for content_type in [None, Some("text/plain;charset=UTF-8")] {
+    for content_type in [
+        None,
+        Some("text/plain;charset=UTF-8"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/octet-stream"),
+        Some(""),
+        Some("application/merge-patch+json"),
+        // Malformed "+json" with no subtype before the suffix — must be
+        // relabelled (not treated as JSON), otherwise axum 422s a non-JSON body.
+        Some("application/+json"),
+    ] {
         let mut req = Request::builder().method("PUT").uri("/proxies/MySelector");
         if let Some(t) = content_type {
             req = req.header("content-type", t);
@@ -3138,6 +3284,7 @@ mod delay_support {
             external_ui: None,
             traffic_feed: Default::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 
@@ -3196,6 +3343,7 @@ mod delay_support {
             external_ui: None,
             traffic_feed: Default::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 }
@@ -4574,6 +4722,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -4736,6 +4885,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     });
 
     let resp = create_router(state)
@@ -6583,6 +6733,222 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
     assert!(state.tunnel.has_tun(), "the running listener must survive");
 }
 
+/// Same admission contract for `sniffer:` (review #887): the TUN carries
+/// the sniffer it was spawned with, so a section `spawn_tun_from_raw`
+/// cannot parse must be rejected before commit — admitted unchecked, the
+/// reconcile would stop a healthy listener and only then fail the
+/// spawn-side parse, leaving TUN down on a 204. The `tun:` change in the
+/// body is what would have fired that restart, so the still-running
+/// handle proves the gate ran before the reconcile.
+#[tokio::test]
+async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    assert!(state.tunnel.has_tun());
+
+    // Two malformed shapes: `enable: true` with no `sniff:` map, and an
+    // out-of-range `timeout` on an otherwise valid section.
+    for sniffer in [
+        "sniffer:\n  enable: true\n",
+        "sniffer:\n  enable: true\n  timeout: 0\n  sniff:\n    TLS:\n      ports: [443]\n",
+    ] {
+        let yaml = format!(
+            "mode: rule\ntun:\n  enable: true\n  mtu: 9000\n{sniffer}rules:\n  - MATCH,DIRECT\n"
+        );
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "sniffer {sniffer:?} must be rejected at admission"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("sniffer config error")),
+            "the 400 must come from the sniffer admission check, got: {body}"
+        );
+    }
+    let committed = state.raw_config.read();
+    assert_eq!(
+        committed.tun.as_ref().map(|t| t.mtu),
+        Some(Some(1500)),
+        "the rejected document must not have been committed"
+    );
+    assert!(committed.sniffer.is_none());
+    drop(committed);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the running listener must survive the rejected PUT"
+    );
+    assert!(state.tunnel.has_tun(), "the running listener must survive");
+}
+
+/// Semantic diff (review #887): a `sniffer:` respelled with reordered or
+/// duplicated ports/domains parses to the same `SnifferConfig` and must
+/// NOT restart the running listener — only a real change may.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_sniffer_respelling_does_not_reconcile() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
+    raw.sniffer = Some(
+        serde_saphyr::from_str(
+            "enable: true\nsniff:\n  TLS:\n    ports: [443, 8443]\nskip-domain: [b.example, a.example]\n",
+        )
+        .unwrap(),
+    );
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    // Same sniffer spelled differently: port and domain order swapped,
+    // duplicates added — all normalize away at parse.
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "sniffer:\n",
+        "  enable: true\n",
+        "  sniff:\n",
+        "    TLS:\n",
+        "      ports: [8443, 443, 8443]\n",
+        "  skip-domain: [a.example, b.example, a.example]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a semantically identical sniffer must not restart the listener"
+    );
+    assert!(state.tunnel.has_tun());
+
+    // Counterpoint: a real port change restarts — under this build the
+    // spawn fails and `enable` rolls back, proving the diff ran.
+    let yaml = yaml.replace("ports: [8443, 443, 8443]", "ports: [443, 4430]");
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "a real sniffer diff must restart the running listener"
+    );
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "the restart's spawn failure rolls `enable` back on this build"
+    );
+}
+
+/// A disabled sniffer's remaining fields are dead config — changing
+/// `timeout` or the port lists while `enable: false` is not a restart-
+/// worthy diff (review #887).
+#[tokio::test]
+async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
+    raw.sniffer = Some(
+        serde_saphyr::from_str("enable: false\ntimeout: 100\nsniff:\n  TLS:\n    ports: [443]\n")
+            .unwrap(),
+    );
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "sniffer:\n",
+        "  enable: false\n",
+        "  timeout: 900\n",
+        "  sniff:\n",
+        "    TLS:\n",
+        "      ports: [443, 8443]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "dead-field churn under `enable: false` must not restart the listener"
+    );
+    assert!(state.tunnel.has_tun());
+    assert!(
+        state
+            .raw_config
+            .read()
+            .sniffer
+            .as_ref()
+            .is_some_and(|s| s.timeout == Some(900)),
+        "the respelled section still commits — only the restart is skipped"
+    );
+}
+
 /// Same admission contract for `listeners:` — an entry the startup parser
 /// would reject must not be committed into `raw_config`, where the next
 /// `load_config` would hard-error on boot (issue #564 review).
@@ -7416,6 +7782,152 @@ async fn patch_configs_tun_merges_over_committed_section() {
     );
 }
 
+/// `inet4-address` may be committed in mihomo's list form (#885), but
+/// `GET /configs` always reports the string form the field's contract
+/// declares — the first entry, the one `parse_tun_config` assigns the
+/// device. Echoing the committed array would break `string | null`
+/// clients; `[]` is unset and reports absent, not an empty array.
+#[tokio::test]
+async fn get_configs_tun_inet4_address_reports_the_string_form() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(
+        serde_saphyr::from_str("enable: false\ninet4-address: [10.9.0.1/30, 10.8.0.1/30]").unwrap(),
+    );
+    let state = test_state(raw);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+        "the list form must report its first entry as a string"
+    );
+
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: false\ninet4-address: []").unwrap());
+    let state = test_state(raw);
+    let tun = get_configs_json(&state).await["tun"].clone();
+    assert!(
+        tun.get("inet4-address").is_none(),
+        "[] is unset: the key must be absent, got {tun}"
+    );
+}
+
+/// PATCH accepts the list form too: the committed section keeps the
+/// spelling the client sent while `GET /configs` still reports a string.
+#[tokio::test]
+async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: false").unwrap());
+    let state = test_state(raw);
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"inet4-address": ["10.9.0.1/30", "10.8.0.1/30"]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tun.as_ref().unwrap().inet4_address,
+        Some(serde_json::json!(["10.9.0.1/30", "10.8.0.1/30"])),
+        "the committed section keeps the list spelling"
+    );
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+    );
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"inet4-address": "10.7.0.1/30"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.7.0.1/30"),
+    );
+}
+
+/// A `PUT /configs` document in the list form commits and reports the
+/// string, like a config file load would.
+#[tokio::test]
+async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: false\n",
+        "  inet4-address: [10.9.0.1/30]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+    );
+}
+
+/// `?force` commits a `tun:` section `parse_tun_config` rejected, garbage
+/// `inet4-address` included — and `GET /configs` still never reports a
+/// non-string: an unreportable committed value is absent, while a
+/// committed string (invalid CIDR or not) is echoed verbatim as a string.
+#[tokio::test]
+async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
+    use base64::Engine as _;
+    let put = |inet4: &str| {
+        let yaml = format!(
+            "mode: rule\ntun:\n  enable: false\n  inet4-address: {inet4}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        base64::engine::general_purpose::STANDARD.encode(yaml)
+    };
+    let state = test_state(test_raw_config());
+    for (payload, want) in [
+        (put("[7]"), serde_json::Value::Null),
+        (put("{a: 1}"), serde_json::Value::Null),
+        // A committed string reports verbatim — the contract is
+        // `string | absent`, not `valid CIDR | absent`.
+        (put("not-a-cidr"), serde_json::json!("not-a-cidr")),
+    ] {
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let tun = get_configs_json(&state).await["tun"].clone();
+        if want.is_null() {
+            assert!(
+                tun.get("inet4-address").is_none(),
+                "an unreportable committed value must be absent, got {tun}"
+            );
+        } else {
+            assert_eq!(tun["inet4-address"], want);
+        }
+    }
+}
+
 /// Unknown keys — mihomo's upstream-only `tun` keys and other top-level
 /// sections (Clash Party sends `dns` with its TUN switch) — are ignored,
 /// not stored and not rejected.
@@ -7429,7 +7941,6 @@ async fn patch_configs_tun_ignores_unknown_keys() {
             "tun": {
                 "enable": false,
                 "device": "utun9",
-                "stack": "gvisor",
                 "strict-route": true,
                 "auto-detect-interface": true,
                 "not-a-key": 1,
@@ -7441,10 +7952,64 @@ async fn patch_configs_tun_ignores_unknown_keys() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let tun = state.raw_config.read().tun.clone().unwrap();
     assert_eq!(tun.device.as_deref(), Some("utun9"));
-    assert!(tun.stack.is_none());
     assert!(tun.strict_route.is_none());
     assert!(tun.auto_detect_interface.is_none());
     assert!(state.raw_config.read().dns.is_none());
+}
+
+/// `stack` is an implemented `tun:` key, not an upstream-only leftover:
+/// a PATCH carrying it commits the value and `GET /configs` echoes it.
+/// A fallback spelling (`gvisor` → lwIP) commits verbatim like the file
+/// section — on a running listener it parses to the stack already
+/// running, so the parsed diff does not restart it. Deterministic under
+/// both feature sets: no `enable` transition, no respawn.
+#[tokio::test]
+async fn patch_configs_tun_stack_commits_and_echoes() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    // `gvisor` warns and parses to lwIP — the committed section gains the
+    // key while the running listener is left alone.
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"stack": "gvisor"}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a stack spelling that parses to the running one must not restart"
+    );
+    assert!(state.tunnel.has_tun());
+    assert_eq!(
+        state.raw_config.read().tun.as_ref().unwrap().stack,
+        Some(serde_json::json!("gvisor")),
+        "the committed section keeps the client's spelling"
+    );
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["stack"],
+        "gvisor",
+        "GET /configs echoes the committed value"
+    );
+
+    // Turning TUN off while switching `stack` commits both keys and
+    // stops the listener — no spawn is attempted on an on→off.
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"enable": false, "stack": "system"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(stopped.load(Ordering::SeqCst));
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable);
+    assert_eq!(tun.stack, Some(serde_json::json!("system")));
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({"enable": false, "mtu": 1500, "stack": "system"}),
+    );
 }
 
 /// A patch without `tun` leaves the section and the running listener
@@ -8088,6 +8653,10 @@ async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches()
     let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
     assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
+        body_json(failed).await["message"],
+        "Proxy provider refresh failed; the last valid proxies are unchanged"
+    );
+    assert_eq!(
         listed_subscription_info(&state, "usage").await,
         Some(second.clone()),
         "a failed fetch keeps the last accepted usage"
@@ -8302,4 +8871,316 @@ async fn put_configs_strict_remote_payload_defect_commits_empty() {
     })
     .await
     .expect("the committed provider must retry the bad payload in background");
+}
+
+/// Missing/malformed provider content must not erase last-good rules, and
+/// the failure response must not disclose its private source or payload.
+#[tokio::test]
+async fn rule_provider_refresh_failure_is_readable_and_preserves_last_good() {
+    use meow_config::raw::RawRuleProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-source-token.yaml");
+    let good = "payload:\n  - '+.example.com'\n";
+    std::fs::write(&path, good).unwrap();
+    let raw = HashMap::from([(
+        "fixture".into(),
+        RawRuleProvider {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: Some("yaml".into()),
+            url: None,
+            path: Some(path.to_string_lossy().into_owned()),
+            interval: None,
+            proxy: None,
+            header: None,
+            payload: None,
+        },
+    )]);
+    let state = test_state_default();
+    *state.rule_providers.write() = meow_config::rule_provider::load_providers(
+        &raw,
+        Some(dir.path()),
+        &meow_rules::ParserContext::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    let before = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+    for malformed in [false, true] {
+        if malformed {
+            std::fs::write(&path, "payload: [private-payload-secret").unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let failed = api_call(&state, "PUT", "/providers/rules/fixture").await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let message = body_json(failed).await;
+        assert_eq!(
+            message["message"],
+            "Rule provider refresh failed; the last valid rules are unchanged"
+        );
+        assert!(!message.to_string().contains("private-"));
+        let after = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+        assert_eq!(
+            before, after,
+            "failed refresh must retain last-good metadata"
+        );
+    }
+    std::fs::write(
+        &path,
+        "payload:\n  - '+.example.com'\n  - '+.second.test'\n",
+    )
+    .unwrap();
+    let recovered = api_call(&state, "PUT", "/providers/rules/fixture").await;
+    assert_eq!(recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.rule_providers.read()["fixture"].rule_count(), 2);
+    let missing = api_call(&state, "PUT", "/providers/rules/missing").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+// ── PR #882 review: storage endpoint semantics ──────────────────
+
+async fn storage_get(state: &Arc<AppState>, key: &str) -> String {
+    let resp = create_router(Arc::clone(state))
+        .oneshot(
+            Request::get(format!("/storage/{key}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    body_string(resp).await
+}
+
+/// mihomo's `/storage/{key}` contract: GET answers `null` for an unset
+/// key, a stored JSON value echoes back verbatim, and invalid JSON fails
+/// 400 even when the body is also over the 1 MiB value cap (validity is
+/// checked before size, same order as upstream).
+#[tokio::test]
+async fn storage_get_put_delete_and_json_order() {
+    let state = test_state_default();
+    let send = |method: &str, uri: &str, body: String| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    // Unset key -> JSON `null`.
+    let resp = send("GET", "/storage/zashboard", String::new())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await, "null");
+
+    // PUT a JSON body, GET it back verbatim.
+    let resp = send("PUT", "/storage/zashboard", r#"{"theme":"dark"}"#.into())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send("GET", "/storage/zashboard", String::new())
+        .await
+        .unwrap();
+    assert_eq!(body_string(resp).await, r#"{"theme":"dark"}"#);
+
+    // Invalid JSON is 400 — and that check precedes the 1 MiB size cap,
+    // so an oversized *invalid* body still answers 400, not 413.
+    let big_invalid = "x".repeat((1 << 20) + 1);
+    let resp = send("PUT", "/storage/big", big_invalid).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A valid oversized body is the 413 case.
+    let big_valid = format!("\"{}\"", "x".repeat((1 << 20) + 1));
+    let resp = send("PUT", "/storage/big", big_valid).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let resp = send("GET", "/storage/big", String::new()).await.unwrap();
+    assert_eq!(body_string(resp).await, "null");
+
+    // DELETE removes.
+    let resp = send("DELETE", "/storage/zashboard", String::new())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send("GET", "/storage/zashboard", String::new())
+        .await
+        .unwrap();
+    assert_eq!(body_string(resp).await, "null");
+}
+
+/// Upstream quirk (verified against `hub/route/storage.go`): a key past
+/// 64 bytes is silently accepted — PUT answers 204 but stores nothing,
+/// and GET still answers `null`.
+#[tokio::test]
+async fn storage_overlong_key_is_a_silent_noop() {
+    let state = test_state_default();
+    let long_key = "k".repeat(65);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::put(format!("/storage/{long_key}"))
+                .body(axum::body::Body::from("1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = create_router(state)
+        .oneshot(
+            Request::get(format!("/storage/{long_key}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_string(resp).await, "null");
+}
+
+/// The ~1 MiB aggregate budget evicts the least recently WRITTEN key —
+/// an existing key's rewrite refreshes its recency.
+#[tokio::test]
+async fn storage_byte_budget_evicts_oldest_write() {
+    let state = test_state_default();
+    let send = |method: &str, uri: &str, body: String| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    // 2/5 of the ~1 MiB budget each: two entries fit, the third must
+    // evict.
+    let val = format!("\"{}\"", "v".repeat(2 * (1 << 20) / 5));
+    for key in ["a", "b"] {
+        let resp = send("PUT", &format!("/storage/{key}"), val.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    // Rewriting "a" with a different value makes it the newest write;
+    // the third key then evicts "b" (the oldest write now), not "a".
+    let val_a = format!("\"{}\"", "w".repeat(2 * (1 << 20) / 5));
+    let resp = send("PUT", "/storage/a", val_a.clone()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send("PUT", "/storage/c", val.clone()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        storage_get(&state, "b").await,
+        "null",
+        "oldest write evicts first"
+    );
+    assert_eq!(storage_get(&state, "a").await, val_a, "rewritten key stays");
+    assert_eq!(storage_get(&state, "c").await, val, "newest write stays");
+}
+
+// ── PR #882 review: PATCH /rules/disable body shapes ────────────
+
+/// `PATCH /rules/disable` tolerates mihomo's loose body contract: a
+/// literal `null` is an empty patch, and `{"0":null}` reads as "rule 0
+/// enabled" the way Go's `map[int]bool` JSON decode treats it.
+#[tokio::test]
+async fn disable_rules_accepts_null_body_and_null_values() {
+    let state = test_state_default();
+    let patch = |body: &'static str| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules/disable")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    // Disable rule 0 first so the null-value flip has something to undo.
+    assert_eq!(
+        patch(r#"{"0":true}"#).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    // Literal null = empty patch.
+    assert_eq!(
+        patch("null").await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    // {"0":null} -> rule 0 enabled again (serde `Option<bool>` -> false).
+    assert_eq!(
+        patch(r#"{"0":null}"#).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let resp = create_router(state)
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let rules = body_json(resp).await["rules"].as_array().unwrap().clone();
+    assert_eq!(rules[0]["extra"]["disabled"], false);
+}
+
+// ── PR #882 review: POST /rules/append validation ───────────────
+
+/// An appended line that fails to parse must not answer 204 while it
+/// silently never lands — the route dry-parses first and names the line.
+#[tokio::test]
+async fn append_rule_rejects_unparsable_line() {
+    let state = test_state_default();
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::post("/rules/append")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"rule":"NOSUCHRULETYPE,foo,DIRECT"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let message = body_string(resp).await;
+    assert!(
+        message.contains("NOSUCHRULETYPE,foo,DIRECT"),
+        "error names the rejected line: {message}"
+    );
+    // Nothing landed in the config.
+    assert_eq!(state.raw_config.read().rules.as_ref().unwrap().len(), 2);
+}
+
+// ── PR #882 review: /configs sniffing resolution ────────────────
+
+/// `/configs.sniffing` reports the resolved sniffer, matching how the
+/// config build resolves it — the deprecated `tproxy-sni` alias
+/// synthesises an enabled sniffer, and an explicit `sniffer:` block wins.
+#[tokio::test]
+async fn configs_sniffing_uses_resolved_sniffer() {
+    let get_sniffing = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        async move {
+            let resp = create_router(state)
+                .oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(resp).await["sniffing"].as_bool().unwrap()
+        }
+    };
+
+    // tproxy-sni alone -> sniffing on.
+    let mut raw = test_raw_config();
+    raw.tproxy_sni = Some(true);
+    let state = test_state(raw.clone());
+    assert!(get_sniffing(&state).await, "tproxy-sni alias enables");
+
+    // An explicit `sniffer:` block wins over the alias.
+    raw.sniffer = Some(meow_config::raw::RawSniffer {
+        enable: Some(false),
+        ..Default::default()
+    });
+    let state = test_state(raw);
+    assert!(!get_sniffing(&state).await, "explicit sniffer wins");
 }

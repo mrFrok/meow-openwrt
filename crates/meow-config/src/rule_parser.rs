@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use meow_common::{Rule, RuleType};
-use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetBehavior, RuleSetRule};
+use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetRule};
 use tracing::warn;
 
 use crate::sub_rules_parser::{
@@ -170,19 +170,9 @@ fn try_parse_rule_set(
         return Some(Err(format!("unknown rule-provider '{name}'")));
     };
 
-    // Upstream marks `,src` as meaningful only for `ipcidr` providers: on a
-    // `domain` set the src/dst swap is a no-op (the match reads the host),
-    // so a ported `RULE-SET,<domain-set>,...,src` would silently never do
-    // what the author intended — flag it instead of ignoring it (Class B,
-    // ADR-0002).
-    if flags.is_src && set.behavior() == RuleSetBehavior::Domain {
-        warn!(
-            "RULE-SET,{name},{adapter},src: `src` has no effect on a \
-             domain-behavior rule-provider (it is meaningful only for \
-             ipcidr/classical behavior)"
-        );
-    }
-
+    // `,src` on a domain-behavior set is a no-op upstream — the warn lives
+    // in `RuleSetRule::new` so the logic-group path in meow-rules'
+    // `parse_rule_depth` flags it identically.
     Some(Ok(Box::new(RuleSetRule::new(
         name,
         Arc::clone(set),
@@ -550,7 +540,7 @@ mod tests {
     }
 
     /// mihomo parity: `RULE-SET` resolves inside `AND`/`OR`/`NOT` groups
-    /// (e.g. UDP routed with `AND,((NETWORK,udp),(RULE-SET,x)),ProxyUDP`).
+    /// (a router front end routes UDP with `AND,((NETWORK,udp),(RULE-SET,x)),ProxyUDP`).
     #[test]
     fn rule_set_inside_logic_groups() {
         let providers = providers();
