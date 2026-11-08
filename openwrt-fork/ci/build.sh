@@ -14,6 +14,7 @@
 #          OUT       where meow-<profile>-<arch> is copied (default dist)
 #          EXTRA_FEATURES  extra cargo features (experiments only)
 #          MEOW_PGO  0 = no profile-guided optimisation (lightweight/full)
+#          MEOW_TEST cargo test args: run unit tests under qemu-user instead
 #          OPENWRT_MIRROR  SDK mirror bases, space-separated, tried in turn
 #                          (sha256 is checked either way)
 set -euo pipefail
@@ -145,6 +146,16 @@ FEAT=$PROFILE; [ "$ARCH" = mips ] && [ "$PROFILE" = full ] && FEAT=full-be
 # EXTRA_FEATURES: comma list added for experiments (e.g. mimalloc); EXTRA_CARGO:
 # extra cargo args (e.g. --config profile overrides). Releases leave both empty.
 FEAT=$FEAT${EXTRA_FEATURES:+,$EXTRA_FEATURES}
+
+# MEOW_TEST="<cargo test args>": run those unit tests for the target under
+# qemu-user instead of building the release binary (big-endian checks), e.g.
+#   MEOW_TEST="-p meow-transport --features reality --lib" build.sh mips full
+if [ -n "${MEOW_TEST:-}" ]; then
+	export "CARGO_TARGET_$(echo "$RT" | tr a-z- A-Z_)_RUNNER=qemu-${RT%%-*}"
+	# shellcheck disable=SC2086
+	exec cargo +1.96.0 test -Zbuild-std=std,panic_unwind,panic_abort \
+		--target "$RT" --target-dir "$TGT" $MEOW_TEST
+fi
 
 cargo +1.96.0 build -Zbuild-std=std,panic_abort -Zbuild-std-features=optimize_for_size \
 	--release -p meow-app --bin meow --no-default-features --features "$FEAT" \
