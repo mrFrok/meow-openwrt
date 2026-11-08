@@ -412,7 +412,16 @@ async fn reality_handshake(
 
     let leaf_cert =
         leaf_cert.ok_or_else(|| TransportError::Tls("Reality TLS: missing certificate".into()))?;
-    verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
+    verify_reality_certificate(&leaf_cert, &reality_auth_key).map_err(|e| {
+        // An Xray 26+ server that did not authenticate a hello without the
+        // hybrid key share proxies dest's real handshake: say what to try.
+        match e {
+            TransportError::Tls(msg) if !reality.support_x25519_mlkem768 => TransportError::Tls(
+                format!("{msg} (the server may require support-x25519mlkem768: true)"),
+            ),
+            e => e,
+        }
+    })?;
 
     transcript.extend_from_slice(&server_finished);
     let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
