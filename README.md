@@ -109,7 +109,10 @@ mount --bind /usr/bin/meow /usr/bin/mihomo
   `kmod-wireguard` or `kmod-amneziawg`, and meow creates and configures the
   link itself the first time a node is used. The kernel does the crypto, so
   it is fast on MIPS and adds almost nothing to the binary. `reserved` (some
-  WARP setups) is not supported by the module.
+  WARP setups) is not supported by the module. If the handshake never
+  completes over a Qualcomm Wi-Fi client uplink (`ath11k`), turn off TX
+  checksum offload there (`ethtool -K <sta-iface> tx off`): the driver sends
+  the router's own tunnel UDP with bad checksums.
 - **`dns.nftset`**. meow puts the addresses of domains that go to a proxy into
   an nftables set, so the firewall captures only that traffic. 80 000 domains
   take about 1.2 MB in meow, against about 28 MB as dnsmasq lists. See
