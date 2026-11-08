@@ -3500,3 +3500,84 @@ mixed-port: 7890
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
 }
+
+/// OpenWrt front-ends (clashwrt, OpenClash, nikki) keep provider caches on
+/// tmpfs and link them into the config dir: `/etc/mihomo/geo ->
+/// /tmp/…/geo`. Such administrator-made symlinks must load, as in mihomo
+/// (lexical `IsSafePath`); the upstream merge for -8 briefly resolved them
+/// and refused every provider. Traversal and absolute paths outside the dir
+/// stay refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_providers_behind_symlinked_dirs_load() {
+    let home = tempfile::tempdir().unwrap();
+    let tmpfs = tempfile::tempdir().unwrap();
+    for sub in ["geo", "providers"] {
+        std::fs::create_dir(tmpfs.path().join(sub)).unwrap();
+        std::os::unix::fs::symlink(tmpfs.path().join(sub), home.path().join(sub)).unwrap();
+    }
+    std::fs::write(
+        tmpfs.path().join("geo/ads.yaml"),
+        "payload:\n  - '+.ads.example'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmpfs.path().join("providers/sub.yaml"),
+        "proxies:\n  - {name: n1, type: ss, server: 127.0.0.1, port: 8388, cipher: aes-128-gcm, password: x}\n",
+    )
+    .unwrap();
+
+    let yaml = r#"
+mixed-port: 7890
+proxy-providers:
+  sub:
+    type: file
+    path: ./providers/sub.yaml
+proxy-groups:
+  - {name: Proxy, type: select, use: [sub]}
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ./geo/ads.yaml
+rules:
+  - RULE-SET,ads,Proxy
+  - MATCH,DIRECT
+"#;
+    let config_path = home.path().join("config.yaml");
+    std::fs::write(&config_path, yaml).unwrap();
+    let config = meow_config::load_config(config_path.to_str().unwrap())
+        .await
+        .expect("providers behind symlinked dirs must load");
+    assert_eq!(config.rules.len(), 2);
+    assert_eq!(config.rules[0].payload(), "ads");
+    use meow_common::{Metadata, RuleMatchHelper};
+    let meta = Metadata {
+        host: "x.ads.example".into(),
+        dst_port: 443,
+        ..Default::default()
+    };
+    assert!(config.rules[0].match_metadata(&meta, &RuleMatchHelper));
+    assert!(
+        config.proxy_providers.contains_key("sub"),
+        "proxy-provider behind a symlinked dir must be loaded"
+    );
+    assert!(
+        config.dropped_providers.is_empty(),
+        "no provider may be dropped"
+    );
+
+    // The guard itself stays: a path spelled outside the config dir fails.
+    for bad in ["../outside.yaml", "/etc/passwd"] {
+        let yaml = format!(
+            "mixed-port: 7890\nrule-providers:\n  ads: {{type: file, behavior: domain, format: yaml, path: '{bad}'}}\nrules:\n  - RULE-SET,ads,DIRECT\n  - MATCH,DIRECT\n"
+        );
+        std::fs::write(&config_path, yaml).unwrap();
+        let err = meow_config::load_config(config_path.to_str().unwrap())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{bad} must be refused"));
+        assert!(err.to_string().contains("escapes"), "{bad}: {err}");
+    }
+}
