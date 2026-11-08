@@ -24,7 +24,7 @@
 # reality-server.yaml / reality-client.yaml next to this script.
 # Env: RATE=1G LEN=1200 SECS=15 CORE_CPU=0,1 CLI_CPU=2 SRV_CPU=3
 #      SRVBIN=/usr/bin/mihomo (hy2 server), MTU=9000, EXTRA= (extra tun: lines), STACK=system|lwip
-#      MODE=tun|redir (redir: TCP scenarios via nft REDIRECT), HY2OPTS= (extra hy2 proxy keys), SHAPE= (tc tbf args: a slow client), PAR=4
+#      MODE=tun|redir (redir: TCP scenarios via nft REDIRECT), HY2OPTS= (extra hy2 proxy keys), VROPTS= (extra reality-opts keys, e.g. support-x25519mlkem768: true), SHAPE= (tc tbf args: a slow client), PAR=4
 # Prints: received Mbit/s, loss, core CPU (% of one core), %/Mbit, the core's
 # RssAnon and VmHWM (KB) at the end of the run.
 set -u
@@ -91,7 +91,7 @@ tun:
 $EXTRA
 proxies:
   - {name: H, type: hysteria2, server: 203.0.113.2, port: 8444, password: bench, sni: bench.test, skip-cert-verify: true, alpn: [h3]${HY2OPTS:+, $HY2OPTS}}
-  - {name: VR, type: vless, server: 203.0.113.2, port: 8443, uuid: $RUUID, network: tcp, flow: xtls-rprx-vision, tls: true, servername: bench.test, client-fingerprint: chrome, reality-opts: {public-key: $RPUB, short-id: $RSID}}
+  - {name: VR, type: vless, server: 203.0.113.2, port: 8443, uuid: $RUUID, network: tcp, flow: xtls-rprx-vision, tls: true, servername: bench.test, client-fingerprint: chrome, reality-opts: {public-key: $RPUB, short-id: $RSID${VROPTS:+, $VROPTS}}}
 rules: ['MATCH,$1']
 EOF
 }
