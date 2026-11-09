@@ -389,6 +389,34 @@ pub fn p256_public_uncompressed() -> Result<Vec<u8>, CryptoError> {
 mod tests {
     use super::*;
 
+    /// Cost probe for qemu-user instruction counting (`openwrt-fork/bench/
+    /// aead-cost.sh`): seals `MEOW_AEAD_KIB` KiB in 16 KiB records under
+    /// `MEOW_AEAD` (aes128 | aes256 | chacha). Run twice with different
+    /// sizes; the instruction delta over the byte delta is the per-byte cost.
+    #[test]
+    #[ignore = "cost probe, run by aead-cost.sh"]
+    fn aead_cost_probe() {
+        let alg = match std::env::var("MEOW_AEAD").as_deref() {
+            Ok("aes128") => AeadAlg::Aes128Gcm,
+            Ok("aes256") => AeadAlg::Aes256Gcm,
+            _ => AeadAlg::ChaCha20Poly1305,
+        };
+        let kib: usize = std::env::var("MEOW_AEAD_KIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let aead = Aead::new(alg, &[7u8; 32][..alg.key_len()]).unwrap();
+        let mut buf = vec![0x5au8; 16 * 1024];
+        let mut tag = [0u8; TAG_LEN];
+        for i in 0..kib / 16 {
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            aead.seal_in_place(&nonce, &mut buf, &mut tag, b"ad")
+                .unwrap();
+        }
+        std::hint::black_box((&buf, &tag));
+    }
+
     /// RFC 9001 appendix A.2 / A.3 vectors, through every primitive the
     /// QUIC sniffer uses.
     #[test]

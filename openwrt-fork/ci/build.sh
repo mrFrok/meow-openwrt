@@ -152,6 +152,8 @@ FEAT=$FEAT${EXTRA_FEATURES:+,$EXTRA_FEATURES}
 #   MEOW_TEST="-p meow-transport --features reality --lib" build.sh mips full
 if [ -n "${MEOW_TEST:-}" ]; then
 	export "CARGO_TARGET_$(echo "$RT" | tr a-z- A-Z_)_RUNNER=qemu-${RT%%-*}"
+	# Tests unwind: a release-profile panic=abort would build core twice.
+	export CARGO_PROFILE_RELEASE_PANIC=unwind
 	# shellcheck disable=SC2086
 	exec cargo +1.96.0 test -Zbuild-std=std,panic_unwind,panic_abort \
 		--target "$RT" --target-dir "$TGT" $MEOW_TEST
