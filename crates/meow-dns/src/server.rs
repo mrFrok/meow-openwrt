@@ -1230,7 +1230,8 @@ impl BoundDnsServer {
     /// drop was previously invisible). A query lost mid-task (e.g. a panic)
     /// is not counted here.
     pub fn dropped_queries(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        #[allow(clippy::useless_conversion, reason = "u32→u64 on mips32")]
+        u64::from(self.dropped.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Shared handle to the drop counter. [`Self::run`] consumes the
