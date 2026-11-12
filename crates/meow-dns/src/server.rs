@@ -1,28 +1,24 @@
 use crate::resolver::{AddressLookupResult, Resolver};
+use crate::response_policy::ResponseAction;
 use futures::FutureExt;
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::net::TcpStream;
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
 const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
-/// Answer records per response: 8 AAAA (224 B) plus the header, the
-/// longest question (259 B) and an OPT record still fit 512 bytes.
-const MAX_ANSWERS: usize = 8;
 
-/// Hard bound on concurrent upstream-bound query tasks (issue #515).
-/// Queries decidable from local state (hosts, fake-IP, fresh cache) are
-/// answered inline and never consume a permit; beyond this cap additional
-/// upstream-bound queries are dropped and counted — UDP semantics, the
-/// client retries. Tests use a small cap so saturation is exercised
-/// deterministically.
-#[cfg(not(test))]
-const MAX_IN_FLIGHT: usize = 512;
+/// meow-openwrt: answer records per response, as mihomo answers every
+/// address of the family: 8 AAAA (224 B) plus the header, the longest
+/// question (259 B) and an OPT record still fit 512 bytes.
+pub(crate) const MAX_ANSWERS: usize = 8;
 
 /// The hosts entry's addresses of the queried family (A = 1, else AAAA).
 fn family_ips(all: &[std::net::IpAddr], qtype: u16) -> crate::cache::IpList {
@@ -38,21 +34,23 @@ fn family_ips(all: &[std::net::IpAddr], qtype: u16) -> crate::cache::IpList {
         .collect()
 }
 
-/// Tell the answer hook (nftset, reverse table) about every address a
-/// client receives, so a client that picks the second one is covered too.
-fn notify_all(
-    resolver: &crate::Resolver,
-    domain: &str,
-    ips: &[std::net::IpAddr],
-    ttl: std::time::Duration,
-) {
-    for &ip in ips.iter().take(MAX_ANSWERS) {
-        crate::answer_hook::notify(resolver, domain, ip, ttl);
-    }
-}
-
+/// Hard bound on concurrent upstream-bound query tasks (issue #515).
+/// Queries decidable from local state (hosts, fake-IP, fresh cache) are
+/// answered inline and never consume a permit; beyond this cap additional
+/// upstream-bound queries are dropped and counted — UDP semantics, the
+/// client retries. Tests use a small cap so saturation is exercised
+/// deterministically.
+#[cfg(not(test))]
+const MAX_IN_FLIGHT: usize = 512;
 #[cfg(test)]
 const MAX_IN_FLIGHT: usize = 8;
+
+/// Bound idle/partial-frame connections separately from active DNS work.
+#[cfg(not(test))]
+const MAX_TCP_CONNECTIONS: usize = 128;
+#[cfg(test)]
+const MAX_TCP_CONNECTIONS: usize = 4;
+const TCP_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minimal EDNS0 OPT pseudo-record (11 bytes) appended to responses when the
 /// query carried one in the additional section.  Windows DNS Client (used by
@@ -86,8 +84,8 @@ pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
 /// receive loop runs before dispatching a query (issue #515).
 #[derive(Debug)]
 pub enum LocalAnswer {
-    /// Fully answered from local state — send these bytes now.
-    Answer(Vec<u8>),
+    /// Fully answered from local state — send it per [`LocalResponse`].
+    Answer(LocalResponse),
     /// Malformed or otherwise unanswerable — drop silently, exactly what
     /// [`DnsServer::handle_query`]'s error path does, but without spending
     /// an in-flight permit or a task spawn on guaranteed-failure packets.
@@ -95,6 +93,38 @@ pub enum LocalAnswer {
     /// Needs the upstream pipeline (or a full `handle_query` pass) —
     /// dispatch a bounded task.
     Upstream,
+}
+
+/// A locally-decided answer: wire-ready bytes plus the deferred
+/// answer-hook work (`dns.nftset`) that must complete before they are
+/// sent. The hook can block on a netlink ack, so the caller runs `hook`
+/// off the receive loop — `response` goes out only after it completes;
+/// unrelated answers do not queue behind it.
+#[derive(Debug)]
+pub struct LocalResponse {
+    /// The response to put on the wire.
+    pub response: Vec<u8>,
+    /// Deferred hook work; `None` whenever no hook is installed.
+    pub hook: Option<crate::answer_hook::PendingHook>,
+}
+
+impl LocalResponse {
+    /// An answer with no hook work — the overwhelmingly common shape.
+    fn plain(response: Vec<u8>) -> Self {
+        Self {
+            response,
+            hook: None,
+        }
+    }
+}
+
+/// A synthesized response-rule answer: the wire response plus, when it
+/// carries an address record, the `(ip, ttl)` it emitted —
+/// `try_answer_local` hands that to the `dns.nftset` answer hook. Error
+/// replies report no emitted address.
+struct RuleAnswer {
+    response: Vec<u8>,
+    emitted: Option<(IpAddr, u32)>,
 }
 
 /// Simple DNS server that handles queries by forwarding to our resolver.
@@ -124,32 +154,49 @@ impl DnsServer {
     /// with the old `run()`-binds-internally shape, a caller that spawned
     /// `run()` fire-and-forget had no way to distinguish "listening" from
     /// "bind failed, every query will be dropped".
-    ///
-    /// DNS over TCP (RFC 7766) is served on the same address as UDP, as
-    /// mihomo does: clients and forwarders (dnsmasq relays a TCP query to
-    /// its upstream over TCP) that pick TCP otherwise get REFUSED for every
-    /// name. UDP is the contract — a TCP bind failure is logged and the
-    /// server runs UDP-only rather than failing startup.
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
-        let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        let bound = socket.local_addr().unwrap_or(self.listen_addr);
-        let tcp = match TcpListener::bind(bound).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                warn!("DNS server: TCP bind on {bound} failed, serving UDP only: {e}");
-                None
+        // Windows reserves excluded port ranges per protocol (Hyper-V/WINNAT):
+        // a port one protocol's allocator hands out can sit inside the
+        // other's exclusion, and when the two ranges partition the ephemeral
+        // space every same-direction retry fails identically — so :0
+        // attempts alternate which protocol picks the port. A configured
+        // port keeps its single fail-fast attempt; a bind failure on the
+        // picking protocol always surfaces (the OS never hands out a port
+        // it excludes for that protocol).
+        const BIND_ATTEMPTS: u32 = 8;
+        let mut last_err = None;
+        for attempt in 0..BIND_ATTEMPTS {
+            let pair = if attempt % 2 == 0 {
+                let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+                TcpListener::bind(socket.local_addr()?)
+                    .await
+                    .map(|tcp| (socket, tcp))
+            } else {
+                let tcp = TcpListener::bind(self.listen_addr).await?;
+                UdpSocket::bind(tcp.local_addr()?)
+                    .await
+                    .map(|udp| (Arc::new(udp), tcp))
+            };
+            match pair {
+                Ok((socket, tcp)) => {
+                    let bound = socket.local_addr()?;
+                    info!("DNS server listening on {bound}");
+                    return Ok(BoundDnsServer {
+                        resolver: Arc::clone(&self.resolver),
+                        socket,
+                        tcp: Some(tcp),
+                        dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
+                    });
+                }
+                Err(error) => {
+                    if self.listen_addr.port() != 0 {
+                        return Err(error);
+                    }
+                    last_err = Some(error);
+                }
             }
-        };
-        info!(
-            "DNS server listening on {bound} ({})",
-            if tcp.is_some() { "udp+tcp" } else { "udp" }
-        );
-        Ok(BoundDnsServer {
-            resolver: Arc::clone(&self.resolver),
-            socket,
-            tcp,
-            dropped: Arc::new(meow_common::atomic::AtomicU::new(0)),
-        })
+        }
+        Err(last_err.expect("bind loop ran at least once"))
     }
 
     /// Bind and serve in one call. Kept for callers that await `run()`
@@ -163,6 +210,14 @@ impl DnsServer {
     pub async fn handle_query(
         data: &[u8],
         resolver: &Resolver,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::handle_query_charged(data, resolver, None).await
+    }
+
+    pub(crate) async fn handle_query_charged(
+        data: &[u8],
+        resolver: &Resolver,
+        charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         // Minimal DNS parsing: extract the query name and type
         if data.len() < 12 {
@@ -241,6 +296,26 @@ impl DnsServer {
             .await;
         }
 
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            // A static-address answer feeds the nftset hook exactly like
+            // the hosts arm below — run it inline. Normally unreachable
+            // (`try_answer_local` answers matching rules first), but a
+            // resolver-generation swap mid-dispatch or a future caller
+            // skipping the probe must not skip the element add.
+            if let Some((addr, ttl)) = answer.emitted {
+                if let Some(work) = crate::answer_hook::pending(
+                    resolver,
+                    &domain,
+                    addr,
+                    std::time::Duration::from_secs(u64::from(ttl)),
+                ) {
+                    crate::answer_hook::run_blocking(work, charge.clone()).await;
+                }
+            }
+            return Ok(answer.response);
+        }
+
         // Check hosts trie first. If the domain is present in the hosts table
         // but has no IPs of the queried family, return NOERROR with zero answers
         // rather than NXDOMAIN — clients may retry on NXDOMAIN but not on an
@@ -256,8 +331,18 @@ impl DnsServer {
             return Ok(if ips.is_empty() {
                 Self::build_noerror_empty(id, data, flags, question_len)
             } else {
-                let ttl = std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS));
-                notify_all(resolver, &domain, &ips, ttl);
+                // The answer hook runs on the blocking pool (it can
+                // wait on a netlink ack); awaiting it here keeps the
+                // ordering — the elements are in before this answer is
+                // sent.
+                if let Some(work) = crate::answer_hook::pending_all(
+                    resolver,
+                    &domain,
+                    &ips,
+                    std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                ) {
+                    crate::answer_hook::run_blocking(work, charge.clone()).await;
+                }
                 Self::build_response(
                     id,
                     data,
@@ -293,7 +378,10 @@ impl DnsServer {
 
         Ok(match lookup {
             AddressLookupResult::Answer(addrs, ttl) => {
-                notify_all(resolver, &domain, &addrs, ttl);
+                if let Some(work) = crate::answer_hook::pending_all(resolver, &domain, &addrs, ttl)
+                {
+                    crate::answer_hook::run_blocking(work, charge.clone()).await;
+                }
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
@@ -338,14 +426,22 @@ impl DnsServer {
             return LocalAnswer::Drop;
         }
         if flags & 0x7800 != 0 {
-            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_notimp(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         if qdcount == 0 {
             return LocalAnswer::Drop; // handle_query errs — silently dropped
         }
         // Same rule as handle_query: multi-question queries get FORMERR.
         if qdcount != 1 {
-            return LocalAnswer::Answer(Self::build_formerr(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_formerr(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         let Ok((domain, qtype, question_len)) = Self::parse_question(&data[12..]) else {
             // Parity with handle_query's per-error debug log — the inline
@@ -356,7 +452,11 @@ impl DnsServer {
         // Same rule as handle_query: only class IN is served.
         let qclass = u16::from_be_bytes([data[12 + question_len - 2], data[12 + question_len - 1]]);
         if qclass != 1 {
-            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_notimp(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         if qtype != 1 && qtype != 28 {
             // Generic queries escalate to the task path — the remaining
@@ -364,6 +464,25 @@ impl DnsServer {
             // BADVERS) may not even reach upstream, and they are not
             // evaluated on this probe path.
             return LocalAnswer::Upstream;
+        }
+
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            return LocalAnswer::Answer(LocalResponse {
+                response: answer.response,
+                // A static-address answer emits an IP the client will
+                // connect to — `dns.nftset` must see it exactly like a
+                // hosts answer. NODATA/REFUSED and error answers emit no
+                // address; `pending` drops fake-IP answers by design.
+                hook: answer.emitted.and_then(|(addr, ttl)| {
+                    crate::answer_hook::pending(
+                        resolver,
+                        &domain,
+                        addr,
+                        std::time::Duration::from_secs(u64::from(ttl)),
+                    )
+                }),
+            });
         }
 
         let outcome = {
@@ -376,22 +495,36 @@ impl DnsServer {
             if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
                 let ips = family_ips(all_ips, qtype);
                 LocalAnswer::Answer(if ips.is_empty() {
-                    Self::build_noerror_empty(id, data, flags, question_len)
+                    LocalResponse::plain(Self::build_noerror_empty(id, data, flags, question_len))
                 } else {
-                    let ttl = std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS));
-                    notify_all(resolver, &domain, &ips, ttl);
-                    Self::build_response(
-                        id,
-                        data,
-                        flags,
-                        question_len,
-                        qtype,
-                        &ips,
-                        DEFAULT_ANSWER_TTL_SECS,
-                    )
+                    // The hook's `(domain, addrs, ttl)` is captured for the
+                    // caller to run off the loop — the response bytes are
+                    // built here as usual.
+                    LocalResponse {
+                        response: Self::build_response(
+                            id,
+                            data,
+                            flags,
+                            question_len,
+                            qtype,
+                            &ips,
+                            DEFAULT_ANSWER_TTL_SECS,
+                        ),
+                        hook: crate::answer_hook::pending_all(
+                            resolver,
+                            &domain,
+                            &ips,
+                            std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                        ),
+                    }
                 })
             } else if qtype == 28 && !resolver.ipv6_enabled() {
-                LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
+                LocalAnswer::Answer(LocalResponse::plain(Self::build_noerror_empty(
+                    id,
+                    data,
+                    flags,
+                    question_len,
+                )))
             } else {
                 // lookup_*_local covers the remaining local decisions:
                 // hosts alias → upstream, fake-IP synthesis, and fresh
@@ -405,31 +538,35 @@ impl DnsServer {
                     crate::resolver::LocalLookup::Decided(lookup) => {
                         LocalAnswer::Answer(match lookup {
                             AddressLookupResult::Answer(addrs, ttl) => {
-                                notify_all(resolver, &domain, &addrs, ttl);
                                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
-                                Self::build_response(
-                                    id,
-                                    data,
-                                    flags,
-                                    question_len,
-                                    qtype,
-                                    &addrs,
-                                    ttl_secs,
-                                )
+                                LocalResponse {
+                                    response: Self::build_response(
+                                        id,
+                                        data,
+                                        flags,
+                                        question_len,
+                                        qtype,
+                                        &addrs,
+                                        ttl_secs,
+                                    ),
+                                    hook: crate::answer_hook::pending_all(
+                                        resolver, &domain, &addrs, ttl,
+                                    ),
+                                }
                             }
-                            AddressLookupResult::NoData => {
-                                Self::build_noerror_empty(id, data, flags, question_len)
-                            }
-                            AddressLookupResult::NxDomain => {
-                                Self::build_nxdomain(id, data, flags, question_len)
-                            }
+                            AddressLookupResult::NoData => LocalResponse::plain(
+                                Self::build_noerror_empty(id, data, flags, question_len),
+                            ),
+                            AddressLookupResult::NxDomain => LocalResponse::plain(
+                                Self::build_nxdomain(id, data, flags, question_len),
+                            ),
                             // Local probes never yield `Failed` today (they
                             // produce `Upstream` instead); kept so a future
                             // `Decided` variant can't silently change wire
                             // semantics.
-                            AddressLookupResult::Failed => {
-                                Self::build_servfail(id, data, flags, question_len)
-                            }
+                            AddressLookupResult::Failed => LocalResponse::plain(
+                                Self::build_servfail(id, data, flags, question_len),
+                            ),
                         })
                     }
                     crate::resolver::LocalLookup::Upstream(_) => LocalAnswer::Upstream,
@@ -474,54 +611,16 @@ impl DnsServer {
         // successful `parse_question` over `query[12..]`.
         debug_assert!(12 + question_len <= query.len());
 
-        // The declared record counts feed a `Vec::with_capacity` inside
-        // the hickory decode. A datagram cannot physically hold more
-        // resource records than `len / 11` (one-byte root name plus the
-        // 10-byte record header), so an impossible count is malformed
-        // input — FORMERR before the decoder reserves megabytes for it.
-        // The wire outcome is identical either way: hickory fails the
-        // same packet at record-read EOF.
-        let arcount = u16::from_be_bytes([query[10], query[11]]);
-        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
-            + u16::from_be_bytes([query[8], query[9]]) as usize
-            + arcount as usize;
-        // `query.len() - 12 - question_len` == remaining record-region bytes.
-        if declared_records * 11 > query.len() - 12 - question_len {
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
-        }
-
-        // Parse the inbound query before spending an upstream round-trip:
-        // the question echo, RD/CD request bits and EDNS presence all come
-        // from it. A query hickory rejects where `parse_question` succeeded
-        // (duplicate OPT, OPT outside the additional section, malformed
-        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
-        // FORMERR, never a forwarded lookup.
-        let Ok(req) = Message::from_vec(query) else {
-            // The request's EDNS presence is undecodable here — fall back
-            // to the raw ARCOUNT heuristic the preamble uses.
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
+        let req = match Self::parse_request(query, question_len) {
+            Ok(req) => req,
+            Err(response) => return Ok(response),
         };
-
-        // Defense in depth: the preamble already drops QR=1, so this arm
-        // is unreachable — kept so the private function cannot silently
-        // forward a response packet if it ever gains another caller.
-        if req.metadata.message_type != MessageType::Query {
-            return Err("response packet cannot be forwarded".into());
-        }
-
-        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
-        // BADVERS — the extended rcode rides in a version-0 response OPT.
-        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
-            let mut resp = Message::new(id, MessageType::Response, req.metadata.op_code);
-            resp.metadata.recursion_desired = req.metadata.recursion_desired;
-            resp.metadata.checking_disabled = req.metadata.checking_disabled;
-            resp.metadata.recursion_available = true;
-            resp.metadata.response_code = ResponseCode::BADVERS;
-            resp.add_queries(req.queries.iter().cloned());
-            resp.edns = req.edns.as_ref().map(Self::response_edns);
-            return Ok(resp
-                .to_vec()
-                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        if let Some(action) = resolver.response_action(domain, qtype) {
+            if let Some(answer) =
+                Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
+            {
+                return Ok(answer.response);
+            }
         }
 
         // The name sent upstream is the wire-faithful `Name` hickory decoded
@@ -632,6 +731,170 @@ impl DnsServer {
             .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)))
     }
 
+    /// Decode once before a rule can synthesize a reply. Both address serve
+    /// arms share the generic path's bounds, FORMERR and BADVERS checks.
+    fn parse_request(query: &[u8], question_len: usize) -> Result<Message, Vec<u8>> {
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        let flags = u16::from_be_bytes([query[2], query[3]]);
+        // The declared record counts feed a `Vec::with_capacity` inside
+        // the hickory decode. A datagram cannot physically hold more
+        // resource records than `len / 11` (one-byte root name plus the
+        // 10-byte record header), so an impossible count is malformed
+        // input — FORMERR before the decoder reserves megabytes for it.
+        // The wire outcome is identical either way: hickory fails the
+        // same packet at record-read EOF.
+        let arcount = u16::from_be_bytes([query[10], query[11]]);
+        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
+            + u16::from_be_bytes([query[8], query[9]]) as usize
+            + arcount as usize;
+        // `query.len() - 12 - question_len` == remaining record-region bytes.
+        if declared_records * 11 > query.len() - 12 - question_len {
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // Parse the inbound query before spending an upstream round-trip:
+        // the question echo, RD/CD request bits and EDNS presence all come
+        // from it. A query hickory rejects where `parse_question` succeeded
+        // (duplicate OPT, OPT outside the additional section, malformed
+        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
+        // FORMERR, never a forwarded lookup.
+        let Ok(req) = Message::from_vec(query) else {
+            // The request's EDNS presence is undecodable here — fall back
+            // to the raw ARCOUNT heuristic the preamble uses.
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        };
+
+        // Defense in depth: the preamble already drops QR=1, so this arm
+        // is unreachable — kept so the private function cannot silently
+        // forward a response packet if it ever gains another caller.
+        // Replying to a response at all would risk the resolver
+        // ping-pong the preamble's silent drop exists to prevent; the
+        // assert makes a future caller who skipped that gate loud.
+        if req.metadata.message_type != MessageType::Query {
+            debug_assert!(false, "response packet reached parse_request");
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
+        // BADVERS — the extended rcode rides in a version-0 response OPT.
+        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
+            let resp = Self::response_message(&req, ResponseCode::BADVERS);
+            return Err(resp
+                .to_vec()
+                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        }
+
+        Ok(req)
+    }
+
+    fn response_message(req: &Message, code: ResponseCode) -> Message {
+        let mut response =
+            Message::new(req.metadata.id, MessageType::Response, req.metadata.op_code);
+        response.metadata.recursion_desired = req.metadata.recursion_desired;
+        response.metadata.checking_disabled = req.metadata.checking_disabled;
+        response.metadata.recursion_available = true;
+        response.metadata.response_code = code;
+        response.add_queries(req.queries.iter().cloned());
+        response.edns = req.edns.as_ref().map(Self::response_edns);
+        response
+    }
+
+    /// Probe the response rules for an address query. The rule scan is
+    /// cheap — a hosts-trie lookup plus a linear rule scan — so a `forward`
+    /// verdict and no-match leave without touching the wire bytes;
+    /// [`Self::parse_request`]'s full decode only runs when a rule will
+    /// actually synthesize the reply.
+    fn try_response_rule(
+        data: &[u8],
+        question_len: usize,
+        domain: &str,
+        qtype: u16,
+        resolver: &Resolver,
+    ) -> Option<RuleAnswer> {
+        // Keep the ordinary hot path free of full-message decoding.
+        if !resolver.has_response_rules() {
+            return None;
+        }
+        let action = resolver.response_action(domain, qtype)?;
+        if action == ResponseAction::Forward {
+            return None;
+        }
+        let req = match Self::parse_request(data, question_len) {
+            // A matching rule over a malformed packet is still an error
+            // answer, never an upstream forward.
+            Ok(req) => req,
+            Err(response) => {
+                return Some(RuleAnswer {
+                    response,
+                    emitted: None,
+                })
+            }
+        };
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
+    }
+
+    /// Synthesize the rule's reply — the wire bytes plus, when the answer
+    /// section actually carries an address record, the `(ip, ttl)` it
+    /// emitted (for the `dns.nftset` answer hook; `answer_hook::pending`
+    /// drops fake-IP addresses by design). A family-mismatched `address`
+    /// action answers NODATA and reports nothing. `action` comes from the
+    /// caller's `response_action` scan so a matching query pays one rule
+    /// walk, not two.
+    fn build_rule_response(
+        req: &Message,
+        flags: u16,
+        domain: &str,
+        qtype: u16,
+        action: ResponseAction,
+        resolver: &Resolver,
+    ) -> Option<RuleAnswer> {
+        let mut response = Self::response_message(req, ResponseCode::NoError);
+        let address = match action {
+            ResponseAction::Forward => return None,
+            ResponseAction::FakeIp if !matches!(qtype, 1 | 28) => return None,
+            ResponseAction::FakeIp => resolver.response_fake_ip(domain, qtype).map(|ip| {
+                (
+                    ip,
+                    resolver
+                        .fake_ip_ttl()
+                        .as_secs()
+                        .clamp(1, u64::from(u32::MAX)) as u32,
+                )
+            }),
+            ResponseAction::Address { address, ttl } => Some((address, ttl)),
+            ResponseAction::NoData => None,
+            ResponseAction::Refused => {
+                response.metadata.response_code = ResponseCode::Refused;
+                None
+            }
+        };
+        let mut emitted = None;
+        if let Some((address, ttl)) = address {
+            let rdata = match (address, qtype) {
+                (IpAddr::V4(ip), 1) => Some(RData::A(ip.into())),
+                (IpAddr::V6(ip), 28) => Some(RData::AAAA(ip.into())),
+                _ => None,
+            };
+            if let Some(rdata) = rdata {
+                // `qdcount == 1` + a successful decode guarantees a
+                // question — `.first()` mirrors `handle_generic_forward`
+                // so a hypothetical empty parse degrades to NODATA, not
+                // a panic through the probe path's bare call.
+                if let Some(query) = req.queries.first() {
+                    response.add_answer(Record::from_rdata(query.name.clone(), ttl, rdata));
+                    emitted = Some((address, ttl));
+                }
+            }
+        }
+        Some(RuleAnswer {
+            response: response.to_vec().unwrap_or_else(|_| {
+                Self::build_header_error(req.metadata.id, flags, 2, req.edns.is_some())
+            }),
+            emitted,
+        })
+    }
+
     /// Minimal per-hop response OPT synthesized from the client's request
     /// EDNS: version 0, the 2020 DNS-flag-day payload, echoing only DO.
     fn response_edns(req_edns: &Edns) -> Edns {
@@ -739,12 +1002,12 @@ impl DnsServer {
     ) -> Vec<u8> {
         let arcount = u16::from_be_bytes([query[10], query[11]]);
         let mut response = Vec::with_capacity(512);
-
-        let header_pos = response.len();
-        // Every address of the family, like mihomo, but no more than fits a
-        // 512-byte UDP answer (16 B per A, 28 B per AAAA record).
+        // meow-openwrt: every address of the family, like mihomo, but no
+        // more than fits a 512-byte UDP answer (16 B per A, 28 B per AAAA).
         let addrs = &addrs[..addrs.len().min(MAX_ANSWERS)];
         let ancount = u16::try_from(addrs.len()).unwrap_or(1);
+
+        let header_pos = response.len();
 
         // Header
         response.extend_from_slice(&id.to_be_bytes()); // ID
@@ -925,8 +1188,6 @@ impl DnsServer {
 pub struct BoundDnsServer {
     resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
-    /// DNS-over-TCP listener on the same address; `None` for wrapped
-    /// external sockets and when the TCP bind failed.
     tcp: Option<TcpListener>,
     /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
     /// already running. Exposed for stats/observability (issue #515).
@@ -969,8 +1230,7 @@ impl BoundDnsServer {
     /// drop was previously invisible). A query lost mid-task (e.g. a panic)
     /// is not counted here.
     pub fn dropped_queries(&self) -> u64 {
-        #[allow(clippy::useless_conversion, reason = "u32→u64 on mips32")]
-        u64::from(self.dropped.load(std::sync::atomic::Ordering::Relaxed))
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Shared handle to the drop counter. [`Self::run`] consumes the
@@ -1009,37 +1269,30 @@ impl BoundDnsServer {
     /// upstream (previously worker-held strong clones kept the port bound
     /// for up to the ~5 s query timeout after an abort, so an immediate
     /// stop→start rebind of a fixed port hit EADDRINUSE).
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let BoundDnsServer {
-            resolver,
-            socket,
-            tcp,
-            dropped,
-        } = self;
-
+    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-
-        // The TCP accept loop runs inside this future (not a detached task),
-        // so aborting the serve task closes both listeners and — through the
-        // JoinSet it owns — every open TCP connection.
-        let tcp_loop = async {
-            match tcp {
-                Some(listener) => serve_tcp(listener, &resolver, &in_flight).await,
-                None => std::future::pending().await,
+        if let Some(tcp) = self.tcp.take() {
+            let resolver = Arc::clone(&self.resolver);
+            tokio::select! {
+                result = self.run_udp(Arc::clone(&in_flight)) => result,
+                result = run_tcp_listener(tcp, resolver, in_flight) => result,
             }
-        };
-        tokio::select! {
-            r = Self::serve_udp(&resolver, socket, &dropped, &in_flight) => r,
-            () = tcp_loop => unreachable!("TCP accept loop never returns"),
+        } else {
+            self.run_udp(in_flight).await
         }
     }
 
-    async fn serve_udp(
-        resolver: &ResolverSlot,
-        socket: Arc<UdpSocket>,
-        dropped: &meow_common::atomic::AtomicU,
-        in_flight: &Arc<tokio::sync::Semaphore>,
+    async fn run_udp(
+        self,
+        in_flight: Arc<tokio::sync::Semaphore>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let BoundDnsServer {
+            resolver,
+            socket,
+            dropped,
+            tcp: _,
+        } = self;
+
         let mut buf = vec![0u8; 4096];
         // A persistent recv failure must not spin the loop or flood the log;
         // a transient one must not be delayed meaningfully.
@@ -1070,19 +1323,28 @@ impl BoundDnsServer {
                 DnsServer::try_answer_local(&buf[..len], &resolver_guard)
             };
             match local {
-                LocalAnswer::Answer(response) => {
-                    // `try_send_to`, not `send_to().await`: a transient
-                    // full send buffer must not head-of-line block every
-                    // later query behind one slow reply (UDP semantics —
-                    // the stub resolver retries). Counted like the
-                    // saturation drops below so `dropped_queries` stays a
-                    // truthful "no response was sent" signal.
-                    match socket.try_send_to(&response, src) {
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    match hook {
+                        // `dns.nftset` ordering: the element must be in
+                        // before this answer reaches the client. The add
+                        // blocks on netlink, so it runs on the blocking
+                        // pool with the send chained after it — unrelated
+                        // answers don't queue behind it.
+                        Some(work) => {
+                            // Weak, like the query tasks: the loop stays
+                            // the sole strong owner so an abort still
+                            // releases the port. A dead socket means no
+                            // listener is left to answer anyway.
+                            let sock = Arc::downgrade(&socket);
+                            let dropped = Arc::clone(&dropped);
+                            tokio::task::spawn_blocking(move || {
+                                work.run();
+                                if let Some(sock) = sock.upgrade() {
+                                    send_local_answer(&sock, &response, src, &dropped);
+                                }
+                            });
                         }
-                        Err(e) => warn!("DNS send error: {e}"),
-                        Ok(_) => {}
+                        None => send_local_answer(&socket, &response, src, &dropped),
                     }
                     continue;
                 }
@@ -1094,7 +1356,7 @@ impl BoundDnsServer {
 
             // Acquire the permit BEFORE copying the payload: under
             // saturation a dropped query must not pay the alloc either.
-            let Ok(permit) = Arc::clone(in_flight).try_acquire_owned() else {
+            let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
                 let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 // Power-of-two warn cadence: first drop is loud, sustained
                 // saturation stays bounded in the log.
@@ -1107,19 +1369,23 @@ impl BoundDnsServer {
             };
 
             let data = buf[..len].to_vec();
-            let resolver_slot = Arc::clone(resolver);
+            let resolver_slot = Arc::clone(&resolver);
             let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
             tokio::spawn(async move {
-                let _permit = permit;
+                let charge = Arc::new(permit);
                 // Snapshot the current resolver generation per query —
                 // a `PUT /configs` DNS reload swaps the slot (issue #514).
                 // The read guard must drop before `.await`: it is !Send.
                 let resolver = Arc::clone(&resolver_slot.read());
                 // Panic guard: a panicked task would drop the query, so keep
                 // the panic scoped to this one request and log it loudly.
-                let outcome = AssertUnwindSafe(DnsServer::handle_query(&data, &resolver))
-                    .catch_unwind()
-                    .await;
+                let outcome = AssertUnwindSafe(DnsServer::handle_query_charged(
+                    &data,
+                    &resolver,
+                    Some(charge),
+                ))
+                .catch_unwind()
+                .await;
                 match outcome {
                     Ok(Ok(response)) => {
                         // Upgrade per reply; hold the strong ref only across
@@ -1144,130 +1410,159 @@ impl BoundDnsServer {
     }
 }
 
-/// Concurrent DNS-over-TCP connections; further accepts are closed at once.
-#[cfg(not(test))]
-const MAX_TCP_CONNS: usize = 64;
-#[cfg(test)]
-const MAX_TCP_CONNS: usize = 4;
-
-/// Idle bound on a DNS-over-TCP connection: the wait for the next query and
-/// for the rest of a started one (RFC 7766 §6.2.3 — servers may close idle
-/// connections after a few seconds).
-const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Accept DNS-over-TCP connections forever. Connection tasks live in a
-/// `JoinSet` owned by this future, so dropping it closes them all.
-async fn serve_tcp(
+// This task set owns every accepted stream: dropping the listener future
+// cancels idle clients, partial frames and in-flight queries together.
+async fn run_tcp_listener(
     listener: TcpListener,
-    resolver: &ResolverSlot,
-    in_flight: &Arc<tokio::sync::Semaphore>,
-) {
-    let conns = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut accept_backoff = meow_common::ErrorBackoff::new();
+    resolver: ResolverSlot,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut clients = tokio::task::JoinSet::new();
+    let mut backoff = meow_common::ErrorBackoff::new();
     loop {
         tokio::select! {
-            // Reap finished connections so the set doesn't grow unbounded.
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(v) => {
-                        accept_backoff.succeeded();
-                        v
+            completed = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!("DNS TCP client task failed: {error}");
+                }
+            }
+            accepted = listener.accept(), if clients.len() < MAX_TCP_CONNECTIONS => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        backoff.succeeded();
+                        let resolver = Arc::clone(&resolver);
+                        let budget = Arc::clone(&budget);
+                        clients.spawn(async move {
+                            if let Err(error) = serve_tcp_stream(stream, resolver, budget).await {
+                                debug!("DNS TCP exchange failed: {error}");
+                            }
+                        });
                     }
-                    Err(e) => {
-                        if accept_backoff.failed(&e).await {
-                            error!("DNS TCP accept error: {e}");
+                    Err(error) => {
+                        if backoff.failed(&error).await {
+                            error!("DNS TCP accept failed: {error}");
                         } else {
-                            debug!("DNS TCP accept error: {e}");
+                            debug!("DNS TCP accept failed: {error}");
                         }
-                        continue;
                     }
-                };
-                let Ok(permit) = Arc::clone(&conns).try_acquire_owned() else {
-                    debug!("DNS TCP: {MAX_TCP_CONNS} connections open, closing {peer}");
-                    continue;
-                };
-                let resolver = Arc::clone(resolver);
-                let in_flight = Arc::clone(in_flight);
-                tasks.spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) = serve_tcp_conn(stream, &resolver, &in_flight).await {
-                        debug!("DNS TCP connection {peer}: {e}");
-                    }
-                });
+                }
             }
         }
     }
 }
 
-/// Serve length-prefixed queries on one connection, in order, until the
-/// client closes it or it idles out.
-async fn serve_tcp_conn(
-    mut stream: TcpStream,
-    resolver: &ResolverSlot,
-    in_flight: &tokio::sync::Semaphore,
+/// Serve length-prefixed DNS queries on a caller-owned byte stream (for
+/// example a userspace TUN TCP connection). The caller bounds concurrent
+/// connections and cancels this future when its connection/session ends.
+///
+/// Each exchange has a 30-second deadline and at most one 65535-byte query.
+/// Share `budget` across streams to bound upstream queries; locally answerable
+/// queries bypass it. Resolver reloads take effect between complete queries.
+/// Dropping this future drops the stream and pending asynchronous query work;
+/// an already-running blocking response hook retains its own permit until done.
+pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    resolver: ResolverSlot,
+    budget: Arc<tokio::sync::Semaphore>,
 ) -> std::io::Result<()> {
-    let _ = stream.set_nodelay(true);
-    let mut buf = Vec::new();
     loop {
-        let mut len = [0u8; 2];
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut len)).await {
-            Ok(Ok(_)) => {}
-            // Clean close between queries, or idle timeout.
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(()),
-        }
-        let len = usize::from(u16::from_be_bytes(len));
-        buf.resize(len, 0);
-        tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
-
-        let local = {
-            let resolver_guard = resolver.read();
-            DnsServer::try_answer_local(&buf, &resolver_guard)
-        };
-        let response = match local {
-            LocalAnswer::Answer(r) => r,
-            // Same as UDP: an unanswerable query gets no reply. Over TCP
-            // that leaves the client waiting, so close instead.
-            LocalAnswer::Drop => return Ok(()),
-            LocalAnswer::Upstream => {
-                // Share the UDP in-flight budget; waiting (rather than
-                // dropping) is fine here — the connection itself is bounded.
-                let Ok(_permit) = in_flight.acquire().await else {
-                    return Ok(());
-                };
-                let resolver = Arc::clone(&resolver.read());
-                match AssertUnwindSafe(DnsServer::handle_query(&buf, &resolver))
-                    .catch_unwind()
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        debug!("DNS query handling error: {e}");
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        error!("DNS query task survived a panic");
-                        return Ok(());
-                    }
-                }
+        let exchange = async {
+            // Distinguish orderly EOF between queries from truncated frames.
+            let mut prefix = [0; 2];
+            if stream.read(&mut prefix[..1]).await? == 0 {
+                // Queue FIN after the response; dropping lwIP without shutdown
+                // aborts unsent and unacknowledged data. This shares the deadline.
+                stream.shutdown().await?;
+                return Ok(false);
             }
+            stream.read_exact(&mut prefix[1..]).await?;
+            let length = usize::from(u16::from_be_bytes(prefix));
+            if length < 12 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "DNS TCP query length",
+                ));
+            }
+            // The wire prefix bounds each query to 65535 bytes. A client owns
+            // at most one frame, even when it pipelines requests.
+            let mut query = vec![0; length];
+            stream.read_exact(&mut query).await?;
+            let current = Arc::clone(&resolver.read());
+            let response = match DnsServer::try_answer_local(&query, &current) {
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    if let Some(work) = hook {
+                        // Mirror the UDP path: locally answerable queries
+                        // bypass the upstream budget entirely — a saturated
+                        // in-flight pool must not delay an answer that needs
+                        // no upstream, so the hook runs uncharged.
+                        tokio::task::spawn_blocking(move || work.run())
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    }
+                    response
+                }
+                // Non-query traffic (QR=1, garbage) is a protocol event,
+                // not data corruption: close the connection cleanly rather
+                // than answering a frame that needs no response.
+                LocalAnswer::Drop => return Ok(false),
+                LocalAnswer::Upstream => {
+                    let charge = Arc::new(
+                        Arc::clone(&budget)
+                            .acquire_owned()
+                            .await
+                            .map_err(std::io::Error::other)?,
+                    );
+                    DnsServer::handle_query_charged(&query, &current, Some(charge))
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP query")
+                        })?
+                }
+            };
+            let length = u16::try_from(response.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP response length")
+            })?;
+            // One contiguous write avoids a tiny prefix segment waiting on
+            // delayed ACKs before Nagle allows the response body through.
+            let mut framed = Vec::with_capacity(response.len() + 2);
+            framed.extend_from_slice(&length.to_be_bytes());
+            framed.extend_from_slice(&response);
+            stream.write_all(&framed).await?;
+            stream.flush().await?;
+            Ok(true)
         };
-        let Ok(rlen) = u16::try_from(response.len()) else {
-            warn!(
-                "DNS TCP: {}-byte response exceeds 65535, closing",
-                response.len()
-            );
-            return Ok(());
-        };
-        let mut out = Vec::with_capacity(2 + response.len());
-        out.extend_from_slice(&rlen.to_be_bytes());
-        out.extend_from_slice(&response);
-        stream.write_all(&out).await?;
+        match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "DNS TCP exchange",
+                ))
+            }
+        }
+    }
+}
+
+/// `try_send_to`, not `send_to().await`: a transient full send buffer
+/// must not head-of-line block every later query behind one slow reply
+/// (UDP semantics — the stub resolver retries). The drop is counted like
+/// the saturation drops so `dropped_queries` stays a truthful
+/// "no response was sent" signal. Called from the serve loop or from a
+/// `spawn_blocking` worker carrying a deferred answer hook.
+fn send_local_answer(
+    socket: &UdpSocket,
+    response: &[u8],
+    src: SocketAddr,
+    dropped: &meow_common::atomic::AtomicU,
+) {
+    match socket.try_send_to(response, src) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e) => warn!("DNS send error: {e}"),
+        Ok(_) => {}
     }
 }
 
@@ -1719,6 +2014,527 @@ mod tests {
         assert_eq!(&resp[6..8], &[0x00, 0x00], "ANCOUNT must be zero");
     }
 
+    #[tokio::test]
+    async fn dns_tcp_bind_claims_same_port_as_udp() {
+        let server = DnsServer::new(Arc::new(empty_resolver()), "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let competing = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            competing.is_err(),
+            "DNS bind must reserve TCP as well as UDP"
+        );
+        drop(bound);
+        assert!(tokio::net::TcpListener::bind(addr).await.is_ok());
+        assert!(UdpSocket::bind(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_bind_failure_rolls_back_udp() {
+        // The port must be provably bindable over both protocols before the
+        // TCP listener takes it. Windows reserves excluded port ranges per
+        // protocol (Hyper-V/WINNAT) — either protocol's allocator can walk
+        // into the other's exclusion band. Alternate which side picks the
+        // :0 port (matching DnsServer::bind()'s mechanism) so both allocators
+        // sample independent counter positions. The kept socket is always a
+        // TcpListener: DnsServer::bind() attempt 0 is UDP-first and tries to
+        // TCP-bind the configured address; an occupied TCP port therefore
+        // trips the rollback path regardless of which arm found the port.
+        let mut occupied = None;
+        let mut addr = None;
+        'probe: for attempt in 0..16u32 {
+            if attempt % 2 == 0 {
+                // Even: TCP picks, UDP verifies. Keep the TCP listener as the
+                // blocker — DnsServer::bind() attempt 0 (UDP-first) will try
+                // to TCP-bind this port and fail, exercising the rollback path.
+                let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let candidate = probe.local_addr().unwrap();
+                if UdpSocket::bind(candidate).await.is_ok() {
+                    occupied = Some(probe);
+                    addr = Some(candidate);
+                    break 'probe;
+                }
+            } else {
+                // Odd: UDP picks, TCP verifies. Keep the TCP verify listener
+                // (not the UDP pick socket) — same blocker invariant applies.
+                // Cross-protocol independence means dropping the UDP socket
+                // does not affect the TCP listener that holds the port.
+                let probe_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let candidate = probe_udp.local_addr().unwrap();
+                if let Ok(probe_tcp) = tokio::net::TcpListener::bind(candidate).await {
+                    drop(probe_udp);
+                    occupied = Some(probe_tcp);
+                    addr = Some(candidate);
+                    break 'probe;
+                }
+            }
+        }
+        let addr = addr.expect("no port bindable over UDP and TCP after 16 alternating attempts");
+        let _occupied = occupied.unwrap();
+        let server = DnsServer::new(Arc::new(empty_resolver()), addr);
+        let result = server.bind().await;
+        assert!(
+            result.is_err(),
+            "occupied TCP port must fail the whole DNS bind"
+        );
+        // Windows defers closesocket of a reactor-registered socket to a
+        // later poll drain — the rollback drop is issued but the port may not
+        // be free until the runtime ticks, and under CI load that drain can
+        // be starved for well over a second. Yield to pump the reactor, then
+        // retry within a generous bound; a genuine leak never frees at all,
+        // and any other error kind surfaces in the failure message.
+        let mut freed = false;
+        let mut last_err = None;
+        for _ in 0..300 {
+            match UdpSocket::bind(addr).await {
+                Ok(_) => {
+                    freed = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            freed,
+            "failed bind leaked UDP port; last bind error: {last_err:?}"
+        );
+    }
+
+    async fn tcp_frame(stream: &mut TcpStream, query: &[u8]) {
+        stream.write_u16(query.len() as u16).await.unwrap();
+        stream.write_all(query).await.unwrap();
+    }
+
+    async fn tcp_reply(stream: &mut TcpStream) -> Message {
+        let length = stream.read_u16().await.unwrap() as usize;
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await.unwrap();
+        Message::from_vec(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_pipeline_reload_and_abort() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut bytes = [0; 512];
+            for _ in 0..2 {
+                let (len, source) = upstream.recv_from(&mut bytes).await.unwrap();
+                let request = Message::from_vec(&bytes[..len]).unwrap();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_queries(request.queries.iter().cloned());
+                response.metadata.response_code = ResponseCode::Refused;
+                upstream
+                    .send_to(&response.to_bytes().unwrap(), source)
+                    .await
+                    .unwrap();
+            }
+        });
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec![upstream_addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let slot = bound.resolver_slot();
+        let task = tokio::spawn(bound.run());
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        tcp_frame(&mut stream, &sample_query(10, 16)).await;
+        tcp_frame(&mut stream, &sample_query(11, 16)).await;
+        for id in [10, 11] {
+            let reply = tcp_reply(&mut stream).await;
+            assert_eq!(reply.metadata.id, id);
+            assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        }
+        peer.await.unwrap();
+        *slot.write() = Arc::new(resolver_with_upstream_rcode(ResponseCode::NXDomain).await);
+        tcp_frame(&mut stream, &sample_query(12, 16)).await;
+        assert_eq!(
+            tcp_reply(&mut stream).await.metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        // Leave a partial prefix parked when the owner goes away.
+        stream.write_all(&[0]).await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut byte = [0];
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(ended, Ok(0) | Err(_)),
+            "client survived listener cancellation"
+        );
+        assert!(TcpListener::bind(addr).await.is_ok());
+        assert!(UdpSocket::bind(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_shared_budget_blocks_upstream_but_not_local_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let resolver = Arc::new(resolver_with_upstream_rcode(ResponseCode::Refused).await);
+        let slot = new_resolver_slot(resolver);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = budget.acquire().await.unwrap();
+        let task = tokio::spawn(serve_tcp_stream(
+            stream,
+            Arc::clone(&slot),
+            Arc::clone(&budget),
+        ));
+        tcp_frame(&mut client, &sample_query(30, 16)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), tcp_reply(&mut client))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(
+            tcp_reply(&mut client).await.metadata.response_code,
+            ResponseCode::Refused
+        );
+        let held = budget.acquire().await.unwrap();
+        // IPv6-disabled answers are local even when all upstream slots are busy.
+        *slot.write() = Arc::new(crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        tcp_frame(&mut client, &sample_query(31, 28)).await;
+        let reply =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp_reply(&mut client)).await;
+        drop(held);
+        task.abort();
+        let _ = task.await;
+        assert!(reply.is_ok(), "local answer consumed upstream budget");
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_stream_frames_queries_and_reloads_resolver() {
+        let make = |ip| {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![ip]),
+            );
+            Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            ))
+        };
+        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_tcp_stream(
+            server,
+            Arc::clone(&slot),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+        for octet in [1, 2] {
+            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            let query = sample_query(octet as u16, 1);
+            client.write_u16(query.len() as u16).await.unwrap();
+            // Split input framing like a TCP fallback after a truncated UDP answer.
+            client.write_all(&query[..5]).await.unwrap();
+            client.write_all(&query[5..]).await.unwrap();
+            let n = client.read_u16().await.unwrap();
+            let mut response = vec![0; n as usize];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, octet]);
+            assert_eq!(response[2] & 2, 0, "TCP answer not truncated");
+        }
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_clean_eof_shuts_down_after_response() {
+        // A queued writer like lwIP needs ordered shutdown; flush alone is not
+        // delivery. Record the ordering without requiring a privileged TUN.
+        struct Queued {
+            input: std::io::Cursor<Vec<u8>>,
+            written: Vec<u8>,
+            shut: bool,
+        }
+        impl AsyncRead for Queued {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.input).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for Queued {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                assert!(!self.shut);
+                self.written.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                assert!(self.written.len() > 2);
+                self.shut = true;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut query = sample_query(42, 1);
+        query[2] |= 0x08; // unsupported opcode is answered locally (NOTIMP)
+        let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+        frame.extend(query);
+        let mut stream = Queued {
+            input: std::io::Cursor::new(frame),
+            written: Vec::new(),
+            shut: false,
+        };
+        serve_tcp_stream(
+            &mut stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            stream.shut,
+            "clean EOF must shut down queued output before drop"
+        );
+        assert_eq!(
+            usize::from(u16::from_be_bytes([stream.written[0], stream.written[1]])),
+            stream.written.len() - 2
+        );
+        assert_eq!(&stream.written[2..4], &42u16.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_buffered_stream_flushes_before_next_query() {
+        let make = |ip| {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![ip]),
+            );
+            Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            ))
+        };
+        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_tcp_stream(
+            tokio::io::BufStream::new(server),
+            Arc::clone(&slot),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+        for octet in [1, 2] {
+            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            let query = sample_query(octet as u16, 1);
+            client.write_u16(query.len() as u16).await.unwrap();
+            // Split input framing like a TCP fallback after a truncated UDP answer.
+            client.write_all(&query[..5]).await.unwrap();
+            client.write_all(&query[5..]).await.unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_millis(100), client.read_u16())
+                .await
+                .expect("buffered response must be flushed")
+                .unwrap();
+            let mut response = vec![0; n as usize];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, octet]);
+            assert_eq!(response[2] & 2, 0, "TCP answer not truncated");
+        }
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_partial_frame_times_out_and_releases_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        client.write_all(&[0]).await.unwrap();
+        tokio::time::pause();
+        let result = serve_tcp_stream(
+            stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_truncated_frame_is_not_clean_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        client.write_all(&[0, 12, 1]).await.unwrap();
+        client.shutdown().await.unwrap();
+        let result = serve_tcp_stream(
+            stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_connection_cap_keeps_udp_responsive_and_releases_slots() {
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let task = tokio::spawn(bound.run());
+        let mut clients = Vec::new();
+        for id in 0..MAX_TCP_CONNECTIONS {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            tcp_frame(&mut client, &sample_query(id as u16, 28)).await;
+            assert_eq!(tcp_reply(&mut client).await.metadata.id, id as u16);
+            clients.push(client);
+        }
+        let mut waiting = TcpStream::connect(addr).await.unwrap();
+        tcp_frame(&mut waiting, &sample_query(100, 28)).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tcp_reply(&mut waiting)
+        )
+        .await
+        .is_err());
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&sample_query(101, 28), addr).await.unwrap();
+        let mut bytes = [0; 512];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), udp.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(Message::from_vec(&bytes[..len]).unwrap().metadata.id, 101);
+        drop(clients.pop());
+        let reply =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp_reply(&mut waiting))
+                .await
+                .unwrap();
+        assert_eq!(reply.metadata.id, 100);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn ordered_refusal_visits_each_candidate_once_per_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let visits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = empty_resolver();
+        resolver
+            .set_response_rules(
+                (0..32)
+                    .map(|index| {
+                        let visits = Arc::clone(&visits);
+                        crate::response_policy::ResponseRule {
+                            matcher: Arc::new(move |_| {
+                                visits.fetch_add(1, Ordering::Relaxed);
+                                index == 31
+                            }),
+                            query_types: vec![],
+                            action: crate::response_policy::ResponseAction::Refused,
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let query = sample_query(7, 1);
+        let LocalAnswer::Answer(inline) = DnsServer::try_answer_local(&query, &resolver) else {
+            panic!("expected local refusal");
+        };
+        assert_eq!(visits.swap(0, Ordering::Relaxed), 32);
+        let asynchronous = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        assert_eq!(visits.load(Ordering::Relaxed), 32);
+        assert_eq!(inline.response, asynchronous);
+        assert_eq!(inline.response[3] & 15, 5);
+    }
+
+    #[tokio::test]
+    async fn generic_policy_checks_edns_before_refusing_a_query() {
+        let mut resolver = empty_resolver();
+        resolver
+            .set_response_rules(vec![crate::response_policy::ResponseRule {
+                matcher: Arc::new(|_| true),
+                query_types: vec![65],
+                action: crate::response_policy::ResponseAction::Refused,
+            }])
+            .unwrap();
+        let query = sample_edns_query(17, RecordType::HTTPS, false);
+        let mut newer = Message::from_vec(&query).unwrap();
+        newer.edns.as_mut().unwrap().set_version(1);
+        let mut truncated = query.clone();
+        truncated.truncate(truncated.len() - 1);
+        for (packet, expected) in [
+            (newer.to_vec().unwrap(), 16_u16),
+            (truncated, 1),
+            (query, 5),
+        ] {
+            assert!(matches!(
+                DnsServer::try_answer_local(&packet, &resolver),
+                LocalAnswer::Upstream
+            ));
+            let reply = DnsServer::handle_query(&packet, &resolver).await.unwrap();
+            let msg = Message::from_vec(&reply).unwrap();
+            assert_eq!(u16::from(msg.metadata.response_code), expected);
+        }
+    }
+
     fn empty_resolver() -> crate::resolver::Resolver {
         crate::resolver::Resolver::new(
             Vec::new(),
@@ -1836,6 +2652,7 @@ mod tests {
         assert_eq!(resp.len(), 12, "header-only response");
     }
 
+    /// meow-openwrt: the server answers every address of the family.
     #[tokio::test]
     async fn handle_query_answers_every_address_of_the_family() {
         use hickory_proto::rr::rdata::A;
@@ -2825,6 +3642,155 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn response_rule_fake_ip_strips_hints_even_when_filter_bypasses_name() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for block_a in [false, true] {
+            let upstream = spawn_dns_responder(|response| {
+                response.add_answer(https_record_with_hints());
+            })
+            .await;
+            let mut resolver = Resolver::new(
+                vec![upstream],
+                vec![],
+                DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                true,
+                true,
+            );
+            resolver.set_fakeip_v4(Arc::new(
+                Pool::new(
+                    "198.18.0.0/16".parse().unwrap(),
+                    Arc::new(MemoryStore::new(32)),
+                )
+                .unwrap(),
+            ));
+            resolver.set_fakeip_skipper(Skipper::new(
+                &["example.com".to_string()],
+                SkipperMode::BlackList,
+            ));
+            let mut rules = vec![ResponseRule {
+                matcher: Arc::new(|name| name == "example.com"),
+                query_types: vec![],
+                action: ResponseAction::FakeIp,
+            }];
+            if block_a {
+                rules.insert(
+                    0,
+                    ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![1],
+                        action: ResponseAction::NoData,
+                    },
+                );
+            }
+            resolver.set_response_rules(rules).unwrap();
+            let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                .await
+                .unwrap();
+            let response = Message::from_vec(&wire).unwrap();
+            let RData::HTTPS(record) = &response.answers[0].data else {
+                panic!("HTTPS required");
+            };
+            let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+            assert!(keys.contains(&SvcParamKey::Alpn));
+            assert!(!keys.contains(&SvcParamKey::Ipv4Hint));
+            assert!(!keys.contains(&SvcParamKey::Ipv6Hint));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_rule_implicit_fake_ip_suppression_strips_hints() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for forward_aaaa in [false, true] {
+            for bypass in [false, true] {
+                let upstream = spawn_dns_responder(|response| {
+                    response.add_answer(https_record_with_hints());
+                    response.add_authority(https_record_with_hints());
+                    response.add_additional(https_record_with_hints());
+                })
+                .await;
+                let mut resolver = Resolver::new(
+                    vec![upstream],
+                    vec![],
+                    DnsMode::FakeIp,
+                    meow_trie::DomainTrie::new(),
+                    true,
+                    true,
+                );
+                resolver.set_fakeip_v4(Arc::new(
+                    Pool::new(
+                        "198.18.0.0/16".parse().unwrap(),
+                        Arc::new(MemoryStore::new(32)),
+                    )
+                    .unwrap(),
+                ));
+                if bypass {
+                    resolver.set_fakeip_skipper(Skipper::new(
+                        &["example.com".to_string()],
+                        SkipperMode::BlackList,
+                    ));
+                }
+                let mut rules = vec![ResponseRule {
+                    matcher: Arc::new(|name| name == "example.com"),
+                    query_types: vec![1],
+                    action: ResponseAction::NoData,
+                }];
+                if forward_aaaa {
+                    rules.push(ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![28],
+                        action: ResponseAction::Forward,
+                    });
+                }
+                resolver.set_response_rules(rules).unwrap();
+                if !bypass {
+                    for qtype in [1, 28] {
+                        let wire = DnsServer::handle_query(&sample_query(42, qtype), &resolver)
+                            .await
+                            .unwrap();
+                        let response = Message::from_vec(&wire).unwrap();
+                        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                        assert!(
+                            response.answers.is_empty(),
+                            "both address families are suppressed"
+                        );
+                    }
+                }
+                let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                    .await
+                    .unwrap();
+                let response = Message::from_vec(&wire).unwrap();
+                for rec in response
+                    .answers
+                    .iter()
+                    .chain(&response.authorities)
+                    .chain(&response.additionals)
+                {
+                    let RData::HTTPS(record) = &rec.data else {
+                        panic!("HTTPS required")
+                    };
+                    let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+                    assert!(keys.contains(&SvcParamKey::Alpn));
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv4Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv6Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                }
+            }
+        }
+    }
+
     /// With `ipv6` disabled, only `ipv6hint` is stripped — `ipv4hint`
     /// stays usable (ADR-0013), and only in the sections that need it.
     #[tokio::test]
@@ -2994,7 +3960,7 @@ mod tests {
     /// decided.
     fn answered(outcome: super::LocalAnswer) -> Vec<u8> {
         match outcome {
-            super::LocalAnswer::Answer(bytes) => bytes,
+            super::LocalAnswer::Answer(local) => local.response,
             other => panic!("expected a local answer, got {other:?}"),
         }
     }
@@ -3020,102 +3986,6 @@ mod tests {
         let resp = answered(DnsServer::try_answer_local(&q, &resolver));
         assert_eq!(&resp[0..2], &[0x12, 0x34], "ID echoed");
         assert_eq!(&resp[resp.len() - 4..], &[10, 0, 0, 7], "hosts A record");
-    }
-
-    async fn tcp_exchange(stream: &mut tokio::net::TcpStream, query: &[u8]) -> Vec<u8> {
-        let mut framed = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
-        framed.extend_from_slice(query);
-        stream.write_all(&framed).await.unwrap();
-        let mut len = [0u8; 2];
-        stream.read_exact(&mut len).await.unwrap();
-        let mut resp = vec![0u8; usize::from(u16::from_be_bytes(len))];
-        stream.read_exact(&mut resp).await.unwrap();
-        resp
-    }
-
-    /// DNS over TCP on the UDP listen address (dnsmasq relays TCP queries
-    /// to its upstream over TCP): local answers, several queries on one
-    /// connection.
-    #[tokio::test]
-    async fn tcp_serves_local_answers_on_one_connection() {
-        let mut hosts = meow_trie::DomainTrie::new();
-        hosts.insert(
-            "myhost.test",
-            crate::resolver::HostEntry::Addresses(vec![std::net::IpAddr::V4(Ipv4Addr::new(
-                10, 0, 0, 7,
-            ))]),
-        );
-        let resolver = Arc::new(crate::resolver::Resolver::new(
-            vec!["192.0.2.1:53".parse().unwrap()],
-            Vec::new(),
-            DnsMode::Normal,
-            hosts,
-            true,
-            true,
-        ));
-        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
-            .bind()
-            .await
-            .unwrap();
-        let addr = bound.local_addr().unwrap();
-        let serve = tokio::spawn(bound.run());
-
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        for id in [0x1111u16, 0x2222] {
-            let resp = tcp_exchange(&mut stream, &query_named(id, "myhost.test", 1)).await;
-            assert_eq!(&resp[0..2], &id.to_be_bytes(), "ID echoed");
-            assert_eq!(&resp[resp.len() - 4..], &[10, 0, 0, 7], "hosts A record");
-        }
-        serve.abort();
-    }
-
-    #[tokio::test]
-    async fn tcp_forwards_upstream_queries() {
-        use hickory_proto::rr::rdata::TXT;
-        let answer = Record::from_rdata(
-            Name::from_ascii("example.com.").unwrap(),
-            123,
-            RData::TXT(TXT::new(vec!["via tcp".to_string()])),
-        );
-        let resolver = Arc::new(
-            resolver_with_upstream_response(ResponseCode::NoError, Some(answer.clone())).await,
-        );
-        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
-            .bind()
-            .await
-            .unwrap();
-        let addr = bound.local_addr().unwrap();
-        let serve = tokio::spawn(bound.run());
-
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let resp = tcp_exchange(&mut stream, &sample_query(9, u16::from(RecordType::TXT))).await;
-        let resp = Message::from_vec(&resp).unwrap();
-        assert_eq!(resp.metadata.id, 9);
-        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(resp.answers, vec![answer]);
-        serve.abort();
-    }
-
-    /// Aborting the serve task frees the TCP port too, with a connection
-    /// still open.
-    #[tokio::test]
-    async fn tcp_port_released_on_abort_with_open_connection() {
-        let bound = DnsServer::new(Arc::new(empty_resolver()), "127.0.0.1:0".parse().unwrap())
-            .bind()
-            .await
-            .unwrap();
-        let addr = bound.local_addr().unwrap();
-        let serve = tokio::spawn(bound.run());
-        let _conn = tokio::net::TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        serve.abort();
-        let _ = serve.await;
-        let rebind = tokio::net::TcpListener::bind(addr).await;
-        assert!(
-            rebind.is_ok(),
-            "TCP port must be released at abort: {:?}",
-            rebind.err()
-        );
     }
 
     #[test]
@@ -3514,3 +4384,10 @@ mod tests {
         serve.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "server_admission_tests.rs"]
+mod admission_tests;
+#[cfg(test)]
+#[path = "server_budget_tests.rs"]
+mod budget_tests;

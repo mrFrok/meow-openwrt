@@ -4,11 +4,17 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-#[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+// meow-openwrt: mimalloc stays opt-in on musl too — on 64-128 MB routers it
+// idles at 34-50 MB RSS against musl's ~5 MB (openwrt-fork/PLAN.md).
+// Upstream turns it on for every musl build.
+#[cfg(all(
+    not(feature = "dhat-heap"),
+    any(target_os = "linux", target_os = "android"),
+    feature = "alloc-mimalloc"
+))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use anyhow::Context as _;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -1730,8 +1736,8 @@ async fn run(
                     .with_max_connections(nl.max_connections)
                     .with_firewall(*firewall)
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
-                    .with_transparent(*transparent)
-                    .with_tcp_keepalive(config.listeners.tcp_keepalive);
+                    .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                    .with_transparent(*transparent);
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).

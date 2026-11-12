@@ -190,7 +190,10 @@ fn setup(
     let fam = netlink::genl_family(kind)?.ok_or_else(|| {
         std::io::Error::other(format!("no `{kind}` netlink family: install {package}"))
     })?;
-    let mark = meow_common::routing_mark().unwrap_or(WG_MARK);
+    let mark = match meow_common::routing_mark() {
+        0 => WG_MARK,
+        mark => mark,
+    };
     let allowed: Vec<(IpAddr, u8)> = if cfg.allowed_ips.is_empty() {
         vec![
             (Ipv4Addr::UNSPECIFIED.into(), 0),
@@ -227,7 +230,7 @@ fn setup(
         }
         netlink::default_route(index, table, v6)?;
         netlink::rule_add(ifname, table, RULE_PRIORITY, v6)?;
-        if meow_common::routing_mark().is_none() {
+        if meow_common::routing_mark() == 0 {
             netlink::rule_fwmark(WG_MARK, RT_TABLE_MAIN, MARK_RULE_PRIORITY, v6)?;
         }
     }

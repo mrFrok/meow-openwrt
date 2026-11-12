@@ -853,14 +853,14 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
-    #[serde(rename = "routing-mark")]
-    routing_mark: u32,
     #[serde(rename = "unified-delay")]
     unified_delay: bool,
     /// `sniffer.enable`, under mihomo's name for it.
     sniffing: bool,
     #[serde(rename = "skip-auth-prefixes")]
     skip_auth_prefixes: Vec<String>,
+    #[serde(rename = "routing-mark")]
+    routing_mark: u32,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -890,21 +890,22 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
-        routing_mark: raw.routing_mark.unwrap_or(0),
         // The live setting, as mihomo reports `UnifiedDelay.Load()`.
         unified_delay: meow_proxy::health::unified_delay(),
         // The field echoes the committed config's intent: `sniffer.enable`
-        // when the block is present, else the deprecated `tproxy-sni`
-        // alias that synthesises an enabled sniffer. Read directly from
-        // `raw` — re-running `sniffer_config_from_raw` per poll would
-        // re-emit that parser's deprecation/force-dns-mapping warns on
-        // every dashboard GET.
-        sniffing: raw
-            .sniffer
-            .as_ref()
-            .and_then(|s| s.enable)
-            .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
+        // when the block is present — an explicit block wins over the
+        // deprecated `tproxy-sni` alias even without an `enable:` key
+        // (absent `enable` means off, matching the listener synthesis).
+        // Read directly from `raw` — re-running `sniffer_config_from_raw`
+        // per poll would re-emit that parser's deprecation/force-dns-mapping
+        // warns on every dashboard GET.
+        sniffing: raw.sniffer.as_ref().map_or_else(
+            || raw.tproxy_sni.unwrap_or(false),
+            |s| s.enable.unwrap_or(false),
+        ),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
+        // The live mark (what outbound sockets carry), not the document's.
+        routing_mark: meow_common::routing_mark(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1014,6 +1015,8 @@ struct UpdateConfigRequest {
     mode: Option<String>,
     #[serde(rename = "log-level")]
     log_level: Option<String>,
+    #[serde(rename = "routing-mark")]
+    routing_mark: Option<u32>,
     tun: Option<TunFields>,
 }
 
@@ -1036,6 +1039,21 @@ async fn update_configs(
     // `raw_config.write()` here would race a concurrent PUT /configs,
     // whose candidate swap would clobber the patched fields (issue #514).
     let _mutation = CONFIG_MUTATION.lock().await;
+    // The routing-mark refusal gate runs before ANY mutation below —
+    // under pinned managed tproxy rules a change rejects the whole PATCH
+    // rather than partially apply it (same refusal `PUT /configs`
+    // enforces at commit).
+    if body.routing_mark.is_some() {
+        let mut candidate = state.raw_config.read().clone();
+        candidate.routing_mark = body.routing_mark;
+        if let Some(msg) = routing_mark_change_refused(&candidate) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": msg })),
+            )
+                .into_response();
+        }
+    }
     // The patched `tun:` section, checked like a `PUT /configs` one before
     // anything is applied; `None` when the patch leaves it as it is.
     let tun = match body.tun {
@@ -1083,6 +1101,12 @@ async fn update_configs(
     if let Some(tun) = tun {
         let mut candidate = state.raw_config.read().clone();
         candidate.tun = Some(tun);
+        // Carry a patched routing-mark through the same commit path
+        // (`set_routing_mark` inside the swap applies it; the write below
+        // re-asserts it so a mark-only PATCH also lands).
+        if body.routing_mark.is_some() {
+            candidate.routing_mark = body.routing_mark;
+        }
         let preinstalled = preinstall_global_route_binding(&candidate);
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
@@ -1120,6 +1144,14 @@ async fn update_configs(
     }
     if let Some(level) = body.log_level {
         raw.log_level = Some(level);
+    }
+    if let Some(mark) = body.routing_mark {
+        // Commit point: the refusal gate passed before any mutation above.
+        // `set_routing_mark` treats `Some(0)` as unset, like PUT's
+        // `routing-mark: 0`.
+        meow_common::set_routing_mark(Some(mark));
+        raw.routing_mark = Some(mark);
+        info!("routing-mark changed to {mark}");
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1735,6 +1767,9 @@ async fn commit_raw_candidate(
             )
         })?;
     }
+    if let Some(msg) = routing_mark_change_refused(&candidate) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
     let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
@@ -1754,6 +1789,20 @@ async fn commit_raw_candidate(
         change.record();
     }
     Ok(())
+}
+
+/// A candidate that changes `routing-mark` while meow's managed tproxy
+/// rules exempt the current one: applying it would mark meow's own
+/// traffic with a mark nothing exempts, and the rules recapture it.
+fn routing_mark_change_refused(candidate: &RawConfig) -> Option<String> {
+    let new = meow_config::effective_routing_mark(candidate).unwrap_or(0);
+    (meow_common::routing_mark_pinned() && new != meow_common::routing_mark()).then(|| {
+        format!(
+            "routing-mark cannot change to {new} at runtime: meow's managed tproxy \
+             rules exempt mark {}; restart meow to apply it",
+            meow_common::routing_mark()
+        )
+    })
 }
 
 /// A `config.change` logbook event, for [`commit_raw_candidate`].
@@ -1949,8 +1998,9 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
         || urls_tagged(&dns.direct_nameserver)
         || dns
             .nameserver_policy
-            .as_ref()
-            .is_some_and(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
+            .iter()
+            .chain(dns.proxy_server_nameserver_policy.iter())
+            .any(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -1958,7 +2008,7 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// resolver build. Compared structurally (the `Raw*` types derive
 /// `PartialEq`; map sections are order-insensitive, list sections keep
 /// list order — same semantics the JSON comparison had, without building
-/// a DOM per commit) — with two exceptions: `nameserver-policy` key
+/// a DOM per commit) — with two exceptions: both nameserver-policy maps' key
 /// order IS semantic (document order = lookup priority) and `hosts` key
 /// order decides same-slot collision winners (the document-last writer
 /// wins, so a pure reorder must rebuild), but `IndexMap`'s `==` cannot
@@ -1970,10 +2020,18 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     // A pure key reorder of `nameserver-policy` must read as a change —
     // `a.dns == b.dns` alone is order-insensitive for this section.
-    let nsp_equal = {
-        let pa = a.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
-        let pb = b.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
-        match (pa, pb) {
+    fn policies(raw: &RawConfig) -> [Option<&meow_config::raw::RawNameserverPolicy>; 2] {
+        raw.dns.as_ref().map_or([None, None], |dns| {
+            [
+                dns.nameserver_policy.as_ref(),
+                dns.proxy_server_nameserver_policy.as_ref(),
+            ]
+        })
+    }
+    let nsp_equal = policies(a)
+        .into_iter()
+        .zip(policies(b))
+        .all(|(pa, pb)| match (pa, pb) {
             (None, None) => true,
             (Some(ma), Some(mb)) => {
                 ma.len() == mb.len()
@@ -1982,12 +2040,8 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
                         .zip(mb.iter())
                         .all(|((ka, va), (kb, vb))| ka == kb && va == vb)
             }
-            // `(None, Some)` / `(Some, None)` — even `None` vs
-            // `Some(empty)` — reads as a change: a conservative rebuild,
-            // the same Option-diff semantics the derived `==` had.
             _ => false,
-        }
-    };
+        });
     // A pure key reorder of `hosts` must read as a change — document order
     // decides same-slot collision winners, and `IndexMap`'s `==` is
     // order-insensitive.
@@ -2880,7 +2934,7 @@ fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<
         // A committed `sub-rules:` section always parses — on defect the
         // rebuild errors louder than this check, so an empty map stands in.
         Some(map) if !map.is_empty() => {
-            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx)
+            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx, false)
                 .unwrap_or_default()
         }
         _ => Default::default(),
@@ -3272,12 +3326,6 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
-    match meow_config::sniffer_config_from_raw(raw) {
-        Ok(cfg) => {
-            listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(cfg)));
-        }
-        Err(e) => warn!("tun: sniffer config ignored: {e}"),
-    }
     // A broken `sniffer:` section is a parse error like `tun:`'s above,
     // not a warn-and-continue — silently spawning a snifferless TUN while
     // the API still reports success hides the defect (review #887).
@@ -3354,6 +3402,12 @@ async fn spawn_tun_from_raw(
         return Err("this build lacks the 'listener-tun' feature".into());
     }
     Ok(None)
+}
+
+fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
+    prior.fake_ip_v4_net() != current.fake_ip_v4_net()
+        || prior.fake_ip_v4_gateway() != current.fake_ip_v4_gateway()
+        || prior.fake_ip_v6_net() != current.fake_ip_v6_net()
 }
 
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
@@ -3501,6 +3555,10 @@ async fn swap_config_and_reconcile_tun(
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
         // Commit point: a rejected candidate never reaches here.
         meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
+        // Commit point (mihomo re-applies `routing-mark` on every load); a
+        // change under pinned managed rules was refused before this.
+        // meow-openwrt: auto-redirect supplies a mark when none is configured.
+        meow_common::set_routing_mark(meow_config::effective_routing_mark(&candidate));
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -3549,23 +3607,16 @@ async fn swap_config_and_reconcile_tun(
     // resolver, so `tunnel.resolver()` would read the NEW generation and
     // the on→on `fake_ip_changed` check below could never fire
     // (issue #533 review).
-    let old_fake_ip = dns.is_some().then(|| {
-        (
-            prior_resolver.fake_ip_v4_net(),
-            prior_resolver.fake_ip_v4_gateway(),
-        )
-    });
+    let dns_rebuilt = dns.is_some();
     if let Some(dns) = dns {
         publish_dns(&state.tunnel, &state.dns_server, &dns).await;
     }
-    // The TUN listener snapshots `fake_ip_v4_net`/`fake_ip_v4_gateway`/
-    // DnsGuard when the stack is built; after a resolver swap those are
-    // stale — restart the listener so fake-ip-range/enhanced-mode changes
+    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
+    // and DnsGuard when the stack is built; after a resolver swap those are
+    // stale — restart it so either fake-ip range or enhanced-mode changes
     // take effect instead of blackholing the new pool (issue #514).
-    let fake_ip_changed = old_fake_ip.is_some_and(|(net, gw)| {
-        let r = state.tunnel.resolver();
-        r.fake_ip_v4_net() != net || r.fake_ip_v4_gateway() != gw
-    });
+    let fake_ip_changed =
+        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
 
     if old_enable == new_enable {
         // on → on with changed fake-IP inputs or any real `tun:` parameter
@@ -3797,6 +3848,9 @@ async fn put_configs(
     let _mutation = CONFIG_MUTATION.lock().await;
     // Dropped on every rejection below, restoring the running listener's
     // binding; a TUN (re)spawn in the reconcile adopts it instead.
+    if let Some(msg) = routing_mark_change_refused(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
     let preinstalled = preinstall_global_route_binding(&raw_config);
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
@@ -4993,14 +5047,19 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             // (issue #563). `udp`/`udp-timeout` are disclosed for the same
             // reason: external TPROXY rules are only useful if the UDP
             // path is actually enabled (issue #564).
+            // `transparent`: TCP by real TPROXY rather than REDIRECT
+            // (mihomo `type: tproxy`); a `redir` entry is a tproxy listener
+            // with both off.
             if let meow_config::ListenerSpec::TProxy {
                 firewall,
                 udp,
                 udp_timeout,
+                transparent,
                 ..
             } = &l.spec
             {
                 item["firewall"] = serde_json::json!(firewall);
+                item["transparent"] = serde_json::json!(transparent);
                 item["udp"] = serde_json::json!(udp);
                 item["udp-timeout"] = serde_json::json!(udp_timeout);
             }
@@ -5158,6 +5217,20 @@ mod tests {
     /// that only reorders the policy keys must still rebuild the
     /// resolver.
     #[test]
+    fn node_policy_reorder_and_proxy_references_rebuild_dns() {
+        let raw_a: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    z.test: 'tcp://192.0.2.1#P'\n    a.test: rcode://refused\n"
+        ).unwrap();
+        let raw_b: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    a.test: rcode://refused\n    z.test: 'tcp://192.0.2.1#P'\n"
+        ).unwrap();
+        assert!(!dns_inputs_equal(&raw_a, &raw_b));
+        assert!(!dns_inputs_equal(&raw_b, &raw_a));
+        assert!(dns_inputs_equal(&raw_a, &raw_a));
+        assert!(dns_uses_proxy_refs(&raw_a));
+    }
+
+    #[test]
     fn dns_inputs_equal_sees_nameserver_policy_key_order() {
         let raw_a: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver-policy:\n    '+.a.example': 1.1.1.1\n    '+.b.example': 2.2.2.2\n",
@@ -5301,6 +5374,47 @@ mod tests {
             inputs(&prior),
             inputs(&candidate_changed),
             "a fake-IP range change must be visible across generations"
+        );
+    }
+
+    #[test]
+    fn tun_reload_sees_ipv6_fake_ip_pool_add_change_and_remove() {
+        let make = |prefix: Option<&str>| {
+            let mut resolver = meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            );
+            if let Some(prefix) = prefix {
+                resolver.set_fakeip_v6(Arc::new(
+                    meow_dns::Pool::new(
+                        prefix.parse().unwrap(),
+                        Arc::new(meow_dns::MemoryStore::new(16)),
+                    )
+                    .unwrap(),
+                ));
+            }
+            resolver
+        };
+        let absent = make(None);
+        let first = make(Some("fdfe:dcba:9876::/64"));
+        let same = make(Some("fdfe:dcba:9876::/64"));
+        let changed = make(Some("fdfe:dcba:9877::/64"));
+        assert!(
+            tun_fake_ip_changed(&absent, &first),
+            "adding an IPv6 pool requires route installation"
+        );
+        assert!(!tun_fake_ip_changed(&first, &same));
+        assert!(
+            tun_fake_ip_changed(&first, &changed),
+            "changing only the IPv6 pool requires route replacement"
+        );
+        assert!(
+            tun_fake_ip_changed(&first, &absent),
+            "removing an IPv6 pool requires route cleanup"
         );
     }
 

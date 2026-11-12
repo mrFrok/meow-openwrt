@@ -1,6 +1,6 @@
 # Proposal for query-type-specific DNS responses
 
-Status: proposed for discussion.
+Status: response rules implemented; node bootstrap policy is now documented in [proxy-server-dns-policy.md](proxy-server-dns-policy.md).
 Owner: engineer
 Date: 2026-11-07
 Tracking: [PR #906](https://github.com/meow-rs/meow-rs/pull/906)
@@ -8,8 +8,7 @@ Upstream reference: `fake-ip-filter-mode: rule`
 ([MetaCubeX/mihomo#2469](https://github.com/MetaCubeX/mihomo/pull/2469) —
 an ordered `fake-ip`/`real-ip` verdict list, the closest shipped relative
 of the fake-IP action proposed here), `rcode://` nameserver URLs, and
-`proxy-server-nameserver-policy` (an upstream field meow has not
-implemented — see the transport note below).
+`proxy-server-nameserver-policy` (now implemented separately; see the transport note below).
 
 A split DNS gateway may need to return an empty HTTPS answer for one set
 of domains, refuse the same query for a second set, and forward it
@@ -132,7 +131,7 @@ must not change that.
 Keep transport and pool selection in the existing resolver. A proxy
 endpoint can need a different bootstrap pool from ordinary client
 lookups; upstream gives it a dedicated `proxy-server-nameserver-policy`
-field, which meow has never implemented — prefer reusing the
+field, now implemented by reusing the
 nameserver-policy map and builder for the `proxy-server-nameserver`
 resolver, the one `ResolverHostHook` consults for proxy hostnames,
 rather than growing a second policy surface (the `direct-nameserver`
@@ -192,3 +191,27 @@ surface would conflate who resolves a name with what is answered for
 it. It would help to settle that before making a public schema hard to
 change. In either design, transport, domain matching, fake-IP
 allocation and packet validation stay with their current owners.
+
+## Implementation choice
+
+The follow-up implementation uses the dedicated ordered
+`dns.response-rules` list documented in the [DNS guide](../../website/guide/dns.md#ordered-response-rules).
+The schema is a meow extension under review. Rule predicates reuse the
+domain trie and loaded geosite/provider matchers. The main resolver owns
+the immutable rule list for its generation, and only DNS wire handlers
+apply its actions. `GET /dns/query` remains an upstream diagnostic.
+
+The address probe and task path share the same local rule builder.
+Generic queries evaluate rules on the task path after packet validation.
+Raw rule lists participate in ordered `RawDns` equality, while provider
+and geosite discovery include their match conditions. Provider references
+force a rebuild on each candidate commit through the existing runtime-ref
+gate. Strict validation of this new surface rejects rules that could
+otherwise silently forward a query their configuration intended to block
+(ADR-0002 Class A).
+
+Endpoint-specific `proxy-server-nameserver-policy` is a separate transport
+configuration change. It can reuse the existing nameserver-policy builder
+and requires its own construction-cycle and exclusive-pool tests. The
+response-rule implementation keeps proxy-server hostname resolution on
+the existing non-synthesizing path.

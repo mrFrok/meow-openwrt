@@ -1,10 +1,19 @@
-# `dns.nftset` — intercept only what the rules proxy (meow-openwrt)
+# `dns.nftset` — intercept only what the rules proxy
 
 meow adds the address of every DNS answer whose domain the rules would route
 anywhere but `DIRECT` to an nftables set, like dnsmasq's `nftset=`. A
 firewall that sends only those destinations (plus your static proxy IP
 lists) to meow leaves everything else to kernel forwarding — flowtable and
 hardware offload included — and dnsmasq no longer needs the domain lists.
+
+Requirements: Linux only (`nf_tables` kernel support; the key is parsed
+but ignored elsewhere) and `CAP_NET_ADMIN` — adding set elements is an
+nfnetlink mutation, the same privilege class as installing nftables rules
+(see [tproxy-gateway.md](tproxy-gateway.md)).
+
+Memory: ~105 bytes of kernel memory per IPv4 element, hash table included
+(measured on a BPI-R4, 50k elements = +5 MiB slab); only proxied
+destinations seen within `timeout` are held, typically a few thousand.
 
 ```yaml
 dns:
@@ -48,10 +57,7 @@ currently select DIRECT, which errs on the safe side. Classical rule-sets are
 matched on domain and address only. Fake-IP answers are skipped (intercept
 the fake range as a whole).
 
-Memory: ~105 bytes of kernel memory per IPv4 element, hash table included
-(measured on a BPI-R4, 50k elements = +5 MiB slab); only proxied
-destinations seen within `timeout` are held, typically a few thousand.
-
 Caveats: elements stay after a rule change until they expire (flush the set
-on reload if that matters), and clients that bypass meow's DNS (DoH, DoT,
-hard-coded addresses) are not covered — block them in the firewall.
+on reload if that matters), HTTPS/SVCB `ipv4hint`/`ipv6hint` addresses are
+not added, and clients that bypass meow's DNS (DoH, DoT, hard-coded
+addresses) are not covered — block them in the firewall.

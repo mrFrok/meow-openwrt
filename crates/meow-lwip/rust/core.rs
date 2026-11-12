@@ -48,6 +48,8 @@ pub(crate) type StreamId = u64;
 pub(crate) const WRITE_CHUNK: usize = 4096;
 /// Per-stream write channel capacity, in chunks.
 pub(crate) const WRITE_CHAN_CAP: usize = 8;
+/// Bound pending accepts independently of already accepted streams.
+pub(crate) const ACCEPT_QUEUE_CAP: usize = 64;
 
 /// Ordered per-stream commands. Travelling a dedicated bounded channel gives
 /// the write path real backpressure (a full channel parks the writer via
@@ -67,6 +69,13 @@ pub(crate) enum StreamCmd {
 /// because handles send from `poll_*` and `Drop`, where blocking or dropping
 /// a command is not an option.
 pub(crate) enum Cmd {
+    /// (test only) Count pcbs on `tcp_tw_pcbs`, walked on the core thread.
+    #[cfg(test)]
+    TimewaitCount(tokio::sync::oneshot::Sender<usize>),
+    /// (test only) Advances lwIP's global TCP clock ~2*MSL: expires every
+    /// aged pcb, not just TIME_WAIT — send only while no streams are live.
+    #[cfg(test)]
+    ExpireTimewait(tokio::sync::oneshot::Sender<()>),
     /// Handle-side bookkeeping for a freshly accepted stream (created inside
     /// `tcp_accept_cb`); FIFO order guarantees the core sees this before any
     /// other command for the same id.
@@ -129,7 +138,7 @@ pub(crate) struct CbCtx {
 pub(crate) struct ListenerCtx {
     next_id: StreamId,
     cmd_tx: UnboundedSender<Cmd>,
-    accept_tx: UnboundedSender<(TcpStream, SocketAddr, SocketAddr)>,
+    accept_tx: Sender<(TcpStream, SocketAddr, SocketAddr)>,
 }
 
 /// Context the netif output hook pushes egress frames through. The old code
@@ -293,6 +302,14 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         return err_enum_t_ERR_OK as err_t;
     }
     let listener = unsafe { &mut *(arg as *mut ListenerCtx) };
+    let Ok(accept) = listener.accept_tx.try_reserve() else {
+        // No callback context or Rust handle has escaped yet. The C accept
+        // callback must report ERR_ABRT after freeing this new PCB.
+        unsafe {
+            tcp_abort(newpcb);
+        }
+        return err_enum_t_ERR_ABRT as err_t;
+    };
     listener.next_id += 1;
     let id = listener.next_id;
 
@@ -343,7 +360,7 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         write_tx,
         listener.cmd_tx.clone(),
     );
-    let _ = listener.accept_tx.send((stream, src_addr, dest_addr));
+    accept.send((stream, src_addr, dest_addr));
 
     err_enum_t_ERR_OK as err_t
 }
@@ -440,7 +457,7 @@ pub(crate) struct LwipCore {
 /// Bundle handed back to `NetStack::with_buffer_size` alongside the handles.
 pub(crate) struct CoreParts {
     pub core: LwipCore,
-    pub accept_rx: UnboundedReceiver<(TcpStream, SocketAddr, SocketAddr)>,
+    pub accept_rx: Receiver<(TcpStream, SocketAddr, SocketAddr)>,
     pub egress_rx: Receiver<Vec<u8>>,
     pub udp_in_rx: Receiver<super::udp::UdpPkt>,
     pub udp_out_tx: Sender<UdpOut>,
@@ -458,6 +475,7 @@ impl LwipCore {
     pub(crate) fn build(
         stack_buffer_size: usize,
         udp_buffer_size: usize,
+        mtu: u16,
     ) -> Result<CoreParts, crate::Error> {
         use std::sync::Once;
         static LWIP_INIT: Once = Once::new();
@@ -466,7 +484,7 @@ impl LwipCore {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
         let (egress_tx, egress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
-        let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAP);
         let (udp_in_tx, udp_in_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (udp_out_tx, udp_out_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (done_tx, done_rx) = watch::channel(false);
@@ -475,7 +493,10 @@ impl LwipCore {
         unsafe {
             (*netif_list).output = Some(output_ip4);
             (*netif_list).output_ip6 = Some(output_ip6);
-            (*netif_list).mtu = 1500;
+            // Reset stale path-MTU state when a new TUN generation takes over.
+            nd6_cleanup_netif(netif_list);
+            (*netif_list).mtu = mtu;
+            (*netif_list).mtu6 = mtu;
             OUTPUT_PTR = output_ctx;
         }
 
@@ -610,6 +631,29 @@ impl LwipCore {
 
     fn handle_cmd(&mut self, cmd: Cmd) {
         match cmd {
+            #[cfg(test)]
+            Cmd::ExpireTimewait(done) => {
+                // Test time advances through the same owner as packet input.
+                for _ in 0..=2 * TCP_MSL / TCP_SLOW_INTERVAL {
+                    unsafe {
+                        tcp_slowtmr();
+                    }
+                }
+                let _ = done.send(());
+            }
+            #[cfg(test)]
+            Cmd::TimewaitCount(done) => {
+                let mut count = 0;
+                // Only the existing serialized core accesses lwIP's lists.
+                unsafe {
+                    let mut pcb = tcp_tw_pcbs;
+                    while !pcb.is_null() {
+                        count += 1;
+                        pcb = (*pcb).next;
+                    }
+                }
+                let _ = done.send(count);
+            }
             Cmd::NewStream {
                 id,
                 pcb,

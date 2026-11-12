@@ -266,11 +266,7 @@ impl VlessAdapter {
         stream: Box<dyn meow_transport::Stream>,
     ) -> Result<Box<dyn meow_transport::Stream>> {
         let stream = self.transport.connect(stream).await?;
-        #[cfg(feature = "vless-encryption")]
-        if let Some(encryption) = &self.encryption {
-            return encryption.handshake(stream).await;
-        }
-        Ok(stream)
+        self.encrypt(stream).await
     }
 
     /// Run the VLESS request exchange targeting `metadata` on `stream`

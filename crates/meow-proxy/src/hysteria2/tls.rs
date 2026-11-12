@@ -242,6 +242,16 @@ mod tests {
             (w.initial_stream, w.max_stream, w.max_conn),
             (M, 16 * M, 32 * M)
         );
+        // An explicit max_stream above max_conn clamps to the ceiling —
+        // the advertised conn ≥ stream invariant holds either way.
+        let cfg = super::super::ReceiveWindows {
+            max_stream: Some(20 * M),
+            max_conn: Some(4 * M),
+            ..Default::default()
+        };
+        let w = resolve_windows(cfg, None, 1);
+        assert_eq!(w.max_stream, 4 * M);
+        assert_eq!(w.initial_stream, 4 * M);
     }
 
     #[test]

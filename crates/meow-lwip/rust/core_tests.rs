@@ -157,8 +157,21 @@ impl Peer {
 /// handle still held, `MEMP_NUM_TCP_PCB` filler connections force lwIP to
 /// recycle A's pcb, then A's handle is dropped. Nothing may close any
 /// filler, and A must still read the bytes that preceded its EOF.
+#[cfg(not(feature = "libc-malloc"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
+    timewait_reclamation_preserves_live_handles(false).await;
+}
+
+// libc allocation has no MEMP_NUM_TCP_PCB ceiling, so filling that many
+// connections does not prove the TIME_WAIT PCB was freed. Exercise the
+// timer-expiry path under both allocators and observe the actual lwIP list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timewait_pcb_expired_by_lwip_is_not_closed_on_drop() {
+    timewait_reclamation_preserves_live_handles(true).await;
+}
+
+async fn timewait_reclamation_preserves_live_handles(expire: bool) {
     const A_PORT: u16 = 40000;
     const FILLER_BASE: u16 = 20000;
 
@@ -194,11 +207,19 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
     })
     .await;
 
-    // Fill the pcb pool. A still holds a slot, so the last filler's SYN can
-    // only get a pcb by tcp_alloc evicting A through tcp_kill_timewait, and
-    // the LIFO free list hands it A's slot. Every filler being accepted
-    // therefore proves A's pcb was recycled.
-    let pool = usize::try_from(MEMP_NUM_TCP_PCB).unwrap();
+    assert_eq!(listener.timewait_count().await, 1, "A must reach TIME_WAIT");
+    let pool = if expire {
+        listener.expire_timewait().await;
+        assert_eq!(
+            listener.timewait_count().await,
+            0,
+            "timer must free A's PCB"
+        );
+        1
+    } else {
+        // Fixed-pool pressure evicts A and the LIFO free list reuses its slot.
+        usize::try_from(MEMP_NUM_TCP_PCB).unwrap()
+    };
     let mut fillers = Vec::with_capacity(pool);
     for i in 0..pool {
         let port = FILLER_BASE + u16::try_from(i).unwrap();
@@ -209,6 +230,12 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
             .expect("listener closed");
         fillers.push(stream);
     }
+
+    assert_eq!(
+        listener.timewait_count().await,
+        0,
+        "TIME_WAIT reclamation must occur before the stale handle is dropped"
+    );
 
     // A's handle outlived its pcb but must still drain what preceded EOF.
     let mut tail = Vec::new();
@@ -377,4 +404,380 @@ async fn ipv6_tcp_and_udp_flows_keep_their_addresses() {
         .await
         .expect("core teardown timed out")
         .expect("core dropped its done signal");
+}
+
+fn udp_test_datagram(payload: &[u8], source: u16, destination: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(payload.len() + 8);
+    data.extend_from_slice(&source.to_be_bytes());
+    data.extend_from_slice(&destination.to_be_bytes());
+    data.extend_from_slice(&u16::try_from(payload.len() + 8).unwrap().to_be_bytes());
+    data.extend_from_slice(&[0, 0]); // inbound checksum checks are disabled
+    data.extend_from_slice(payload);
+    data
+}
+
+fn udp_test_fragments(ipv6: bool, mtu: u16, payload: &[u8]) -> Vec<Vec<u8>> {
+    let data = udp_test_datagram(payload, 42000, SERVER_PORT);
+    let header = if ipv6 { 48 } else { 20 };
+    let chunk = (usize::from(mtu) - header) & !7;
+    data.chunks(chunk)
+        .enumerate()
+        .map(|(index, part)| {
+            let offset = index * chunk;
+            let more = offset + part.len() < data.len();
+            if ipv6 {
+                let mut fragment = vec![17, 0];
+                fragment.extend_from_slice(&((offset as u16) | u16::from(more)).to_be_bytes());
+                fragment.extend_from_slice(&0x12345678u32.to_be_bytes());
+                fragment.extend_from_slice(part);
+                v6_frame(44, &fragment)
+            } else {
+                let mut frame = vec![0x45, 0];
+                frame.extend_from_slice(&u16::try_from(20 + part.len()).unwrap().to_be_bytes());
+                frame.extend_from_slice(&0x1234u16.to_be_bytes());
+                let flags_offset = (offset as u16 / 8) | if more { 0x2000 } else { 0 };
+                frame.extend_from_slice(&flags_offset.to_be_bytes());
+                frame.extend_from_slice(&[64, 17, 0, 0]);
+                frame.extend_from_slice(&CLIENT.octets());
+                frame.extend_from_slice(&SERVER.octets());
+                frame.extend_from_slice(part);
+                frame
+            }
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_fragmented_udp_reassembles() {
+    let _serial = STACK_LOCK.lock().await;
+    let (mut stack, listener, udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (tx, mut rx) = udp.split();
+    for ipv6 in [false, true] {
+        let payload: Vec<u8> = (0..60000).map(|i| (i % 251) as u8).collect();
+        // Reverse order also checks that the last fragment arriving first
+        // does not cause premature delivery or discard the datagram.
+        for frame in udp_test_fragments(ipv6, 1280, &payload).into_iter().rev() {
+            stack.send(frame).await.unwrap();
+        }
+        let (data, src, dst) = timeout(STEP_TIMEOUT, rx.recv_from())
+            .await
+            .expect("large fragmented UDP was not reassembled")
+            .unwrap();
+        assert_eq!(data, payload);
+        let expected_src = if ipv6 { CLIENT6.into() } else { CLIENT.into() };
+        let expected_dst = if ipv6 { SERVER6.into() } else { SERVER.into() };
+        assert_eq!(src, SocketAddr::new(expected_src, 42000));
+        assert_eq!(dst, SocketAddr::new(expected_dst, SERVER_PORT));
+    }
+    drop((listener, tx, rx));
+    stack.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_reassembly_size_boundary_drops_and_recovers() {
+    let _serial = STACK_LOCK.lock().await;
+    let (mut stack, listener, udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (tx, mut rx) = udp.split();
+    for extension in [false, true] {
+        let header = if extension { 48 } else { 40 };
+        let maximum = 65535 - header - 8;
+        // Reject oversized packets, then prove the queue/stack remains usable
+        // at the exact largest representable reassembled pbuf length.
+        for size in [maximum + 1, 65527, maximum, 60000] {
+            let payload = vec![42; size];
+            for frame in udp_test_fragments(true, 1272, &payload).into_iter().rev() {
+                let frame = if extension {
+                    let mut data = vec![44, 0, 0, 0, 0, 0, 0, 0]; // destination options
+                    data.extend_from_slice(&frame[40..]);
+                    v6_frame(60, &data)
+                } else {
+                    frame
+                };
+                stack.send(frame).await.unwrap();
+            }
+            if size <= maximum {
+                let (data, _, _) = timeout(STEP_TIMEOUT, rx.recv_from())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(data, payload);
+            } else {
+                assert!(
+                    timeout(std::time::Duration::from_millis(50), rx.recv_from())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+    drop((listener, tx, rx));
+    stack.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_accept_queue_pressure_preserves_existing_streams_and_recovers() {
+    let _serial = STACK_LOCK.lock().await;
+    let (stack, mut listener, _udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (sink, egress) = stack.split();
+    let mut peer = Peer { sink, egress };
+    for i in 0..=64 {
+        peer.handshake(30000 + i as u16).await;
+    }
+    peer.expect("new accept rejected", |s| {
+        s.dport == 30000 + 64 && s.flags & RST != 0
+    })
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(
+            timeout(STEP_TIMEOUT, listener.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+        );
+    }
+    held[0].write_all(b"alive").await.unwrap();
+    peer.expect("existing stream survives", |s| {
+        s.dport == 30000 && s.len == 5
+    })
+    .await;
+    peer.handshake(31000).await;
+    let (mut recovered, _, _) = timeout(STEP_TIMEOUT, listener.next())
+        .await
+        .unwrap()
+        .unwrap();
+    recovered.write_all(b"new").await.unwrap();
+    peer.expect("new stream recovers", |s| s.dport == 31000 && s.len == 3)
+        .await;
+    peer.sink.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn checksum_sum(data: &[u8]) -> u16 {
+    let mut sum: u32 = data
+        .chunks(2)
+        .map(|pair| u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+async fn check_udp_reply(egress: &mut SplitStream<NetStack>, ipv6: bool, mtu: u16, payload: &[u8]) {
+    let mut data = vec![0; payload.len() + 8];
+    let mut seen = vec![false; data.len()];
+    let mut remaining = data.len();
+    let mut identity = None;
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while remaining != 0 {
+        let frame = timeout_at(deadline, egress.next())
+            .await
+            .expect("UDP reply fragments timed out")
+            .unwrap()
+            .unwrap();
+        assert!(
+            frame.len() <= usize::from(mtu),
+            "IPv{} emitted {} bytes at MTU {mtu}",
+            if ipv6 { 6 } else { 4 },
+            frame.len()
+        );
+        let (offset, more, part, id) = if ipv6 {
+            assert_eq!(frame[0] >> 4, 6);
+            assert_eq!(
+                frame.len(),
+                40 + usize::from(u16::from_be_bytes([frame[4], frame[5]]))
+            );
+            assert_eq!(&frame[8..24], &SERVER6.octets());
+            assert_eq!(&frame[24..40], &CLIENT6.octets());
+            if frame[6] == 44 {
+                assert_eq!(frame[40], 17);
+                let field = u16::from_be_bytes([frame[42], frame[43]]);
+                (
+                    usize::from(field & !7),
+                    field & 1 != 0,
+                    &frame[48..],
+                    frame[44..48].to_vec(),
+                )
+            } else {
+                assert_eq!(frame[6], 17);
+                (0, false, &frame[40..], Vec::new())
+            }
+        } else {
+            assert_eq!(frame[0], 0x45);
+            assert_eq!(frame[9], 17);
+            assert_eq!(
+                frame.len(),
+                usize::from(u16::from_be_bytes([frame[2], frame[3]]))
+            );
+            assert_eq!(checksum_sum(&frame[..20]), 0xffff, "IPv4 header checksum");
+            assert_eq!(&frame[12..16], &SERVER.octets());
+            assert_eq!(&frame[16..20], &CLIENT.octets());
+            let field = u16::from_be_bytes([frame[6], frame[7]]);
+            (
+                usize::from(field & 0x1fff) * 8,
+                field & 0x2000 != 0,
+                &frame[20..],
+                frame[4..6].to_vec(),
+            )
+        };
+        assert_eq!(
+            identity.get_or_insert(id.clone()),
+            &id,
+            "fragment identity changed"
+        );
+        assert!(!part.is_empty());
+        assert!(offset + part.len() <= data.len());
+        assert_eq!(more, offset + part.len() < data.len());
+        if more {
+            assert_eq!(part.len() % 8, 0);
+        }
+        for byte in &mut seen[offset..offset + part.len()] {
+            assert!(!*byte, "overlapping or duplicate reply fragments");
+            *byte = true;
+        }
+        data[offset..offset + part.len()].copy_from_slice(part);
+        remaining -= part.len();
+    }
+    assert_eq!(&data[..2], &SERVER_PORT.to_be_bytes());
+    assert_eq!(&data[2..4], &42000u16.to_be_bytes());
+    assert_eq!(
+        usize::from(u16::from_be_bytes([data[4], data[5]])),
+        data.len()
+    );
+    assert_eq!(&data[8..], payload, "UDP reply payload changed");
+    let mut pseudo = Vec::new();
+    if ipv6 {
+        pseudo.extend_from_slice(&SERVER6.octets());
+        pseudo.extend_from_slice(&CLIENT6.octets());
+        pseudo.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 17]);
+    } else {
+        pseudo.extend_from_slice(&SERVER.octets());
+        pseudo.extend_from_slice(&CLIENT.octets());
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    }
+    pseudo.extend_from_slice(&data);
+    assert_eq!(checksum_sum(&pseudo), 0xffff, "UDP reply checksum");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_replies_obey_mtu() {
+    let _serial = STACK_LOCK.lock().await;
+    // Consecutive generations reuse the process-global netif. Finish at
+    // the minimum MTU to catch stale values after a larger-MTU generation.
+    assert!(matches!(
+        NetStack::with_mtu(1279),
+        Err(crate::Error::InvalidMtu(1279))
+    ));
+    for mtu in [1280, 1400, 1500, 9000, 1280] {
+        let (stack, listener, udp) = NetStack::with_mtu(mtu).unwrap();
+        let mut done = stack.core_done();
+        let (mut sink, mut egress) = stack.split();
+        let (tx, rx) = udp.split();
+        for ipv6 in [false, true] {
+            let src = SocketAddr::new(
+                if ipv6 { SERVER6.into() } else { SERVER.into() },
+                SERVER_PORT,
+            );
+            let dst = SocketAddr::new(if ipv6 { CLIENT6.into() } else { CLIENT.into() }, 42000);
+            for len in [0, 1, 64, 1232, 1352, 1374, 1600, 8192, 60000] {
+                let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                tx.send_to(&payload, &src, &dst).unwrap();
+                check_udp_reply(&mut egress, ipv6, mtu, &payload).await;
+            }
+        }
+        drop((listener, tx, rx));
+        sink.close().await.unwrap();
+        timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// TCP send segmentation derives from `netif.mtu` (`tcp_eff_send_mss_netif`
+/// clamps `TCP_MSS` at `mtu - 40` for IPv4): every frame a stream write
+/// emits must fit the generation's MTU. Duplicate/retransmitted segments
+/// are counted by sequence high-water mark so they can't double-count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_replies_obey_mtu() {
+    const PORT: u16 = 30000;
+    let _serial = STACK_LOCK.lock().await;
+    for mtu in [1280u16, 1500] {
+        let (stack, mut listener, _udp) = NetStack::with_mtu(mtu).unwrap();
+        let mut done = stack.core_done();
+        let (sink, egress) = stack.split();
+        let mut peer = Peer { sink, egress };
+        peer.handshake(PORT).await;
+        let (mut stream, _, _) = timeout(STEP_TIMEOUT, listener.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = vec![0xABu8; usize::from(mtu) * 3];
+        stream.write_all(&payload).await.unwrap();
+
+        // The client must ACK each data segment or lwIP's send window
+        // stalls after the first burst. ACK cumulatively at the sequence
+        // high-water mark; retransmits of covered bytes count nothing.
+        let mut start_seq = None;
+        let mut high_water = 0u32;
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        loop {
+            let covered = start_seq.map_or(0, |s| high_water.wrapping_sub(s));
+            if covered as usize >= payload.len() {
+                break;
+            }
+            let frame = timeout_at(deadline, peer.egress.next())
+                .await
+                .expect("TCP reply segments timed out")
+                .unwrap()
+                .unwrap();
+            assert!(
+                frame.len() <= usize::from(mtu),
+                "emitted {} bytes at MTU {mtu}",
+                frame.len()
+            );
+            if let Some(seg) = parse(&frame) {
+                if seg.dport == PORT && seg.len > 0 {
+                    let end = seg.seq.wrapping_add(seg.len as u32);
+                    match start_seq {
+                        None => {
+                            start_seq = Some(seg.seq);
+                            high_water = end;
+                        }
+                        Some(_) if end.wrapping_sub(high_water) as i32 > 0 => {
+                            high_water = end;
+                        }
+                        _ => {}
+                    }
+                    peer.send(PORT, CLIENT_ISN + 1, high_water, ACK, &[]).await;
+                }
+            }
+        }
+
+        drop(stream);
+        drop(listener);
+        peer.sink.close().await.unwrap();
+        timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

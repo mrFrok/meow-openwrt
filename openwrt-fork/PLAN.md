@@ -193,6 +193,17 @@ rp_filter: meow ставит 0 на линке; при `all.rp_filter=1` отв�
 - **Тест:** обычный WG в unshare-netns против второго wg-интерфейса (модуль хоста); AWG — на машине с
   `kmod-amneziawg` (у BPI-R4 сборки нет WG в ядре). mihomo-сервер не нужен: peer — сам ядро.
 
+## Постоянные расхождения с upstream
+- **`tproxy-port` (решено 2026-11-12, meow-rs#901 закрыт):** upstream навсегда оставил шорткат
+  managed-REDIRECT на loopback, а семантику mihomo выражает через `listeners: {type: tproxy,
+  transparent: true, udp: true, firewall: false}` (наш #884). В форке шорткат = mihomo (реальный TPROXY,
+  TCP + IPv4 UDP, правила деплоера) — точка дельты одна: блок шорткатов в `meow-config/src/lib.rs`,
+  тест `test_tproxy_shorthand_is_mihomo_tproxy`. PR `tproxy-mode` в upstream не делаем.
+- **mimalloc:** upstream включил его на всех musl-сборках; в форке остаётся opt-in
+  (`alloc-mimalloc`, алиас `mimalloc`) — на роутере 34–50 МБ RSS против ~5 у musl.
+- **DNS-сервер:** за основу взят upstream (bounded DNS-over-TCP, hook вне receive-loop); поверх — ответ
+  всеми адресами семейства (`MAX_ANSWERS`, `answer_hook::pending_all`) и `AtomicU` для mips32.
+
 ## Проверка
 - Каждый этап: `cargo test` затронутых крейтов; `meow -t` на боевом конфиге роутера (без `cp -rL`, без предупреждений).
 - Сборки: SDK-пакеты 4 архитектур, `qemu-mipsel`, BPI-R4 (SSH), волонтёры — self-run скрипт (без SSH).

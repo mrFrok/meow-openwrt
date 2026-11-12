@@ -10,12 +10,77 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
+  all domain depths in both blacklist and whitelist modes.
+
+- `dns.fake-ip-range6` installs an additional IPv6 fake-IP pool alongside the
+  existing IPv4 pool. Each family preserves its mappings on unchanged reloads.
+  Global-scope TUN routing (`auto-route: true` with `inet6-address`) captures
+  that pool too — on Linux also for forwarded LAN/container traffic — and
+  reloads update both families' routes.
+
+- **hysteria2:** mihomo's `initial-stream-receive-window`, `max-stream-receive-window`,
+  `initial-connection-receive-window` and `max-connection-receive-window` are honoured
+  (they used to fail the node). Unset, the connection window ceiling is MemTotal/16
+  (4-24 MiB), so a slow reader cannot park ~24 MiB per connection on a small router;
+  4 GB+ hosts keep the stock windows.
+- **mimalloc allocator on musl targets + `alloc-mimalloc` cargo feature** —
+  Linux/Android musl builds now swap the global allocator to mimalloc
+  unconditionally, fixing the stock allocator's freed-page retention that
+  ratcheted RSS upward under periodic churn (url-test sweeps, provider
+  rebuilds — observed 305 MB over 20 h on an embedded gateway). Other
+  Linux/Android builds can opt in via `--features alloc-mimalloc`. Uses
+  the mimalloc v2 line and no `override`, so C dependencies (e.g.
+  BoringSSL) still use the platform malloc; `dhat-heap` takes precedence
+  when both are enabled. Implements the `alloc-mimalloc` feature named
+  by ADR-0008 §2 — the default-on question for other targets stays open
+  for M2.
+- `dns.proxy-server-nameserver-policy` selects nameservers for node domains
+  without changing ordinary DNS. It preserves policy order on reload and uses
+  the existing `nameserver-policy-exclusive` flag. Node-policy dependencies
+  must bootstrap independently; see `docs/specs/proxy-server-dns-policy.md`.
+- `dns.listen` now binds TCP and UDP at the same address. TCP connections use
+  bounded admission, framed queries, per-query resolver reload and owned cleanup.
+- **`dns` upstream through a proxy:** literal-address UDP upstreams dial the
+  adapter's real datagram transport (`support_udp`) instead of always
+  tunneling TCP — Shadowsocks-style UDP relays get native latency. TCP-only
+  adapters, hostname upstreams and explicit `tcp://` entries keep the
+  TCP-over-proxy path; a valid truncated UDP answer retries over the same
+  proxy's TCP under the query's original deadline (ADR-0012).
+
+- `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
+  owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
+  for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).
+- `routing-mark` (Linux only) sets `SO_MARK` on every outbound socket meow
+  opens (proxy
+  servers, DIRECT TCP/UDP, DNS, health checks, provider fetches), as mihomo;
+  `PUT /configs` applies a new mark, and refuses one while meow's managed
+  tproxy rules exempt the current mark. `GET /configs` reports the live mark.
+  Not marked: inbound/reply sockets and SIP003 plugin subprocesses.
+- **`dns.nftset`** (Linux): each A/AAAA answer whose domain and address the
+  rules would route anywhere but `DIRECT` is added to an nftables set
+  (`family#table#set`, dnsmasq `nftset=` style) before the answer leaves
+  meow, so a firewall can intercept only those destinations and leave the
+  rest to kernel forwarding / flowtable / hardware offload. Libc-only
+  netlink writer; fake-IP answers skipped. See `docs/nftset.md`.
+- **`lwip-libc-malloc`** feature (meow-app, meow-listener; meow-lwip
+  `libc-malloc`): lwIP's pools and heap come from libc malloc on demand
+  (`MEM_LIBC_MALLOC` compiles out `mem.c`'s heap arm including `ram_heap`;
+  `MEMP_MEM_MALLOC` drops the static pool arrays) instead of ~3.2 MB of
+  static `.bss` that `memp_init` touches when the TUN starts — 1.2–3 MB
+  less anonymous RSS on a router, same throughput. Off in every bundle;
+  silently inert without `listener-tun`.
 - **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
   names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
   `PATCH /rules/disable` switches rules off, the switch following its rule
   across reloads; `GET/PUT/DELETE /storage/{key}` keeps dashboard settings
   (zashboard's sync); `POST /rules/append`. Rule lines in mihomo's API
   spelling (`DomainSuffix,a.com,DIRECT`) parse through `/rules`.
+- Optional `dns.response-rules` select ordered, query-type-specific NODATA,
+  REFUSED, static addresses with TTLs, forwarding or per-family fake-IP
+  answers. Rules reuse domain/geosite/provider matching, honor hosts
+  precedence and reload atomically with their resolver generation.
+
 - **`support-x25519mlkem768: true`** — REALITY now offers an
   X25519MLKEM768 key share (its own X25519 key) ahead of X25519, which
   Xray REALITY servers >= 26.9.8 require; the REALITY ClientVer is a
@@ -98,6 +163,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **gRPC and XHTTP (stream-one) tunnels share one HTTP/2 connection per
+  proxy**, as mihomo and Xray clients do, instead of a TCP + TLS/REALITY
+  handshake per tunnel (each REALITY handshake costs the server a `dest`
+  round trip). Only user dials straight to the server share it: a
+  `dialer-proxy` chain, a relay hop and internal probes keep their own
+  connection. A connection at the peer's concurrent-stream limit is passed
+  over at once; an idle one is PINGed after 30 s and retired after 30 min;
+  a network change (`reset_sessions`) drops it, and a reload builds new
+  adapters with none.
+
 - **meow-rules public API:** `MrsError::WrongFormat` carries the
   expected magic (`'MRS!'` vs `'MRS\x01'`) instead of being a unit
   variant, and `UpstreamRuleSetReader::for_each_domain` returns
@@ -129,6 +204,98 @@ the canonical, in-repo source a release is cut from.
   never waits on it.
 
 ### Fixed
+
+- **`ech-opts` on a VLESS REALITY node.** A node with both was refused with
+  `reality-opts cannot be combined with ech-opts` once the ECH config was
+  known, whether inline or fetched from DNS. `ech-opts` is now ignored with a
+  warning and no DNS lookup is made, as in mihomo, which takes the REALITY
+  path before it looks at ECH. A malformed `ech-opts.config` is still
+  refused.
+- `DOMAIN-REGEX` payloads preserve commas, including repetition bounds such
+  as `{1,3}`: classical rule providers take the whole tail after the first
+  comma, while `rules:` entries and logic sub-rules take the last comma
+  field as the target — matching upstream comma protection.
+- `dns.proxy-server-nameserver-policy` now also rejects a proxy tagged while
+  it carries a `dialer-proxy:` chain through the relay-based fallback
+  wrapper (hysteria2 and anytls nodes cannot take an injected dialer): the
+  declared dependency is read through a `ProxyAdapter` query instead of a
+  concrete-type downcast, so a front group parked on REJECT can no longer
+  make the chain invisible.
+- hysteria2 `max-stream-receive-window` values configured above
+  `max-connection-receive-window` are clamped to the connection ceiling —
+  a stream can never outrun connection credit — keeping the advertised
+  `conn ≥ stream` invariant the code documents.
+- Hostname TCP dialing tries the alternate address family after 250 ms so a
+  stalled IPv6 or IPv4 connect does not starve a reachable alternative.
+- Restore OpenHarmony builds of `meow-common` by matching the peer-aware
+  outbound-interface helper's re-export to its platform availability.
+
+- TUN UDP connection refresh now cancels pending QUIC sniffing, DNS resolution,
+  route selection and outbound dialing, without waiting for establishment to
+  finish on an obsolete network binding.
+
+- Encrypted DNS `?proxy=NAME` parameters decode percent-escaped UTF-8 names,
+  including spaces and URL delimiters, without changing SNI or the DoH path.
+  Encode literal percent signs as `%25`; malformed escapes and control characters
+  are rejected. Plain DNS `#PROXY` fragments and literal `+` stay unchanged.
+
+- **`DOMAIN` payload check now consults `is_valid_host` itself** (the gate
+  every `host`/`sniff_host` producer passes), so all-numeric non-IP
+  spellings — libc `inet_aton` forms like `DOMAIN,2130706433`,
+  `DOMAIN,123.456`, `DOMAIN,0177.0.0.1` — are flagged dead as hosts no
+  listener can produce, while `DOMAIN,10.0.0.1` (`sniff_host` can still
+  carry the literal) and `DOMAIN,0x7f000001` (a letter-bearing name a
+  client may send) stay live. `DOMAIN-SUFFIX` keeps the label-structure
+  check: an all-numeric
+  payload can still end a legal mixed host (`x.2130706433`), closing the
+  last #869 dead-key item.
+
+- TUN UDP shutdown also cancels in-flight DNS hijack queries and owns the
+  lwIP reply pump, so pending queries do not retain the stopped loop's replies.
+  Completed flows leave the table without waiting for more packets; old task
+  completions cannot remove a newer flow using the same address pair.
+
+- **`rules:` payload-defect check closes the #869 gaps**: empty
+  `DOMAIN-KEYWORD`/`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-REGEX` payloads are
+  no longer silently classified — the KEYWORD needle is a total
+  match-all (`contains("")` is true for every flow), an empty
+  `DOMAIN,,X` or `DOMAIN-SUFFIX,,X` still matches every host-less
+  IP-literal destination, and `Regex::new("")` is a zero-width match on
+  everything, so each gets its own warning instead of the
+  "can never match" label or silence; impossible-byte payloads
+  (`*`, `+`, `?`, space, non-ASCII — outside the `is_valid_host`
+  alphabet) are flagged dead on `DOMAIN`, `DOMAIN-SUFFIX`,
+  `DOMAIN-WILDCARD` and `DOMAIN-KEYWORD` alike; and `sub-rules:` bodies
+  plus `AND`/`OR`/`NOT` legs get the same pass `rules:` lines do.
+  Lenient mode warns and keeps the rule — the empty needle still
+  matches all, as mihomo does — while `strict: true` fails the load.
+- **Plain-HTTP absolute-form requests with a duplicated `Host` header
+  are refused with 400**, matching the origin-form path and `sniff_http`
+  — RFC 9110 §5.4 permits refusing the ambiguous pair, which previously
+  was forwarded to the origin verbatim (issue #869).
+- TUN UDP loops own their flow tasks, cancelling blocked flows on shutdown
+  or loop cancellation instead of retaining them until their idle timeout.
+
+- TUN UDP flows join their reply reader before closing the packet connection;
+  cancelling a flow also cancels its reader instead of leaving it detached.
+
+- **A live fake-IP allocation wins routing over a conflicting sniffed
+  name.** When the fake-IP pool maps the flow's destination to a domain
+  (#908), a sniffed SNI/Host that differs no longer selects another
+  domain's routing rule — the mapped name routes and dials the flow.
+  The same conflict is cleared when the allocation is stale and the
+  listener-supplied `host` survives; an equal sniffed name (modulo its
+  FQDN trailing-dot spelling) is kept for the API's `sniffHost` field.
+- **The tproxy/redir listener drops unsafe original destinations.** A
+  REDIRECT'd or TPROXY'd TCP flow whose recovered destination is port 0,
+  unspecified, loopback, multicast or broadcast is refused before routing,
+  as is a same-port flow aimed at one of the host's own interface
+  addresses — the only genuine self-target on a wildcard bind, which
+  previously refused every same-port destination. IPv4-mapped IPv6
+  destinations are canonicalised before the checks.
+- Internal HTTP fetch errors omit full request/redirect URLs and response
+  body snippets from provider diagnostics, preserving the HTTP status and
+  failure category without copying subscription credentials into logs.
 
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
   driver queue reported `Closed`, so the tunnel tore the association

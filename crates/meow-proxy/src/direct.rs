@@ -13,7 +13,6 @@ pub struct DirectAdapter {
     /// adapter (upstream `outbound.NewCompatible()` — a `*Direct` with the
     /// `C.Compatible` type tag, used as GLOBAL's default member).
     adapter_type: AdapterType,
-    routing_mark: Option<u32>,
     /// Optional internal DNS resolver. When set, `dial_tcp` resolves
     /// hostnames via this resolver instead of the OS resolver — this is
     /// important when meow-rs *is* the system DNS, because routing a direct
@@ -49,7 +48,6 @@ impl DirectAdapter {
     pub fn new() -> Self {
         Self {
             adapter_type: AdapterType::Direct,
-            routing_mark: None,
             resolver: None,
             direct_slot: None,
             connect_timeout: None,
@@ -60,7 +58,7 @@ impl DirectAdapter {
 
     /// `COMPATIBLE` built-in — a direct dialer carrying the `Compatible`
     /// type tag, like upstream `NewCompatible`. Receives the same
-    /// routing-mark/resolver/timeout options as `DIRECT` via the `with_*`
+    /// resolver/timeout options as `DIRECT` via the `with_*`
     /// builders.
     pub fn compatible() -> Self {
         Self {
@@ -79,23 +77,18 @@ impl DirectAdapter {
     async fn connect(&self, dest: SocketAddr) -> std::io::Result<TcpStream> {
         #[cfg(target_os = "linux")]
         if let Some(iface) = &self.interface {
-            return connect_bound(dest, iface, self.routing_mark).await;
+            return connect_bound(dest, iface).await;
         }
-        connect_with_mark(dest, self.routing_mark).await
+        meow_common::connect_tcp(dest).await
     }
 
     /// UDP socket for `peer`, bound to the adapter's interface when it has one.
     async fn bind_udp(&self, peer: std::net::IpAddr) -> std::io::Result<tokio::net::UdpSocket> {
         #[cfg(target_os = "linux")]
         if let Some(iface) = &self.interface {
-            return udp_bound(peer, iface, self.routing_mark);
+            return udp_bound(peer, iface);
         }
         meow_common::bind_udp_for_peer(peer).await
-    }
-
-    pub fn with_routing_mark(mut self, routing_mark: u32) -> Self {
-        self.routing_mark = Some(routing_mark);
-        self
     }
 
     /// Wrap `resolver` in a fresh private slot — this adapter will not
@@ -283,6 +276,18 @@ impl tokio::io::AsyncWrite for DirectConn {
         std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -372,19 +377,13 @@ where
     }
 }
 
-/// Create a TCP socket with an optional routing mark (SO_MARK on Linux)
-/// set BEFORE connecting, so the SYN packet is already marked. On Android
-/// the installed `meow_common::SocketProtector` is applied to the socket
-/// fd (also pre-connect) so the dial bypasses VpnService when meow-rs runs
-/// inside a VPN app.
-/// A socket bound to `iface` and marked (the adapter's mark, else the
-/// global `routing-mark`), so the deployer's capture rules skip it.
+/// A socket bound to `iface` and marked with the global `routing-mark`, so
+/// the deployer's capture rules skip it (meow-openwrt).
 #[cfg(target_os = "linux")]
 fn bound_socket(
     peer: std::net::IpAddr,
     ty: socket2::Type,
     iface: &str,
-    mark: Option<u32>,
 ) -> std::io::Result<socket2::Socket> {
     use socket2::{Domain, Socket};
     let domain = if peer.is_ipv4() {
@@ -393,7 +392,8 @@ fn bound_socket(
         Domain::IPV6
     };
     let socket = Socket::new(domain, ty, None)?;
-    if let Some(mark) = mark.or_else(meow_common::routing_mark) {
+    let mark = meow_common::routing_mark();
+    if mark != 0 {
         socket.set_mark(mark)?;
     }
     socket.bind_device(Some(iface.as_bytes()))?;
@@ -402,24 +402,16 @@ fn bound_socket(
 }
 
 #[cfg(target_os = "linux")]
-async fn connect_bound(
-    dest: SocketAddr,
-    iface: &str,
-    mark: Option<u32>,
-) -> std::io::Result<TcpStream> {
-    let socket = bound_socket(dest.ip(), socket2::Type::STREAM, iface, mark)?;
+async fn connect_bound(dest: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
+    let socket = bound_socket(dest.ip(), socket2::Type::STREAM, iface)?;
     tokio::net::TcpSocket::from_std_stream(socket.into())
         .connect(dest)
         .await
 }
 
 #[cfg(target_os = "linux")]
-fn udp_bound(
-    peer: std::net::IpAddr,
-    iface: &str,
-    mark: Option<u32>,
-) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket = bound_socket(peer, socket2::Type::DGRAM, iface, mark)?;
+fn udp_bound(peer: std::net::IpAddr, iface: &str) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = bound_socket(peer, socket2::Type::DGRAM, iface)?;
     let any: std::net::IpAddr = if peer.is_ipv4() {
         Ipv4Addr::UNSPECIFIED.into()
     } else {
@@ -427,44 +419,6 @@ fn udp_bound(
     };
     socket.bind(&SocketAddr::new(any, 0).into())?;
     tokio::net::UdpSocket::from_std(socket.into())
-}
-
-async fn connect_with_mark(
-    dest: SocketAddr,
-    routing_mark: Option<u32>,
-) -> std::io::Result<TcpStream> {
-    #[cfg(target_os = "linux")]
-    if let Some(mark) = routing_mark {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let domain = if dest.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_mark(mark)?;
-        // TUN global-route loop avoidance (#375): this branch bypasses
-        // `meow_common::connect_tcp`, so apply the outbound-interface
-        // binding here too (no-op when none is installed).
-        meow_common::apply_outbound_interface_for_peer(&socket, domain, dest.ip())?;
-        socket.set_nonblocking(true)?;
-
-        match socket.connect(&dest.into()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(e) => return Err(e),
-        }
-
-        let std_stream: std::net::TcpStream = socket.into();
-        return TcpStream::from_std(std_stream);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    let _ = routing_mark;
-
-    meow_common::connect_tcp(dest).await
 }
 
 #[async_trait]
@@ -490,21 +444,16 @@ impl ProxyAdapter for DirectAdapter {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let dests = self.resolve_targets(metadata).await?;
-        let mut last_err = None;
-
-        for dest in dests {
-            match apply_connect_timeout(self.connect(dest), self.connect_timeout, dest).await {
-                Ok(stream) => return Ok(Box::new(DirectConn(stream))),
-                // An errno-backed connect failure (e.g. EMFILE on
-                // socket()) outranks a later context-only error — the
-                // errno is what dead-mark classification reads (issue
-                // #668); this error also escapes through relay hop-0 /
-                // dialer-proxy front boundaries.
-                Err(err) => last_err = MeowError::prefer_errno(last_err, err),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| MeowError::Proxy("direct: no reachable address".into())))
+        // meow-openwrt: `self.connect` keeps the adapter's `interface-name`
+        // binding and routing mark under upstream's candidate racing.
+        let stream = meow_common::connect_tcp_candidates(dests, |dest| async move {
+            apply_connect_timeout(self.connect(dest), self.connect_timeout, dest)
+                .await
+                .map_err(|error| error.into_io_error("direct candidate"))
+        })
+        .await
+        .map_err(MeowError::Io)?;
+        Ok(Box::new(DirectConn(stream)))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -600,6 +549,35 @@ impl ProxyAdapter for DirectAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn direct_conn_preserves_vectored_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let expected = stream.is_write_vectored();
+        assert!(
+            expected,
+            "fixture socket must support scatter/gather writes"
+        );
+        let mut conn = super::DirectConn(stream);
+        assert_eq!(
+            conn.is_write_vectored(),
+            expected,
+            "wrapper lost the socket capability"
+        );
+        let chunks = [
+            std::io::IoSlice::new(b"head"),
+            std::io::IoSlice::new(b"body"),
+        ];
+        assert_eq!(conn.write_vectored(&chunks).await.unwrap(), 8);
+        let mut received = [0; 8];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"headbody");
+    }
+
     use super::*;
     use meow_common::DnsMode;
     use meow_dns::HostEntry;

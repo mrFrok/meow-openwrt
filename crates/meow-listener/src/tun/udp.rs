@@ -27,7 +27,7 @@ use futures::{FutureExt, StreamExt};
 use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
 use meow_common::{ConnType, Metadata, Network};
-use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
+use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer, LocalResponse};
 use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
@@ -102,6 +102,20 @@ pub(super) const DIRECT_REPLY_QUEUE: usize = REPLY_QUEUE;
 
 /// `(client source, packet destination)` — the flow-table key.
 type FlowKey = (SocketAddr, SocketAddr);
+type FlowOwners = HashMap<tokio::task::Id, (FlowKey, Arc<AtomicU>)>;
+
+fn reap_flow(flows: &mut FlowTable, owners: &mut FlowOwners, id: tokio::task::Id) {
+    if let Some((key, identity)) = owners.remove(&id) {
+        // The timestamp allocation belongs to this incarnation of the flow.
+        // An old completion must not remove a replacement with the same key.
+        if flows
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.last_activity, &identity))
+        {
+            flows.remove(&key);
+        }
+    }
+}
 
 /// Epoch for flow activity stamps. `Instant` cannot be shared atomically
 /// between the reader loop and flow tasks, so activity is recorded as
@@ -128,6 +142,10 @@ fn activity_ms() -> Uint {
 struct FlowEntry {
     tx: mpsc::Sender<Vec<u8>>,
     last_activity: Arc<AtomicU>,
+    /// Owning task's id — every entry removal must also drop this slot
+    /// from `flow_owners` so slow-winding evictees cannot accumulate
+    /// stale owner records (`None` only in test fixtures).
+    task_id: Option<tokio::task::Id>,
 }
 
 /// One loop's flow table bundled with its share of the shared occupancy
@@ -215,11 +233,14 @@ pub(super) async fn run_udp(
     live_flows: Arc<AtomicUsize>,
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 ) {
+    // One owner for the loop's cancellable async work: flows, DNS queries
+    // and the lwIP reply pump. Blocking nftset hooks are handled separately.
+    let mut tasks = tokio::task::JoinSet::new();
     let (reply_tx, mut incoming) = match io {
         UdpIo::Lwip(socket) => {
             let (write_half, read_half) = socket.split();
             let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 while let Some((data, src, dst)) = reply_rx.recv().await {
                     // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
                     if let Err(e) = write_half.send_to(&data, &src, &dst) {
@@ -237,16 +258,47 @@ pub(super) async fn run_udp(
     };
 
     // Flow table, touched only by this loop — its `Drop` returns the
-    // gauge share however this future ends. A flow task signals its own
-    // death by closing its queue; the entry is evicted lazily — on the
-    // next datagram for the tuple, by the periodic sweep, or by LRU
-    // eviction when the table reaches MAX_FLOWS (issue #515).
+    // gauge share however this future ends. Completions remove their own
+    // entries even without another datagram. The closed-queue, sweep and LRU
+    // paths remain admission backstops (issue #515).
     let mut flows = FlowTable::new(live_flows);
+    let mut flow_owners = FlowOwners::new();
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
     let hijack_dropped = Arc::new(AtomicU::new(0));
 
-    while let Some((data, src, dst)) = incoming.next().await {
+    loop {
+        let packet = tokio::select! {
+            packet = incoming.next() => packet,
+            done = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                let id = match done {
+                    Some(Ok((id, ()))) => id,
+                    Some(Err(error)) => {
+                        if error.is_panic() {
+                            // Flow tasks own a table entry; helpers (hijack
+                            // queries, the reply pump) do not — the owner map
+                            // distinguishes which subsystem panicked.
+                            if flow_owners.contains_key(&error.id()) {
+                                warn!("tun UDP flow task survived a panic: {error}");
+                            } else {
+                                warn!("tun UDP helper task survived a panic: {error}");
+                            }
+                        } else {
+                            debug!("tun UDP worker: {error}");
+                        }
+                        error.id()
+                    }
+                    None => continue,
+                };
+                reap_flow(&mut flows, &mut flow_owners, id);
+                // Reap completions even with no incoming packets; otherwise
+                // finished task records accumulate for the listener lifetime.
+                continue;
+            }
+        };
+        let Some((data, src, dst)) = packet else {
+            break;
+        };
         // The TCP NAT's trust boundary holds for UDP too: the peer
         // addresses are assigned to nothing, so a datagram claiming one
         // as its source is forged (a LAN peer forwarded in under loose
@@ -267,9 +319,26 @@ pub(super) async fn run_udp(
             // answered inline — they never spend a hijack permit or a task
             // spawn, so a warm cache can't queue behind slow upstreams.
             match DnsServer::try_answer_local(&data, &resolver) {
-                LocalAnswer::Answer(response) => {
-                    if reply_tx.try_send((response, dst, src)).is_err() {
-                        note_hijack_drop(&hijack_dropped);
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    match hook {
+                        // `dns.nftset` ordering, same as the serve loop:
+                        // the (blocking) element add finishes before this
+                        // answer is queued for the stack writer.
+                        Some(work) => {
+                            let reply_tx = reply_tx.clone();
+                            let hijack_dropped = Arc::clone(&hijack_dropped);
+                            tokio::task::spawn_blocking(move || {
+                                work.run();
+                                if reply_tx.try_send((response, dst, src)).is_err() {
+                                    note_hijack_drop(&hijack_dropped);
+                                }
+                            });
+                        }
+                        None => {
+                            if reply_tx.try_send((response, dst, src)).is_err() {
+                                note_hijack_drop(&hijack_dropped);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -282,7 +351,7 @@ pub(super) async fn run_udp(
                 Ok(permit) => {
                     let reply_tx = reply_tx.clone();
                     let hijack_dropped = Arc::clone(&hijack_dropped);
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let _permit = permit;
                         // Panic guard — parity with the serve loop in
                         // meow-dns: a panicked task would silently drop the
@@ -329,8 +398,19 @@ pub(super) async fn run_udp(
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
             // `FlowTable` applies the gauge delta of whatever it sheds —
-            // and on `Drop` for whatever is left.
-            flows.retain(|_, e| !e.tx.is_closed());
+            // and on `Drop` for whatever is left. Shed entries drop their
+            // `flow_owners` slot too: the completion will find nothing to
+            // reap and skip harmlessly.
+            flows.retain(|_, e| {
+                if e.tx.is_closed() {
+                    if let Some(id) = e.task_id {
+                        flow_owners.remove(&id);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
         }
 
         let key = (src, dst);
@@ -344,7 +424,11 @@ pub(super) async fn run_udp(
                     // Flow task ended (idle timeout or error): evict and fall
                     // through to re-create the flow with this datagram.
                     Err(mpsc::error::TrySendError::Closed(data)) => {
+                        let task_id = entry.task_id;
                         flows.remove(&key);
+                        if let Some(id) = task_id {
+                            flow_owners.remove(&id);
+                        }
                         data
                     }
                 }
@@ -377,20 +461,14 @@ pub(super) async fn run_udp(
         // Admission bound: reclaim dead entries first, then evict the
         // least-recently-active live flow.
         if flows.len() >= MAX_FLOWS {
-            evict_for_admission(&mut flows);
+            evict_for_admission(&mut flows, &mut flow_owners);
         }
 
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         tx.try_send(data).expect("fresh flow queue has capacity");
         let last_activity = Arc::new(AtomicU::new(activity_ms()));
-        flows.insert(
-            key,
-            FlowEntry {
-                tx,
-                last_activity: Arc::clone(&last_activity),
-            },
-        );
-        tokio::spawn(flow_task(
+        let identity = Arc::clone(&last_activity);
+        let task = tasks.spawn(flow_task(
             tunnel.clone(),
             FlowSpec {
                 rx,
@@ -402,9 +480,23 @@ pub(super) async fn run_udp(
                 sniffer: sniffer.clone(),
             },
         ));
+        let task_id = task.id();
+        flows.insert(
+            key,
+            FlowEntry {
+                tx,
+                last_activity: Arc::clone(&identity),
+                task_id: Some(task_id),
+            },
+        );
+        flow_owners.insert(task_id, (key, identity));
     }
-    // `flows` drops here, returning this table's share of the gauge —
-    // also when the future is aborted mid-loop and never reaches this line.
+    // Stop flows parked in dial/write and DNS queries waiting for upstream.
+    // Each flow owns its reply reader, which is cancelled with it; also stop
+    // the reply pump instead of waiting for every cloned sender to disappear.
+    drop(flows);
+    tasks.shutdown().await;
+    // On external cancellation the table and set also clean up via Drop.
 }
 
 /// Per-flow state handed to the spawned flow task.
@@ -441,18 +533,30 @@ fn note_hijack_drop(counter: &AtomicU) {
 /// sender closes that flow's queue; its task exits through the ordinary
 /// `rx.recv() == None` shutdown path. The gauge deltas ride along inside
 /// [`FlowTable`]'s `retain`/`remove`.
-fn evict_for_admission(flows: &mut FlowTable) {
-    flows.retain(|_, e| !e.tx.is_closed());
+fn evict_for_admission(flows: &mut FlowTable, owners: &mut FlowOwners) {
+    flows.retain(|_, e| {
+        if e.tx.is_closed() {
+            if let Some(id) = e.task_id {
+                owners.remove(&id);
+            }
+            false
+        } else {
+            true
+        }
+    });
     if flows.len() >= MAX_FLOWS {
         // Oldest = largest age; ages stay correct across a u32 stamp wrap.
         let now = activity_ms();
-        if let Some(victim) = flows
+        if let Some((victim, task_id)) = flows
             .iter()
             .max_by_key(|(_, e)| now.wrapping_sub(e.last_activity.load(Ordering::Relaxed)))
-            .map(|(k, _)| *k)
+            .map(|(k, e)| (*k, e.task_id))
         {
             debug!("tun UDP flow table full: evicting LRU flow {victim:?}");
             flows.remove(&victim);
+            if let Some(id) = task_id {
+                owners.remove(&id);
+            }
         }
     }
 }
@@ -461,6 +565,18 @@ async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
     let (src, dst) = spec.key;
     if let Err(e) = relay_flow(&tunnel, spec).await {
         debug!("tun UDP {src} -> {dst}: {e}");
+    }
+}
+
+/// Map a completed reply-reader join to the flow's exit error — the
+/// reader owns the only `up_tx`, so any reader exit ends the flow.
+/// `None` (empty set) is unreachable today — every earlier `join_next`
+/// breaks out — and folds into the clean-exit message.
+fn reply_reader_exit(done: Option<Result<Result<(), String>, tokio::task::JoinError>>) -> String {
+    match done {
+        Some(Ok(Err(e))) => e,
+        Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
+        Some(Err(e)) => format!("downstream reader task: {e}"),
     }
 }
 
@@ -480,6 +596,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         last_activity,
         sniffer,
     } = spec;
+    // Capture the generation before any await, including sniffing and DNS.
+    // A refresh must cancel establishment, not just a connected relay.
+    let mut flush = tunnel.inner().udp_flush_watch();
     let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Tun,
@@ -495,6 +614,20 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // server name, at most `sniffer.timeout` and a few packets; they are
     // sent upstream first once the flow is dialed.
     let mut held: Vec<Vec<u8>> = Vec::new();
+
+    // Flush and error returns below exit before `held` is flushed to the
+    // conn: say so when that drops datagrams — the client sent its
+    // Initials and otherwise waits out its idle timeout for answers that
+    // were never forwarded.
+    let drop_held = |held: &[Vec<u8>]| {
+        if !held.is_empty() {
+            debug!(
+                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
+                held.len()
+            );
+        }
+    };
+
     if sniffer.is_some() {
         crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
     }
@@ -502,9 +635,15 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         let deadline = Instant::now() + rt.timeout();
         let mut quic = crate::sniffer_quic::QuicSniffer::default();
         while held.len() < QUIC_SNIFF_PACKETS {
-            let Ok(Some(data)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
-                break;
+            let packet = tokio::select! {
+                biased;
+                () = flush.flushed() => {
+                    drop_held(&held);
+                    return Ok(());
+                }
+                packet = tokio::time::timeout_at(deadline, rx.recv()) => packet,
             };
+            let Ok(Some(data)) = packet else { break };
             let step = quic.feed(&data);
             held.push(data);
             match step {
@@ -518,19 +657,6 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         }
     }
 
-    // Routing or dial failures below return before `held` is flushed to
-    // the conn: say so when that drops datagrams — the client sent its
-    // Initials and otherwise waits out its idle timeout for answers that
-    // were never forwarded.
-    let drop_held = |held: &[Vec<u8>]| {
-        if !held.is_empty() {
-            debug!(
-                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
-                held.len()
-            );
-        }
-    };
-
     let inner = tunnel.inner();
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
@@ -542,8 +668,19 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
-    inner.pre_resolve(&mut metadata).await;
-    inner.resolve_udp_dst(&mut metadata).await;
+    tokio::select! {
+        biased;
+        () = flush.flushed() => {
+            drop_held(&held);
+            // A flush between pre_resolve and resolve_udp_dst can leave
+            // metadata half-resolved; it is never read after this return.
+            return Ok(());
+        }
+        () = async {
+            inner.pre_resolve(&mut metadata).await;
+            inner.resolve_udp_dst(&mut metadata).await;
+        } => {}
+    }
     let Some(dst_ip) = metadata.dst_ip else {
         drop_held(&held);
         return Err(format!(
@@ -554,12 +691,20 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Non-hijacked client traffic follows the same policy on every port.
+    let target = tokio::select! {
+        biased;
+        () = flush.flushed() => {
+            drop_held(&held);
+            return Ok(());
+        }
+        target = inner.resolve_proxy(&metadata) => target,
+    };
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = inner.resolve_proxy(&metadata).await
+    }) = target
     else {
         drop_held(&held);
         return Err(format!(
@@ -575,17 +720,24 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
-    // Taken before the dial so a flush landing mid-dial still ends the flow
-    // (issue #695): its socket may predate the new outbound binding.
-    let mut flush = inner.udp_flush_watch();
-    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> =
-        match inner.dial_udp(proxy.as_ref(), &metadata).await {
-            Ok(conn) => std::sync::Arc::from(conn),
-            Err(e) => {
-                drop_held(&held);
-                return Err(format!("dial_udp via {}: {e}", proxy.name()));
-            }
-        };
+    // Prioritize an already-pending flush even if the dial is ready too.
+    // Invariant: dial_udp must not spawn detached tasks — cancellation via
+    // future drop must release every socket the dial opened.
+    let dialed = tokio::select! {
+        biased;
+        () = flush.flushed() => {
+            drop_held(&held);
+            return Ok(());
+        }
+        result = inner.dial_udp(proxy.as_ref(), &metadata) => result,
+    };
+    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = match dialed {
+        Ok(conn) => std::sync::Arc::from(conn),
+        Err(e) => {
+            drop_held(&held);
+            return Err(format!("dial_udp via {}: {e}", proxy.name()));
+        }
+    };
     // `_route` exists to pin the route-table generation across the dial
     // only — a long-lived flow must not keep its dial-time generation
     // alive across config reloads.
@@ -599,7 +751,10 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // traffic for its idle deadline — one owned buffer per datagram
     // (`read_packet_owned`: no copy at all for a conn that owns it already).
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
-    let mut reply_task = tokio::spawn({
+    // A one-task set keeps the reader owned by this flow on cancellation,
+    // and lets normal exits wait for its in-flight read and buffer to drop.
+    let mut reply_task = tokio::task::JoinSet::new();
+    reply_task.spawn({
         let conn = std::sync::Arc::clone(&conn);
         async move {
             let mut rbuf = vec![0u8; DATAGRAM_BUF];
@@ -634,11 +789,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             let write_result = tokio::select! {
                 () = &mut idle => break 'flow Ok(()), // idle-timeout during write
                 () = flush.flushed() => break 'flow Ok(()), // flush during write
-                done = &mut reply_task => break 'flow Err(match done {
-                    Ok(Err(e)) => e,
-                    Ok(Ok(())) => "downstream reader exited".into(),
-                    Err(e) => format!("downstream reader task: {e}"),
-                }),
+                done = reply_task.join_next() => break 'flow Err(reply_reader_exit(done)),
                 r = conn.write_packet(&data, &dst_addr) => r,
             };
             match write_result {
@@ -671,11 +822,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                         let write_result = tokio::select! {
                             () = &mut idle => break Ok(()), // idle-timeout during write
                             () = flush.flushed() => break Ok(()), // flush during write
-                            done = &mut reply_task => break Err(match done {
-                                Ok(Err(e)) => e,
-                                Ok(Ok(())) => "downstream reader exited".into(),
-                                Err(e) => format!("downstream reader task: {e}"),
-                            }),
+                            done = reply_task.join_next() => break Err(reply_reader_exit(done)),
                             r = conn.write_packet(&data, &dst_addr) => r,
                         };
                         match write_result {
@@ -717,18 +864,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                         }
                     }
                     // The reader task exited — it owns the only `up_tx`. The
-                    // borrow-await keeps the handle usable for the abort below.
-                    None => break Err(match (&mut reply_task).await {
-                        Ok(Err(e)) => e,
-                        Ok(Ok(())) => "downstream reader exited".into(),
-                        Err(e) => format!("downstream reader task: {e}"),
-                    }),
+                    // set removes its completed task, so shutdown will not poll it twice.
+                    None => break Err(reply_reader_exit(reply_task.join_next().await)),
                 },
             }
         }
     };
 
-    reply_task.abort();
+    reply_task.shutdown().await;
     let _ = conn.close();
     result
 }
@@ -801,6 +944,7 @@ mod tests {
                     last_activity: std::sync::Arc::new(meow_common::atomic::AtomicU::new(
                         now.wrapping_sub((total - i) as meow_common::atomic::Uint),
                     )),
+                    task_id: None,
                 },
             );
         }
@@ -810,7 +954,7 @@ mod tests {
     #[test]
     fn evict_for_admission_reclaims_dead_before_touching_live() {
         let (mut flows, _keepers) = seeded_table(MAX_FLOWS - 1, 3);
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert_eq!(flows.len(), MAX_FLOWS - 1, "only dead entries removed");
     }
 
@@ -819,7 +963,7 @@ mod tests {
         let (mut flows, _keepers) = seeded_table(MAX_FLOWS, 0);
         // seeded_table stamps index 0 as least-recently-active.
         let oldest_key: super::FlowKey = (([10, 0, 0, 1], 10000).into(), ([8, 8, 8, 8], 53).into());
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert_eq!(flows.len(), MAX_FLOWS - 1);
         assert!(
             flows.get(&oldest_key).is_none(),
@@ -837,7 +981,7 @@ mod tests {
             .unwrap()
             .last_activity
             .store(super::activity_ms(), std::sync::atomic::Ordering::Relaxed);
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert!(flows.get(&oldest_key).is_some(), "refreshed flow survives");
         assert!(
             flows.get(&next_oldest_key).is_none(),
@@ -878,7 +1022,7 @@ mod tests {
             let (tx, incoming) = tokio::sync::mpsc::channel(4);
             let (replies, _rx) = tokio::sync::mpsc::channel(4);
             let task = tokio::spawn(super::run_udp(
-                crate::test_rule_tunnel(),
+                super::cleanup_tests::live_tunnel(),
                 super::UdpIo::Direct { incoming, replies },
                 false,
                 Duration::from_secs(60),
@@ -961,7 +1105,7 @@ mod tests {
         let (tx, incoming) = tokio::sync::mpsc::channel(4);
         let (replies, _rx) = tokio::sync::mpsc::channel(4);
         let task = tokio::spawn(super::run_udp(
-            crate::test_rule_tunnel(),
+            super::cleanup_tests::live_tunnel(),
             super::UdpIo::Direct { incoming, replies },
             false,
             Duration::from_secs(60),
@@ -1083,5 +1227,547 @@ mod tests {
         assert!(!is_looping_dst(ip("fdfe:dcba:9876::1"), net()));
         assert!(!is_looping_dst(ip("fdfe:dcba:9876::4"), dual_net()));
         assert!(!is_looping_dst(ip("2001:db8::1"), dual_net()));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use meow_common::{Proxy, ProxyAdapter, ProxyHealth, ProxyPacketConn};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct Probe {
+        reading: Notify,
+        dialing: Notify,
+        stall_dial: AtomicBool,
+        dial_dropped: AtomicBool,
+        writing: Notify,
+        release_read: Notify,
+        read_dropped: AtomicBool,
+        conn_dropped: Notify,
+        closed_while_reading: AtomicBool,
+    }
+    struct DialGuard(Arc<Probe>);
+    impl Drop for DialGuard {
+        fn drop(&mut self) {
+            self.0.dial_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    struct Conn(Arc<Probe>);
+    impl Drop for Conn {
+        fn drop(&mut self) {
+            self.0.conn_dropped.notify_one();
+        }
+    }
+    struct ReadGuard(Arc<Probe>);
+    impl Drop for ReadGuard {
+        fn drop(&mut self) {
+            self.0.read_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for Conn {
+        async fn read_packet(&self, _: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            let _guard = ReadGuard(Arc::clone(&self.0));
+            self.0.reading.notify_one();
+            self.0.release_read.notified().await;
+            Err(std::io::Error::other("fixture reader ended").into())
+        }
+        async fn write_packet(&self, _: &[u8], _: &SocketAddr) -> meow_common::Result<usize> {
+            self.0.writing.notify_one();
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok(([127, 0, 0, 1], 0).into())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            self.0.closed_while_reading.store(
+                !self.0.read_dropped.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+    struct FixtureProxy {
+        probe: Arc<Probe>,
+        health: ProxyHealth,
+    }
+    #[async_trait::async_trait]
+    impl ProxyAdapter for FixtureProxy {
+        fn name(&self) -> &str {
+            "cleanup-fixture"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+        async fn dial_tcp(
+            &self,
+            _: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            if self.probe.stall_dial.load(Ordering::SeqCst) {
+                let _guard = DialGuard(Arc::clone(&self.probe));
+                self.probe.dialing.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(Box::new(Conn(Arc::clone(&self.probe))))
+        }
+    }
+    impl Proxy for FixtureProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            vec![]
+        }
+    }
+    fn fixture() -> (Tunnel, FlowSpec, mpsc::Sender<Vec<u8>>, Arc<Probe>) {
+        let probe = Arc::new(Probe::default());
+        let tunnel = crate::test_rule_tunnel();
+        let mut config = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        config.proxies.insert(
+            "cleanup-fixture".into(),
+            Arc::new(FixtureProxy {
+                probe: Arc::clone(&probe),
+                health: ProxyHealth::new(),
+            }),
+        );
+        tunnel.update_proxies(config.proxies, config.dialer_registry);
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "cleanup-fixture",
+        ))]);
+        let (tx, rx) = mpsc::channel(1);
+        let (reply_tx, _reply_rx) = mpsc::channel(1);
+        let spec = FlowSpec {
+            rx,
+            reply_tx,
+            key: (([10, 0, 0, 2], 12345).into(), ([192, 0, 2, 1], 443).into()),
+            udp_timeout: Duration::from_secs(60),
+            in_name: "tun".into(),
+            last_activity: Arc::new(AtomicU::new(0)),
+            sniffer: None,
+        };
+        (tunnel, spec, tx, probe)
+    }
+
+    // Occupancy tests must keep an actual flow alive: REJECT completes
+    // immediately and is now correctly removed by the completion branch.
+    pub(super) fn live_tunnel() -> Tunnel {
+        fixture().0
+    }
+
+    #[tokio::test]
+    async fn old_completion_preserves_same_key_replacement_even_on_panic() {
+        for panic in [false, true] {
+            let gauge = Arc::new(AtomicUsize::new(0));
+            let mut flows = FlowTable::new(Arc::clone(&gauge));
+            let mut owners = FlowOwners::new();
+            let key = (([10, 0, 0, 2], 12345).into(), ([192, 0, 2, 1], 443).into());
+            let old = Arc::new(AtomicU::new(0));
+            let fresh = Arc::new(AtomicU::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+            let id = tasks
+                .spawn(async move {
+                    assert!(!panic, "fixture panic");
+                })
+                .id();
+            owners.insert(id, (key, old));
+            let (tx, _rx) = mpsc::channel(1);
+            flows.insert(
+                key,
+                FlowEntry {
+                    tx,
+                    last_activity: Arc::clone(&fresh),
+                    task_id: Some(id),
+                },
+            );
+            let completed = match tasks.join_next_with_id().await.unwrap() {
+                Ok((id, ())) => id,
+                Err(error) => error.id(),
+            };
+            reap_flow(&mut flows, &mut owners, completed);
+            assert_eq!(gauge.load(Ordering::Relaxed), 1);
+            assert!(Arc::ptr_eq(&flows.get(&key).unwrap().last_activity, &fresh));
+            assert!(owners.is_empty());
+            // A completion of the current incarnation removes it exactly
+            // once — the second call no-ops because the owner slot was
+            // already consumed by the first (early-return on `None`), not
+            // because the identity check rejects it again.
+            owners.insert(id, (key, fresh));
+            reap_flow(&mut flows, &mut owners, id);
+            reap_flow(&mut flows, &mut owners, id);
+            assert_eq!(gauge.load(Ordering::Relaxed), 0);
+            assert_eq!(flows.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_flow_reclaims_table_without_more_packets() {
+        let (tunnel, spec, _tx, probe) = fixture();
+        let (tx, incoming) = mpsc::channel(1);
+        let (replies, _rx) = mpsc::channel(1);
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_udp(
+            tunnel,
+            UdpIo::Direct { incoming, replies },
+            false,
+            Duration::from_secs(60),
+            "tun".into(),
+            TunNets {
+                v4: "198.18.0.1/30".parse().unwrap(),
+                v6: None,
+                nat: None,
+            },
+            Arc::clone(&gauge),
+            None,
+        ));
+        tx.send((vec![1], spec.key.0, spec.key.1)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), probe.reading.notified())
+            .await
+            .unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 1);
+        probe.release_read.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), probe.conn_dropped.notified())
+            .await
+            .unwrap();
+        let reclaimed = tokio::time::timeout(Duration::from_secs(1), async {
+            while gauge.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(tx);
+        task.await.unwrap();
+        assert!(
+            reclaimed.is_ok(),
+            "completed flow stayed in table without new packets"
+        );
+    }
+
+    async fn stop_loop_with_pending_dns(abort: bool) {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![upstream.local_addr().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let (tx, incoming) = mpsc::channel(1);
+        let (replies, mut rx) = mpsc::channel(1);
+        let task = tokio::spawn(run_udp(
+            Tunnel::new(resolver),
+            UdpIo::Direct { incoming, replies },
+            true,
+            Duration::from_secs(60),
+            "tun".into(),
+            TunNets {
+                v4: "198.18.0.1/30".parse().unwrap(),
+                v6: None,
+                nat: None,
+            },
+            Arc::new(AtomicUsize::new(0)),
+            None,
+        ));
+        // Standard recursive TXT question for example.com, with no local answer.
+        let query = b"\x00\x2a\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x10\x00\x01".to_vec();
+        tx.send((
+            query,
+            ([10, 0, 0, 2], 12345).into(),
+            ([8, 8, 8, 8], 53).into(),
+        ))
+        .await
+        .unwrap();
+        let mut packet = [0u8; 4096];
+        let (n, peer) =
+            tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        // The real query is now in flight, not merely queued for the loop.
+        if abort {
+            task.abort();
+        }
+        drop(tx);
+        let done = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap();
+        if abort {
+            assert!(done.unwrap_err().is_cancelled());
+        } else {
+            done.unwrap();
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        // Release the baseline's detached query as well: a valid NOERROR,
+        // empty response. Cleanup must not depend on this delayed response.
+        packet[2] = 0x81;
+        packet[3] = 0x80;
+        upstream.send_to(&packet[..n], peer).await.unwrap();
+        assert!(
+            matches!(closed, Ok(None)),
+            "stopped UDP loop retained a DNS reply sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_dns_query_cancelled_on_loop_eof() {
+        stop_loop_with_pending_dns(false).await;
+    }
+
+    #[tokio::test]
+    async fn tun_dns_query_cancelled_on_loop_abort() {
+        stop_loop_with_pending_dns(true).await;
+    }
+
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_dial() {
+        let (tunnel, spec, _tx, probe) = fixture();
+        probe.stall_dial.store(true, Ordering::SeqCst);
+        let worker_tunnel = tunnel.clone();
+        let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });
+        tokio::time::timeout(Duration::from_secs(2), probe.dialing.notified())
+            .await
+            .unwrap();
+        assert_eq!(tunnel.close_all_udp_sessions(), 1);
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        if done.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(done.is_ok(), "flush left the old outbound dial pending");
+        assert!(done.unwrap().unwrap().is_ok());
+        assert!(probe.dial_dropped.load(Ordering::SeqCst));
+        assert_eq!(tunnel.close_all_udp_sessions(), 0, "watch was released");
+    }
+
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_sniff() {
+        let (tunnel, mut spec, tx, _probe) = fixture();
+        spec.sniffer = Some(Arc::new(crate::sniffer::SnifferRuntime::new(
+            meow_common::sniffer::SnifferConfig {
+                enable: true,
+                quic_ports: vec![443],
+                timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )));
+        let relay = relay_flow(&tunnel, spec);
+        tokio::pin!(relay);
+        // Feed one packet so the first poll lands inside the sniff-loop
+        // select, not at the function entry — the flush arm under test is
+        // the loop's, and a second recv parks there awaiting packet two.
+        // A v1 0-RTT long-header with a zero-length payload feeds `More`
+        // (not Initial): the loop stays parked on `rx.recv()`.
+        tx.try_send(vec![0xd0, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        assert!(futures::poll!(&mut relay).is_pending());
+        let count = tunnel.close_all_udp_sessions();
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut relay).await;
+        assert!(done.is_ok(), "flush left the QUIC gather pending");
+        assert!(done.unwrap().is_ok());
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_resolution() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: ['{}']\n",
+            upstream.local_addr().unwrap()
+        ))
+        .unwrap();
+        let dns =
+            meow_config::parse_dns_from_raw(&raw, None, &HashMap::new(), None, None, None, None)
+                .await
+                .unwrap();
+        let resolver = dns.resolver;
+        let fake = resolver.lookup_ipv4("pending.example").await.unwrap();
+        let (tunnel, mut spec, _tx, probe) = fixture();
+        tunnel.set_resolver(resolver);
+        spec.key.1.set_ip(fake);
+        let worker_tunnel = tunnel.clone();
+        let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });
+        let mut packet = [0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        let count = tunnel.close_all_udp_sessions();
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        if done.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(done.is_ok(), "flush left pre-dial DNS resolution pending");
+        assert!(done.unwrap().unwrap().is_ok());
+        assert_eq!(count, 1, "resolving flows must already hold a flush watch");
+        assert!(!probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    async fn loop_stop_releases_blocked_flow(abort: bool) {
+        let (tunnel, spec, _keepalive_tx, probe) = fixture();
+        let flush = tunnel.clone();
+        let (incoming_tx, incoming) = mpsc::channel(1);
+        let (replies, _reply_rx) = mpsc::channel(1);
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_udp(
+            tunnel,
+            UdpIo::Direct { incoming, replies },
+            false,
+            Duration::from_secs(60),
+            "tun".into(),
+            TunNets {
+                v4: "198.18.0.1/30".parse().unwrap(),
+                v6: None,
+                nat: None,
+            },
+            Arc::clone(&gauge),
+            None,
+        ));
+        incoming_tx
+            .send((vec![1], spec.key.0, spec.key.1))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            probe.reading.notified().await;
+            probe.writing.notified().await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 1);
+        if abort {
+            task.abort();
+        }
+        drop(incoming_tx);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap();
+        if abort {
+            assert!(outcome.unwrap_err().is_cancelled());
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+        let released =
+            tokio::time::timeout(Duration::from_secs(2), probe.conn_dropped.notified()).await;
+        // Clean up the unfixed baseline too; the assertion must not rely on
+        // this external flush or the 60-second idle deadline.
+        flush.close_all_udp_sessions();
+        probe.release_read.notify_one();
+        assert!(
+            released.is_ok(),
+            "UDP loop stopped but its blocked flow retained the connection"
+        );
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_loop_eof_releases_blocked_flow() {
+        loop_stop_releases_blocked_flow(false).await;
+    }
+
+    #[tokio::test]
+    async fn tun_udp_loop_abort_releases_blocked_flow() {
+        loop_stop_releases_blocked_flow(true).await;
+    }
+
+    #[tokio::test]
+    async fn tun_udp_exit_joins_reader_before_closing_conn() {
+        let (tunnel, spec, tx, probe) = fixture();
+        let stop = async {
+            probe.reading.notified().await;
+            drop(tx);
+        };
+        // Poll the real relay in this task: after it returns, the assertion
+        // runs before a detached reader can incidentally get scheduled.
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), stop)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(
+            !probe.closed_while_reading.load(Ordering::SeqCst),
+            "connection closed while the reader still owned an in-flight read"
+        );
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_cancel_does_not_detach_reader() {
+        let (tunnel, spec, _tx, probe) = fixture();
+        let flow = tokio::spawn(async move { relay_flow(&tunnel, spec).await });
+        tokio::time::timeout(Duration::from_secs(2), probe.reading.notified())
+            .await
+            .unwrap();
+        flow.abort();
+        assert!(flow.await.unwrap_err().is_cancelled());
+        let released =
+            tokio::time::timeout(Duration::from_secs(2), probe.conn_dropped.notified()).await;
+        // Also release the baseline's leaked task, so a red test leaves no
+        // fixture task waiting indefinitely.
+        probe.release_read.notify_one();
+        assert!(
+            released.is_ok(),
+            "cancelled flow detached its reader and packet connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_udp_flush_during_write_joins_reader() {
+        let (tunnel, spec, tx, probe) = fixture();
+        tx.send(vec![1]).await.unwrap();
+        let flush = async {
+            probe.reading.notified().await;
+            probe.writing.notified().await;
+            tunnel.close_all_udp_sessions();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), flush)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(!probe.closed_while_reading.load(Ordering::SeqCst));
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_reader_error_finishes_without_rejoining_consumed_task() {
+        let (tunnel, spec, tx, probe) = fixture();
+        tx.send(vec![1]).await.unwrap(); // pending write must not hide reader death
+        let finish = async {
+            probe.reading.notified().await;
+            probe.release_read.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), finish)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("fixture reader ended"));
+        assert!(!probe.closed_while_reading.load(Ordering::SeqCst));
     }
 }

@@ -45,7 +45,8 @@ pub(super) fn resolve_windows(
     });
     let auto_conn = (auto_conn / connections.max(1) as u64).max(MIN_AUTO_CONN_WINDOW / 2);
     let max_conn = cfg.max_conn.unwrap_or(auto_conn);
-    let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW.min(max_conn));
+    // An explicit `max_stream` is clamped too: conn >= stream always holds.
+    let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW).min(max_conn);
     Windows {
         initial_stream: cfg
             .initial_stream

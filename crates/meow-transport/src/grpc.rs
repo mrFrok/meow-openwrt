@@ -74,11 +74,12 @@ impl Default for GrpcConfig {
 /// Transport layer that wraps an inner stream with gRPC (gun) framing over HTTP/2.
 pub struct GrpcLayer {
     config: GrpcConfig,
-    /// The last h2 connection `connect` opened: later tunnels open a new
-    /// stream on it (`reuse`) instead of a new TCP + TLS/REALITY session,
-    /// as mihomo/Xray gRPC clients do (meow-openwrt). Each REALITY
-    /// handshake makes the server fetch `dest`, so per-tunnel connections
-    /// cost a dest round trip every time.
+    /// The last h2 connection `connect_shared` opened: later tunnels open
+    /// a new stream on it (`reuse`) instead of a new TCP + TLS/REALITY
+    /// session, as mihomo/Xray gRPC clients do. A plain `connect` (relay
+    /// chains, probes) never populates it. Each REALITY handshake makes
+    /// the server fetch `dest`, so per-tunnel connections cost a dest
+    /// round trip every time.
     session: SharedH2Slot,
 }
 
@@ -144,6 +145,16 @@ impl Transport for GrpcLayer {
     }
 
     async fn connect_shared(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        // Single-flight on a slot miss: without the gate two concurrent
+        // misses each dial and `set` last-writer-wins, orphaning a conn.
+        // The second caller re-checks `reuse` behind the gate and opens a
+        // stream on the winner's connection instead (`MuxClient::offer`
+        // holds its pool lock across the dial the same way). Held across
+        // the dial, so it is a tokio Mutex; plain `connect` never takes it.
+        let _gate = self.session.dial.lock().await;
+        if let Some(stream) = self.reuse().await {
+            return Ok(stream);
+        }
         self.dial(inner, true).await
     }
 
@@ -159,12 +170,25 @@ impl GrpcLayer {
         // Validate the request before opening the h2 connection.
         self.request()?;
 
+        // A `reset` landing mid-dial invalidates the connection being set
+        // up — its socket may predate a new outbound binding (issue #695)
+        // — so `set` discards it when the generation captured here has
+        // moved on (`MuxClient::offer_new_locked` drops a straddling
+        // session the same way).
+        let generation = self.session.generation();
+
         // Perform the HTTP/2 client handshake over the inner stream, with
         // the proxy-sized receive windows (see `h2_common::client_builder`).
-        let (h2, conn) = crate::h2_common::client_builder()
-            .handshake::<_, Bytes>(inner)
-            .await
-            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
+        // Bounded: `connect_shared` callers hold the slot's dial gate, so
+        // the handshake needs its own ceiling independent of the caller's
+        // dial deadline.
+        let (h2, conn) = tokio::time::timeout(
+            crate::h2_common::OPEN_TIMEOUT,
+            crate::h2_common::client_builder().handshake::<_, Bytes>(inner),
+        )
+        .await
+        .map_err(|_| TransportError::Grpc("timed out in h2 handshake".into()))?
+        .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
 
         // The driver task processes h2 control frames; its last owner bounds
         // the shutdown flush (issue #669).
@@ -173,7 +197,9 @@ impl GrpcLayer {
         // (issue #669); only a working connection is offered for reuse.
         let stream = self.open(&session, true).await?;
         if share {
-            self.session.set(session);
+            if let Some(generation) = generation {
+                self.session.set(session, generation);
+            }
         }
         Ok(stream)
     }
@@ -343,11 +369,13 @@ struct GunStream {
     /// still stashed at `poll_shutdown` (i.e. the parked write was cancelled)
     /// is flushed together with the closing EOS frame, never discarded.
     pending_write: Option<Bytes>,
-    /// h2 conn driver task. The conn owns the inner stream's fd: dropping
+    /// h2 conn driver lease. The conn owns the inner stream's fd: dropping
     /// this stream's send/recv refs makes the driver self-terminate, but
-    /// only if its closing flush can make progress — the handle lets Drop
-    /// bound that wait (issue #669).
-    _conn_driver: StreamLease,
+    /// only if its closing flush can make progress — the lease keeps the
+    /// driver alive until Drop's bounded drain (issue #669). Received
+    /// bytes are reported through it so the connection's liveness is
+    /// proven by the peer, not by submissions (see `SharedH2::alive`).
+    conn_driver: StreamLease,
 }
 
 impl GunStream {
@@ -358,7 +386,7 @@ impl GunStream {
             read_buf: Bytes::new(),
             pending_frame: Vec::new(),
             pending_write: None,
-            _conn_driver: conn_driver,
+            conn_driver,
         }
     }
 }
@@ -429,10 +457,18 @@ impl AsyncRead for GunStream {
             // ── Need more bytes from the h2 DATA stream ───────────────────────
             // Resolving the response is part of the read path, not of
             // `connect()`; see `h2_common::RecvState`.
+            let awaiting_headers = this.recv.stream().is_none();
             match this.recv.poll_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) => {
+                    // Response headers just arrived — the conn proved
+                    // itself (stamping on every resolved poll would mask
+                    // a conn that went silent afterwards).
+                    if awaiting_headers {
+                        this.conn_driver.note_recv();
+                    }
+                }
             }
             let recv = this.recv.stream().expect("poll_ready resolved Ok");
             match recv.poll_data(cx) {
@@ -444,6 +480,7 @@ impl AsyncRead for GunStream {
                 Poll::Ready(Some(Ok(bytes))) => {
                     // Release flow-control window back to the sender.
                     let _ = recv.flow_control().release_capacity(bytes.len());
+                    this.conn_driver.note_recv();
                     this.pending_frame.extend_from_slice(&bytes);
                     // loop → re-check pending_frame for a complete frame
                 }

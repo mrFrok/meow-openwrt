@@ -5,6 +5,8 @@
 
 pub mod auth;
 pub mod dns_parser;
+mod dns_proxy;
+mod dns_response_rules;
 pub mod dropped_providers;
 pub mod ech_dns;
 // Force-disabled on iOS/Android: mobile apps embed their own UI and must not
@@ -189,8 +191,10 @@ pub enum ListenerSpec {
         #[serde(default = "default_udp_timeout_secs")]
         udp_timeout: u64,
         /// TCP by real TPROXY (local address = original destination)
-        /// instead of REDIRECT; requires `firewall: false`. Set by the
-        /// mihomo-style `tproxy-port` shorthand.
+        /// instead of REDIRECT; requires `firewall: false`. Set by a
+        /// `listeners:` `type: tproxy` entry's `transparent:` key and, in
+        /// meow-openwrt, by the `tproxy-port` shorthand (mihomo semantics;
+        /// upstream keeps that shorthand managed-REDIRECT, meow-rs#901).
         #[serde(default)]
         transparent: bool,
     },
@@ -421,6 +425,16 @@ pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net 
         .expect("the default fake-IP range is an IPv4 /16")
 }
 
+/// Reject capacities Tokio cannot represent before any listener starts.
+fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
+    anyhow::ensure!(
+        value <= tokio::sync::Semaphore::MAX_PERMITS,
+        "max-connections exceeds the runtime maximum ({})",
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+    Ok(())
+}
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
 /// `tun.auto-redirect` (mihomo's key; Linux, meow-openwrt): TCP is captured
@@ -579,6 +593,7 @@ pub fn parse_tun_config(
     global_max_connections: Option<usize>,
     fake_ip_range: Option<&str>,
 ) -> Result<TunConfig, anyhow::Error> {
+    validate_connection_limit(global_max_connections.unwrap_or(256))?;
     let Some(r) = raw else {
         // Keep the global-cap folding symmetric with the `Some` arm: an
         // absent section still inherits `max-connections`, so callers
@@ -1676,6 +1691,7 @@ pub async fn parse_dns_from_raw(
     prior_resolver: Option<&meow_dns::Resolver>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(raw)?;
     let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
@@ -1706,6 +1722,9 @@ pub async fn parse_dns_from_raw(
     } else {
         HashMap::new()
     };
+    let bound_proxies =
+        dialer_registry.map(|generation| dns_proxy::registry(proxy_registry, generation));
+    let proxy_registry = bound_proxies.as_ref().unwrap_or(proxy_registry);
     let dns = dns_parser::parse_dns(
         raw,
         geo.mmdb_path.as_deref(),
@@ -2518,9 +2537,6 @@ fn build_proxy_layer(
         } else {
             meow_proxy::DirectAdapter::new()
         };
-        if let Some(mark) = raw.routing_mark {
-            direct = direct.with_routing_mark(mark);
-        }
         if let Some(slot) = resolver.cloned() {
             direct = direct.with_resolver_slot(slot);
         }
@@ -3074,6 +3090,7 @@ fn rebuild_from_raw_impl(
     // and validation/test rebuilds must not reach the network.
     fetch_geodata: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(raw)?;
     // Top-level `strict: true` (issue #533): warn-skipped defects in
     // *operator-authored* content become hard errors — proxies,
     // proxy-groups and rules are covered inside
@@ -3243,7 +3260,9 @@ fn rebuild_from_raw_impl(
     // Parse sub-rules before top-level rules so that SUB-RULE entries in
     // `rules:` can resolve against already-built blocks.
     let sub_rules = match raw.sub_rules.as_ref() {
-        Some(map) if !map.is_empty() => sub_rules_parser::parse_sub_rules(map, &ruleset_map, ctx)?,
+        Some(map) if !map.is_empty() => {
+            sub_rules_parser::parse_sub_rules(map, &ruleset_map, ctx, strict)?
+        }
         _ => HashMap::new(),
     };
 
@@ -4227,35 +4246,16 @@ fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
     if !enabled {
         return false;
     }
-    raw.dns
-        .as_ref()
-        .and_then(|dns| dns.nameserver_policy.as_ref())
-        .is_some_and(|policy| {
-            // Expand per segment like the policy builder — a mixed key
-            // (`"+.a,geosite:cn"`) puts the prefix on a non-leading segment
-            // the whole-key check would miss (issue #514 review).
-            policy
-                .keys()
-                .flat_map(|key| dns_parser::expand_policy_keys(key))
-                .any(|ek| ek.to_ascii_lowercase().starts_with("geosite:"))
-        })
+    dns_parser::dns_policy_keys(raw)
+        .flat_map(dns_parser::expand_policy_keys)
+        .any(|key| key.to_ascii_lowercase().starts_with("geosite:"))
 }
 
 fn collect_dns_policy_geosite_categories(
     raw: &raw::RawConfig,
 ) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    let Some(policy) = raw
-        .dns
-        .as_ref()
-        .and_then(|dns| dns.nameserver_policy.as_ref())
-    else {
-        return out;
-    };
-    for expanded in policy
-        .keys()
-        .flat_map(|key| dns_parser::expand_policy_keys(key))
-    {
+    for expanded in dns_parser::dns_policy_keys(raw).flat_map(dns_parser::expand_policy_keys) {
         let lower = expanded.to_ascii_lowercase();
         let Some(rest) = lower.strip_prefix("geosite:") else {
             continue;
@@ -4475,17 +4475,6 @@ pub(crate) fn resolve_listener_bind(
     )
 }
 
-/// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
-/// Hard errors on unknown types (Class A per ADR-0002).
-///
-/// `per-listener` fields (`tproxy-sni`/`firewall`/`udp`/`udp-timeout` on the
-/// raw entry, plus `global_tproxy_sni`) are folded into the `TProxy` variant
-/// here so the returned spec is always complete — callers never need to
-/// overwrite a placeholder value. Fields that don't apply to the listener's
-/// type are ignored; `firewall`/`udp`/`udp-timeout` misuse is diagnosed by
-/// the caller (which has the listener name in scope). `Shadowsocks` returns
-/// a placeholder spec; `build_named_listeners`
-/// completes it via `build_ss_listener_spec`.
 /// mihomo `listeners:` types meow has no inbound for (server-side protocols,
 /// and `tun`, which meow configures from the top-level `tun:` section).
 const SERVER_ONLY_INBOUNDS: &[&str] = &[
@@ -4504,10 +4493,42 @@ const SERVER_ONLY_INBOUNDS: &[&str] = &[
     "tun",
 ];
 
+/// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
+/// Hard errors on unknown types (Class A per ADR-0002).
+///
+/// `per-listener` fields (`tproxy-sni`/`firewall`/`udp`/`udp-timeout` on the
+/// raw entry, plus `global_tproxy_sni`) are folded into the `TProxy` variant
+/// here so the returned spec is always complete — callers never need to
+/// overwrite a placeholder value. Fields that don't apply to the listener's
+/// type are ignored; `firewall`/`udp`/`udp-timeout` misuse is diagnosed by
+/// the caller (which has the listener name in scope). `Shadowsocks` returns
+/// a placeholder spec; `build_named_listeners`
+/// completes it via `build_ss_listener_spec`.
+///
+/// `sniffer_declared` says the raw config carries an explicit `sniffer:`
+/// block (even `enable: false`) — the deliberate knob then defeats the
+/// deprecated `tproxy-sni` synthesis on every arm that carries `sni`, or
+/// `tproxy-sni: true` + `sniffer.enable: false` would still sniff (the
+/// listener's synthesized runtime survives `with_sniffer`'s off state).
 fn parse_listener_spec(
     raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
+    sniffer_declared: bool,
 ) -> Result<ListenerSpec, anyhow::Error> {
+    // The resolved `sni` for `TProxy`-shaped arms — deprecated `tproxy-sni`,
+    // dead once a `sniffer:` section exists.
+    let tproxy_shaped = matches!(
+        raw_l.listener_type.to_lowercase().as_str(),
+        "redir" | "tproxy"
+    );
+    if tproxy_shaped && sniffer_declared && raw_l.tproxy_sni.is_some() {
+        warn!(
+            "listeners[{}]: `tproxy-sni` is ignored — the `sniffer:` block \
+             takes precedence (deprecated alias)",
+            raw_l.name
+        );
+    }
+    let sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni) && !sniffer_declared;
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
@@ -4515,13 +4536,37 @@ fn parse_listener_spec(
         "socks5" | "socks" => Ok(ListenerSpec::Socks5),
         // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
         // rules — the deployer's REDIRECT rules steer traffic here.
-        "redir" => Ok(ListenerSpec::TProxy {
-            sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
-            firewall: false,
-            udp: false,
-            udp_timeout: default_udp_timeout_secs(),
-            transparent: false,
-        }),
+        "redir" => {
+            for (key, set) in [
+                ("firewall", raw_l.firewall.is_some()),
+                ("udp", raw_l.udp.is_some()),
+                ("udp-timeout", raw_l.udp_timeout.is_some()),
+                ("transparent", raw_l.transparent.is_some()),
+                ("cipher", raw_l.cipher.is_some()),
+                ("password", raw_l.password.is_some()),
+                ("simple-obfs", raw_l.simple_obfs.is_some()),
+                ("shadow-tls", raw_l.shadow_tls.is_some()),
+                ("res-tls", raw_l.res_tls.is_some()),
+                ("jls-config", raw_l.jls_config.is_some()),
+                ("kcp-tun", raw_l.kcp_tun.is_some()),
+                ("mux-option", raw_l.mux_option.is_some()),
+            ] {
+                if set {
+                    warn!(
+                        "listeners[{}]: `{key}` is ignored on `type: redir` \
+                         (REDIRECT TCP, rules owned by the deployer)",
+                        raw_l.name
+                    );
+                }
+            }
+            Ok(ListenerSpec::TProxy {
+                sni,
+                firewall: false,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
+                transparent: false,
+            })
+        }
         "tproxy" => {
             // #564: `udp` is opt-in and IPv4-only in this release, and the
             // managed firewall only produces host TCP OUTPUT REDIRECT rules —
@@ -4529,6 +4574,30 @@ fn parse_listener_spec(
             // combination is rejected rather than silently TCP-only.
             let udp = raw_l.udp.unwrap_or(false);
             let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
+            if raw_l.transparent.is_none() {
+                warn!(
+                    "listeners[{}]: mihomo's `type: tproxy` is real TPROXY — meow \
+                     defaults to REDIRECT for backward compatibility; set \
+                     `transparent: true` for upstream semantics (requires \
+                     `firewall: false`)",
+                    raw_l.name
+                );
+            }
+            // mihomo's `type: tproxy` is real TPROXY: `transparent: true`.
+            let transparent = raw_l.transparent.unwrap_or(false);
+            if transparent && firewall {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TCP by TPROXY) requires \
+                     `firewall: false` — meow's managed rules are REDIRECT",
+                    raw_l.name
+                );
+            }
+            if transparent && !cfg!(target_os = "linux") {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TPROXY) is Linux-only",
+                    raw_l.name
+                );
+            }
             if udp && firewall {
                 anyhow::bail!(
                     "listeners[{}]: `udp: true` requires `firewall: false` — meow does \
@@ -4555,11 +4624,11 @@ fn parse_listener_spec(
                 None => default_udp_timeout_secs(),
             };
             Ok(ListenerSpec::TProxy {
-                sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
+                sni,
                 firewall,
                 udp,
                 udp_timeout,
-                transparent: false,
+                transparent,
             })
         }
         "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
@@ -4569,7 +4638,7 @@ fn parse_listener_spec(
             simple_obfs: None,
         })),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, or shadowsocks"
+            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, or shadowsocks"
         ),
     }
 }
@@ -4809,10 +4878,19 @@ fn build_named_listeners(
     default_bind: &str,
     global_tproxy_sni: bool,
 ) -> Result<Vec<NamedListener>, anyhow::Error> {
+    // An explicit `sniffer:` block — even `enable: false` — is the newer,
+    // deliberate knob: the deprecated `tproxy-sni` synthesis must not
+    // outlive it (its private runtime survives `with_sniffer`'s off
+    // state, so a global disable would still sniff). Deadens the global
+    // default for the shorthands below; per-listener `tproxy-sni` is
+    // deadened inside `parse_listener_spec`.
+    let sniffer_declared = raw.sniffer.is_some();
+    let global_tproxy_sni = global_tproxy_sni && !sniffer_declared;
     let mut result: Vec<NamedListener> = Vec::new();
     let mut used_ports: HashMap<u16, String> = HashMap::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let global_max_conns = raw.max_connections.unwrap_or_else(default_max_connections);
+    validate_connection_limit(global_max_conns)?;
 
     let mut listener_proxies: Vec<(String, String)> = Vec::new();
     let mut add = |name: &str,
@@ -4821,6 +4899,8 @@ fn build_named_listeners(
                    listen: &str,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
+        validate_connection_limit(max_connections)
+            .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
         // a distinct port at runtime, so they are not duplicates of each other.
         if port != 0 {
@@ -4902,6 +4982,7 @@ fn build_named_listeners(
     // (OpenWrt front-ends generate them), bound like the other shorthands.
     // Upstream meow's `tproxy-port` instead installs managed host REDIRECT
     // rules on loopback; that mode stays available via `listeners:`.
+    // A permanent fork delta: upstream keeps its meaning (meow-rs#901).
     if let Some(port) = raw.redir_port.filter(|p| *p != 0) {
         add(
             "redir",
@@ -4951,7 +5032,10 @@ fn build_named_listeners(
             );
             continue;
         }
-        let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
+        // `type: redir` lowers to a `TProxy` spec, which erases its origin —
+        // the listen-default and warn-dedupe branches below still need it.
+        let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
+        let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
@@ -4968,6 +5052,9 @@ fn build_named_listeners(
         }
         match (&spec, raw_l.udp_timeout) {
             (ListenerSpec::TProxy { udp: true, .. }, _) | (_, None) => {}
+            // `type: redir` already warned that `udp-timeout` is ignored
+            // on it at spec-parse — don't warn a second time here.
+            (ListenerSpec::TProxy { .. }, Some(_)) if is_redir => {}
             (ListenerSpec::TProxy { .. }, Some(_)) => warn!(
                 "listeners[{}].udp-timeout: has no effect unless `udp: true` is set; \
                  remove it to suppress this warning",
@@ -4993,11 +5080,34 @@ fn build_named_listeners(
                 raw_l.name
             );
         }
-        let listen_raw = raw_l.listen.as_deref().unwrap_or({
-            if matches!(spec, ListenerSpec::TProxy { .. }) {
-                "127.0.0.1"
-            } else {
+        // `transparent` is tproxy-only — on `type: redir` it already
+        // warned at spec-parse, so non-TProxy specs are all that remain.
+        if raw_l.transparent.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
+            warn!(
+                "listeners[{}].transparent: only meaningful on `type: tproxy`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        let listen_raw = raw_l.listen.as_deref().unwrap_or_else(|| {
+            // A `type: redir` or `transparent: true` entry only ever sees
+            // PREROUTING-steered traffic, which the kernel delivers to the
+            // inbound interface address — a loopback default would be a
+            // dead listener, so those take the allow-lan-honoring bind the
+            // port shorthands use. Other tproxy entries keep the
+            // historical 127.0.0.1 default (issue #563 shape).
+            let gateway_facing = is_redir
+                || matches!(
+                    spec,
+                    ListenerSpec::TProxy {
+                        transparent: true,
+                        ..
+                    }
+                );
+            if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
                 default_bind
+            } else {
+                "127.0.0.1"
             }
         });
         let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
@@ -5092,6 +5202,7 @@ pub async fn build_config(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(&raw)?;
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
@@ -5190,8 +5301,8 @@ pub async fn build_config(
     //      depends on the placeholder built in step 1.
     //
     // Both passes publish into ONE shared `dialer-proxy` registry: pass-1
-    // adapters are retained by the DNS resolver (`#PROXY` nameservers) and
-    // by rule-provider fetch contexts for the app's whole first generation,
+    // adapters may be retained by rule-provider fetch contexts for the
+    // first generation; DNS resolves named proxies through this shared cell,
     // and the shared cell lets them resolve the pass-2 snapshot rather than
     // a stale pass-1 map (issue #533).
     let dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -5297,11 +5408,14 @@ pub async fn build_config(
     // DNS — pass the explicit mmdb path so fallback-filter GeoIP uses the
     // same path as the rule engine, plus the proxy registry from step 1
     // so #PROXY-tagged nameservers can resolve their referenced adapter.
+    // Bind DNS to the published generation rather than retaining pass-1 groups.
+    // Weak targets avoid a resolver -> DIRECT -> resolver ownership cycle.
+    let dns_proxies = dns_proxy::registry(&proxies, &dialer_registry);
     let dns_config = dns_parser::parse_dns(
         &raw,
         geodata.mmdb_path.as_deref(),
         cache_dir,
-        &proxies,
+        &dns_proxies,
         ctx.geosite.clone(),
         &rule_providers,
         None,
@@ -5347,7 +5461,11 @@ pub async fn build_config(
         bind_address: bind_addr,
         tproxy_port: raw.tproxy_port,
         tproxy_sni: global_tproxy_sni,
-        routing_mark: raw.routing_mark,
+        // `Some(0)` means "unset" like `None` (`set_routing_mark` stores 0
+        // for both) — normalize here so no downstream consumer can read a
+        // literal mark-0 as "exempt unmarked traffic" (see
+        // `FirewallGuard::setup`, which filters again defensively).
+        routing_mark: raw.routing_mark.filter(|m| *m != 0),
         tcp_keepalive,
         named: named_listeners,
     };
@@ -8669,7 +8787,7 @@ rules:
              udp-timeout: 18446744073709551615\n",
         )
         .unwrap();
-        let err = parse_listener_spec(&raw_l, false)
+        let err = parse_listener_spec(&raw_l, false, false)
             .expect_err("absurd listener udp-timeout must be rejected");
         assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
     }
@@ -10049,5 +10167,69 @@ mod max_connections_default_tests {
         assert_eq!(auto_max_connections(mib(256)), 1024);
         assert_eq!(auto_max_connections(mib(1024)), 4096);
         assert_eq!(auto_max_connections(mib(64 << 10)), 16_384, "ceiling");
+    }
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_global_connection_limit_is_a_config_error() {
+        let raw = raw::RawConfig {
+            mixed_port: Some(1080),
+            max_connections: Some(tokio::sync::Semaphore::MAX_PERMITS + 1),
+            ..Default::default()
+        };
+        assert!(build_named_listeners(&raw, "127.0.0.1", false).is_err());
+    }
+
+    #[test]
+    fn oversized_named_connection_limit_is_a_config_error() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&format!(
+            "listeners:\n  - name: test\n    type: mixed\n    port: 0\n    max-connections: {}\n",
+            tokio::sync::Semaphore::MAX_PERMITS + 1
+        ))
+        .unwrap();
+        assert!(build_named_listeners(&raw, "127.0.0.1", false).is_err());
+    }
+
+    #[test]
+    fn tun_parser_rejects_unrepresentable_connection_limit() {
+        let oversized = Some(tokio::sync::Semaphore::MAX_PERMITS + 1);
+        assert!(parse_tun_config(None, oversized, None).is_err());
+        assert!(parse_tun_config(Some(&raw::RawTun::default()), oversized, None).is_err());
+    }
+
+    #[test]
+    fn connection_limit_boundaries_preserve_existing_semantics() {
+        for limit in [0, 256, tokio::sync::Semaphore::MAX_PERMITS] {
+            let raw = raw::RawConfig {
+                mixed_port: Some(1080),
+                max_connections: Some(limit),
+                ..Default::default()
+            };
+            let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+            assert_eq!(listeners[0].max_connections, limit);
+            assert_eq!(
+                parse_tun_config(None, Some(limit), None)
+                    .unwrap()
+                    .max_connections,
+                limit
+            );
+        }
+        let raw = raw::RawConfig {
+            mixed_port: Some(1080),
+            ..Default::default()
+        };
+        // meow-openwrt: the default scales with RAM (`default_max_connections`).
+        assert_eq!(
+            build_named_listeners(&raw, "127.0.0.1", false).unwrap()[0].max_connections,
+            default_max_connections()
+        );
+        assert_eq!(
+            parse_tun_config(None, None, None).unwrap().max_connections,
+            default_max_connections()
+        );
     }
 }

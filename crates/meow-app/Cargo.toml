@@ -34,9 +34,12 @@ logbook = ["meow-common/logbook"]
 traffic-ledger = ["meow-common/traffic-ledger"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
-# mimalloc as the global allocator instead of the libc one (musl mallocng on
-# OpenWrt); a memory/CPU trade-off measured in openwrt-fork/BENCHMARKS.md.
-mimalloc = ["dep:mimalloc"]
+# mimalloc global allocator — opt-in on every target. meow-openwrt: upstream
+# forces it on musl; here it stays a choice (a memory/CPU trade-off measured
+# in openwrt-fork/PLAN.md). Mutually exclusive with dhat-heap by cfg in main.rs.
+alloc-mimalloc = ["dep:mimalloc"]
+# The fork's earlier name for the same feature (ci/build.sh EXTRA_FEATURES).
+mimalloc = ["alloc-mimalloc"]
 
 # Protocol features — forwarded to meow-proxy and meow-config
 ss = ["meow-config/ss", "meow-proxy/ss"]
@@ -95,7 +98,9 @@ listener-mixed = ["meow-listener/listener-mixed"]
 # TUN inbound (issue #326) — transparent proxy without a tproxy/REDIRECT
 # firewall; the only transparent-proxy mode available on Windows.
 listener-tun = ["meow-listener/listener-tun", "meow-api/listener-tun"]
-# lwIP memory on demand instead of ~3.2 MB of static pools (routers).
+# lwIP memory from libc malloc on demand instead of ~3.2 MB of static
+# pools in .bss (meow-lwip `libc-malloc`). Off in every bundle; for
+# memory-tight Linux devices.
 lwip-libc-malloc = ["meow-listener/lwip-libc-malloc"]
 # Shadowsocks encrypted-server inbound. In `full` (about 200 KiB on
 # x86_64; the `shadowsocks` crate is already there for the `ss` outbound).
@@ -166,8 +171,22 @@ dashmap = { workspace = true }
 libc = "0.2"
 log = "0.4"
 dhat = { workspace = true, optional = true }
-mimalloc = { workspace = true, optional = true }
 same-file = { workspace = true }
+
+# mimalloc semantics (see main.rs for the matching code gate): opt-in via
+# --features alloc-mimalloc on linux/android.
+# v2 line pinned deliberately: libmimalloc-sys 0.1.49+ vendors mimalloc v3,
+# whose 3.3.x has a multi-threaded heap-corruption SIGSEGV upstream
+# (microsoft/mimalloc#1287) — wrong gamble for a long-running tokio daemon.
+# The v2 feature selects the vendored v2 source; a sys crate that drops the
+# flag fails to resolve loudly rather than silently shipping v3, while the
+# Cargo.lock pin on libmimalloc-sys is the actual version guarantee.
+# No `override` feature: on musl static links it collides with musl's own
+# malloc symbol (microsoft/mimalloc#243); C deps like BoringSSL keep musl
+# malloc, only the Rust heap moves to mimalloc.
+# meow-openwrt: optional on musl as well (see the `alloc-mimalloc` feature).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+mimalloc = { version = "0.1", optional = true, features = ["v2"] }
 
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2.5"

@@ -3,6 +3,7 @@ use crate::cache::{
 };
 use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
+use crate::response_policy::{ResponseAction, ResponseRule};
 use crate::upstream::{H3Policy, HostOrIp, NameServerEntry, NameServerUrl};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -44,7 +45,7 @@ impl From<Vec<IpAddr>> for HostEntry {
 #[non_exhaustive]
 pub enum BootstrapError {
     #[error(
-        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
+        "default-nameserver entry '{entry}' must use an IP literal — a bootstrap root cannot carry a hostname that itself needs resolving"
     )]
     DefaultNameserverNotPlain { entry: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
@@ -326,6 +327,7 @@ pub struct Resolver {
     /// [`InflightMap`].
     inflight: [InflightMap; 3],
     policy: Option<NameserverPolicy>,
+    response_rules: Vec<ResponseRule>,
     fallback_filter: Option<FallbackFilter>,
     /// IPv4 fake-IP pool (None when fake-ip mode is disabled or only v6 is configured).
     fakeip_v4: Option<Arc<Pool>>,
@@ -347,6 +349,44 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// Install wire-response rules after configuring the fake-IP pools.
+    pub fn set_response_rules(&mut self, rules: Vec<ResponseRule>) -> Result<(), &'static str> {
+        if rules
+            .iter()
+            .any(|rule| rule.action == ResponseAction::FakeIp)
+            && (self.mode != DnsMode::FakeIp
+                || (self.fakeip_v4.is_none() && self.fakeip_v6.is_none()))
+        {
+            return Err("dns.response-rules: fake-ip requires enhanced-mode: fake-ip and a pool");
+        }
+        self.response_rules = rules;
+        Ok(())
+    }
+
+    pub(crate) fn has_response_rules(&self) -> bool {
+        !self.response_rules.is_empty()
+    }
+
+    pub(crate) fn response_action(&self, host: &str, qtype: u16) -> Option<ResponseAction> {
+        // Address aliases are explicit hosts overrides too. Generic types
+        // still use response rules, because the hosts table cannot answer them.
+        if matches!(qtype, 1 | 28) && self.use_hosts && self.hosts.search(host).is_some() {
+            return None;
+        }
+        self.response_rules
+            .iter()
+            .find(|rule| rule.matches(host, qtype))
+            .map(|rule| rule.action)
+    }
+
+    pub(crate) fn response_fake_ip(&self, host: &str, qtype: u16) -> Option<IpAddr> {
+        match qtype {
+            1 => self.fakeip_v4.as_ref().map(|pool| pool.lookup(host)),
+            28 if self.ipv6 => self.fakeip_v6.as_ref().map(|pool| pool.lookup(host)),
+            _ => None,
+        }
+    }
+
     /// The global (main) upstream clients — exposed so config-layer tests
     /// can assert which adapters `#PROXY`-tagged nameserver entries
     /// captured.
@@ -386,34 +426,6 @@ fn clamp_ttl(raw: Duration) -> Duration {
     const MIN_TTL: Duration = Duration::from_secs(10);
     const MAX_TTL: Duration = Duration::from_secs(3600);
     raw.clamp(MIN_TTL, MAX_TTL)
-}
-
-fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
-    match url {
-        NameServerUrl::Udp { addr, port } | NameServerUrl::Tcp { addr, port } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, *port)
-        }
-        NameServerUrl::Tls { addr, .. }
-        | NameServerUrl::Https { addr, .. }
-        | NameServerUrl::Quic { addr, .. } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, 53)
-        }
-        NameServerUrl::RCode { .. } => {
-            unreachable!("rcode default-nameserver does not have a socket address")
-        }
-    }
 }
 
 /// Read the platform's configured recursive resolvers, used as bootstrap
@@ -861,6 +873,7 @@ impl Resolver {
             use_hosts,
             inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy: None,
+            response_rules: Vec::new(),
             fallback_filter: None,
             fakeip_v4: None,
             fakeip_v6: None,
@@ -1082,14 +1095,10 @@ impl Resolver {
                 default_ns
                     .iter()
                     .map(|ns| {
-                        let c = match ns {
-                            NameServerUrl::RCode { code, .. } => DnsClient::rcode(*code),
-                            NameServerUrl::Tcp { .. } => {
-                                DnsClient::tcp(url_to_plain_socketaddr(ns))
-                            }
-                            _ => DnsClient::udp(url_to_plain_socketaddr(ns)),
-                        };
-                        Arc::new(c.with_timeout(Duration::from_secs(3)))
+                        Arc::new(
+                            Self::build_resolver_client(ns, &HashMap::new(), None)
+                                .with_timeout(Duration::from_secs(3)),
+                        )
                     })
                     .collect()
             };
@@ -1159,6 +1168,7 @@ impl Resolver {
             use_hosts,
             inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy,
+            response_rules: Vec::new(),
             fallback_filter,
             fakeip_v4: None,
             fakeip_v6: None,
@@ -1204,6 +1214,14 @@ impl Resolver {
         resolved: &HashMap<String, IpAddr>,
         proxy: Option<Arc<dyn meow_common::Proxy>>,
     ) -> Arc<DnsClient> {
+        Arc::new(Self::build_resolver_client(url, resolved, proxy))
+    }
+
+    fn build_resolver_client(
+        url: &NameServerUrl,
+        resolved: &HashMap<String, IpAddr>,
+        proxy: Option<Arc<dyn meow_common::Proxy>>,
+    ) -> DnsClient {
         let (socket_addr, proxy_target) = match url {
             NameServerUrl::Udp { addr, port }
             | NameServerUrl::Tcp { addr, port }
@@ -1248,7 +1266,7 @@ impl Resolver {
                     Some(p) => client.with_proxy(p),
                     None => client,
                 };
-                return Arc::new(client);
+                return client;
             }
         };
         let label = encrypted_upstream_label(url);
@@ -1320,12 +1338,11 @@ impl Resolver {
             Some(label) => client.with_upstream_label(label),
             None => client,
         };
-        let client = match (proxy, proxy_target) {
+        match (proxy, proxy_target) {
             (Some(p), Some((host, port))) => client.with_proxy(p).with_proxy_target(host, port),
             (Some(p), None) => client.with_proxy(p),
             (None, _) => client,
-        };
-        Arc::new(client)
+        }
     }
 
     /// Resolve `host` to every enabled address.
@@ -2216,7 +2233,28 @@ impl Resolver {
         if self.use_hosts && self.hosts.search(host).is_some() {
             return false;
         }
-        (self.fakeip_v4.is_some() || self.fakeip_v6.is_some()) && !self.skipper_bypasses(host)
+        if self.response_rules.is_empty() {
+            return (self.fakeip_v4.is_some() || self.fakeip_v6.is_some())
+                && !self.skipper_bypasses(host);
+        }
+        [
+            (1, self.fakeip_v4.is_some()),
+            // The ordinary v4-only fake-IP path suppresses AAAA too
+            // (lookup_ipv6_local), even without an explicit fake-ip rule.
+            (
+                28,
+                self.ipv6 && (self.fakeip_v6.is_some() || self.fakeip_v4.is_some()),
+            ),
+        ]
+        .into_iter()
+        .any(|(qtype, enabled)| match self.response_action(host, qtype) {
+            // A forced family without a pool answers NODATA. Real hints
+            // must not bypass that decision, even if the other family was
+            // already suppressed by an earlier rule.
+            Some(ResponseAction::FakeIp) => true,
+            Some(ResponseAction::Forward) | None => enabled && !self.skipper_bypasses(host),
+            _ => false,
+        })
     }
 
     /// True if `ip` is an active fake-IP allocation (either family).
@@ -2280,6 +2318,12 @@ impl Resolver {
     /// device (loop-free capture — real IPs never re-enter the tun).
     pub fn fake_ip_v4_net(&self) -> Option<ipnet::IpNet> {
         self.fakeip_v4.as_ref().map(|p| p.ipnet())
+    }
+
+    /// The optional IPv6 fake-IP pool prefix. TUN main-table routes need
+    /// this too: Linux's policy rules capture host-originated traffic only.
+    pub fn fake_ip_v6_net(&self) -> Option<ipnet::IpNet> {
+        self.fakeip_v6.as_ref().map(|p| p.ipnet())
     }
 
     /// The v4 fake-IP pool gateway (network + 1, e.g. `198.18.0.1`), which
@@ -4884,5 +4928,55 @@ mod tests {
             "fenced fallback must return exactly the enabled-family subset \
              of the system answer (v6 leaked if this differs)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "encrypted"))]
+mod bootstrap_transport_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn assert_tls_bootstrap(scheme: &str, suffix: &str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolve = Resolver::new_with_bootstrap(
+            vec![NameServerUrl::parse("tls://bootstrap-target.invalid").unwrap()],
+            vec![],
+            vec![NameServerUrl::parse(&format!("{scheme}://127.0.0.1:{port}{suffix}")).unwrap()],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+            None,
+            None,
+        );
+        let observe = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 3];
+            socket.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(
+                &prefix[..2],
+                &[0x16, 0x03],
+                "expected a TLS handshake record"
+            );
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("configured encrypted bootstrap port was never contacted"),
+            _ = observe => {},
+            result = resolve => panic!(
+                "bootstrap completed before TLS transport was observed: {:?}",
+                result.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_bootstrap_preserves_transport_and_port() {
+        assert_tls_bootstrap("tls", "#bootstrap.test").await;
+    }
+
+    #[tokio::test]
+    async fn doh_bootstrap_preserves_transport_and_port() {
+        assert_tls_bootstrap("https", "/dns-query#bootstrap.test").await;
     }
 }

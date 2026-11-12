@@ -897,9 +897,11 @@ impl DnsClient {
     /// - DoT / DoH exchanges dial `proxy.dial_tcp` and run the TLS
     ///   handshake over the returned [`meow_common::ProxyConn`] via
     ///   [`TlsLayer::connect_typed`].
-    /// - UDP exchanges fall through to TCP-over-proxy, since most proxy
-    ///   adapters can't relay arbitrary UDP. The fallback matches the
-    ///   semantics in ADR-0012.
+    /// - Literal-address UDP exchanges use the adapter's datagram support
+    ///   when available. TCP-only adapters and hostname upstreams retain
+    ///   TCP-over-proxy; explicit TCP entries always remain TCP.
+    /// - A validated truncated UDP answer retries through the same proxy's
+    ///   TCP transport under the original query deadline.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
         #[cfg(feature = "quic-dns")]
         {
@@ -1741,6 +1743,11 @@ impl DnsClient {
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
         if let Some(proxy) = self.proxy.as_ref() {
+            if let Transport::Udp { addr } = &self.transport {
+                if proxy.support_udp() && self.proxy_target.is_none() {
+                    return proxy_udp_exchange(self, proxy, *addr, wire, expected).await;
+                }
+            }
             match &self.transport {
                 Transport::Udp { .. } | Transport::Tcp { .. } => {
                     let response = self.proxy_tcp_exchange(proxy, wire).await?;
@@ -1944,6 +1951,87 @@ fn tls_connect_error<S>(err: meow_transport::tls::ConnectTypedError<S>) -> Clien
         other => ClientError::Tls(other.to_string()),
     }
 }
+
+/// The packet association belongs to this query future. Dropping an exchange
+/// on success, error, timeout or caller cancellation always signals close.
+struct DnsPacket(Box<dyn meow_common::ProxyPacketConn>);
+
+impl Drop for DnsPacket {
+    fn drop(&mut self) {
+        let _ = self.0.close();
+    }
+}
+
+async fn proxy_udp_exchange(
+    client: &DnsClient,
+    proxy: &DnsProxy,
+    addr: SocketAddr,
+    wire: &[u8],
+    expected: &ExpectedResponse,
+) -> Result<Message, ClientError> {
+    use meow_common::{ConnType, Metadata, Network};
+    // Same canonicalization as proxy_dial: an adapter dialing dst_ip
+    // verbatim (DirectAdapter) fails on v4-mapped IPv6 nameservers.
+    let addr = meow_common::canonical_socket_addr(addr);
+    let metadata = Metadata {
+        network: Network::Udp,
+        conn_type: ConnType::Inner,
+        host: smol_str::SmolStr::from(addr.ip().to_string()),
+        dst_ip: Some(addr.ip()),
+        dst_port: addr.port(),
+        internal: true,
+        ..Default::default()
+    };
+    let packet = DnsPacket(
+        meow_common::socket_protect::dns_via_proxy_dial_scope(proxy.dial_udp(&metadata))
+            .await
+            .map_err(|e| e.into_io_error("dns-via-proxy UDP dial"))?,
+    );
+    let written = packet
+        .0
+        .write_packet(wire, &addr)
+        .await
+        .map_err(|e| e.into_io_error("dns-via-proxy UDP send"))?;
+    if written != wire.len() {
+        return Err(ClientError::Protocol("short DNS datagram write"));
+    }
+    // The full DNS wire limit, bounded per query. A shorter receive buffer
+    // could silently truncate a datagram before its DNS TC flag is examined.
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = packet
+            .0
+            .read_packet(&mut buf)
+            .await
+            .map_err(|e| e.into_io_error("dns-via-proxy UDP receive"))?;
+        // Bound transports may report an unspecified source by contract.
+        // For per-packet transports verify both address and port, accepting
+        // equivalent IPv4-mapped IPv6 representations.
+        if !peer.ip().to_canonical().is_unspecified()
+            && (peer.ip().to_canonical() != addr.ip().to_canonical() || peer.port() != addr.port())
+        {
+            continue;
+        }
+        let Some(bytes) = buf.get(..n) else {
+            return Err(ClientError::Protocol("oversized DNS datagram read"));
+        };
+        let Ok(response) = decode_validated_response(bytes, expected) else {
+            continue;
+        };
+        if response.metadata.truncation {
+            // Release the UDP association before the explicit DNS TCP retry,
+            // through the same proxy and under the query's original deadline.
+            drop(packet);
+            let response = client.proxy_tcp_exchange(proxy, wire).await?;
+            return decode_validated_response(&response, expected);
+        }
+        return Ok(response);
+    }
+}
+
+#[cfg(test)]
+#[path = "proxy_udp_tests.rs"]
+mod proxy_udp_tests;
 
 fn ip_from_record(rec: &Record) -> Option<IpAddr> {
     match &rec.data {
@@ -2233,12 +2321,14 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 /// proxied paths, which differ only in how `stream` was dialed.
 ///
 /// Sends a minimal `POST path` with `application/dns-message` (no
-/// `Connection: close` — the session is poolable), then reads the
-/// response with full RFC 7230 §3.3 framing via [`read_http_response`]
-/// and returns the DNS body plus the pool-eligibility verdict.
+/// `Connection: close` — the session is poolable), restricted to
+/// `Accept-Encoding: identity` so a coded body cannot poison the DNS
+/// parse, then reads the response with full RFC 7230 §3.3 framing via
+/// [`read_http_response`] and returns the DNS body plus the
+/// pool-eligibility verdict.
 #[cfg(feature = "encrypted")]
-async fn doh_http_exchange(
-    stream: &mut TlsConn,
+async fn doh_http_exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    stream: &mut S,
     sni: &str,
     path: &str,
     wire: &[u8],
@@ -2248,6 +2338,7 @@ async fn doh_http_exchange(
          Host: {host}\r\n\
          User-Agent: meow-rs\r\n\
          Accept: application/dns-message\r\n\
+         Accept-Encoding: identity\r\n\
          Content-Type: application/dns-message\r\n\
          Content-Length: {len}\r\n\
          \r\n",
@@ -2435,13 +2526,10 @@ where
     /// the stream via [`read_bounded_http_response`] (the historical EOF
     /// arm), the total bounded by [`MAX_DOH_RESPONSE_BYTES`].
     async fn read_to_eof(&mut self) -> Result<Vec<u8>, ClientError> {
-        let mut body = self.unconsumed().to_vec();
-        let rest = read_bounded_http_response(self.stream).await?;
-        if body.len() + rest.len() > MAX_DOH_RESPONSE_BYTES {
-            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
-        }
-        body.extend_from_slice(&rest);
-        Ok(body)
+        // Include already-read headers and body in the same budget before
+        // awaiting any more input. An oversized response need not send EOF.
+        let all = read_bounded_http_response(self.stream, std::mem::take(&mut self.buf)).await?;
+        Ok(all[self.pos..].to_vec())
     }
 
     /// Read a `Transfer-Encoding: chunked` body (RFC 7230 §4.1): hex-size
@@ -2575,6 +2663,10 @@ where
                         .next()
                         .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked")),
                 );
+            } else if name.trim().eq_ignore_ascii_case("content-encoding") {
+                if !value.eq_ignore_ascii_case("identity") {
+                    return Err(ClientError::Protocol("doh: unsupported content-encoding"));
+                }
             } else if name.trim().eq_ignore_ascii_case("content-length") {
                 // Duplicate CLs take the last value. RFC 7230 §3.3.3 #4
                 // wants mismatched duplicates rejected — tolerated
@@ -2660,11 +2752,13 @@ pub(crate) const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
 /// the bounded read stays unit testable without standing up a TLS DoH
 /// server.
 #[cfg(feature = "encrypted")]
-async fn read_bounded_http_response<R>(stream: &mut R) -> Result<Vec<u8>, ClientError>
+async fn read_bounded_http_response<R>(
+    stream: &mut R,
+    mut all: Vec<u8>,
+) -> Result<Vec<u8>, ClientError>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
-    let mut all = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
         let n = stream.read(&mut chunk).await?;
@@ -2754,6 +2848,69 @@ mod tests {
         assert_eq!(find_subseq(b"", b"x"), None);
     }
 
+    /// A close-delimited DoH body charges the bytes already buffered with
+    /// the headers against the cap, so an oversized response is rejected
+    /// without waiting for EOF.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_close_delimited_counts_buffered_bytes_before_eof() {
+        let (mut client, mut server) = tokio::io::duplex(2 * MAX_DOH_RESPONSE_BYTES);
+        // Leave the peer open after exceeding the total budget. The first
+        // fill includes part of this body along with the headers.
+        let response = [
+            b"HTTP/1.0 200 OK\r\n\r\n".to_vec(),
+            vec![b'x'; MAX_DOH_RESPONSE_BYTES + 1],
+        ]
+        .concat();
+        server.write_all(&response).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), read_http_response(&mut client))
+            .await
+            .expect("oversized buffered body must not wait for EOF");
+        assert!(matches!(
+            result,
+            Err(ClientError::Protocol("doh: response exceeds maximum size"))
+        ));
+    }
+
+    /// `Accept-Encoding: identity` is sent, and a server that ignores it
+    /// with a coded body is rejected rather than fed garbage bytes.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_requests_identity_from_a_compression_capable_server() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(server.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let mut query = [0; 5];
+            server.read_exact(&mut query).await.unwrap();
+            let body: &[u8] = if head.contains("\r\nAccept-Encoding: identity\r\n") {
+                b"ABCD"
+            } else {
+                // A gzip-coded ABCD response; absence of Accept-Encoding does
+                // not forbid a server from applying a content coding.
+                &[
+                    31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 115, 116, 114, 118, 1, 0, 165, 32, 23, 219, 4,
+                    0, 0, 0,
+                ]
+            };
+            let coding = if body == b"ABCD" { "identity" } else { "gzip" };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            server.write_all(response.as_bytes()).await.unwrap();
+            server.write_all(body).await.unwrap();
+        });
+        let (body, _) = doh_http_exchange(&mut client, "dns.example", "/dns-query", b"query")
+            .await
+            .unwrap();
+        peer.await.unwrap();
+        assert_eq!(body, b"ABCD");
+    }
+
     /// A DoH response at exactly the cap is accepted; one byte over the cap
     /// is rejected with a protocol error. Guards the low-risk review fix
     /// that bounds the previously unbounded `read_to_end`.
@@ -2762,12 +2919,16 @@ mod tests {
     async fn doh_bounded_read_enforces_response_size_cap() {
         let at_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES];
         let mut reader = at_cap.as_slice();
-        let got = read_bounded_http_response(&mut reader).await.unwrap();
+        let got = read_bounded_http_response(&mut reader, Vec::new())
+            .await
+            .unwrap();
         assert_eq!(got.len(), MAX_DOH_RESPONSE_BYTES);
 
         let over_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES + 1];
         let mut reader = over_cap.as_slice();
-        let err = read_bounded_http_response(&mut reader).await.unwrap_err();
+        let err = read_bounded_http_response(&mut reader, Vec::new())
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2807,6 +2968,23 @@ mod tests {
     async fn doh_response(raw: &[u8]) -> Result<(Vec<u8>, bool), ClientError> {
         let mut reader = Dribble { data: raw, step: 3 };
         read_http_response(&mut reader).await
+    }
+
+    /// A `Content-Encoding` other than `identity` is rejected while the
+    /// headers are parsed — before the body is read or the connection is
+    /// considered for pooling.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_coded_response_is_rejected_before_body_and_pooling() {
+        for coding in ["gzip", "br", "identity, gzip"] {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nContent-Length: 999\r\n\r\n"
+            );
+            assert!(matches!(
+                doh_response(head.as_bytes()).await,
+                Err(ClientError::Protocol("doh: unsupported content-encoding"))
+            ));
+        }
     }
 
     /// The DoH framing matrix (RFC 7230 §3.3): `Content-Length` and
@@ -4371,6 +4549,49 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn encrypted_dns_uses_named_proxy_and_never_falls_back_after_dial_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy = Arc::new(CapturingMetaProxy {
+            seen: Default::default(),
+            health: meow_common::ProxyHealth::new(),
+        });
+        for client in [
+            DnsClient::dot(addr, "dns.example"),
+            DnsClient::doh(addr, "dns.example", "/dns-query"),
+        ] {
+            assert!(client
+                .with_proxy(Arc::clone(&proxy) as DnsProxy)
+                .query("test.example", RecordType::A)
+                .await
+                .is_err());
+        }
+        {
+            let seen = proxy.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen
+                .iter()
+                .all(|m| m.internal && m.dst_ip == Some(addr.ip()) && m.dst_port == addr.port()));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let proxy: DnsProxy = Arc::new(ErrnoProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = DnsClient::dot(addr, "dns.example")
+            .with_proxy(proxy)
+            .dial_tls_inner()
+            .await
+            .err()
+            .unwrap();
+        assert!(err.is_errno_backed());
+    }
+
     fn emfile_client() -> DnsClient {
         DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(std::sync::Arc::new(
             ErrnoProxy {
@@ -4531,3 +4752,7 @@ mod tests {
         assert!(r.ips.is_empty());
     }
 }
+
+#[cfg(all(test, feature = "encrypted"))]
+#[path = "doh_stream_tests.rs"]
+mod doh_stream_tests;

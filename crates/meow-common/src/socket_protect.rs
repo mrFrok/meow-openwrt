@@ -23,8 +23,12 @@
 //! whose upstream sockets *are* protected) before falling back to the
 //! system resolver.
 //!
-//! The `SocketProtector` (raw-fd) hook is compiled only on Android in
-//! production — that's the platform whose VPN model demands it; for tests we
+//! The `SocketProtector` (raw-fd) hook is compiled only on Android and
+//! OpenHarmony (`target_env = "ohos"`) in production — the platforms whose
+//! VPN model demands it. OpenHarmony is fail-closed: without a protector
+//! [`connect_tcp`] / [`bind_udp`] refuse to open a socket, and hostname
+//! lookups go to the embedder's bootstrap resolver
+//! (`set_bootstrap_host_resolver`) instead of libc. For tests we
 //! also enable it on any unix host so CI can exercise it against real
 //! loopback sockets. The `HostResolver` hook carries no platform dependency
 //! and is compiled everywhere: Android installs it alongside the protector,
@@ -87,6 +91,32 @@ pub trait HostResolver: Send + Sync {
 }
 
 static RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
+
+/// OpenHarmony's stand-in for the system resolver (see
+/// [`set_bootstrap_host_resolver`]).
+#[cfg(target_env = "ohos")]
+static BOOTSTRAP_RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
+
+/// Install the OpenHarmony bootstrap resolver: a lookup that runs on the
+/// physical network (e.g. the embedder's `connection.getAddressesByName`
+/// bound to the default net), not through the VPN.
+///
+/// On OpenHarmony [`connect_tcp_host`] never falls back to libc's
+/// `getaddrinfo` — its DNS sockets cannot be protected and would loop through
+/// the tunnel — so every lookup the [`HostResolver`] hook does not answer
+/// (none installed yet, or a re-entrant lookup from inside the hook) goes
+/// here instead, and fails with `NotConnected` while none is installed.
+/// Only compiled for `target_env = "ohos"`.
+#[cfg(target_env = "ohos")]
+pub fn set_bootstrap_host_resolver(resolver: Arc<dyn HostResolver>) {
+    *BOOTSTRAP_RESOLVER.write() = Some(resolver);
+}
+
+/// Remove the OpenHarmony bootstrap resolver, if any.
+#[cfg(target_env = "ohos")]
+pub fn clear_bootstrap_host_resolver() {
+    *BOOTSTRAP_RESOLVER.write() = None;
+}
 
 /// Install the global host resolver. Call once at startup, right after the
 /// meow-rs `Resolver` is built. Safe to re-install (e.g. config reload) — the
@@ -157,11 +187,8 @@ pub fn in_dns_via_proxy_dial() -> bool {
 
 /// Run `fut` with the [`in_dns_via_proxy_dial`] task-local set — the DNS
 /// client's counterpart of `resolve_via_hook`'s `IN_HOST_RESOLVER` scope.
-/// A plain `fn`: an `async fn` would hold `fut` twice (argument + awaitee).
-pub fn dns_via_proxy_dial_scope<F: std::future::Future>(
-    fut: F,
-) -> impl std::future::Future<Output = F::Output> {
-    IN_DNS_VIA_PROXY_DIAL.scope((), fut)
+pub async fn dns_via_proxy_dial_scope<F: std::future::Future>(fut: F) -> F::Output {
+    IN_DNS_VIA_PROXY_DIAL.scope((), fut).await
 }
 
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
@@ -222,12 +249,13 @@ fn sys_cache_evict(host: &str) {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sys_cache_evict(_host: &str) {}
 
-// In production we only compile the protector hook on Android — that's the
-// platform whose VPN model demands `VpnService.protect(fd)` and we don't want
-// non-Android binaries paying any footprint for it. For tests we additionally
+// In production we only compile the protector hook on Android and
+// OpenHarmony (`target_env = "ohos"`, whose VPN extension has the same
+// per-fd `VpnConnection.protect(fd)` model) — the platforms whose VPN model
+// demands it — and we don't want other binaries paying any footprint for it. For tests we additionally
 // enable the module on any unix host so CI (which does not target Android)
 // can actually exercise the protector path against real loopback sockets.
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 mod android {
     use super::*;
     use std::os::fd::{AsRawFd, RawFd};
@@ -237,7 +265,11 @@ mod android {
 
     /// Hook invoked on every outbound socket fd just before `connect()` /
     /// `bind()`. Typically a thin JNI shim around
-    /// `android.net.VpnService.protect(int)`.
+    /// `android.net.VpnService.protect(int)`, or on OpenHarmony a NAPI shim
+    /// around `VpnConnection.protect(fd)`.
+    ///
+    /// On OpenHarmony a dial or bind made while none is installed fails
+    /// with `NotConnected` instead of opening an unprotected socket.
     ///
     /// Implementations must not block — the call runs on the async runtime
     /// worker that is dialing the socket.
@@ -322,80 +354,127 @@ mod android {
     }
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 pub use android::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
 
-/// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
-/// Android, applies the installed `SocketProtector` (if any) to the
-/// socket fd before `connect()` so the connection bypasses the VPN.
-/// Desktop targets apply the installed outbound-interface policy.
-///
-/// Callers that only have a hostname must use [`connect_tcp_host`] —
-/// passing a hostname here is a compile error by construction (the type
-/// is `SocketAddr`, not `ToSocketAddrs`). That split exists to prevent
-/// silent regressions back into the system resolver; see the module docs
-/// for the loop-routing failure mode.
-/// meow-openwrt: mihomo's `routing-mark` — `SO_MARK` on every outbound
+/// mihomo's `routing-mark` — `SO_MARK` on every outbound
 /// socket meow opens through this module (proxy servers, DIRECT, DNS,
 /// health checks, provider fetches, TCP and UDP), so the deployer's
 /// TPROXY/REDIRECT rules can exempt meow's own traffic. `0` = unset.
-#[cfg(target_os = "linux")]
+/// OpenHarmony is `target_os = "linux"` too, but its dials go through the
+/// VPN protector — every mark consumer below is `not(target_env = "ohos")`,
+/// so the state itself is excluded there as well.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 static ROUTING_MARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Install (or clear with `None` / `Some(0)`) the global routing mark.
 /// Setting `SO_MARK` needs `CAP_NET_ADMIN`; without it outbound sockets
 /// fail to open, as in mihomo. Linux only; a no-op elsewhere.
 pub fn set_routing_mark(mark: Option<u32>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     ROUTING_MARK.store(mark.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(target_os = "linux"))]
-    let _ = mark;
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    if mark.is_some_and(|m| m != 0) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("routing-mark (SO_MARK) is Linux-only; ignored on this platform");
+        });
+    }
 }
 
-/// The global routing mark, `None` when unset (always `None` off Linux).
-pub fn routing_mark() -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    return match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        mark => Some(mark),
-    };
-    #[cfg(not(target_os = "linux"))]
-    None
+/// The live routing mark (`0` = unset; always `0` off Linux).
+pub fn routing_mark() -> u32 {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    {
+        0
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// Holders of firewall rules that exempt the current routing mark (meow's
+/// managed tproxy tables): while any is alive the mark cannot change at
+/// runtime, or meow's own traffic would stop matching the exemption.
+static ROUTING_MARK_PINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keeps the routing mark pinned until dropped (see [`routing_mark_pinned`]).
+#[must_use = "the mark is pinned only while the guard lives"]
+pub struct RoutingMarkPin(());
+
+/// Pin the routing mark for the lifetime of the returned guard.
+pub fn pin_routing_mark() -> RoutingMarkPin {
+    ROUTING_MARK_PINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RoutingMarkPin(())
+}
+
+impl Drop for RoutingMarkPin {
+    fn drop(&mut self) {
+        ROUTING_MARK_PINS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether installed firewall rules exempt the current mark, so it must
+/// not change before a restart.
+pub fn routing_mark_pinned() -> bool {
+    ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn routing_mark_set() -> bool {
-    #[cfg(target_os = "linux")]
-    return ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) != 0;
-    #[cfg(not(target_os = "linux"))]
-    false
+    routing_mark() != 0
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// `SO_MARK` on a `socket2` socket per [`ROUTING_MARK`] (`0` = unset).
+/// Linux-only by definition — `set_mark` exists on no other cfg target —
+/// so callers wrap the call in `#[cfg(target_os = "linux")]`. OpenHarmony
+/// counts as `linux` but its only callers are `not(target_env = "ohos")`,
+/// so the fn is excluded there too.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
     match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {}
         mark => socket.set_mark(mark)?,
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = socket;
     Ok(())
 }
 
+/// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
+/// Android, applies the installed `SocketProtector` (if any) to the
+/// socket fd before `connect()` so the connection bypasses the VPN.
+/// Desktop targets apply the installed outbound-interface policy, and on
+/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]).
+///
+/// Callers that only have a hostname must use [`connect_tcp_host`] —
+/// passing a hostname here is a compile error by construction (the type
+/// is `SocketAddr`, not `ToSocketAddrs`). That split exists to prevent
+/// silent regressions back into the system resolver; see the module docs
+/// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             return android::connect_tcp_protected(addr, p.as_ref()).await;
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "OpenHarmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
     // takes the physical route past the TUN default routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if routing_mark_set()
             || (crate::outbound_iface::binds_peer(addr.ip())
@@ -404,14 +483,21 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
             return connect_tcp_iface_bound(addr).await;
         }
     }
-    TcpStream::connect(addr).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        TcpStream::connect(addr).await
+    }
 }
 
 /// Dial with the socket bound to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before `connect()`.
 /// Uses `tokio::net::TcpSocket` for the async connect so connection errors
 /// surface here, not on first I/O.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+// Unused on OpenHarmony, whose dials fail closed without a protector.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -419,6 +505,7 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(target_os = "linux")]
     apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
     socket.set_nonblocking(true)?;
@@ -478,7 +565,8 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(cached);
     }
 
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    // Not on OpenHarmony: it never falls back to the system resolver.
+    #[cfg(all(not(target_env = "ohos"), any(target_os = "android", all(test, unix))))]
     {
         if android::socket_protector().is_some() {
             tracing::warn!(
@@ -489,6 +577,19 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         }
     }
 
+    // OpenHarmony: libc's resolver sockets cannot be protected, so the
+    // embedder's physical-network resolver stands in for it (fail-closed).
+    #[cfg(target_env = "ohos")]
+    let addrs: Vec<SocketAddr> = {
+        let bootstrap = BOOTSTRAP_RESOLVER.read().clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenHarmony bootstrap resolver is not initialized",
+            )
+        })?;
+        resolve_via_hook(bootstrap.as_ref(), host, port).await?
+    };
+    #[cfg(not(target_env = "ohos"))]
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -523,7 +624,8 @@ async fn resolve_via_hook(
 
 /// Dial an outbound TCP stream to `host:port`. The hostname is resolved
 /// through `resolve_addrs` (installed `HostResolver` → cache → system
-/// resolver), then each candidate is dialed via [`connect_tcp`] so the
+/// resolver). Address families race after a 250 ms fallback delay, retaining
+/// resolver order within each family. Each candidate uses [`connect_tcp`] so the
 /// `SocketProtector` (Android) still applies. If every candidate fails to
 /// connect, any cached system-resolver entry is evicted so the next dial
 /// re-resolves instead of reusing a dead address.
@@ -532,21 +634,183 @@ async fn resolve_via_hook(
 /// consulted, but the protector still applies to the literal dial.
 pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     let addrs = resolve_addrs(host, port).await?;
-    let mut last_err: Option<io::Error> = None;
-    for addr in &addrs {
-        match connect_tcp(*addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                // An errno-backed failure (e.g. EMFILE on socket()) must
-                // not be masked by a later errno-less error — it carries
-                // the local-vs-member classification (issue #668).
-                last_err = crate::MeowError::prefer_errno_io(last_err, e);
-            }
+    let result = connect_tcp_candidates(addrs, connect_tcp).await;
+    if result.is_err() {
+        sys_cache_evict(host);
+    }
+    result
+}
+
+/// Connect resolved physical addresses using the caller's existing dial budget.
+/// With a deadline, at most two attempts run at once and later addresses receive
+/// a share of the remaining time. Without a deadline, preserve the ordinary
+/// two-family fallback without introducing a new overall timeout. Callers must
+/// retain their socket protection/binding and configured per-connect timeout —
+/// under a deadline that per-connect timeout is a ceiling the fairness window
+/// may tighten, so no candidate is guaranteed its full configured slice.
+pub async fn connect_tcp_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    match crate::dial::dial_deadline() {
+        Some(deadline) => connect_candidates_before(addrs, deadline, dial).await,
+        None => connect_resolved_candidates(addrs, dial).await,
+    }
+}
+
+async fn connect_candidates_before<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    deadline: tokio::time::Instant,
+    mut dial: F,
+) -> io::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use tokio::time::{sleep_until, timeout_at, Duration, Instant};
+    const STAGGER: Duration = Duration::from_millis(250);
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut other): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+        addrs
+            .into_iter()
+            .partition(|addr| addr.is_ipv6() == first_v6);
+    let mut ordered = std::collections::VecDeque::new();
+    while !first.is_empty() || !other.is_empty() {
+        if let Some(addr) = first.pop_front() {
+            ordered.push_back(addr);
+        }
+        if let Some(addr) = other.pop_front() {
+            ordered.push_back(addr);
         }
     }
-    // Every candidate failed — drop any cached system entry so the next dial
-    // re-resolves. No-op for the literal / resolver-hook paths (not cached).
-    sys_cache_evict(host);
+    // All attempts belong to this one future. Once the queue is drained,
+    // slicing no longer needs to free a slot: survivors can use the rest of
+    // the caller budget. Atomic storage keeps the enclosing future Send.
+    let all_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pending = FuturesUnordered::new();
+    let mut next = Instant::now();
+    let mut last_err = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into()));
+        }
+        if pending.is_empty() || (pending.len() < 2 && now >= next) {
+            let waves = (pending.len() + ordered.len()).div_ceil(2).max(1);
+            let window = (deadline - now).div_f64(waves as f64).min(ATTEMPT_TIMEOUT);
+            if let Some(addr) = ordered.pop_front() {
+                let attempt = dial(addr);
+                let attempt_deadline = (now + window).min(deadline);
+                all_started.store(ordered.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                let all_started = Arc::clone(&all_started);
+                pending.push(async move {
+                    tokio::pin!(attempt);
+                    match timeout_at(attempt_deadline, &mut attempt).await {
+                        Ok(result) => result,
+                        Err(_) if all_started.load(std::sync::atomic::Ordering::Relaxed) => {
+                            // Keep the original connect future; never restart a socket.
+                            attempt.await
+                        }
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TCP candidate timed out",
+                        )),
+                    }
+                });
+                // Compress staggering for a nearly exhausted caller budget;
+                // reserve time for the remaining addresses rather than sleeping
+                // through their entire opportunity.
+                next = now + STAGGER.min((deadline - now).div_f64((ordered.len() + 1) as f64));
+            } else if pending.is_empty() {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "no TCP candidate addresses")
+                }));
+            }
+        }
+        tokio::select! {
+            () = sleep_until(deadline) => return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into())),
+            result = pending.next(), if !pending.is_empty() => {
+                match result.expect("pending candidate") {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_err = crate::MeowError::prefer_errno_io(last_err, error),
+                }
+                next = Instant::now();
+            }
+            () = sleep_until(next), if pending.len() < 2 && !ordered.is_empty() => {}
+        }
+    }
+}
+
+// Race address families, not protocol handshakes. Each family retains resolver
+// order and has at most one physical connect pending. No spawned task can
+// outlive the caller; returning a winner drops the other family's future.
+async fn connect_resolved_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (preferred, fallback): (Vec<_>, Vec<_>) = addrs
+        .into_iter()
+        .partition(|addr| addr.is_ipv6() == first_v6);
+    if fallback.is_empty() {
+        return connect_address_family(preferred, &dial).await;
+    }
+    let first = connect_address_family(preferred, &dial);
+    tokio::pin!(first);
+    // A failed preferred family starts fallback immediately. Otherwise allow
+    // it 250 ms before racing the other family under the caller's deadline.
+    tokio::select! {
+        biased;
+        result = &mut first => {
+            return match result {
+                Ok(stream) => Ok(stream),
+                Err(error) => connect_address_family(fallback, &dial)
+                    .await
+                    .map_err(|other| {
+                        crate::MeowError::prefer_errno_io(Some(error), other)
+                            .expect("prefer_errno_io yields Some for a Some prev")
+                    }),
+            };
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
+    let second = connect_address_family(fallback, &dial);
+    tokio::pin!(second);
+    tokio::select! {
+        biased;
+        result = &mut first => match result {
+            Ok(stream) => Ok(stream),
+            Err(error) => second.await.map_err(|other| {
+                crate::MeowError::prefer_errno_io(Some(error), other)
+                    .expect("prefer_errno_io yields Some for a Some prev")
+            }),
+        },
+        result = &mut second => match result {
+            Ok(stream) => Ok(stream),
+            Err(error) => first.await.map_err(|other| {
+                crate::MeowError::prefer_errno_io(Some(error), other)
+                    .expect("prefer_errno_io yields Some for a Some prev")
+            }),
+        },
+    }
+}
+
+async fn connect_address_family<T, F, Fut>(addrs: Vec<SocketAddr>, dial: &F) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let mut last_err = None;
+    for addr in addrs {
+        match dial(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_err = crate::MeowError::prefer_errno_io(last_err, error),
+        }
+    }
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -616,9 +880,13 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     local: A,
     peer: Option<IpAddr>,
 ) -> io::Result<UdpSocket> {
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    // Only the interface-bound path below consults the peer.
+    #[cfg(not(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     let _ = peer;
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             let resolved = tokio::net::lookup_host(local)
@@ -630,10 +898,18 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
             return android::bind_udp_protected(resolved, p.as_ref());
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "OpenHarmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if routing_mark_set() || crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
@@ -645,13 +921,22 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
             return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
         }
     }
-    UdpSocket::bind(local).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        UdpSocket::bind(local).await
+    }
 }
 
 /// Bind a UDP socket to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
 /// The destination determines whether the interface binding is required.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// A socket pinned to a loopback `local` address is left unbound where the
+/// platform's binding would break it (see `outbound_iface::binds_peer`).
+// Unused on OpenHarmony, whose dials fail closed without a protector.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
@@ -659,6 +944,7 @@ pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Resul
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    #[cfg(target_os = "linux")]
     apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
     socket.bind(&local.into())?;
@@ -1277,5 +1563,266 @@ mod tests {
         assert_eq!(r.count(), 2, "the guard must not leak across calls");
 
         clear_host_resolver();
+    }
+}
+
+#[cfg(test)]
+mod candidate_progress_regression {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_first_family_does_not_starve_reachable_second_family() {
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let result = tokio::time::timeout(
+            crate::dial::DIAL_TIMEOUT,
+            connect_resolved_candidates(addrs, |addr| async move {
+                if addr.is_ipv6() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reachable IPv4 candidate must be tried before the dial deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_preferred_family_does_not_start_fallback() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let winner = connect_resolved_candidates(addrs, |addr| {
+            calls.lock().unwrap().push(addr);
+            async move { Ok(addr) }
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv6());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_family_advances_immediately_in_resolver_order() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let addrs: Vec<SocketAddr> = ["[::1]:443", "127.0.0.1:443", "[::2]:443"]
+            .into_iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let start = tokio::time::Instant::now();
+        connect_resolved_candidates(addrs.clone(), |addr| {
+            calls.lock().unwrap().push(addr);
+            async move {
+                if addr.is_ipv6() {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    Ok(addr)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![addrs[0], addrs[2], addrs[1]]);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    struct PendingGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for PendingGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn winner_drops_stalled_loser_in_both_family_orders() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for first_v6 in [true, false] {
+            let active = Arc::new(AtomicUsize::new(0));
+            let mut addrs: Vec<SocketAddr> = ["[::1]:443", "127.0.0.1:443"]
+                .into_iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+            if !first_v6 {
+                addrs.reverse();
+            }
+            let start = tokio::time::Instant::now();
+            let winner = connect_resolved_candidates(addrs, |addr| {
+                let active = Arc::clone(&active);
+                async move {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(count <= 2);
+                    let _guard = PendingGuard(active);
+                    if addr.is_ipv6() == first_v6 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(addr)
+                }
+            })
+            .await
+            .unwrap();
+            assert_ne!(winner.is_ipv6(), first_v6);
+            assert_eq!(start.elapsed(), std::time::Duration::from_millis(250));
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_cancels_both_candidates_without_resetting_budget() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("test", async {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let addrs = vec![
+                "[::1]:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            ];
+            connect_resolved_candidates(addrs, |_| {
+                let active = Arc::clone(&active);
+                let started = &started;
+                async move {
+                    assert_eq!(
+                        crate::dial::dial_deadline(),
+                        Some(start + crate::dial::DIAL_TIMEOUT)
+                    );
+                    started.fetch_add(1, Ordering::SeqCst);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = PendingGuard(active);
+                    std::future::pending::<io::Result<()>>().await
+                }
+            })
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), crate::dial::DIAL_TIMEOUT);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn all_failures_preserve_errno_and_empty_input_error() {
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let error = connect_resolved_candidates(addrs, |addr| async move {
+            if addr.is_ipv6() {
+                Err::<(), _>(io::Error::from_raw_os_error(24))
+            } else {
+                Err(io::Error::other("synthetic failure"))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(24));
+        let error = connect_resolved_candidates(Vec::new(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod same_family_progress {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test(start_paused = true)]
+    async fn surviving_candidate_reclaims_budget_after_others_fail() {
+        let addrs = (1..=3)
+            .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
+            .collect();
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("reclaim fixture", async {
+            Ok(connect_tcp_candidates(addrs, |addr| async move {
+                if addr.port() == 1 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(addr)
+                } else {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                }
+            })
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap().port(), 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_same_family_addresses_do_not_starve_later_candidates() {
+        let addresses = (1..=3)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+            .collect();
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("same-family fixture", async {
+            Ok(connect_tcp_candidates(addresses, |addr| async move {
+                if addr.port() != 3 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            })
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap().port(), 3);
+        assert!(start.elapsed() < crate::dial::DIAL_TIMEOUT);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn no_caller_deadline_does_not_introduce_five_second_limit() {
+        let addr = SocketAddr::from(([192, 0, 2, 1], 1));
+        let start = tokio::time::Instant::now();
+        let result = connect_tcp_candidates(vec![addr], |address| async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Ok(address)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, addr);
+        assert_eq!(start.elapsed(), Duration::from_secs(6));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_deadline_race_bounds_and_drops_pending_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Live(Arc<AtomicUsize>);
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = (1..=4)
+            .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
+            .collect();
+        let race = crate::dial::with_dial_timeout::<_, ()>("cancel fixture", async {
+            Ok(connect_tcp_candidates(addrs, |_| {
+                let live = Arc::clone(&live);
+                async move {
+                    assert!(live.fetch_add(1, Ordering::SeqCst) < 2);
+                    let _guard = Live(live);
+                    std::future::pending::<io::Result<()>>().await
+                }
+            })
+            .await?)
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(1), race)
+            .await
+            .is_err());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 }

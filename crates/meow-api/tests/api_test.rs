@@ -5913,10 +5913,35 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
         )
     };
 
-    // First PUT: bind a standalone DNS listener on a free port.
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port_a = sock.local_addr().unwrap().port();
-    drop(sock);
+    // The DNS bind needs UDP *and* TCP on the same port, and Windows can
+    // exclude a port per protocol (Hyper-V/WINNAT) — either protocol's
+    // allocator can walk into the other's exclusion band. Alternate which
+    // protocol picks the :0 port so both allocators sample independent
+    // counter positions (the same mechanism DnsServer::bind() uses).
+    let mut port_a = None;
+    'probe: for attempt in 0..16u32 {
+        if attempt % 2 == 0 {
+            // Even: TCP picks, UDP verifies.
+            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
+                drop(sock);
+                port_a = Some(candidate);
+                break 'probe;
+            }
+        } else {
+            // Odd: UDP picks, TCP verifies.
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                drop(sock);
+                port_a = Some(candidate);
+                break 'probe;
+            }
+        }
+    }
+    let port_a =
+        port_a.expect("no port bindable over both UDP and TCP after 16 alternating attempts");
     let yaml_a = format!(
         "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
     );
@@ -9183,4 +9208,112 @@ async fn configs_sniffing_uses_resolved_sniffer() {
     });
     let state = test_state(raw);
     assert!(!get_sniffing(&state).await, "explicit sniffer wins");
+}
+
+#[tokio::test]
+async fn response_rules_reload_order_provider_generation_and_rejection() {
+    use base64::Engine as _;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+
+    async fn code(resolver: &Resolver, name: &str) -> ResponseCode {
+        let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii(name).unwrap(),
+            RecordType::HTTPS,
+        ));
+        let wire = meow_dns::DnsServer::handle_query(&query.to_vec().unwrap(), resolver)
+            .await
+            .unwrap();
+        Message::from_vec(&wire).unwrap().metadata.response_code
+    }
+
+    let state = test_state(test_raw_config());
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let first = r#"mode: rule
+rules: ['MATCH,DIRECT']
+rule-providers:
+  selected: {type: inline, behavior: domain, payload: [one.test]}
+dns:
+  enable: true
+  use-system-hosts: false
+  nameserver: [rcode://refused]
+  response-rules:
+    - {match: 'rule-set:selected', action: refused}
+    - {match: '*', action: nodata}
+"#;
+    assert_eq!(put(first).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let original = state.tunnel.resolver();
+    assert_eq!(code(&original, "one.test").await, ResponseCode::Refused);
+    assert_eq!(code(&original, "two.test").await, ResponseCode::NoError);
+
+    let second = first.replace("payload: [one.test]", "payload: [two.test]");
+    assert_eq!(put(&second).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let current = state.tunnel.resolver();
+    assert!(!Arc::ptr_eq(&original, &current));
+    assert_eq!(code(&current, "one.test").await, ResponseCode::NoError);
+    assert_eq!(code(&current, "two.test").await, ResponseCode::Refused);
+    assert_eq!(code(&original, "one.test").await, ResponseCode::Refused);
+
+    // Identical raw input still binds the newly built provider generation.
+    assert_eq!(put(&second).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let current = state.tunnel.resolver();
+    let invalid = second.replace("action: nodata", "action: fake-ip");
+    assert_eq!(
+        put(&invalid).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(Arc::ptr_eq(&current, &state.tunnel.resolver()));
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::Refused
+    );
+
+    let reordered = second.replace(
+        "    - {match: 'rule-set:selected', action: refused}\n    - {match: '*', action: nodata}",
+        "    - {match: '*', action: nodata}\n    - {match: 'rule-set:selected', action: refused}",
+    );
+    assert_eq!(
+        put(&reordered).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::NoError
+    );
+    // Pure domain rules must also detect a reorder without runtime references.
+    let plain = reordered.replace("rule-set:selected", "+.test");
+    assert_eq!(put(&plain).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::NoError
+    );
+    let reversed = plain.replace(
+        "    - {match: '*', action: nodata}\n    - {match: '+.test', action: refused}",
+        "    - {match: '+.test', action: refused}\n    - {match: '*', action: nodata}",
+    );
+    assert_eq!(
+        put(&reversed).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::Refused
+    );
+    assert_eq!(
+        put("rules: ['MATCH,DIRECT']\n").await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
 }

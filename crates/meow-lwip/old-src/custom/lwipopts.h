@@ -121,10 +121,16 @@
 // #define MEM_LIBC_MALLOC 1
 // #define MEMP_MEM_MALLOC 1
 // meow-lwip feature `libc-malloc`: pools and heap from libc on demand.
+// MEM_LIBC_MALLOC compiles out mem.c's entire heap arm (ram_heap
+// included); MEMP_MEM_MALLOC drops the static pool arrays.
 #ifdef MEOW_LWIP_LIBC_MALLOC
 #define MEM_LIBC_MALLOC 1
 #define MEMP_MEM_MALLOC 1
 #endif
+
+// One full-size UDP datagram at the supported minimum MTU (1280) needs
+// up to 54 fragments. Keep reassembly bounded, but allow that datagram.
+#define IP_REASS_MAX_PBUFS 64
 
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS

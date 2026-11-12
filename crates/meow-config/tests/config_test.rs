@@ -3581,3 +3581,61 @@ rules:
         assert!(err.to_string().contains("escapes"), "{bad}: {err}");
     }
 }
+
+/// mihomo's `type: tproxy` is real TPROXY: `listeners:` takes
+/// `transparent`, which needs `firewall: false`.
+#[tokio::test]
+async fn test_listener_transparent_tproxy() {
+    let yaml = "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    listen: 0.0.0.0\n    firewall: false\n    udp: true\n    transparent: true\n";
+    let result = load_config_from_str(yaml).await;
+    if cfg!(target_os = "linux") {
+        let config = result.unwrap();
+        let tp = &config.listeners.named[0];
+        assert!(matches!(
+            tp.spec,
+            ListenerSpec::TProxy {
+                transparent: true,
+                firewall: false,
+                udp: true,
+                ..
+            }
+        ));
+    } else {
+        assert!(result.is_err(), "transparent is Linux-only");
+    }
+    let managed =
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    transparent: true\n";
+    let err = load_config_from_str(managed)
+        .await
+        .err()
+        .expect("transparent with the managed firewall is rejected")
+        .to_string();
+    assert!(err.contains("firewall: false"), "{err}");
+}
+
+#[tokio::test]
+async fn classical_provider_preserves_regex_quantifiers() {
+    let config = load_config_from_str(
+        r#"
+strict: true
+rule-providers:
+  nodes:
+    type: inline
+    behavior: classical
+    payload:
+      - 'DOMAIN-REGEX,^api[0-9]{1,3}\.example$'
+rules:
+  - RULE-SET,nodes,REJECT
+  - MATCH,DIRECT
+"#,
+    )
+    .await
+    .unwrap();
+    let metadata = |host: &str| meow_common::Metadata {
+        host: host.into(),
+        ..Default::default()
+    };
+    let rule = &config.rules[0];
+    assert!(rule.match_metadata(&metadata("api123.example"), &meow_common::RuleMatchHelper));
+    assert!(!rule.match_metadata(&metadata("api1234.example"), &meow_common::RuleMatchHelper));
+}

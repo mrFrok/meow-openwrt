@@ -349,7 +349,7 @@ async fn xhttp_receive_window_absorbs_1mib_before_first_read() {
     assert_eq!(recv_buf, payload, "pushed bytes must arrive intact");
 }
 
-/// stream-one tunnels share one h2 connection (meow-openwrt), as Xray's
+/// stream-one tunnels share one h2 connection, as Xray's
 /// xmux does: later tunnels open a new request stream with no dial and no
 /// TLS/REALITY handshake. The server sees one TCP connection for all.
 #[tokio::test]

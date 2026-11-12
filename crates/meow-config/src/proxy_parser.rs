@@ -123,6 +123,11 @@ impl ProxyAdapter for WrappedProxy {
         }
     }
 
+    /// Configured dependency, independent of the front group's current pick.
+    fn has_configured_dialer(&self) -> bool {
+        self.hop.is_some()
+    }
+
     fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
         self.adapter.dialer_hop_network(flow)
     }
@@ -139,6 +144,10 @@ impl ProxyAdapter for WrappedProxy {
 }
 
 impl Proxy for WrappedProxy {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn alive(&self) -> bool {
         self.adapter.health().alive()
     }
@@ -1426,9 +1435,11 @@ fn reject_unsupported_anytls_options(
 /// Optional fields follow the mihomo surface supported by the in-tree Rust
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
-/// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`, and
-/// `fast-open`; meow's own `connections` (parallel QUIC connections, 1-8,
-/// unset = one per CPU up to 4).
+/// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`,
+/// `fast-open`, and the four `*-receive-window` keys (bytes; `0`/absent
+/// is unset — a present non-integer value is a hard error); meow's own
+/// `connections` (parallel QUIC connections, 1-8, unset = one per CPU up
+/// to 4).
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1761,17 +1772,22 @@ fn parse_hysteria2(
             _ => return Err(format!("hysteria2[{name}]: connections must be 1-8")),
         },
     };
-    let window = |key: &str| {
-        config
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&v| v > 0)
+    // mihomo treats an absent or zero window as unset; a present value of
+    // the wrong type is a config error, not a silent default.
+    let window = |key: &str| -> std::result::Result<Option<u64>, String> {
+        let Some(value) = config.get(key).filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let n = value.as_u64().ok_or_else(|| {
+            format!("hysteria2[{name}]: '{key}' must be an unsigned integer (bytes)")
+        })?;
+        Ok((n > 0).then_some(n))
     };
     let windows = meow_proxy::Hy2ReceiveWindows {
-        initial_stream: window("initial-stream-receive-window"),
-        max_stream: window("max-stream-receive-window"),
-        initial_conn: window("initial-connection-receive-window"),
-        max_conn: window("max-connection-receive-window"),
+        initial_stream: window("initial-stream-receive-window")?,
+        max_stream: window("max-stream-receive-window")?,
+        initial_conn: window("initial-connection-receive-window")?,
+        max_conn: window("max-connection-receive-window")?,
     };
 
     meow_proxy::Hy2Adapter::new(Hy2Options {
@@ -2498,6 +2514,8 @@ fn parse_vless(
                 }
             }
         }
+
+        drop_ech_under_reality(name, &mut tls_cfg);
 
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
@@ -3251,6 +3269,17 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
         "ws" => vec!["http/1.1".to_string()],
         "grpc" | "h2" | "xhttp" => vec!["h2".to_string()],
         _ => alpn,
+    }
+}
+
+/// Drop `ech-opts` from a REALITY connection. mihomo's `StreamTLSConn` takes
+/// the REALITY path before it looks at ECH, so subscriptions carrying both
+/// work there; the REALITY record layer refuses the pair. Nothing is exposed
+/// by dropping it: the REALITY SNI is a public cover name by design.
+#[cfg(feature = "vless")]
+fn drop_ech_under_reality(name: &str, tls: &mut meow_transport::tls::TlsConfig) {
+    if tls.reality.is_some() && tls.ech.take().is_some() {
+        tracing::warn!(proxy = %name, "ech-opts is ignored because reality-opts is set");
     }
 }
 
@@ -5133,6 +5162,26 @@ tls: true
                  certificate: ./client.crt\n",
                 "certificate",
             ),
+            (
+                "string receive window",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 initial-stream-receive-window: 32m\n",
+                "must be an unsigned integer",
+            ),
+            (
+                "negative receive window",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 max-connection-receive-window: -1\n",
+                "must be an unsigned integer",
+            ),
         ];
 
         // Collect every failure instead of asserting inline so one bad row does
@@ -5168,6 +5217,23 @@ tls: true
     fn parse_hysteria2_accepts_zero_port_with_ports() {
         let cfg = hy2_config(
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_accepts_zero_and_positive_windows() {
+        // mihomo treats an explicit 0 as unset — only a present value of the
+        // wrong type is a hard error.
+        let cfg = hy2_config(
+            "name: jp-hy2\n\
+             type: hysteria2\n\
+             server: 1.2.3.4\n\
+             port: 443\n\
+             password: secret\n\
+             initial-stream-receive-window: 0\n\
+             max-connection-receive-window: 4194304\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
     }
@@ -6616,17 +6682,18 @@ tls: true
         }
     }
 
-    /// `plugin: null` is Go's zero value — the node parses as plain SS
-    /// with no plugin, exactly like an absent `plugin:` key.
+    /// Both YAML representations of an empty plugin select plain Shadowsocks.
     #[cfg(feature = "ss")]
     #[test]
-    fn null_plugin_value_means_no_plugin() {
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: null\n",
-        );
-        let proxy = parse_proxy(&cfg).expect("plugin: null parses as plain ss");
-        assert_eq!(proxy.name(), "s");
+    fn empty_or_null_plugin_value_means_no_plugin() {
+        for value in ["null", "''"] {
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 192.0.2.1\nport: 8388\npassword: p\ncipher: aes-128-gcm\nplugin: {value}\n"
+            ));
+            assert!(!node_selects_external_plugin(&cfg));
+            let proxy = parse_proxy(&cfg).expect("empty plugin parses as plain ss");
+            assert_eq!(proxy.name(), "s");
+        }
     }
 
     /// The dispatch is exact (`"ss"` only, like mihomo) while

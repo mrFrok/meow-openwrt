@@ -546,35 +546,16 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
     (
         "crates/meow-proxy/src/direct.rs",
         "Socket::new(",
-        2,
-        "routing-mark dial (applies meow_common::apply_outbound_interface_for_peer \
-         itself) and meow-openwrt's `interface-name` dial, which binds the device \
-         explicitly (SO_BINDTODEVICE) and sets the mark",
+        1,
+        "meow-openwrt's `interface-name` dial, which binds the device \
+         explicitly (SO_BINDTODEVICE) and sets the routing mark",
     ),
     // meow-openwrt: sockets that are not outbound proxy connections.
-    (
-        "crates/meow-common/src/nftset.rs",
-        "libc::socket(",
-        1,
-        "NETLINK_NETFILTER socket for dns.nftset writes; never leaves the host",
-    ),
     (
         "crates/meow-proxy/src/wireguard/netlink.rs",
         "libc::socket(",
         1,
         "rtnetlink/genetlink socket configuring the kernel WireGuard link",
-    ),
-    (
-        "crates/meow-listener/src/tproxy/mod.rs",
-        "TcpSocket::new_v4(",
-        1,
-        "the tproxy listener's own listening socket (IP_TRANSPARENT), not a dial",
-    ),
-    (
-        "crates/meow-listener/src/tproxy/mod.rs",
-        "TcpSocket::new_v6(",
-        1,
-        "the tproxy listener's own listening socket (IPV6_TRANSPARENT), not a dial",
     ),
     // Vendored anytls: its own protect helper and its server side.
     (
@@ -620,8 +601,9 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
     (
         "crates/meow-dns/src/server.rs",
         "UdpSocket::bind(",
-        1,
-        "inbound DNS listener",
+        2,
+        "inbound DNS listener — :0 retries alternate which protocol picks \
+         the port (Windows per-protocol exclusions can partition it)",
     ),
     (
         "crates/meow-listener/src/socks5_udp.rs",
@@ -636,6 +618,18 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "local-address probe for the traffic ledger's app lookup (macOS, \
          Windows): bound to a flow's source address and dropped unused, never \
          sends",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v4(",
+        1,
+        "inbound tproxy listening socket (IP_TRANSPARENT before bind), never dials",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v6(",
+        1,
+        "inbound tproxy listening socket (IPV6_TRANSPARENT before bind), never dials",
     ),
     (
         "crates/meow-listener/src/tproxy/udp.rs",
@@ -654,6 +648,12 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "Socket::new(",
         1,
         "NETLINK_ROUTE socket installing the TUN policy rules; not IP-routed",
+    ),
+    (
+        "crates/meow-common/src/nftset.rs",
+        "libc::socket(",
+        1,
+        "AF_NETLINK nftables set-element socket; not IP-routed",
     ),
     (
         "crates/meow-app/src/arp.rs",

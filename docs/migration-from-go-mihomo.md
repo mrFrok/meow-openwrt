@@ -83,11 +83,14 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
+| `dns:` — `proxy-server-nameserver-policy` | ✓ with safeguards | Dedicated node-domain policy; active only with nonempty `proxy-server-nameserver`. Same ordered keys/values; uses `nameserver-policy-exclusive`. HTTP condition providers and hostname/group/chained proxy dependencies are rejected before policy construction; see [bootstrap requirements](specs/proxy-server-dns-policy.md). |
 | `dns:` — `nameserver-policy-exclusive` | ✓ | meow-rs opt-in for upstream's ordering: a policy match is terminal — no `fallback-filter` domain/IP gate, no main/`fallback:` tiers. Off by default (meow's default tiers defer to `fallback-filter`). |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
-| `tproxy-port` | ✓ | Linux nftables / macOS pf. |
+| `tproxy-port` | ✓ | Linux nftables / macOS pf. Managed-REDIRECT semantic (TCP, host `output` chain) — mihomo's real-TPROXY shorthand maps to `listeners:` `type: tproxy transparent: true` instead. **meow-openwrt:** the shorthand is mihomo's real TPROXY (TCP + IPv4 UDP, deployer-owned rules, bound per `bind-address`); the managed mode is the `listeners:` form. |
+| `redir-port` | ✓ | Deployer-REDIRECT listener, meow owns no rules. Same as `listeners:` `type: redir`. |
+| `routing-mark` | ✓ | Linux only. `SO_MARK` on every outbound socket; the deployer's rules exempt meow's own traffic. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
 | `geodata:` | ✓ | Path overrides, auto-update, interval, and download URL overrides. |
 | `/metrics` Prometheus endpoint | ✓ | meow-rs enhancement (no Go upstream equiv). |
@@ -139,7 +142,7 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 |---------|-----------|-------------|
 | Duplicate listener port | Silently overwrites last | Hard parse error naming both conflicting listeners |
 | Duplicate listener name | Silently overwrites last | Hard parse error |
-| Unknown listener type (e.g. `type: redir`) | Silently ignored | Hard parse error |
+| Unknown listener type | Silently ignored | Hard parse error (`redir` is a valid type) |
 | Shorthand port + `listeners:` entry on same port | Both accepted | Hard parse error (same as duplicate port) |
 | `authentication` entry with no `:` | Silently stored with empty password | Hard parse error |
 | `authentication` entry with empty username (`:pass`) | Silently accepted | Hard parse error |
@@ -532,8 +535,9 @@ dns:
   semantics); use `+.example.com` for apex + any-depth subdomains, `*.` for
   exactly one label, `.` for any-depth subdomains excluding the apex.
 - **AAAA in v4-only configs.** Returns NOERROR-empty so clients fall back
-  to IPv4 cleanly. To allocate v6 fake IPs, point `fake-ip-range` at an
-  IPv6 prefix (e.g. `fc00::/64`).
+  to IPv4 cleanly. To allocate v6 fake IPs alongside the v4 pool, set
+  `fake-ip-range6` (e.g. `fdfe:dcba:9876::/64`) — an IPv6 CIDR in
+  `fake-ip-range` itself makes the single pool v6-only.
 - **Persistence.** `store-fake-ip: true` writes `fakeip-v4.json` /
   `fakeip-v6.json` under the provider cache dir (next to the config file
   for file-backed runs; the resolved home dir under `--config-string`),
@@ -573,18 +577,43 @@ run `meow -t` once in lenient mode — the warnings name every dead key the
 strict load would refuse, so you can fix the list first.
 
 The same dead-key concept reaches the `rules:` list per rule type, judged
-against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
-flag an empty label, a leading or trailing dot, or a verbatim-dead `*`/`+`
-spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
-`DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
-subdomains, so `+.` adds nothing);
-`DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
-`+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
-flags `..` only (a `foo.` needle still matches `foo.bar` as a substring,
+against the normalized host rules compare with: `DOMAIN` flags its payload
+against `is_valid_host` itself — the gate every `host`/`sniff_host`
+producer passes — so besides an empty label, a leading or trailing dot, and
+any byte no hostname carries (`*`, `+`, `?`, a space, non-ASCII —
+`DOMAIN,*.x.com` can never equal a host; `*` belongs on `DOMAIN-WILDCARD`),
+all-numeric non-IP spellings like `DOMAIN,2130706433` or `DOMAIN,123.456`
+are dead too (libc `inet_aton` forms no listener produces), while
+`DOMAIN,10.0.0.1` and `DOMAIN,0x7f000001` stay live — `sniff_host` can
+still carry the literal, and `0x7f000001` is a legal hostname spelling a
+client may send. `DOMAIN-SUFFIX` keeps the label-structure check rather
+than the oracle — an all-numeric payload can still end a legal mixed host
+(`x.2130706433`), so it only flags an empty label, a leading or trailing
+dot, or alphabet-impossible bytes (`DOMAIN-SUFFIX,x.com` already covers
+apex plus subdomains, so `+.` adds nothing);
+`DOMAIN-WILDCARD` flags any literal byte outside the same alphabet —
+its matcher globs `*` only (no `?` glob either), so `+.x.com` and
+`a?b` are dead literal bytes there too — plus dead literal labels;
+`DOMAIN-KEYWORD` flags `..` and any byte no normalized host can carry
+(`*`, `+`, `?`, a space, non-ASCII — every `host`/`sniff_host`
+producer passes the hostname gate, so such a needle is never a
+substring) — a `foo.` needle still matches `foo.bar` as a substring,
 though it no longer hits the bare `foo` under trailing-dot
 normalization — the same residual applies to an anchored
 `DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
-arbitrary pattern's reachability is not decidable by label inspection).
+arbitrary pattern's reachability is not decidable by label inspection
+(the *empty* pattern is the one decidable case — see below). Two more
+surfaces get the same pass: `sub-rules:` bodies and `AND`/`OR`/`NOT`
+legs flag the defects above (reported against the block name or the
+outer rule line). An *empty* payload is flagged separately per type —
+never as dead, but as a silent match-all spelled out: `contains("")`
+is always true, so `DOMAIN-KEYWORD,,X` swallows every flow rather than
+dying (a comma slip for `MATCH,X`, which mihomo also accepts as a
+match-all); `Regex::new("")` is a zero-width match, so
+`DOMAIN-REGEX,,X` does the same; and since `rule_host()` is `""` on
+host-less flows, `DOMAIN,,X` / `DOMAIN-SUFFIX,,X` still match every
+IP-literal destination — a host-less match-all, warned as such rather
+than mislabeled "dead".
 
 ---
 
@@ -705,7 +734,17 @@ Most common format from public providers. Typical issues:
    `auto-route: true` captures all traffic and `dns-hijack` defaults on, no
    `auto-redirect` / `strict-route` needed; see `docs/tun.md`), or use
    `tproxy-port` with nftables `TPROXY`/`REDIRECT` rules.
-2. **`redir-port`** — not supported. Use `tproxy-port`.
+2. **`redir-port`** — supported: a `type: redir` REDIRECT inbound whose
+   rules the deployer owns entirely (meow installs nothing). Upstream's
+   `tproxy-port` real-TPROXY semantic is a `listeners:` `type: tproxy`
+   entry with `transparent: true` (Linux only, `firewall: false`
+   required) — meow's `tproxy-port` shorthand keeps the managed-REDIRECT
+   behaviour the crate has always had. `routing-mark` is also supported
+   (Linux only) — `SO_MARK` on all outbound sockets so the deployer's
+   nftables `meta mark` accept rule keeps meow's own traffic out of its
+   TPROXY/REDIRECT rules; meow's managed firewall installs the matching
+   exemption itself and refuses runtime `routing-mark` changes while it
+   is up.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
    macOS libproc) via M1.D-1. Elsewhere (Android, iOS) they stay dead unless
    the embedder's inbound names each flow's owner itself and calls

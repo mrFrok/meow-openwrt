@@ -727,12 +727,26 @@ impl TunListener {
             v6: cfg.inet6_address,
             nat: None,
         };
-        let fake_ip_net = self.tunnel.resolver().fake_ip_v4_net();
+        let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
+        if cfg.inet6_address.is_none() && self.tunnel.resolver().fake_ip_v6_net().is_some() {
+            warn!(
+                "tun '{}': 'dns.fake-ip-range6' is configured but the device has no \
+                 'inet6-address' — fake AAAA answers have no route into '{dev_name}'. \
+                 'inet6-address' applies only under 'auto-route: true'.",
+                self.name
+            );
+        }
 
+        // meow-openwrt: auto-redirect's route set takes the IPv4 fake range.
+        #[cfg(target_os = "linux")]
+        let fake_ip_v4_net = fake_ip_nets
+            .iter()
+            .copied()
+            .find(|net| matches!(net, ipnet::IpNet::V4(_)));
         #[cfg(target_os = "linux")]
         let auto_redirect = match &cfg.auto_redirect {
             Some(ar) if cfg.auto_route && cfg.route_scope == TunRouteScope::Global => Some(
-                self.start_auto_redirect(ar, &dev_name, &tun_net, fake_ip_net, if_index)
+                self.start_auto_redirect(ar, &dev_name, &tun_net, fake_ip_v4_net, if_index)
                     .await?,
             ),
             _ => None,
@@ -787,8 +801,8 @@ impl TunListener {
             (true, TunRouteScope::Global) if redirected => Vec::new(),
             // The policy rules leave traffic the host forwards
             // (containers, VMs, a gateway's LAN clients) to the main table,
-            // where the fake-IP range still catches its domain flows.
-            (true, TunRouteScope::Global) if policy_routed => fake_ip_net.into_iter().collect(),
+            // where both configured fake-IP ranges catch its domain flows.
+            (true, TunRouteScope::Global) if policy_routed => fake_ip_nets,
             // Split defaults: two /1s (macOS: eight routes that avoid the
             // all-zero key) cover all IPv4 while staying more specific
             // than the physical 0/0 default, so the original route
@@ -797,7 +811,7 @@ impl TunListener {
             // the /1s already.
             (true, TunRouteScope::Global) => global_route_nets(cfg.inet6_address.is_some()),
             (true, TunRouteScope::FakeIp) => {
-                if fake_ip_net.is_none() {
+                if fake_ip_nets.is_empty() {
                     warn!(
                         "tun '{}': 'auto-route: fake-ip' only routes the fake-IP range, but \
                          DNS is not in fake-ip mode — no routes installed. Use \
@@ -805,7 +819,7 @@ impl TunListener {
                         self.name
                     );
                 }
-                fake_ip_net.into_iter().collect()
+                fake_ip_nets
             }
         };
 
@@ -940,8 +954,8 @@ impl TunListener {
                 }
             }
         }
-        let (stack, mut tcp_listener, udp_socket) =
-            lwip::NetStack::new().map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
+        let (stack, tcp_listener, udp_socket) = lwip::NetStack::with_mtu(cfg.mtu)
+            .map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
         // Publish this generation's done signal so the next stack build
         // gates on it — including the case where this listener is aborted
         // before readiness fires.
@@ -975,7 +989,9 @@ impl TunListener {
         // Built before the pumps so the first SYN is already translated.
         let system = if cfg.stack == TunStack::System {
             if cfg!(target_os = "linux") {
-                match system::SystemStack::bind(tun_net, used_addr, used_addr6).await {
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6, cfg.dns_hijack)
+                    .await
+                {
                     Ok(sys) => Some(sys),
                     Err(e) => {
                         warn!("tun.stack system unavailable ({e}); TCP stays on lwIP");
@@ -1098,6 +1114,8 @@ impl TunListener {
             None
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
+        // Bound upstream DNS work across all intercepted TCP streams.
+        let tcp_dns_budget = Arc::new(Semaphore::new(64));
         // System stack: kernel accept errors (ECONNABORTED, EMFILE under a
         // flow storm) back off and retry, as the other listeners do.
         // The accept future is pinned across `select!` iterations — the
@@ -1114,63 +1132,93 @@ impl TunListener {
             meow_common::ErrorBackoff::new(),
         ));
 
+        // Both admission futures remain in the outer select. A semaphore
+        // permit reserved for one backend must not prevent polling that backend.
+        let mut lwip_accept_fut = Box::pin(accept_lwip(
+            tcp_listener,
+            conn_limit.clone(),
+            &warned_saturated,
+            &self.name,
+        ));
+
         let result = loop {
             tokio::select! {
-                accepted = tcp_listener.next() => match accepted {
-                    Some((stream, src, dst)) => {
-                        // Same loop guard as the UDP path: a dial to the
-                        // TUN's own subnet routes back into the device.
-                        if udp::is_looping_dst(dst.ip(), tun_net) {
-                            debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
-                            drop(stream);
-                            continue;
-                        }
-                        let tunnel = self.tunnel.clone();
-                        let name = self.name.clone();
-                        let sem = conn_limit.clone();
-                        let warned = Arc::clone(&warned_saturated);
-                        let sniffer = self.sniffer.clone();
-                        tasks.spawn(async move {
-                            // lwIP only delivers this stream after the
-                            // handshake. Sniff the client's first bytes for
-                            // up to TUN_SNIFF_WINDOW; a close/reset inside
-                            // the window drops the flow, silence dials it
-                            // with an empty prefix (server-first, #695).
-                            let mut stream = stream;
-                            let prefix = match sniff_first_payload(&mut stream).await {
-                                Ok(p) => {
-                                    if p.is_empty() {
-                                        debug!(
-                                            "tun TCP: {src} -> {dst} silent for {}ms, \
-                                             dialing without prefix",
-                                            TUN_SNIFF_WINDOW.as_millis()
-                                        );
+                accepted = lwip_accept_fut.as_mut() => {
+                    let (listener, accepted) = accepted;
+                    lwip_accept_fut.set(accept_lwip(
+                        listener, conn_limit.clone(), &warned_saturated, &self.name,
+                    ));
+                    match accepted {
+                        Some(((stream, src, dst), permit)) => {
+                            // Same loop guard as the UDP path: a dial to the
+                            // TUN's own subnet routes back into the device.
+                            if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) {
+                                debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
+                                drop(stream);
+                                continue;
+                            }
+                            let dns_hijack = cfg.dns_hijack;
+                            let dns_budget = Arc::clone(&tcp_dns_budget);
+                            let tunnel = self.tunnel.clone();
+                            let name = self.name.clone();
+                            let sniffer = self.sniffer.clone();
+                            tasks.spawn(async move {
+                                let _permit = permit;
+                                // lwIP only delivers this stream after the
+                                // handshake. Sniff the client's first bytes for
+                                // up to TUN_SNIFF_WINDOW; a close/reset inside
+                                // the window drops the flow, silence dials it
+                                // with an empty prefix (server-first, #695).
+                                let mut stream = stream;
+                                let prefix = match sniff_first_payload(&mut stream).await {
+                                    Ok(p) => {
+                                        if p.is_empty() {
+                                            debug!(
+                                                "tun TCP: {src} -> {dst} silent for {}ms, \
+                                                 dialing without prefix",
+                                                TUN_SNIFF_WINDOW.as_millis()
+                                            );
+                                        }
+                                        p
                                     }
-                                    p
+                                    Err(e) => {
+                                        debug!(
+                                            "tun TCP: dropping {src} -> {dst} before payload: {e}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                if dns_hijack && dst.port() == 53 {
+                                    let stream = TunTcpConn {
+                                        prefix,
+                                        pos: 0,
+                                        inner: std::sync::Mutex::new(stream),
+                                    };
+                                    if let Err(e) = meow_dns::server::serve_tcp_stream(
+                                        stream,
+                                        tunnel.resolver_slot(),
+                                        dns_budget,
+                                    )
+                                    .await
+                                    {
+                                        debug!("tun TCP DNS: {src} -> {dst}: {e}");
+                                    }
+                                } else {
+                                    handle_tcp_flow(
+                                        tunnel,
+                                        stream,
+                                        prefix,
+                                        src,
+                                        dst,
+                                        &name,
+                                        sniffer.as_deref(),
+                                    )
+                                    .await;
                                 }
-                                Err(e) => {
-                                    debug!(
-                                        "tun TCP: dropping {src} -> {dst} before payload: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                            // A slot is taken only once the flow leaves the
-                            // sniff window (payload seen, or silent past it),
-                            // so a flow that dies inside the window never
-                            // occupies one. Past the window every flow —
-                            // including an idle server-first one — holds its
-                            // slot for its lifetime, exactly as on the other
-                            // inbounds. Flows queued here at saturation are
-                            // bounded by lwIP's MEMP_NUM_TCP_PCB.
-                            let Ok(_permit) = flow_slot(sem, &warned, &name).await else {
-                                return;
-                            };
-                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name, sniffer.as_deref())
-                                .await;
-                        });
+                            });
+                        }
+                        None => break Err("netstack TCP listener or connection quota closed".into()),
                     }
-                    None => break Err("netstack TCP listener closed".into()),
                 },
                 accepted = accept_fut.as_mut() => match accepted {
                     Some((accepted, backoff)) => {
@@ -1191,6 +1239,9 @@ impl TunListener {
                             dst,
                             guard,
                         } = accepted;
+                        if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) { continue; }
+                        let dns_hijack = cfg.dns_hijack;
+                        let dns_budget = Arc::clone(&tcp_dns_budget);
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
@@ -1200,13 +1251,9 @@ impl TunListener {
                             // path, peeked so the bytes stay queued: a
                             // close or reset before any payload drops the
                             // flow, silence dials it (server-first, #695).
-                            // Unlike lwIP the slot is already held — taken
-                            // in the pinned accept future once the kernel
-                            // had a connection. Taking it here after the
-                            // window would match lwIP's hold span, but the
-                            // accept loop would keep accepting and park an
-                            // unbounded number of tasks on the semaphore,
-                            // each holding a kernel fd.
+                            // Both backends hold their slot before spawning.
+                            // Waiting here would accumulate handler tasks and
+                            // accepted sockets outside the explicit quota.
                             let mut probe = [0u8; 1];
                             match timeout(TUN_SNIFF_WINDOW, stream.peek(&mut probe)).await {
                                 Ok(Ok(0)) => {
@@ -1220,6 +1267,18 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
+                            if dns_hijack && dst.port() == 53 {
+                                if let Err(e) = meow_dns::server::serve_tcp_stream(
+                                    stream,
+                                    tunnel.resolver_slot(),
+                                    dns_budget,
+                                )
+                                .await
+                                {
+                                    debug!("tun TCP DNS: {src} -> {dst}: {e}");
+                                }
+                                return;
+                            }
                             let mut metadata = Metadata {
                                 network: Network::Tcp,
                                 conn_type: ConnType::Tun,
@@ -1282,9 +1341,30 @@ impl TunListener {
             let _ = pump_out.await;
         }
         tasks.shutdown().await;
-        drop(tcp_listener);
+        drop(lwip_accept_fut);
         result
     }
+}
+
+/// Retain one accepted stream while waiting for a slot. The caller pins this
+/// future alongside system admission and both pumps, preserving FIFO progress.
+/// Return the listener so the next future can own it without overlapping borrows.
+async fn accept_lwip<S: futures::Stream + Unpin>(
+    mut listener: S,
+    sem: Option<Arc<Semaphore>>,
+    warned: &AtomicBool,
+    name: &str,
+) -> (
+    S,
+    Option<(S::Item, Option<tokio::sync::OwnedSemaphorePermit>)>,
+) {
+    let Some(stream) = listener.next().await else {
+        return (listener, None);
+    };
+    let Ok(permit) = flow_slot(sem, warned, name).await else {
+        return (listener, None);
+    };
+    (listener, Some((stream, permit)))
 }
 
 /// What one completed kernel accept hands the select arm.
@@ -1347,7 +1427,7 @@ async fn accept_system(
     }
 }
 
-/// A `max-connections` slot for a flow leaving its sniff window (`Ok(None)`
+/// A `max-connections` slot for an accepted flow (`Ok(None)`
 /// when unlimited; `Err` when the limit is gone with the listener). Warns
 /// once per saturation episode.
 async fn flow_slot(
@@ -1369,6 +1449,18 @@ async fn flow_slot(
         warned.store(false, Ordering::Relaxed);
     }
     Ok(Some(permit))
+}
+
+/// Main-table fake-IP routes also capture forwarded LAN/container traffic,
+/// which Linux's host-originated policy rules deliberately leave untouched.
+fn fake_ip_route_nets(resolver: &meow_dns::Resolver, ipv6: bool) -> Vec<ipnet::IpNet> {
+    [
+        resolver.fake_ip_v4_net(),
+        ipv6.then(|| resolver.fake_ip_v6_net()).flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// The split default routes of global route scope (#375): more specific
@@ -1561,6 +1653,11 @@ where
     Ok(buf)
 }
 
+// Intercept DNS to the TUN address before rejecting subnet loopback traffic.
+fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
+    !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
+}
+
 async fn handle_tcp_flow(
     tunnel: Tunnel,
     tcp: lwip::TcpStream,
@@ -1733,10 +1830,13 @@ impl TunListener {
         }
         #[cfg(feature = "listener-tproxy")]
         {
-            let bypass = meow_common::routing_mark().unwrap_or_else(|| {
-                meow_common::set_routing_mark(Some(auto_redirect::DEFAULT_BYPASS_MARK));
-                auto_redirect::DEFAULT_BYPASS_MARK
-            });
+            let bypass = match meow_common::routing_mark() {
+                0 => {
+                    meow_common::set_routing_mark(Some(auto_redirect::DEFAULT_BYPASS_MARK));
+                    auto_redirect::DEFAULT_BYPASS_MARK
+                }
+                mark => mark,
+            };
             let mut listeners = Vec::new();
             let port4 = self.spawn_redirect(Ipv4Addr::UNSPECIFIED.into(), &mut listeners)?;
             let port6 = match tun_net.v6 {
@@ -1987,11 +2087,180 @@ mod tests {
         sniff_first_payload, sniff_first_payload_within, Ipv4Addr, Ipv6Net, TunTcpConn,
         TUN_SNIFF_WINDOW,
     };
+    use super::{timeout, Arc, AtomicBool, Semaphore};
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn forwarded_fake_ip_routes_include_the_configured_ipv6_pool() {
+        let mut resolver = meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        );
+        let v4 = "198.18.0.0/16".parse().unwrap();
+        let v6 = "fdfe:dcba:9876::/64".parse().unwrap();
+        for (range, ipv6) in [(v4, false), (v6, true)] {
+            let pool = Arc::new(
+                meow_dns::Pool::new(range, Arc::new(meow_dns::MemoryStore::new(16))).unwrap(),
+            );
+            if ipv6 {
+                resolver.set_fakeip_v6(pool);
+            } else {
+                resolver.set_fakeip_v4(pool);
+            }
+        }
+        assert_eq!(super::fake_ip_route_nets(&resolver, true), vec![v4, v6]);
+        assert_eq!(
+            super::fake_ip_route_nets(&resolver, false),
+            vec![v4],
+            "an IPv4-only device must not claim IPv6 routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn lwip_admission_cancel_closes_waiting_stream() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).acquire_owned().await.unwrap();
+        let warned = AtomicBool::new(false);
+        let (stream, mut peer) = tokio::io::duplex(8);
+        let mut admission = Box::pin(super::accept_lwip(
+            futures::stream::iter([stream]),
+            Some(Arc::clone(&sem)),
+            &warned,
+            "test",
+        ));
+        assert!(futures::poll!(&mut admission).is_pending());
+        drop(admission);
+        // A non-empty buffer proves EOF; bound the wait so a retained
+        // stream fails the regression rather than hanging the test.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(held);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn lwip_admission_progresses_behind_system_waiter() {
+        for system_first in [false, true] {
+            let sem = Arc::new(Semaphore::new(1));
+            let held = Arc::clone(&sem).acquire_owned().await.unwrap();
+            let warned = AtomicBool::new(false);
+            let mut system = Box::pin(super::flow_slot(Some(Arc::clone(&sem)), &warned, "system"));
+            let mut lwip = Box::pin(super::accept_lwip(
+                futures::stream::iter([42]),
+                Some(Arc::clone(&sem)),
+                &warned,
+                "lwip",
+            ));
+            if system_first {
+                assert!(futures::poll!(&mut system).is_pending());
+                assert!(futures::poll!(&mut lwip).is_pending());
+            } else {
+                assert!(futures::poll!(&mut lwip).is_pending());
+                assert!(futures::poll!(&mut system).is_pending());
+            }
+            drop(held);
+            timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    permit = &mut system => {
+                        assert!(system_first);
+                        drop(permit.unwrap());
+                        let (_, accepted) = lwip.await;
+                        let (stream, permit) = accepted.unwrap();
+                        assert_eq!(stream, 42); drop(permit);
+                    }
+                    (_, accepted) = &mut lwip => {
+                        assert!(!system_first);
+                        let (stream, permit) = accepted.unwrap();
+                        assert_eq!(stream, 42); drop(permit);
+                        drop(system.await.unwrap());
+                    }
+                }
+            })
+            .await
+            .expect("both backends must progress through a shared FIFO quota");
+            assert_eq!(sem.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn lwip_admission_observes_either_pump_exit_while_saturated() {
+        for failed_input in [false, true] {
+            let sem = Arc::new(Semaphore::new(0));
+            let warned = AtomicBool::new(false);
+            let mut input = tokio::spawn(std::future::pending::<io::Result<()>>());
+            let mut output = tokio::spawn(std::future::pending::<io::Result<()>>());
+            if failed_input {
+                input.abort();
+            } else {
+                output.abort();
+            }
+            let (stream, mut peer) = tokio::io::duplex(8);
+            let mut admission = Box::pin(super::accept_lwip(
+                futures::stream::iter([stream]),
+                Some(sem),
+                &warned,
+                "test",
+            ));
+            timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    _ = &mut admission => panic!("saturated admission completed"),
+                    _ = &mut input => assert!(failed_input),
+                    _ = &mut output => assert!(!failed_input),
+                }
+            })
+            .await
+            .unwrap();
+            drop(admission);
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            if failed_input {
+                output.abort();
+                let _ = output.await;
+            } else {
+                input.abort();
+                let _ = input.await;
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_dns_hijack_precedes_subnet_loop_guard() {
+        let nets = super::udp::TunNets {
+            v4: "172.19.0.1/30".parse().unwrap(),
+            v6: Some("fd00::1/126".parse().unwrap()),
+            nat: None,
+        };
+        for ip in ["172.19.0.1", "fd00::1"] {
+            let dns = std::net::SocketAddr::new(ip.parse().unwrap(), 53);
+            assert!(!super::tcp_loop_guard(dns, true, nets));
+            assert!(super::tcp_loop_guard(dns, false, nets));
+            assert!(super::tcp_loop_guard(
+                std::net::SocketAddr::new(dns.ip(), 80),
+                true,
+                nets
+            ));
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

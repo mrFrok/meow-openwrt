@@ -118,7 +118,10 @@ mount --bind /usr/bin/meow /usr/bin/mihomo
   take about 1.2 MB in meow, against about 28 MB as dnsmasq lists. See
   [docs/nftset.md](docs/nftset.md).
 - **mihomo behaviour where meow-rs differed**: `tproxy-port` is a real TPROXY
-  listener with UDP, `RULE-SET` works inside `AND`/`OR`/`NOT`, proxy providers
+  listener with UDP (upstream keeps it managed-REDIRECT for good,
+  [meow-rs#901](https://github.com/meow-rs/meow-rs/issues/901); its
+  equivalent there is a `listeners:` `type: tproxy` entry with
+  `transparent: true`, which works here too), `RULE-SET` works inside `AND`/`OR`/`NOT`, proxy providers
   run their health checks, and REST API answers were compared against mihomo
   with [`api-compare.py`](openwrt-fork/bench/api-compare.py).
 - **Small-memory defaults**: `max-connections` scales with RAM (256 on 64 MB),
