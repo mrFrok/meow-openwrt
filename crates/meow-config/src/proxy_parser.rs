@@ -13,7 +13,10 @@ use meow_proxy::{
 };
 #[cfg(feature = "vless")]
 use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
-#[cfg(feature = "wireguard")]
+#[cfg(all(
+    feature = "wireguard",
+    not(all(feature = "wireguard-kernel", target_os = "linux"))
+))]
 use meow_proxy::{WireGuardAdapter, WireGuardConfig};
 use smol_str::SmolStr;
 use std::collections::HashMap;
@@ -3071,7 +3074,10 @@ fn reject_nonzero_hy2_option(
 /// built-in smoltcp stack; `system` warns once then does the same).
 ///
 /// upstream: `adapter/outbound/wireguard.go`
-#[cfg(feature = "wireguard")]
+#[cfg(all(
+    feature = "wireguard",
+    not(all(feature = "wireguard-kernel", target_os = "linux"))
+))]
 fn parse_wireguard(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
@@ -3261,7 +3267,10 @@ fn parse_wireguard(
 
 /// Decode a required WireGuard key field: base64 (standard alphabet, as
 /// every WG tool emits) that must come out to exactly 32 bytes.
-#[cfg(feature = "wireguard")]
+#[cfg(all(
+    feature = "wireguard",
+    not(all(feature = "wireguard-kernel", target_os = "linux"))
+))]
 fn parse_wg_key(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
@@ -3284,7 +3293,10 @@ fn parse_wg_key(
 /// `allowed-ips`: each entry must be a CIDR (`addr/prefix`). An absent or
 /// empty list is *not* an error — [`WireGuardAdapter::new`] substitutes
 /// the catch-all `0.0.0.0/0` + `::/0` default at construction.
-#[cfg(feature = "wireguard")]
+#[cfg(all(
+    feature = "wireguard",
+    not(all(feature = "wireguard-kernel", target_os = "linux"))
+))]
 fn parse_wg_allowed_ips(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
@@ -3312,7 +3324,10 @@ fn parse_wg_allowed_ips(
 /// of three bytes (`[13, 53, 133]`) or a base64 string decoding to exactly
 /// 3 bytes (`"DTWF"`). The pump overwrites bytes 1–4 of each outbound WG
 /// datagram with it after encapsulation.
-#[cfg(feature = "wireguard")]
+#[cfg(all(
+    feature = "wireguard",
+    not(all(feature = "wireguard-kernel", target_os = "linux"))
+))]
 fn parse_wg_reserved(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
