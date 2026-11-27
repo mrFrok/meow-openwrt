@@ -297,16 +297,19 @@ impl FallbackFilter {
         if self.geoip_enabled {
             if let Some(reader) = &self.geoip_reader {
                 for addr in addrs {
-                    if let Some(record) = reader
-                        .lookup(*addr)
-                        .ok()
-                        .and_then(|r| r.decode::<maxminddb::geoip2::Country>().ok())
-                        .flatten()
-                    {
-                        let code = record.country.iso_code;
-                        match code {
-                            Some(c) if c == self.geoip_code.as_str() => {}
-                            _ => return true,
+                    // Only `country.iso_code` is read: decoding the whole
+                    // `geoip2::Country` record costs ~100 KB of serde code.
+                    let path = [
+                        maxminddb::PathElement::Key("country"),
+                        maxminddb::PathElement::Key("iso_code"),
+                    ];
+                    if let Ok(lookup) = reader.lookup(*addr) {
+                        if lookup.has_data() {
+                            match lookup.decode_path::<&str>(&path) {
+                                Ok(Some(c)) if c == self.geoip_code.as_str() => {}
+                                Ok(_) => return true,
+                                Err(_) => {}
+                            }
                         }
                     }
                 }

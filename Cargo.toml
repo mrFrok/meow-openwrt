@@ -223,7 +223,9 @@ regex = { version = "1", default-features = false, features = ["std", "unicode"]
 bytes = "1"
 
 # Compression (mrs geosite / rule-provider binary format)
-zstd = "0.14"
+# No `legacy` (zstd v0.1-0.7 frame decoders, ~54 KB on mipsel): .mrs and
+# geosite payloads are current-format frames.
+zstd = { version = "0.14", default-features = false }
 
 # Randomness
 rand = "0.9"

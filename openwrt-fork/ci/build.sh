@@ -27,7 +27,8 @@ aarch64)
 	SDK_TGT=mediatek/filogic; SDK_SHA=1c04ac47bdfc361d6aab299eb520d570e368013dedcb8d29cf39dc7168ae642e
 	SDK_FILE=openwrt-sdk-$SDK_REL-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
 	RT=aarch64-unknown-linux-musl; GCC=aarch64-openwrt-linux-musl
-	CFL="-Os -mcpu=cortex-a53 -mno-outline-atomics"; RFL="" ;;
+	# No unwind tables for the C side either (panic=abort): -66 KB.
+	CFL="-Os -mcpu=cortex-a53 -mno-outline-atomics -fno-asynchronous-unwind-tables -fno-unwind-tables"; RFL="" ;;
 armv7)
 	SDK_TGT=ipq40xx/generic; SDK_SHA=72b2a064190a46b8026e192e29b8ff357dc040850eb3309573124509acbb8a05
 	SDK_FILE=openwrt-sdk-$SDK_REL-ipq40xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
@@ -94,11 +95,32 @@ export "BORING_BSSL_RUST_CPPLIB_$T=static=stdc++"
 TGT=${TGT:-target/owrt-$ARCH}
 mkdir -p "$TGT"
 CMAKE_TC=$(realpath "$TGT")/openwrt.cmake
+# MIPS has no BoringSSL assembly: the C ChaCha20-Poly1305 is the cipher of
+# every TLS/QUIC byte there and -Os halves its speed. A g++ wrapper builds
+# just those sources at -O3 (MEOW_CC_O3: space-separated path fragments).
+CXXBIN=$TC/bin/$GCC-g++
+case $ARCH in mips|mipsel) : "${MEOW_CC_O3=chacha/chacha.cc poly1305/poly1305.cc}" ;; esac
+if [ -n "${MEOW_CC_O3:-}" ]; then
+	CXXBIN=$(realpath "$TGT")/g++-o3
+	{
+		echo '#!/bin/sh'
+		echo 'case " $* " in'
+		for f in $MEOW_CC_O3; do echo "*$f\\ *) exec $TC/bin/$GCC-g++ \"\$@\" -O3 ;;"; done
+		echo 'esac'
+		echo "exec $TC/bin/$GCC-g++ \"\$@\""
+	} > "$CXXBIN"
+	chmod +x "$CXXBIN"
+fi
+# cargo does not see the wrapper: a changed set must rebuild BoringSSL.
+if [ "$(cat "$TGT/cc-o3.stamp" 2>/dev/null)" != "${MEOW_CC_O3:-}" ]; then
+	rm -rf "$TGT/$RT"/release/build/boring-sys-*
+	echo "${MEOW_CC_O3:-}" > "$TGT/cc-o3.stamp"
+fi
 cat > "$CMAKE_TC" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR ${RT%%-*})
 set(CMAKE_C_COMPILER $TC/bin/$GCC-gcc)
-set(CMAKE_CXX_COMPILER $TC/bin/$GCC-g++)
+set(CMAKE_CXX_COMPILER $CXXBIN)
 set(CMAKE_ASM_COMPILER $TC/bin/$GCC-gcc)
 set(CMAKE_AR $TC/bin/$GCC-gcc-ar)
 set(CMAKE_RANLIB $TC/bin/$GCC-gcc-ranlib)
