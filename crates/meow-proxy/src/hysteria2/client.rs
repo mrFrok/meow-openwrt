@@ -6,7 +6,9 @@
 //! throughput across flows — a single flow still gets one connection.
 
 use super::config::Config;
-use super::driver::{self, Cmd, ConnHandle, DriverSocket};
+#[cfg(hy2_quiche)]
+use super::driver::DriverSocket;
+use super::driver::{self, Cmd, ConnHandle};
 use super::proto;
 use super::tcp::DuplexStream;
 use super::udp::UdpSession;
@@ -15,7 +17,9 @@ use crate::dialer::{PacketConnSocket, TcpDialer, UdpTarget};
 use meow_common::atomic::{AtomicU, Uint};
 use meow_common::ProxyPacketConn;
 use meow_transport::datagram::SocketIo;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
+#[cfg(hy2_quiche)]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
