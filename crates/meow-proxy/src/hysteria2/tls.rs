@@ -11,6 +11,7 @@ use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
 use boring::x509::X509StoreContextRef;
 use sha2::{Digest, Sha256};
 
+pub(crate) use super::params::MAX_SEND_UDP_PAYLOAD;
 use super::params::*;
 
 /// Build a client `quiche::Config` for the given hysteria2 config.

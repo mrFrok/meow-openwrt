@@ -552,10 +552,17 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
     ),
     // meow-openwrt: sockets that are not outbound proxy connections.
     (
-        "crates/meow-proxy/src/wireguard/netlink.rs",
+        "crates/meow-proxy/src/wireguard_kernel/netlink.rs",
         "libc::socket(",
         1,
         "rtnetlink/genetlink socket configuring the kernel WireGuard link",
+    ),
+    // Inbound controller sockets, not outbound dials.
+    (
+        "crates/meow-api/src/endpoint.rs",
+        "Socket::new(",
+        1,
+        "the external-controller-tls listener's dual-stack [::] bind",
     ),
     // Vendored anytls: its own protect helper and its server side.
     (
@@ -660,6 +667,28 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "libc::socket(",
         1,
         "AF_PACKET ARP frame on an explicit interface; not IP-routed",
+    ),
+    (
+        "crates/meow-proxy/src/wireguard/pump.rs",
+        "Socket::new(",
+        2,
+        "smoltcp tcp::Socket/udp::Socket struct constructors — userspace \
+         netstack objects with no fd to bind; the endpoint OS socket is \
+         created via meow_common::bind_udp_for_peer (adapter.rs)",
+    ),
+    (
+        "crates/meow-listener/src/wireguard/actor.rs",
+        "Socket::new(",
+        1,
+        "smoltcp tcp::Socket struct constructor for the lazy listen pool — \
+         userspace netstack object with no fd to bind",
+    ),
+    (
+        "crates/meow-listener/src/wireguard/mod.rs",
+        "UdpSocket::bind(",
+        1,
+        "inbound WireGuard listener endpoint socket facing the peers — \
+         bound by the app before spawn, never dials",
     ),
     // A separate process, never inside the engine.
     (

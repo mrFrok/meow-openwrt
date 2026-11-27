@@ -2,10 +2,10 @@ use axum::{
     body::Body,
     extract::ws::{Message, WebSocketUpgrade},
     extract::{FromRequestParts, Path, Query, Request, State},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, uri::Authority, Method, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post, put, MethodFilter},
     Router,
 };
 use dashmap::DashMap;
@@ -21,10 +21,12 @@ use meow_tunnel::{TrackedTcp, Tunnel};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tower_http::cors::CorsLayer;
+use tower::Layer;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
@@ -32,23 +34,46 @@ use meow_listener::TunListener;
 
 use crate::log_stream::{parse_log_level, LogMessage};
 use crate::ui;
-use crate::{preinstall_global_route_binding, OutboundBinding, PreinstalledBinding};
+use crate::{
+    preinstall_global_route_binding, OutboundBinding, PreinstallScope, PreinstalledBinding,
+};
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
+
+/// Whether the request is a WebSocket upgrade attempt on either HTTP
+/// version axum serves: `Upgrade: websocket` on HTTP/1.1, or an RFC 8441
+/// extended CONNECT on h2 — `axum::serve` advertises
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (no opt-out), so h2 clients may
+/// legitimately arrive this way (issue #974).
+fn is_websocket_attempt(method: &Method, version: Version, headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        || (*method == Method::CONNECT && version >= Version::HTTP_2)
+}
 
 impl<S> FromRequestParts<S> for MaybeWebSocket
 where
     S: Send + Sync,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let is_websocket = parts
-            .headers
-            .get(header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        if !is_websocket {
+        // CONNECT only reaches these routes for an RFC 8441 upgrade —
+        // anything that is not a valid upgrade is an ordinary
+        // method-mismatch, answered like upstream chi's 405 for a
+        // GET-only route (never the route's GET body, which would fake
+        // a tunnel).
+        if parts.method == Method::CONNECT {
+            return WebSocketUpgrade::from_request_parts(parts, state)
+                .await
+                .map(|upgrade| Self(Some(upgrade)))
+                .map_err(|_| {
+                    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "GET")]).into_response()
+                });
+        }
+        if !is_websocket_attempt(&parts.method, parts.version, &parts.headers) {
             return Ok(Self(None));
         }
         Ok(Self(
@@ -63,6 +88,11 @@ pub struct TrafficFeed {
     sender: std::sync::Mutex<Option<broadcast::Sender<Arc<str>>>>,
 }
 
+/// The commit lane's handle into the daemon's NTP supervisor: called
+/// with each accepted document's resolved [`meow_config::NtpConfig`]
+/// (issue #974).
+pub type NtpReconcile = Arc<dyn Fn(meow_config::NtpConfig) + Send + Sync>;
+
 pub struct AppState {
     pub tunnel: Tunnel,
     /// Optional Bearer token enforced by `require_auth`. `None` or empty disables auth.
@@ -73,6 +103,10 @@ pub struct AppState {
     pub raw_config: Arc<RwLock<RawConfig>>,
     /// Fan-out channel for log events. Each WS client subscribes a Receiver.
     pub log_tx: broadcast::Sender<LogMessage>,
+    /// The NTP supervisor's reconcile handle — the commit lane feeds it
+    /// each accepted document's resolved service config; `None` for
+    /// embedders/tests without a supervisor (issue #974).
+    pub ntp_reconcile: Option<NtpReconcile>,
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     /// The cell provider-sourced `dialer-proxy` targets resolve against.
@@ -110,6 +144,9 @@ pub struct AppState {
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
     /// `/storage/{key}`, opened on first use (`crate::storage`).
     pub ui_storage: crate::storage::UiStorageSlot,
+    /// `external-controller-cors` resolved at startup — every transport
+    /// (TCP/TLS/unix/pipe) serves this one policy (issue #974).
+    pub cors: meow_config::ApiCorsConfig,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -122,6 +159,114 @@ pub struct DnsServerHandle {
     /// Slot the serve workers read per query — write the rebuilt resolver
     /// here to hot-swap without rebinding.
     pub resolver_slot: meow_dns::ResolverSlot,
+    /// Weak ref into the serve loop's UDP socket: `upgrade` failing is the
+    /// proof of port release, covering an in-flight reply that holds a
+    /// strong ref briefly past the task's join. `None` for handles whose
+    /// socket never passed through [`meow_dns::BoundDnsServer`].
+    pub socket: Option<std::sync::Weak<tokio::net::UdpSocket>>,
+}
+
+/// A listener [`install_dns_publish`] retired: its task was aborted but
+/// the socket's actual release is only proven by joining the task AND
+/// watching the weak ref die. [`plan_dns_listen`] drains this queue
+/// before attempting any bind, so a remove→re-add at the same address
+/// can never bind over a still-held port (Codex review).
+struct RetiredDnsListener {
+    task: tokio::task::JoinHandle<()>,
+    socket: Option<std::sync::Weak<tokio::net::UdpSocket>>,
+}
+
+/// Retired listeners awaiting teardown proof — process-global like the
+/// sockets themselves (and like [`CONFIG_MUTATION`], the sole lane every
+/// drain and retire runs under). Never held across an `.await`.
+static DNS_RETIRING: parking_lot::Mutex<Vec<RetiredDnsListener>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn retire_dns_listener(old: DnsServerHandle) {
+    old.task.abort();
+    DNS_RETIRING.lock().push(RetiredDnsListener {
+        task: old.task,
+        socket: old.socket,
+    });
+}
+
+/// Bounded time to wait for a retired listener's serve task to die —
+/// abort lands on the next yield, so this only bounds a wedged runtime.
+const DNS_RETIRE_JOIN_WAIT: Duration = Duration::from_secs(5);
+/// Bounded time to wait out an in-flight reply's upgraded socket ref —
+/// the reply holds it only across a `send_to`, so this is a safety cap,
+/// not a pacing delay.
+const DNS_SOCKET_RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+/// Join every retired listener and wait out its socket's last upgraded
+/// ref — the actual-release barrier `plan_dns_listen` runs before
+/// binding. A retired handle embedders built without a socket probe is
+/// covered by the join alone.
+async fn drain_retired_dns() {
+    let retired = std::mem::take(&mut *DNS_RETIRING.lock());
+    for mut old in retired {
+        let _ = tokio::time::timeout(DNS_RETIRE_JOIN_WAIT, &mut old.task).await;
+        if let Some(socket) = old.socket {
+            let deadline = tokio::time::Instant::now() + DNS_SOCKET_RELEASE_WAIT;
+            while socket.upgrade().is_some() {
+                if tokio::time::timeout_at(deadline, tokio::task::yield_now())
+                    .await
+                    .is_err()
+                {
+                    warn!("retired DNS listener's socket outlived its release bound");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `listen` shares the socket set a Windows TUN's loopback-DNS
+/// bind claims — `local_dns::bind` takes `127.0.0.1:53` and `[::1]:53`,
+/// so only a `:53` loopback or wildcard standalone listener collides (a
+/// `192.0.2.x:53` bind does not).
+fn standalone_listen_collides_with_tun_local_dns(listen: std::net::SocketAddr) -> bool {
+    listen.port() == 53 && (listen.ip().is_unspecified() || listen.ip().is_loopback())
+}
+
+/// Whether the commit must retire the standalone `dns.listen` socket
+/// BEFORE its TUN (re)spawn — the Windows DNS→TUN `:53` handoff. A
+/// `Remove` plan only retires the socket inside the commit section,
+/// after the spawn, but a spawning TUN whose hijack shape calls
+/// `local_dns::bind` then hits `EADDRINUSE`: the rollback turns
+/// `tun.enable` off while the committed document still drops
+/// `dns.listen`, stranding both listeners on a single PUT (Codex
+/// review). A `Bound` plan retires the same socket at the same point —
+/// the replacement was bound elsewhere pre-commit — so a move off `:53`
+/// needs the identical handoff. `Keep`/`BindFailed` keep the old
+/// listener serving and never hand off. `windows_local_dns` carries
+/// `cfg!(target_os = "windows") && tun_wants_local_dns_bind` from the
+/// call site — kept a parameter so the decision matrix is testable on
+/// every target.
+fn dns_retire_conflicts_with_tun_bind(
+    dns_plan: &Option<DnsListenPlan>,
+    tun_will_spawn: bool,
+    windows_local_dns: bool,
+    held_listen: Option<std::net::SocketAddr>,
+) -> bool {
+    matches!(
+        dns_plan,
+        Some(DnsListenPlan::Remove | DnsListenPlan::Bound(..))
+    ) && tun_will_spawn
+        && windows_local_dns
+        && held_listen.is_some_and(standalone_listen_collides_with_tun_local_dns)
+}
+
+/// Retire the held standalone `dns.listen` handle and await its socket's
+/// release — the handoff a TUN spawn's loopback `:53` bind needs before
+/// it runs. After it returns, `install_dns_publish`'s `Remove`/`Bound`
+/// arms take/replace a `None` handle: no second teardown, and the
+/// resolver-slot install still runs.
+async fn release_standalone_dns_for_tun(dns_server: &RwLock<Option<DnsServerHandle>>) {
+    if let Some(old) = dns_server.write().take() {
+        retire_dns_listener(old);
+    }
+    drain_retired_dns().await;
 }
 
 /// The API server owns one raw/runtime configuration, so all mutation
@@ -148,9 +293,6 @@ async fn require_auth_ws(
     req: Request,
     next: Next,
 ) -> Response {
-    if !state.auth_required() {
-        return next.run(req).await;
-    }
     let expected = state.secret.as_deref().unwrap_or("");
 
     let bearer = req
@@ -159,12 +301,7 @@ async fn require_auth_ws(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    let is_websocket = req
-        .headers()
-        .get(header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let token_param = if is_websocket {
+    let token_param = if is_websocket_attempt(req.method(), req.version(), req.headers()) {
         query.get("token").map(std::string::String::as_str)
     } else {
         None
@@ -187,6 +324,150 @@ async fn require_auth_ws(
         )
             .into_response()
     }
+}
+
+/// Marker extension the `external-controller-tls` router clone inserts:
+/// the no-secret origin guard compares `Origin` against the transport's
+/// real scheme, and an HTTP/1.1 request line carries no scheme of its own
+/// — without the marker a same-origin `https://` dashboard would look
+/// cross-scheme (issue #974).
+#[derive(Clone, Copy)]
+pub struct TlsTransport;
+
+/// Outer layer for the TLS endpoint's router — runs before the origin
+/// guard inside `create_router`.
+pub async fn mark_tls_transport(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(TlsTransport);
+    next.run(req).await
+}
+
+/// chi emits `Allow` only on a real 405 — one header line per registered
+/// method — while axum's `MethodRouter` attaches a combined `allow:`
+/// (including the `HEAD` `get` implies) to *every* response that passes
+/// through its method fallback: the 405, but also preflights and auth
+/// rejections answered by middleware. Nothing layered inside `Router`
+/// runs after that attach, so `create_router` puts this behind a
+/// catch-all fallback service where the map sees the finished wire:
+/// `allow` is stripped from non-405s and a 405's combined list is
+/// rewritten into chi's per-method lines minus `HEAD` — and minus the
+/// `CONNECT` the WS routes take for h2 extended-CONNECT upgrades, which
+/// upstream never advertises (issue #974).
+async fn allow_header_compat(mut resp: Response) -> Response {
+    let Some(allow) = resp.headers_mut().remove(header::ALLOW) else {
+        return resp;
+    };
+    if resp.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return resp;
+    }
+    let Ok(list) = allow.to_str() else {
+        return resp;
+    };
+    for method in list
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "HEAD" && *m != "CONNECT")
+    {
+        if let Ok(v) = method.parse() {
+            resp.headers_mut().append(header::ALLOW, v);
+        }
+    }
+    resp
+}
+
+/// Restrict browser access when the controller has no token. In particular,
+/// an arbitrary DNS name is never a trusted Host, even when Origin matches it.
+async fn require_controller_origin(req: Request, next: Next) -> Response {
+    if controller_origin_allowed(&req) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "message": "Controller requires a secret for this host or origin"
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn controller_origin_allowed(req: &Request) -> bool {
+    let headers = req.headers();
+    // Also reject cross-site browser requests that did not send an Origin.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin" && site != "none")
+    {
+        return false;
+    }
+
+    let host_header;
+    let authority = match (req.uri().authority(), headers.get(header::HOST)) {
+        (Some(authority), _) => Some(authority),
+        (None, Some(host)) => {
+            host_header = host
+                .to_str()
+                .ok()
+                .and_then(|host| host.parse::<Authority>().ok());
+            let Some(authority) = host_header.as_ref() else {
+                return false;
+            };
+            Some(authority)
+        }
+        // Embedded and HTTP/1.0 clients may send neither header.
+        (None, None) => None,
+    };
+
+    if authority.is_some_and(|authority| !allowed_controller_authority(authority)) {
+        return false;
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let parsed_origin = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"));
+    let (Some(authority), Some((scheme, origin_authority))) = (authority, parsed_origin) else {
+        return false;
+    };
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return false,
+    };
+    let served_scheme = if req.extensions().get::<TlsTransport>().is_some() {
+        "https"
+    } else {
+        req.uri().scheme_str().unwrap_or("http")
+    };
+    if scheme != served_scheme {
+        return false;
+    }
+    let Ok(origin_authority) = origin_authority.parse::<Authority>() else {
+        return false;
+    };
+    allowed_controller_authority(&origin_authority)
+        && origin_authority
+            .host()
+            .eq_ignore_ascii_case(authority.host())
+        && origin_authority.port_u16().unwrap_or(default_port)
+            == authority.port_u16().unwrap_or(default_port)
+}
+
+fn allowed_controller_authority(authority: &Authority) -> bool {
+    let host = authority.host();
+    if authority.as_str().contains('@')
+        || (authority.as_str() != host && authority.port_u16().is_none())
+    {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<Ipv4Addr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<Ipv6Addr>().is_ok())
 }
 
 /// mihomo decodes request bodies as JSON whatever their `Content-Type`
@@ -254,29 +535,44 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
-        .route("/connections", get(get_connections))
+        // WebSocket-capable routes also take CONNECT so an RFC 8441
+        // extended-CONNECT upgrade over h2 reaches the handler — the
+        // route's `Allow` output keeps chi's shape (CONNECT filtered in
+        // `allow_header_compat`) (issue #974).
+        .route(
+            "/connections",
+            get(get_connections).on(MethodFilter::CONNECT, get_connections),
+        )
         .route(
             "/connections/{id}",
             get(get_connection).delete(close_connection),
         )
         .route("/connections", delete(close_all_connections))
+        // Registered in upstream's handler order so the 405 `Allow` lines
+        // come out identical (issue #974).
         .route(
             "/configs",
-            get(get_configs).patch(update_configs).put(put_configs),
+            get(get_configs).put(put_configs).patch(update_configs),
         )
         .route("/metrics", get(get_metrics))
-        .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic",
+            get(get_traffic).on(MethodFilter::CONNECT, get_traffic),
+        )
         .route(
             "/traffic/ledger",
             get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
         )
         .route("/statistics", get(get_statistics))
-        .route("/logs", get(get_logs))
+        .route("/logs", get(get_logs).on(MethodFilter::CONNECT, get_logs))
         .route(
             "/logbook",
             get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
         )
-        .route("/memory", get(get_memory))
+        .route(
+            "/memory",
+            get(get_memory).on(MethodFilter::CONNECT, get_memory),
+        )
         // Dashboard settings sync (zashboard), as mihomo's cache.db store.
         .route(
             "/storage/{key}",
@@ -338,11 +634,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_rule_provider).put(refresh_rule_provider),
         )
         // Listeners (read-only list)
-        .route("/listeners", get(get_listeners))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/listeners", get(get_listeners));
+    let auth_required = state.auth_required();
+    let api = if auth_required {
+        api.route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_auth_ws,
-        ));
+        ))
+    } else {
+        api.layer(middleware::from_fn(require_controller_origin))
+    };
 
     // Web UI is intentionally unauthenticated so dashboards can load and then
     // present a token prompt; this matches upstream mihomo behaviour.
@@ -350,23 +651,38 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // When `external-ui` is configured (issue #223) the static directory is
     // served at `/ui` via tower-http's `ServeDir`; otherwise the built-in
     // single-page panel is served.
-    let router = api;
     let router = if let Some(dir) = state.external_ui.clone() {
         // `ServeDir` resolves `index.html` for the directory root and serves
         // any nested asset; `nest_service("/ui", …)` strips the `/ui` prefix so
         // both `/ui` and `/ui/<asset>` resolve. Dashboards (metacubexd, yacd)
         // use hash routing, so no server-side SPA fallback is required.
-        router.nest_service("/ui", tower_http::services::ServeDir::new(dir))
+        api.nest_service("/ui", tower_http::services::ServeDir::new(dir))
     } else {
-        router
-            .route("/ui", get(ui::serve_ui))
+        api.route("/ui", get(ui::serve_ui))
             .route("/ui/{*rest}", get(ui::serve_ui))
     };
 
-    router
-        .layer(middleware::map_request(assume_json_body))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+    let router = router.layer(middleware::map_request(assume_json_body));
+    // CORS answers preflights outside Bearer auth on every transport —
+    // upstream mounts the middleware on the router itself. Deliberate
+    // divergence (issue #974): the no-secret mode keeps its no-grants
+    // posture and mounts no CORS layer at all — cross-origin dashboards
+    // must configure a secret.
+    let router = if auth_required {
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::cors::handle,
+        ))
+    } else {
+        router
+    };
+    let app = router.with_state(state);
+    // `allow_header_compat` has to see the response after the method
+    // router attaches `allow`, so the routes are served behind a catch-all
+    // fallback service — a `Route` endpoint carries no allow list of its
+    // own, so nothing re-adds the header the shim removed (issue #974).
+    Router::new()
+        .fallback_service(middleware::map_response::<_, ()>(allow_header_compat).layer(app))
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
@@ -825,6 +1141,38 @@ async fn close_connection(
     }
 }
 
+/// The `ntp:` section as `GET /configs` reports it — the resolved
+/// service configuration (`enable`/`server`/`port`/`interval`/
+/// `dialer-proxy`), with `write-to-system` always `false`: the knob is
+/// parsed for compatibility but meow never writes the OS clock
+/// (issue #974). The offset reaches only the protocol clock — there is
+/// no "synced" claim.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct NtpFields {
+    enable: bool,
+    server: String,
+    port: u16,
+    /// `interval` in minutes, as the config spells it.
+    interval: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dialer_proxy: Option<String>,
+    write_to_system: bool,
+}
+
+impl From<meow_config::NtpConfig> for NtpFields {
+    fn from(cfg: meow_config::NtpConfig) -> Self {
+        Self {
+            enable: cfg.enable,
+            server: cfg.server,
+            port: cfg.port,
+            interval: cfg.interval_minutes,
+            dialer_proxy: cfg.dialer_proxy,
+            write_to_system: false,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ConfigResponse {
     mode: String,
@@ -861,6 +1209,47 @@ struct ConfigResponse {
     skip_auth_prefixes: Vec<String>,
     #[serde(rename = "routing-mark")]
     routing_mark: u32,
+    /// mihomo's top-level `interface-name` (issue #974) — the live global
+    /// binding ("" when unset), like `routing-mark` above.
+    #[serde(rename = "interface-name")]
+    interface_name: String,
+    /// mihomo's top-level `global-ua` (issue #974) — the live UA override
+    /// internal fetches and probes send ("" when unset = the default
+    /// `clash.meta/<version>`).
+    #[serde(rename = "global-ua")]
+    global_ua: String,
+    /// mihomo's top-level `global-client-fingerprint` (issue #974) — the
+    /// committed document's value ("" when unset). PUT-only: adapters bake
+    /// it at parse, so it cannot hot-swap.
+    #[serde(rename = "global-client-fingerprint")]
+    global_client_fingerprint: String,
+    /// mihomo's `tcp-concurrent` — the live dial policy (always reported:
+    /// the process-global the next candidate selection reads, not the
+    /// document's).
+    #[serde(rename = "tcp-concurrent")]
+    tcp_concurrent: bool,
+    /// mihomo's `find-process-mode` — the tunnel's live lookup policy
+    /// (`always`/`strict`/`off`), not the document's (issue #974).
+    #[serde(rename = "find-process-mode")]
+    find_process_mode: String,
+    /// mihomo's `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
+    /// — the effective outbound-dial keepalive policy (seconds), like the
+    /// other live globals above: what the next `connect_tcp` applies, not
+    /// necessarily the committed document's spellings (`0`/absent → 15 s).
+    #[serde(rename = "keep-alive-idle")]
+    keep_alive_idle: u64,
+    #[serde(rename = "keep-alive-interval")]
+    keep_alive_interval: u64,
+    #[serde(rename = "disable-keep-alive")]
+    disable_keep_alive: bool,
+    /// The effective `profile:` flags — resolved over the committed
+    /// document (`profile.store-fake-ip` > `dns.store-fake-ip` > false),
+    /// matching how mihomo reports them flat on `GET /configs`
+    /// (issue #974).
+    #[serde(rename = "store-selected")]
+    store_selected: bool,
+    #[serde(rename = "store-fake-ip")]
+    store_fake_ip: bool,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -870,10 +1259,18 @@ struct ConfigResponse {
     /// `tun.enable` rather than `tun-enable`: `enable` is the running
     /// state, the other keys echo the committed section.
     tun: TunFields,
+    /// The resolved `ntp:` section (issue #974).
+    ntp: NtpFields,
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
-    let tun_running = state.tunnel.has_tun();
+    // `tun-enable`/`tun.enable` report the top-level section's device
+    // only — a running named `type: tun` listener is not `tun.enable`
+    // (its lifecycle belongs to startup, not this toggle).
+    let tun_running = matches!(
+        state.tunnel.tun_owner(),
+        Some(meow_tunnel::TunOwner::TopLevel)
+    );
     let raw = state.raw_config.read();
     Json(ConfigResponse {
         mode: state.tunnel.mode().to_string(),
@@ -906,8 +1303,55 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         // The live mark (what outbound sockets carry), not the document's.
         routing_mark: meow_common::routing_mark(),
+        // The live global interface binding likewise (issue #974).
+        interface_name: meow_common::global_interface_name()
+            .as_deref()
+            .unwrap_or("")
+            .to_string(),
+        // The live UA override likewise — what the next internal fetch or
+        // latency probe actually sends (issue #974).
+        global_ua: meow_common::global_ua()
+            .as_deref()
+            .unwrap_or("")
+            .to_string(),
+        // Echo the committed value normalized, as the parsers resolve it:
+        // `"none"`/`""`/whitespace report unset, case/space folds away.
+        global_client_fingerprint: meow_config::proxy_parser::normalize_client_fingerprint(
+            raw.global_client_fingerprint.as_deref(),
+        )
+        .unwrap_or_default(),
+        // The live dial policy likewise — what the next candidate run
+        // observes; a PATCH can flip it without a committed-document
+        // round-trip (like `unified-delay` above).
+        tcp_concurrent: meow_common::dial::tcp_concurrent(),
+        // The live policy on the tunnel — a PATCH can change it without a
+        // committed-document round-trip, like `tcp-concurrent` above.
+        find_process_mode: state.tunnel.process_lookup_mode().to_string(),
+        // The live outbound keepalive posture — same live-vs-document
+        // reporting as `tcp-concurrent` (issue #974).
+        keep_alive_idle: meow_common::outbound_tcp_keepalive().idle.as_secs(),
+        keep_alive_interval: meow_common::outbound_tcp_keepalive().interval.as_secs(),
+        disable_keep_alive: !meow_common::outbound_tcp_keepalive().enabled,
+        // Effective profile flags — the resolved pair, so `GET` reports
+        // what selection/fake-IP persistence actually does, not the
+        // spelling the operator happened to use.
+        store_selected: meow_config::resolve_profile(&raw).store_selected,
+        store_fake_ip: meow_config::resolve_profile(&raw).store_fake_ip,
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
+        // The committed document always resolves — it passed admission;
+        // the fallback keeps a hand-rolled test raw from failing the GET.
+        ntp: meow_config::resolve_ntp(&raw).map_or(
+            NtpFields {
+                enable: false,
+                server: "time.apple.com".to_string(),
+                port: 123,
+                interval: 30,
+                dialer_proxy: None,
+                write_to_system: false,
+            },
+            NtpFields::from,
+        ),
     })
 }
 
@@ -1017,12 +1461,40 @@ struct UpdateConfigRequest {
     log_level: Option<String>,
     #[serde(rename = "routing-mark")]
     routing_mark: Option<u32>,
+    /// mihomo's top-level `interface-name` (issue #974); `""` clears.
+    #[serde(rename = "interface-name")]
+    interface_name: Option<String>,
+    /// mihomo's top-level `global-ua` (issue #974); `""` clears to the
+    /// default UA. Rejected when it carries CR/LF/NUL/control bytes.
+    #[serde(rename = "global-ua")]
+    global_ua: Option<String>,
+    /// mihomo's `tcp-concurrent` — live dial policy; absent/null leaves
+    /// the running value alone.
+    #[serde(rename = "tcp-concurrent")]
+    tcp_concurrent: Option<bool>,
+    /// mihomo's `find-process-mode` — live lookup policy; absent/null
+    /// leaves the running mode alone. Case-insensitive like the YAML key;
+    /// an unknown spelling fails JSON extraction with 422 before anything
+    /// is applied (issue #974).
+    #[serde(rename = "find-process-mode")]
+    find_process_mode: Option<meow_common::ProcessLookupMode>,
+    /// mihomo's `keep-alive-*` outbound-dial knobs — merged over the
+    /// committed document like every field here; absent/null keeps the
+    /// committed value (issue #974). Raw `Value` so a malformed number
+    /// (negative, fractional, past u64) reaches the handler's 400 gate
+    /// instead of dying as a 422 extraction failure.
+    #[serde(rename = "keep-alive-idle")]
+    keep_alive_idle: Option<serde_json::Value>,
+    #[serde(rename = "keep-alive-interval")]
+    keep_alive_interval: Option<serde_json::Value>,
+    #[serde(rename = "disable-keep-alive")]
+    disable_keep_alive: Option<bool>,
     tun: Option<TunFields>,
 }
 
 async fn update_configs(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateConfigRequest>,
+    Json(mut body): Json<UpdateConfigRequest>,
 ) -> Response {
     // Validate every field first so we never partially apply on error.
     let mode = body.mode.map(|s| s.parse::<TunnelMode>());
@@ -1034,11 +1506,18 @@ async fn update_configs(
             return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
         }
     }
+    // `global-ua` gate (issue #974): CR/LF/NUL/control bytes are header
+    // injection — reject before anything below is applied.
+    if let Some(ref ua) = body.global_ua {
+        if let Err(e) = meow_config::validate_global_ua(Some(ua)) {
+            return msg_err(StatusCode::BAD_REQUEST, e.to_string().as_str());
+        }
+    }
 
     // Enter the shared mutation lane before applying anything: a bare
     // `raw_config.write()` here would race a concurrent PUT /configs,
     // whose candidate swap would clobber the patched fields (issue #514).
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     // The routing-mark refusal gate runs before ANY mutation below —
     // under pinned managed tproxy rules a change rejects the whole PATCH
     // rather than partially apply it (same refusal `PUT /configs`
@@ -1054,6 +1533,55 @@ async fn update_configs(
                 .into_response();
         }
     }
+    // `keep-alive-*` patch: merge the supplied fields over the committed
+    // document and validate the COMPLETE result before anything below is
+    // applied — a bad merged posture rejects the whole PATCH, like the
+    // `global-ua` gate above (issue #974). The numeric fields arrive as
+    // raw `Value`s: a non-`u64` number (negative, fractional, oversized)
+    // or non-number is a shape defect — 400, the verdict every other bad
+    // field in this PATCH gets, not a 422 extraction failure (Codex
+    // review).
+    let keep_alive_idle = match body.keep_alive_idle.take() {
+        Some(v) => match v.as_u64() {
+            Some(v) => Some(v),
+            None => return msg_err(StatusCode::BAD_REQUEST, "Body invalid"),
+        },
+        None => None,
+    };
+    let keep_alive_interval = match body.keep_alive_interval.take() {
+        Some(v) => match v.as_u64() {
+            Some(v) => Some(v),
+            None => return msg_err(StatusCode::BAD_REQUEST, "Body invalid"),
+        },
+        None => None,
+    };
+    let keepalive_supplied = keep_alive_idle.is_some()
+        || keep_alive_interval.is_some()
+        || body.disable_keep_alive.is_some();
+    let keepalive = if keepalive_supplied {
+        let mut candidate = state.raw_config.read().clone();
+        if let Some(v) = keep_alive_idle {
+            candidate.keep_alive_idle = Some(v);
+        }
+        if let Some(v) = keep_alive_interval {
+            candidate.keep_alive_interval = Some(v);
+        }
+        if let Some(v) = body.disable_keep_alive {
+            candidate.disable_keep_alive = Some(v);
+        }
+        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
+            Ok(ka) => Some((candidate, ka)),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": e.to_string() })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        None
+    };
     // The patched `tun:` section, checked like a `PUT /configs` one before
     // anything is applied; `None` when the patch leaves it as it is.
     let tun = match body.tun {
@@ -1068,6 +1596,28 @@ async fn update_configs(
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "message": format!("tun config error: {e}") })),
+                )
+                    .into_response();
+            }
+            // A merged `enable: true` runs the same one-effective-TUN
+            // rule `PUT /configs` enforces: refused while a named
+            // `type: tun` device holds the slot or the committed
+            // document still stages one (a PATCH cannot drop
+            // `listeners:`, so the doc check is against `raw` itself).
+            if tun.enable
+                && (matches!(
+                    state.tunnel.tun_owner(),
+                    Some(meow_tunnel::TunOwner::Named(_))
+                ) || raw
+                    .listeners
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|l| l.listener_type.eq_ignore_ascii_case("tun")))
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": "tun.enable cannot be set while a named `type: tun` listener is declared — meow-rs runs one effective TUN" })),
                 )
                     .into_response();
             }
@@ -1093,41 +1643,100 @@ async fn update_configs(
             (raw.tun.as_ref() != Some(&tun)).then_some(tun)
         }
     };
+    // The remaining writes share one commit shape — packaged so the TUN
+    // arm can carry the identical tail inside the owned task.
+    let tail = PatchTail {
+        mode: mode.and_then(Result::ok),
+        log_level: body.log_level.take(),
+        routing_mark: body.routing_mark,
+        interface_name: body.interface_name.take(),
+        global_ua: body.global_ua.take(),
+        tcp_concurrent: body.tcp_concurrent,
+        find_process_mode: body.find_process_mode,
+        keepalive,
+    };
     // Apply the fallible sides first — committing mode before a failed
     // step would partially apply the PATCH (issue #514). TUN goes first:
     // it is the step that fails in practice (a device the process may not
     // create), so such a PATCH leaves mode and log level as they were. The
-    // TUN change runs the reload path's reconcile, rollback included.
+    // TUN change runs the reload path's reconcile, rollback included —
+    // the whole arm rides `run_owned_mutation` so a cancelled request
+    // cannot interrupt stop → spawn → commit → tail-write partway.
     if let Some(tun) = tun {
-        let mut candidate = state.raw_config.read().clone();
+        let prior = state.raw_config.read().clone();
+        let mut candidate = prior.clone();
         candidate.tun = Some(tun);
-        // Carry a patched routing-mark through the same commit path
-        // (`set_routing_mark` inside the swap applies it; the write below
-        // re-asserts it so a mark-only PATCH also lands).
-        if body.routing_mark.is_some() {
-            candidate.routing_mark = body.routing_mark;
-        }
-        let preinstalled = preinstall_global_route_binding(&candidate);
+        // The tail fields deliberately do NOT ride the candidate: the
+        // swap's commit would publish them (and the keepalive posture it
+        // resolves from `final_doc`) BEFORE `finish_patch_writes` runs
+        // the fallible log-level reload — a reloader error would answer
+        // 500 over an already-committed PATCH. With `candidate` carrying
+        // only the `tun:` change, the swap's process-global installs all
+        // re-assert the committed values (no-ops) and every tail knob
+        // still lands in `finish_patch_writes`, after every fallible
+        // step — the same ordering the non-TUN path below already uses.
+        let preinstalled = preinstall_global_route_binding(
+            &candidate,
+            PreinstallScope::Mutation {
+                named_tun_running: matches!(
+                    state.tunnel.tun_owner(),
+                    Some(meow_tunnel::TunOwner::Named(_))
+                ),
+            },
+        );
         // No routing publish runs here, so tracked TCP predating a
-        // pre-installed global-route binding is still live.
-        if let Err(e) = swap_config_and_reconcile_tun(
-            &state,
-            candidate,
-            None,
-            state.tunnel.resolver(),
-            preinstalled,
-            TrackedTcp::Cancel,
-        )
-        .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "message": e })),
+        // pre-installed global-route binding is still live. The rollback
+        // document is the pre-patch one: a failed spawn commits it with
+        // `tun.enable` rolled back, and the tail fields were never
+        // merged into the candidate — a rejected PATCH publishes none of
+        // them (issue #974).
+        let (lane, response) = run_owned_mutation(&state, mutation, |state| async move {
+            let receipt = swap_config_and_reconcile_tun(
+                &state,
+                candidate,
+                PendingPublish::default(),
+                state.tunnel.resolver(),
+                preinstalled,
+                TrackedTcp::Cancel,
+                Some(prior),
             )
-                .into_response();
-        }
+            .await;
+            if let Err(e) = receipt.tun {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": e })),
+                )
+                    .into_response();
+            }
+            finish_patch_writes(&state, tail)
+        })
+        .await;
+        let _mutation = lane;
+        return response;
     }
-    if let Some(level) = body.log_level.as_deref() {
+    finish_patch_writes(&state, tail)
+}
+
+/// The PATCH fields `finish_patch_writes` installs and writes into the
+/// committed document — after every fallible step (the TUN reconcile,
+/// the log-level reload), so both PATCH paths land the same set of
+/// knobs with the same failure semantics.
+struct PatchTail {
+    mode: Option<TunnelMode>,
+    log_level: Option<String>,
+    routing_mark: Option<u32>,
+    interface_name: Option<String>,
+    global_ua: Option<String>,
+    tcp_concurrent: Option<bool>,
+    find_process_mode: Option<meow_common::ProcessLookupMode>,
+    keepalive: Option<(RawConfig, meow_common::OutboundTcpKeepalive)>,
+}
+
+/// Write `tail`'s fields into the committed document and the live
+/// process-globals — the PATCH's own commit point, run after every
+/// fallible step (the TUN reconcile, when present, already landed).
+fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
+    if let Some(level) = tail.log_level.as_deref() {
         if let Err(e) = crate::log_stream::reload_log_level(level) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1137,21 +1746,60 @@ async fn update_configs(
         }
     }
     let mut raw = state.raw_config.write();
-    if let Some(Ok(parsed_mode)) = mode {
+    if let Some(parsed_mode) = tail.mode {
         state.tunnel.set_mode(parsed_mode);
         raw.mode = Some(parsed_mode.to_string());
         info!("Mode changed to {}", parsed_mode);
     }
-    if let Some(level) = body.log_level {
+    if let Some(level) = tail.log_level {
         raw.log_level = Some(level);
     }
-    if let Some(mark) = body.routing_mark {
+    if let Some(mark) = tail.routing_mark {
         // Commit point: the refusal gate passed before any mutation above.
         // `set_routing_mark` treats `Some(0)` as unset, like PUT's
         // `routing-mark: 0`.
         meow_common::set_routing_mark(Some(mark));
         raw.routing_mark = Some(mark);
         info!("routing-mark changed to {mark}");
+    }
+    if let Some(name) = tail.interface_name {
+        // The setter normalizes the same way as the node parser (issue
+        // #974): trimmed, empty meaning unset — so `interface-name: ""`
+        // clears.
+        let trimmed = name.trim();
+        meow_common::set_global_interface_name(Some(trimmed));
+        info!("interface-name changed to {trimmed}");
+        raw.interface_name = Some(name);
+    }
+    if let Some(ua) = tail.global_ua {
+        // Already validated above; the setter re-trims, and `""` clears
+        // to the default `clash.meta/<version>` UA (issue #974).
+        meow_common::set_global_ua(Some(ua.trim()));
+        info!("global-ua changed to {}", ua.trim());
+        raw.global_ua = Some(ua);
+    }
+    if let Some(concurrent) = tail.tcp_concurrent {
+        // Dial policy is a live process-global like `global-ua`: commit
+        // here after every fallible step above.
+        meow_common::dial::set_tcp_concurrent(concurrent);
+        info!("tcp-concurrent changed to {concurrent}");
+        raw.tcp_concurrent = Some(concurrent);
+    }
+    if let Some(mode) = tail.find_process_mode {
+        // The tunnel's live policy — the traffic ledger shares the cell,
+        // so queued app lookups recheck it too (issue #974).
+        state.tunnel.set_process_lookup_mode(mode);
+        info!("find-process-mode changed to {mode}");
+        raw.find_process_mode = Some(mode);
+    }
+    if let Some((merged, ka)) = tail.keepalive {
+        // Commit point after every fallible step above: install the
+        // merged policy and echo the merged fields into the document —
+        // an omitted key keeps its committed value.
+        meow_common::set_outbound_tcp_keepalive(ka);
+        raw.keep_alive_idle = merged.keep_alive_idle;
+        raw.keep_alive_interval = merged.keep_alive_interval;
+        raw.disable_keep_alive = merged.disable_keep_alive;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1569,16 +2217,20 @@ fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String>
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
 /// are not Send and would otherwise break the axum Handler bound.
 ///
-/// Returns the rebuilt [`meow_config::DnsConfig`] (when its inputs changed)
-/// plus the resolver generation that was live before the early install —
-/// the caller passes it to [`swap_config_and_reconcile_tun`] so the TUN
-/// fake-IP comparison sees the true old state (issue #533 review).
+/// Returns the candidate's publish payload — the rebuilt route table,
+/// provider registries and [`meow_config::DnsConfig`] when its inputs
+/// changed, unpublished — plus the resolver generation that was live
+/// before the rebuild, which the caller passes to
+/// [`swap_config_and_reconcile_tun`] so the TUN fake-IP comparison sees
+/// the true old state (issue #533 review). Nothing here installs a live
+/// structure: every publish lands inside the swap's synchronous commit
+/// section so a cancelled request changes nothing (issue #974 review).
 ///
 /// Callers must hold the `CONFIG_MUTATION` lane (issue #543).
 async fn apply_raw_to_tunnel(
     raw: RawConfig,
     state: &AppState,
-) -> Result<(Option<meow_config::DnsConfig>, Arc<meow_dns::Resolver>), (StatusCode, String)> {
+) -> Result<(PendingPublish, Arc<meow_dns::Resolver>), (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -1634,12 +2286,15 @@ async fn apply_raw_to_tunnel(
         providers,
         cache_dir,
         state.provider_dialer_registry.clone(),
+        state.tunnel.selection_backing(),
+        state.tunnel.dns_outbound_cell(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let meow_config::RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry,
         rule_providers,
         proxy_providers,
@@ -1655,6 +2310,17 @@ async fn apply_raw_to_tunnel(
             format!("proxy group '{missing}' failed validation"),
         ));
     }
+    // The prospective-route sweep: the candidate's own `listeners[]`
+    // references and the still-running listeners' `proxy:`/`rule`
+    // overrides must all keep resolving against this map — before the
+    // DNS rebuild dials or `update_routing` publishes anything.
+    listener_route_deps_guard(
+        &state.listeners,
+        &raw,
+        &proxies,
+        &sub_rules,
+        &proxy_providers,
+    )?;
     // Issue #514: a changed `dns:`/`hosts:`/`ipv6:`/`geodata:` section must
     // rebuild the resolver, not just land in the persisted config. Parse
     // against the freshly rebuilt proxy registry so circular
@@ -1671,43 +2337,41 @@ async fn apply_raw_to_tunnel(
         Some(&dialer_registry),
     )
     .await?;
-    // Snapshot the resolver being replaced BEFORE the early install below
-    // — `swap_config_and_reconcile_tun` compares its fake-IP inputs against
-    // the new generation's; reading `tunnel.resolver()` there would already
-    // see the candidate and never detect a change (issue #533 review).
+    // Snapshot the resolver being replaced before the commit — the swap
+    // compares its fake-IP inputs against the candidate's; reading
+    // `tunnel.resolver()` at the commit still sees the old generation
+    // because nothing has installed yet (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
-    // Publish the rebuilt resolver to every consumer before the route swap
-    // drops the old registry cell: a `#name` upstream still resolving
-    // through the standalone DNS server's or host hook's OLD resolver
-    // would fail closed in the gap until `publish_dns` runs (issue #533
-    // review). Idempotent — `publish_dns` installs the same Arc again.
+    // The named-TUN fake-IP pin gates first so a rejected candidate never
+    // publishes the moving pool. The resolver itself — and every other
+    // install this rebuild produced — stays unpublished until the swap's
+    // synchronous commit section (issue #974 review): a candidate-side
+    // await or cancellation below changes nothing live.
     if let Some(dns) = &dns {
-        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
+        named_tun_fake_ip_guard(state, &prior_resolver, dns)?;
     }
-    state.tunnel.update_routing(proxies, rules, dialer_registry);
-    state.tunnel.set_connection_notes(connection_notes);
-    // mihomo re-applies `routing-mark` on every config load.
-    meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw));
-    meow_tunnel::nftset::install(&state.tunnel, meow_config::effective_nftset(&raw));
-    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
-    // Commit point reached: every fallible check passed. The candidate's
-    // provider sets become the live registries — the rules and DNS
-    // `rule-set:` matchers installed above already reference these Arcs
-    // (issue #533 review). `commit_registry` publishes the map *and*
-    // reconciles the interval refresh loops so providers added, removed,
-    // or re-intervalled by this commit gain/lose their task (issue #543).
-    state
-        .rule_provider_refresh
-        .commit_registry(&state.rule_providers, rule_providers);
-    commit_proxy_providers(
-        &state.proxy_providers,
-        &proxy_providers,
-        raw.strict.unwrap_or(false),
-        raw.proxy_providers.as_ref(),
-        &state.proxy_provider_refresh,
-    );
-    dropped_providers.record();
-    Ok((dns, prior_resolver))
+    Ok((
+        PendingPublish {
+            routing: Some(PendingRouting {
+                proxies,
+                rules,
+                sub_rules,
+                dialer_registry,
+                rule_providers,
+                proxy_providers,
+                dropped_providers,
+                connection_notes,
+                nftset: meow_config::effective_nftset(&raw),
+                tcp_idle_timeout,
+                store_selected: meow_config::resolve_profile(&raw).store_selected,
+                strict: raw.strict.unwrap_or(false),
+                raw_proxy_providers: raw.proxy_providers,
+                install: RouteInstall::KeepTrackedTcp,
+            }),
+            dns,
+        },
+        prior_resolver,
+    ))
 }
 
 /// Rebuild routing + DNS from `candidate`, then commit it as the new raw
@@ -1723,11 +2387,18 @@ async fn apply_raw_to_tunnel(
 /// is covered the same way as on the cold path.
 ///
 /// `change` is recorded in the logbook once the candidate is committed.
+/// The candidate build (`apply_raw_to_tunnel`) still runs request-side
+/// so a cancelled caller leaves zero change; everything from the swap on
+/// — the TUN transition and the synchronous publish — runs inside
+/// [`run_owned_mutation`], which holds the lane continuously until the
+/// whole commit has landed. The lane is returned so the caller keeps its
+/// critical section.
 async fn commit_raw_candidate(
-    state: &AppState,
+    state: &Arc<AppState>,
     candidate: RawConfig,
     change: impl Into<Option<logbook::Event>>,
-) -> Result<(), (StatusCode, String)> {
+    lane: tokio::sync::MutexGuard<'static, ()>,
+) -> Result<tokio::sync::MutexGuard<'static, ()>, (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -1767,26 +2438,247 @@ async fn commit_raw_candidate(
             )
         })?;
     }
+    if let Some(msg) = named_tun_enable_blocked(state, &candidate) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
     if let Some(msg) = routing_mark_change_refused(&candidate) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
-    let preinstalled = preinstall_global_route_binding(&candidate);
-    let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
+    let preinstalled = preinstall_global_route_binding(
+        &candidate,
+        PreinstallScope::Mutation {
+            named_tun_running: matches!(
+                state.tunnel.tun_owner(),
+                Some(meow_tunnel::TunOwner::Named(_))
+            ),
+        },
+    );
+    let (publish, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
     // tracked TCP: a flush must cancel the flows that predate the binding.
     // A TUN restart that fails is rolled back and recorded there; the edit
     // itself is committed.
-    let _ = swap_config_and_reconcile_tun(
-        state,
-        candidate,
-        dns,
-        prior_resolver,
-        preinstalled,
-        TrackedTcp::Cancel,
-    )
+    let change = change.into();
+    let (lane, _receipt) = run_owned_mutation(state, lane, |state| async move {
+        let receipt = swap_config_and_reconcile_tun(
+            &state,
+            candidate,
+            publish,
+            prior_resolver,
+            preinstalled,
+            TrackedTcp::Cancel,
+            None,
+        )
+        .await;
+        if let Some(change) = change {
+            change.record();
+        }
+        receipt
+    })
     .await;
-    if let Some(change) = change.into() {
-        change.record();
+    Ok(lane)
+}
+
+/// A candidate that enables the top-level `tun:` section collides with a
+/// named `listeners: type: tun` — meow runs one effective TUN. Refused
+/// while the named device owns the slot (it keeps it until a restart
+/// publishes the request's `listeners:` — removing the entry in the same
+/// PUT does not free the slot) and whenever the next-boot document itself
+/// declares a named TUN. Hard admission, unbypassable by `?force`, and
+/// checked before the pre-installed binding so a rejected candidate never
+/// disturbs the running device's outbound-interface binding.
+fn named_tun_enable_blocked(state: &AppState, candidate: &RawConfig) -> Option<String> {
+    if !candidate.tun.as_ref().is_some_and(|t| t.enable) {
+        return None;
+    }
+    if let Some(meow_tunnel::TunOwner::Named(name)) = state.tunnel.tun_owner() {
+        return Some(format!(
+            "tun.enable: named `type: tun` listener '{name}' holds the TUN slot — \
+             meow-rs runs one effective TUN; restart on a config without it before \
+             enabling the top-level section"
+        ));
+    }
+    candidate
+        .listeners
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|l| l.listener_type.eq_ignore_ascii_case("tun"))
+        .map(|l| {
+            format!(
+                "tun.enable: cannot coexist with named `type: tun` listener '{}' — \
+                 meow-rs runs one effective TUN; drop one of them",
+                l.name
+            )
+        })
+}
+
+/// The named-TUN fake-IP pin: a `listeners: type: tun` device snapshots
+/// the fake-IP pool it was started with — its default device address,
+/// fake-IP routes and DNS-hijack target all derive from it — and has no
+/// restart path, so a resolver generation that would move the pinned
+/// pool (either family net or the v4 gateway, [`tun_fake_ip_changed`])
+/// is refused wholesale. Unrelated resolver changes keep the device
+/// alive. Runs before the candidate's `install_resolver_everywhere` so a
+/// rejected mutation never publishes the moving pool.
+fn named_tun_fake_ip_guard(
+    state: &AppState,
+    prior: &meow_dns::Resolver,
+    dns: &meow_config::DnsConfig,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(meow_tunnel::TunOwner::Named(name)) = state.tunnel.tun_owner() {
+        if tun_fake_ip_changed(prior, &dns.resolver) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "resolver change moves the fake-IP pool while named `type: tun` \
+                     listener '{name}' is running — the device pins the pool it \
+                     started with; restart meow to apply it"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `tun:` reconcile tuple `swap_config_and_reconcile_tun` restarts a
+/// running device on — extracted so the forced-commit fallbacks can
+/// refuse a transition the candidate cannot safely fire (issue #974):
+/// when the rebuild (or just its dns half) failed under `force`, the
+/// committed document keeps the PREVIOUS resolver generation, so a
+/// respawned device would derive its fake-IP geometry from a document
+/// whose pool the kept resolver does not implement — mismatched routes
+/// and hijack target. The compare itself mirrors the reconcile's:
+/// semantic diff on the PARSED `TunConfig`s plus the sniffer-enable
+/// half, raw-diff conservative when either side fails to parse.
+fn tun_reconcile_differs(old: &RawConfig, candidate: &RawConfig) -> bool {
+    if old.tun == candidate.tun
+        && old.max_connections == candidate.max_connections
+        && old.sniffer == candidate.sniffer
+        && old.tproxy_sni == candidate.tproxy_sni
+        && old.fake_ip_range() == candidate.fake_ip_range()
+    {
+        // Fast path: identical raw sections cannot differ semantically —
+        // and skipping the parse avoids re-warn!ing on every commit that
+        // never touched `tun:` (upstream-only fields like `strict-route:`
+        // and `stack:`'s warn-and-fall-back spellings all warn at parse).
+        return false;
+    }
+    match (
+        meow_config::parse_tun_config(old.tun.as_ref(), old.max_connections, old.fake_ip_range()),
+        meow_config::parse_tun_config(
+            candidate.tun.as_ref(),
+            candidate.max_connections,
+            candidate.fake_ip_range(),
+        ),
+    ) {
+        (Ok(o), Ok(n)) => {
+            o != n
+                || match (
+                    meow_config::sniffer_config_from_raw(old),
+                    meow_config::sniffer_config_from_raw(candidate),
+                ) {
+                    // A disabled sniffer's remaining fields are dead
+                    // config — `enable: false` with a different timeout
+                    // or port list is the same off state, not a
+                    // restart-worthy change (review #887).
+                    (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
+                    _ => old.sniffer != candidate.sniffer,
+                }
+        }
+        // Raw sections already known to differ — a broken candidate stays
+        // conservative: restart → spawn fails → `enable` rolls back.
+        _ => true,
+    }
+}
+
+/// Whether committing `candidate` would fire the TUN reconcile — an
+/// `enable` flip, or a restart-worthy `tun:`-tuple diff while a device
+/// runs. The resolver-kept forced fallbacks refuse it wholesale: the
+/// transition would run on a document whose fake-IP geometry the kept
+/// resolver generation does not implement.
+fn tun_transition_pending(old: &RawConfig, candidate: &RawConfig) -> bool {
+    let old_enable = old.tun.as_ref().is_some_and(|t| t.enable);
+    let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
+    old_enable != new_enable || (old_enable && tun_reconcile_differs(old, candidate))
+}
+
+/// The prospective-route dependency sweep every publication must pass:
+///
+/// 1. The candidate's own `listeners[].proxy`/`rule` references must
+///    resolve in the rebuilt map — a committed dangling reference fails
+///    the next boot's `build_config` the same way `-t` already rejects
+///    it ([`meow_config::listener_proxy_target_err`], and `rule:` is
+///    rechecked against the PARSED block set, not just the raw keys).
+/// 2. The still-running listeners' `proxy:`/`rule:` overrides must keep
+///    resolving: PUT never rebinds running inbounds, so a route that
+///    drops their forced target or selected block strands them — the
+///    flow then fails closed at resolve time, which is exactly the
+///    silent break this rejects. `force` cannot push past either check.
+///
+/// `sub_rules` keys are `String` on the rebuild side
+/// ([`meow_config::RebuildResult`]) and `SmolStr` on the route-table
+/// side — names compare by `str`.
+pub fn listener_route_deps_guard(
+    running: &[meow_config::NamedListener],
+    raw: &RawConfig,
+    proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    sub_rules: &meow_config::sub_rules_parser::SubRuleBlocks,
+    proxy_providers: &std::collections::HashMap<String, Arc<ProxyProvider>>,
+) -> Result<(), (StatusCode, String)> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        if let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(why) =
+                meow_config::listener_proxy_target_err(name, proxies, proxy_providers)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("listeners[{}].proxy: {why}", l.name),
+                ));
+            }
+        }
+        if let Some(name) = l.rule.as_deref().filter(|s| !s.is_empty()) {
+            if !sub_rules.contains_key(name) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                        l.name
+                    ),
+                ));
+            }
+        }
+    }
+    for l in running {
+        let Some(ov) = &l.route_override else {
+            continue;
+        };
+        if let Some(proxy) = &ov.proxy {
+            if !proxies.contains_key(proxy.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listener '{}' forces proxy '{proxy}', which this route removes — \
+                         the running listener still references it and cannot be re-pointed \
+                         without a restart",
+                        l.name
+                    ),
+                ));
+            }
+        }
+        if let Some(block) = &ov.rule {
+            if !sub_rules.contains_key(block.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listener '{}' selects sub-rules block '{block}', which this route \
+                         removes — the running listener still references it and cannot be \
+                         re-pointed without a restart",
+                        l.name
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2016,7 +2908,8 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// When a `dns:` section references
 /// proxies/rule-providers (`#name` nameserver tags, `rule-set:` policy
 /// keys), those sections join the comparison — the resolver snapshots
-/// them at build time.
+/// them at build time. Unmodelled `extra` keys ride the `==`s, so an
+/// unknown-key-only edit reads as a change — a safe over-trigger.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     // A pure key reorder of `nameserver-policy` must read as a change —
     // `a.dns == b.dns` alone is order-insensitive for this section.
@@ -2058,11 +2951,25 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
             _ => false,
         }
     };
+    // `store-fake-ip` compares on its resolved value — `profile` and
+    // `dns` spellings fold to one effective flag (`profile` wins), so an
+    // alias move with an equal verdict is not a pool change; a changed
+    // effective flag is (issue #974). Normalized out of the section
+    // compare so the raw spelling can't trigger a spurious rebuild.
+    let dns_sections_equal = {
+        let (mut da, mut db) = (a.dns.clone(), b.dns.clone());
+        for d in [&mut da, &mut db].into_iter().flatten() {
+            d.store_fake_ip = None;
+        }
+        da == db
+            && meow_config::resolve_profile(a).store_fake_ip
+                == meow_config::resolve_profile(b).store_fake_ip
+    };
     // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
     // same `parse_geodata` result, so it joins the DNS-input comparison.
     let base = hosts_equal
         && nsp_equal
-        && a.dns == b.dns
+        && dns_sections_equal
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
         && a.geox_url == b.geox_url;
@@ -2184,7 +3091,16 @@ pub fn install_resolver_everywhere(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
-    tunnel.set_resolver(Arc::clone(&dns.resolver));
+    tunnel.set_resolver(Arc::clone(&dns.resolver), dns.enabled);
+
+    // Bind the dns-outbound indirection to the tunnel's live slot
+    // (issue #974): `type: dns` leaves parsed under this or any earlier
+    // config — including provider nodes — read the *generation* inside
+    // the slot, so one write serves every past and future swap. The
+    // `enabled` verdict travels inside `ResolverGen`, so a disabled
+    // `dns:` section still binds: the leaves SERVFAIL on `enabled`, not
+    // on an unbound cell.
+    *tunnel.dns_outbound_cell().write() = Some(tunnel.resolver_slot());
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
     // DNS is enabled, unconditionally on VPN platforms where it is the
@@ -2202,7 +3118,137 @@ pub fn install_resolver_everywhere(
     }
 
     if let Some(h) = dns_server.read().as_ref() {
-        *h.resolver_slot.write() = Arc::clone(&dns.resolver);
+        *h.resolver_slot.write() = meow_dns::ResolverGen {
+            resolver: Arc::clone(&dns.resolver),
+            enabled: dns.enabled,
+        };
+    }
+}
+
+/// The standalone `dns.listen` outcome a commit applies — decided and
+/// bound in the await phase so [`install_dns_publish`] needs no `.await`
+/// inside the raw-config write guard (issue #974 review).
+enum DnsListenPlan {
+    /// Existing listener keeps serving — `install_resolver_everywhere`
+    /// already moved its resolver slot; nothing else to do.
+    Keep,
+    /// The rebind's socket was bound pre-commit: spawn it and replace
+    /// the handle, detaching the old listener's teardown.
+    Bound(meow_dns::BoundDnsServer, meow_dns::ResolverSlot),
+    /// A rebind was wanted (`dns.enabled` + `listen`) but the socket
+    /// bind failed: keep the old listener (a live-but-stale listener
+    /// beats none; the config is already committed — issue #514 review).
+    /// Its resolver slot still follows — `install_resolver_everywhere`
+    /// moved it.
+    BindFailed,
+    /// Server off or no `listen` — drop the handle; teardown detached.
+    Remove,
+}
+
+/// Decide the standalone `dns.listen` outcome and attempt any required
+/// socket bind — the only `await` the DNS publish needs. Must run before
+/// the commit point: a bind is fallible I/O, and a failed bind must not
+/// strand the running server (issue #514). Callers must hold the
+/// `CONFIG_MUTATION` lane.
+async fn plan_dns_listen(
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: &meow_config::DnsConfig,
+) -> DnsListenPlan {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
+    // Reap every listener a previous commit retired — task joined AND
+    // socket released — before the keep-check and any bind below. A bind
+    // attempted over a still-held port fails EADDRINUSE and would leave
+    // the committed document's `dns.listen` with no listener.
+    drain_retired_dns().await;
+    // Keep-decision: an unchanged listen addr with a live serve task
+    // needs nothing but the resolver slot's swap at install.
+    {
+        let guard = dns_server.read();
+        if let Some(h) = guard.as_ref() {
+            if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
+                return DnsListenPlan::Keep;
+            }
+        }
+    }
+    if !dns.enabled {
+        return DnsListenPlan::Remove;
+    }
+    match dns.listen_addr {
+        Some(addr) => {
+            let server = meow_dns::DnsServer::new(Arc::clone(&dns.resolver), addr);
+            let slot = server.resolver_slot();
+            match server.bind().await {
+                Ok(bound) => DnsListenPlan::Bound(bound, slot),
+                Err(e) => {
+                    warn!("dns.listen {addr} bind failed after config reload: {e}");
+                    DnsListenPlan::BindFailed
+                }
+            }
+        }
+        None => DnsListenPlan::Remove,
+    }
+}
+
+/// Apply a [`plan_dns_listen`] outcome plus the resolver-slot installs —
+/// the synchronous half of [`publish_dns`], callable inside the commit
+/// section's write guard. Replaced listeners abort now and move to
+/// [`DNS_RETIRING`]: `abort` is synchronous, so the handle swap can never
+/// leave the slot empty with zero DNS listeners (issue #621), and the
+/// next `plan_dns_listen` drains the queue for actual socket release
+/// before any same-address bind.
+fn install_dns_publish(
+    tunnel: &Tunnel,
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: &meow_config::DnsConfig,
+    plan: DnsListenPlan,
+) {
+    install_resolver_everywhere(tunnel, dns_server, dns);
+    match plan {
+        DnsListenPlan::Keep => {
+            info!("DNS resolver hot-swapped on unchanged listen socket");
+        }
+        DnsListenPlan::BindFailed => {
+            let mut guard = dns_server.write();
+            match guard.as_ref() {
+                Some(h) if !h.task.is_finished() => {
+                    warn!(
+                        "dns.listen rebind failed; keeping existing listener on {}",
+                        h.listen
+                    );
+                }
+                _ => {
+                    // A finished task is no working path — drop the dead
+                    // handle the way the awaited tail used to abort it.
+                    let _ = guard.take();
+                }
+            }
+        }
+        DnsListenPlan::Remove => {
+            let old = dns_server.write().take();
+            if let Some(old) = old {
+                retire_dns_listener(old);
+            }
+        }
+        DnsListenPlan::Bound(bound, slot) => {
+            let socket = bound.socket_weak();
+            let task = tokio::spawn(async move {
+                if let Err(e) = bound.run().await {
+                    warn!("DNS server error: {e}");
+                }
+            });
+            let old = dns_server.write().replace(DnsServerHandle {
+                listen: dns.listen_addr.unwrap(),
+                task,
+                resolver_slot: slot,
+                socket: Some(socket),
+            });
+            if let Some(old) = old {
+                retire_dns_listener(old);
+            }
+        }
     }
 }
 
@@ -2221,99 +3267,8 @@ pub async fn publish_dns(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
-    install_resolver_everywhere(tunnel, dns_server, dns);
-
-    // Standalone `dns.listen` server keep-decision: `keep` also requires a
-    // live serve task — the slot was already swapped above, so an
-    // unchanged listen addr with a live task needs nothing more.
-    {
-        let guard = dns_server.read();
-        if let Some(h) = guard.as_ref() {
-            if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
-                info!("DNS resolver hot-swapped on unchanged listen socket");
-                return;
-            }
-        }
-    }
-
-    // Listen addr changed, server toggled, or its task died: bind the new
-    // socket BEFORE tearing the old listener down — a failed bind must not
-    // strand the running server (the config is already committed; the old
-    // listener is the only working path left).
-    let new_bound = if dns.enabled {
-        match dns.listen_addr {
-            Some(addr) => {
-                let server = meow_dns::DnsServer::new(Arc::clone(&dns.resolver), addr);
-                let slot = server.resolver_slot();
-                match server.bind().await {
-                    Ok(bound) => Some((bound, slot)),
-                    Err(e) => {
-                        warn!("dns.listen {addr} bind failed after config reload: {e}");
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    match new_bound {
-        Some((bound, slot)) => {
-            let task = tokio::spawn(async move {
-                if let Err(e) = bound.run().await {
-                    warn!("DNS server error: {e}");
-                }
-            });
-            // Install the new handle BEFORE tearing the old listener down:
-            // `replace` commits the swap synchronously, so a cancellation
-            // in the abort/await below can never leave the slot empty with
-            // zero DNS listeners (issue #621).
-            let old = dns_server.write().replace(DnsServerHandle {
-                listen: dns.listen_addr.unwrap(),
-                task,
-                resolver_slot: slot,
-            });
-            if let Some(old) = old {
-                old.task.abort();
-                let _ = old.task.await;
-            }
-        }
-        None => {
-            // No new listener. Two sub-cases: the config turned the server
-            // OFF (`!dns.enabled || listen_addr: None`) — tear the old one
-            // down — or a rebind FAILED while the config still wants one —
-            // keep the old listener alive (a live-but-stale listener beats
-            // none; the config is already committed). All parking_lot guard
-            // work stays inside the block — only the Send-able handle
-            // escapes, so the abort/await below keeps this future Send.
-            let old = {
-                let mut guard = dns_server.write();
-                let wanted = dns.enabled && dns.listen_addr.is_some();
-                match guard.take() {
-                    Some(old) if wanted && !old.task.is_finished() => {
-                        warn!(
-                            "dns.listen rebind failed; keeping existing listener on {}",
-                            old.listen
-                        );
-                        // The socket stays, but the resolver generation
-                        // must still follow — `tunnel.set_resolver` already
-                        // swapped routing; leaving the kept listener on its
-                        // old slot would serve a stale generation
-                        // (issue #514 review).
-                        *old.resolver_slot.write() = Arc::clone(&dns.resolver);
-                        *guard = Some(old);
-                        None
-                    }
-                    other => other,
-                }
-            };
-            if let Some(old) = old {
-                old.task.abort();
-                let _ = old.task.await;
-            }
-        }
-    }
+    let plan = plan_dns_listen(dns_server, dns).await;
+    install_dns_publish(tunnel, dns_server, dns, plan);
 }
 
 async fn rebuild_from_raw_runtime_async(
@@ -2322,15 +3277,32 @@ async fn rebuild_from_raw_runtime_async(
     providers: HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<std::path::PathBuf>,
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    // The running config's `profile.store-selected` owner — the same
+    // backing startup installed on the tunnel, so rebuilt groups keep
+    // persisted picks and the commit's epoch bump fences correctly
+    // (issue #974).
+    selection: Arc<meow_proxy::SelectionBacking>,
+    // The tunnel's dns-outbound indirection — `type: dns` leaves the
+    // candidate builds resolve the live slot through it (issue #974).
+    provider_dns_cell: meow_dns::DnsOutboundCell,
 ) -> Result<meow_config::RebuildResult, String> {
+    // Carry the caller's tracing dispatcher into the rebuild thread — the
+    // same propagation `spawn_blocking_with_current_dispatcher` applies
+    // inside meow-config — so warnings emitted there reach the subscriber
+    // in effect at the call site.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     tokio::task::spawn_blocking(move || {
-        meow_config::rebuild_from_raw_runtime(
-            &raw,
-            Some(&resolver_slot),
-            &providers,
-            cache_dir.as_deref(),
-            &provider_dialer_registry,
-        )
+        tracing::dispatcher::with_default(&dispatch, || {
+            meow_config::rebuild_from_raw_runtime(
+                &raw,
+                Some(&resolver_slot),
+                &providers,
+                cache_dir.as_deref(),
+                &provider_dialer_registry,
+                &selection,
+                &provider_dns_cell,
+            )
+        })
     })
     .await
     .map_err(|e| format!("config rebuild task failed: {e}"))?
@@ -2417,7 +3389,7 @@ async fn add_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
@@ -2450,6 +3422,7 @@ async fn add_subscription(
             applied_proxies: Vec::new(),
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         };
         raw.subscriptions.get_or_insert_with(Vec::new).push(sub);
 
@@ -2462,7 +3435,7 @@ async fn add_subscription(
         (raw, counts)
     };
     let change = subscription_event(logbook::kind::CONFIG_CHANGE, "Added", &snapshot, &body.name);
-    commit_raw_candidate(&state, snapshot.clone(), change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), change, mutation).await?;
 
     // Auto-save so subscription data is cached on disk — skipped (with a
     // warning and `persisted: false`) when the daemon was started via
@@ -2482,7 +3455,7 @@ async fn delete_subscription(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
 
@@ -2509,7 +3482,7 @@ async fn delete_subscription(
         raw
     };
     let change = config_change(format!("Removed subscription '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot.clone(), change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), change, mutation).await?;
     persist_candidate(&state, &snapshot, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2552,7 +3525,7 @@ async fn refresh_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
@@ -2591,7 +3564,7 @@ async fn refresh_subscription(
         (raw, counts)
     };
     let update = subscription_update(&state.raw_config.read(), &snapshot, &name);
-    commit_raw_candidate(&state, snapshot.clone(), update)
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), update, mutation)
         .await
         .inspect_err(|(_, message)| subscription_failed(&name, message))?;
 
@@ -2694,7 +3667,7 @@ async fn create_proxy_group(
     Json(body): Json<CreateProxyGroupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let group_name = body.name.clone();
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         if let Some(ref groups) = raw.proxy_groups {
@@ -2716,7 +3689,7 @@ async fn create_proxy_group(
     };
     let change =
         config_change(format!("Created proxy group '{group_name}'")).subject(group_name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(Json(
         serde_json::json!({"message": "group created", "name": group_name}),
     ))
@@ -2727,7 +3700,7 @@ async fn update_proxy_group(
     Path(name): Path<String>,
     Json(body): Json<CreateProxyGroupRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let group = raw
@@ -2743,7 +3716,7 @@ async fn update_proxy_group(
         raw
     };
     let change = config_change(format!("Changed proxy group '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2751,7 +3724,7 @@ async fn delete_proxy_group(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         if let Some(ref mut groups) = raw.proxy_groups {
@@ -2777,7 +3750,7 @@ async fn delete_proxy_group(
         raw
     };
     let change = config_change(format!("Deleted proxy group '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2819,7 +3792,7 @@ async fn replace_rules(
     Json(body): Json<ReplaceRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let count = body.rules.len();
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // Same contract as `append_rule`: a line the reload would warn
@@ -2840,7 +3813,7 @@ async fn replace_rules(
         raw
     };
     let change = config_change(format!("Replaced the rules ({count})")).field("rules", count);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2854,7 +3827,7 @@ async fn update_rule_at_index(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateRuleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // Same contract as `append_rule`: a line the reload would warn
@@ -2877,7 +3850,7 @@ async fn update_rule_at_index(
         raw
     };
     let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2891,7 +3864,7 @@ async fn append_rule(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AppendRuleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // `parse_rules_full` warns and skips a line that fails — an append
@@ -2912,7 +3885,13 @@ async fn append_rule(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
+    let _mutation = commit_raw_candidate(
+        &state,
+        snapshot,
+        config_change("Appended a rule".into()),
+        mutation,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2931,11 +3910,12 @@ fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<
         geosite: None,
     };
     let sub_rules = match raw.sub_rules.as_ref() {
-        // A committed `sub-rules:` section always parses — on defect the
-        // rebuild errors louder than this check, so an empty map stands in.
+        // A committed `sub-rules:` section always parses — but when it
+        // does not, the parse error is the real defect the caller needs,
+        // not a phantom "block not defined" under an empty map.
         Some(map) if !map.is_empty() => {
             meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx, false)
-                .unwrap_or_default()
+                .map_err(|e| format!("sub-rules: {e}"))?
         }
         _ => Default::default(),
     };
@@ -2947,7 +3927,7 @@ async fn delete_rule(
     State(state): State<Arc<AppState>>,
     Path(index): Path<usize>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let rules = raw.rules.get_or_insert_with(Vec::new);
@@ -2959,7 +3939,7 @@ async fn delete_rule(
         raw
     };
     let change = config_change(format!("Deleted rule {index}")).field("index", index);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2973,7 +3953,7 @@ async fn reorder_rules(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReorderRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let rules = raw.rules.get_or_insert_with(Vec::new);
@@ -2987,7 +3967,7 @@ async fn reorder_rules(
     let change = config_change(format!("Moved rule {} to {}", body.from, body.to))
         .field("from", body.from)
         .field("to", body.to);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3298,12 +4278,19 @@ async fn get_chain_health(
 /// adopts it, so it stays in effect from the mutation's first dial through
 /// the listener's lifetime. On any failure it is dropped with the listener,
 /// which hands the binding back to an older live owner or clears it.
+///
+/// `setup_resolver` is the *candidate* generation's resolver — the
+/// device gateway and fake-IP routes must be built from the fake-IP
+/// geometry being committed, not the live resolver the previous
+/// generation still owns (Codex review; the candidate is not published
+/// until the commit section runs).
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
     binding: Option<OutboundBinding>,
-    rule_providers: &crate::ProviderRegistry,
+    setup_resolver: &meow_dns::Resolver,
+    rule_providers: &Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(
         raw.tun.as_ref(),
@@ -3325,7 +4312,9 @@ async fn spawn_tun_from_raw(
         crate::tun_config_to_listener_config(&tun_cfg, rule_providers),
         "meow-tun".to_string(),
     )
-    .with_readiness_signal(ready_tx);
+    .with_readiness_signal(ready_tx)
+    .with_tcp_dns_hijack(tun_cfg.dns_hijack)
+    .with_setup_resolver(Some(setup_resolver));
     // A broken `sniffer:` section is a parse error like `tun:`'s above,
     // not a warn-and-continue — silently spawning a snifferless TUN while
     // the API still reports success hides the defect (review #887).
@@ -3362,12 +4351,16 @@ async fn spawn_tun_from_raw(
                  (check permissions / admin / CAP_NET_ADMIN)"
                 );
                 handle.abort();
+                // Reap so the rollback commits while the device is truly
+                // gone — not merely scheduled to die.
+                let _ = handle.await;
                 return Err(msg);
             }
             Ok(Err(_)) => {
                 // Should not happen with ReadyNotifier, but handle defensively.
                 tracing::error!("TUN listener readiness signal dropped unexpectedly");
                 handle.abort();
+                let _ = handle.await;
                 return Err("TUN listener readiness signal dropped unexpectedly".into());
             }
             Err(_) => {
@@ -3377,12 +4370,14 @@ async fn spawn_tun_from_raw(
                 );
                 tracing::error!("{msg}");
                 handle.abort();
+                let _ = handle.await;
                 return Err(msg);
             }
         };
 
     Ok(Some(meow_tunnel::TunHandle {
         task: handle,
+        owner: meow_tunnel::TunOwner::TopLevel,
         core_done: Some(core_done),
         udp_flows,
     }))
@@ -3393,7 +4388,8 @@ async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
     _binding: Option<OutboundBinding>,
-    _rule_providers: &Arc<parking_lot::RwLock<HashMap<String, Arc<RuleProvider>>>>,
+    _setup_resolver: &meow_dns::Resolver,
+    _rule_providers: &Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
@@ -3404,10 +4400,31 @@ async fn spawn_tun_from_raw(
     Ok(None)
 }
 
-fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
+pub fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
     prior.fake_ip_v4_net() != current.fake_ip_v4_net()
         || prior.fake_ip_v4_gateway() != current.fake_ip_v4_gateway()
         || prior.fake_ip_v6_net() != current.fake_ip_v6_net()
+}
+
+/// Whether the candidate's TUN selection makes a spawned listener call
+/// `local_dns::bind` — `dns-hijack && auto-route` with a fake-IP v4
+/// gateway, the gate `TunListener::run_inner` applies (the bind itself
+/// is Windows-only). `setup_resolver` is the candidate generation the
+/// spawn reads its geometry from. An unparseable `tun:` section fails
+/// the spawn on the same error — nothing to hand off, answer `false`.
+#[cfg(feature = "listener-tun")]
+fn tun_wants_local_dns_bind(raw: &RawConfig, setup_resolver: &meow_dns::Resolver) -> bool {
+    let Ok(tun_cfg) =
+        meow_config::parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())
+    else {
+        return false;
+    };
+    tun_cfg.dns_hijack && tun_cfg.auto_route && setup_resolver.fake_ip_v4_gateway().is_some()
+}
+
+#[cfg(not(feature = "listener-tun"))]
+fn tun_wants_local_dns_bind(_raw: &RawConfig, _setup_resolver: &meow_dns::Resolver) -> bool {
+    false
 }
 
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
@@ -3429,13 +4446,85 @@ fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver)
 /// committed, while `PATCH /configs`, whose `tun` change is the request,
 /// answers it with an error.
 ///
-/// `dns` is the candidate's rebuilt [`meow_config::DnsConfig`] when its
-/// DNS-relevant inputs changed (`Some`), already validated by the caller —
-/// publishing it here keeps the swap inside the same lane (issue #514).
-/// `prior_resolver` is the resolver generation that was live BEFORE the
-/// caller early-installed the candidate's — the fake-IP comparison must
-/// read its inputs, not `tunnel.resolver()` (which already serves the new
-/// generation and would always compare equal) (issue #533 review).
+/// Everything a mutation's commit section publishes atomically with the
+/// document — assembled candidate-side and carried unpublished so the
+/// whole install fits inside one `raw_config` write guard with no
+/// `await` between its steps (issue #974 review).
+#[derive(Default)]
+struct PendingPublish {
+    /// The rebuilt route table plus the provider registries its rules
+    /// reference — `None` on lanes with no routing publish (PATCH, the
+    /// forced verbatim fallback).
+    routing: Option<PendingRouting>,
+    /// The rebuilt DNS runtime — `None` when `dns:`/`hosts:`/`ipv6:`/
+    /// `geodata:` inputs did not move.
+    dns: Option<meow_config::DnsConfig>,
+}
+
+/// The route-table halves a rebuild produced plus everything that must
+/// publish with them.
+struct PendingRouting {
+    proxies: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    rules: Vec<Box<dyn meow_common::Rule>>,
+    sub_rules: meow_config::sub_rules_parser::SubRuleBlocks,
+    dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    rule_providers: HashMap<String, Arc<RuleProvider>>,
+    proxy_providers: HashMap<String, Arc<ProxyProvider>>,
+    dropped_providers: meow_config::DroppedProviders,
+    connection_notes: bool,
+    nftset: Option<meow_common::nftset::NftsetConfig>,
+    tcp_idle_timeout: Option<Duration>,
+    /// `profile.store-selected` resolved from the candidate — committed
+    /// with the epoch flip, before the new group writers go live.
+    store_selected: bool,
+    strict: bool,
+    raw_proxy_providers: Option<HashMap<String, meow_config::raw::RawProxyProvider>>,
+    install: RouteInstall,
+}
+
+/// Which routing publish the commit section runs.
+enum RouteInstall {
+    /// `update_routing` — keeps tracked TCP flows (warm mutations).
+    KeepTrackedTcp,
+    /// `reload_routing` — cancels tracked TCP and may install `mode`
+    /// (the `PUT /configs` cold path).
+    CancelTrackedTcp { mode: Option<TunnelMode> },
+}
+
+/// What a [`swap_config_and_reconcile_tun`] call settled.
+struct PublishReceipt {
+    /// Tracked TCP flows the routing publish closed — 0 on lanes that
+    /// publish no routing or keep tracked TCP.
+    dropped: usize,
+    /// The TUN reconcile outcome — `Err` means the candidate's
+    /// `tun.enable` was rolled back inside the committed document.
+    tun: Result<(), String>,
+}
+
+/// Run `work` to completion detached from the request's cancellation:
+/// the `CONFIG_MUTATION` guard moves into the spawned task, keeps the
+/// lane continuously held for the whole operation, and comes back
+/// through the JoinHandle. Cancelling the handler future can no longer
+/// interrupt a commit halfway — once `work` starts it always lands
+/// before the lane lets a sibling in (issue #974, Codex review).
+async fn run_owned_mutation<T, Fut>(
+    state: &Arc<AppState>,
+    lane: tokio::sync::MutexGuard<'static, ()>,
+    work: impl FnOnce(Arc<AppState>) -> Fut + Send + 'static,
+) -> (tokio::sync::MutexGuard<'static, ()>, T)
+where
+    Fut: Future<Output = T> + Send,
+    T: Send + 'static,
+{
+    let state = Arc::clone(state);
+    let task = tokio::spawn(async move { (lane, work(state).await) });
+    task.await.expect("config commit task panicked")
+}
+
+/// `dns`/`prior_resolver` carry the rebuilt DNS runtime and the resolver
+/// generation it replaces — the fake-IP comparison must read its inputs,
+/// not `tunnel.resolver()` (nothing has installed the candidate yet, so
+/// the live slot still serves the old generation — issue #533 review).
 ///
 /// `preinstalled` is the candidate's global-route binding, installed by
 /// the caller under this lane before the mutation's first dial
@@ -3445,27 +4534,45 @@ fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver)
 /// after it. Without a spawn it is dropped on return, handing the binding
 /// back to the running listener (or clearing it when none runs).
 ///
-/// `tracked_tcp` says whether the caller's routing publish already
-/// cancelled every tracked TCP flow after the binding was installed
+/// `tracked_tcp` says whether the publish payload's routing install
+/// already cancels every tracked TCP flow after the binding was installed
 /// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
+///
+/// `rollback_doc` is the document to commit when the TUN reconcile fails
+/// — PATCH supplies the pre-patch document so the rejected request
+/// publishes nothing of the candidate's riding fields; `None` (PUT and
+/// warm lanes) keeps the candidate with `tun.enable` rolled back.
 async fn swap_config_and_reconcile_tun(
-    state: &AppState,
-    candidate: RawConfig,
-    dns: Option<meow_config::DnsConfig>,
+    state: &Arc<AppState>,
+    mut candidate: RawConfig,
+    publish: PendingPublish,
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
     tracked_tcp: TrackedTcp,
-) -> Result<(), String> {
+    rollback_doc: Option<RawConfig>,
+) -> PublishReceipt {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
     let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
-    // Snapshot the candidate (only on an off→on transition, before it is
-    // moved into the lock) so the parking_lot write guard — which is
-    // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level, (logbook_enable, ledger)) = {
-        let mut guard = state.raw_config.write();
+    // Read the committed document for the old-side diffs — a read guard
+    // only: `CONFIG_MUTATION` is the sole writer lane, so these stay true
+    // through the candidate-stage settles below. Nothing here may await:
+    // every settle is hoisted above the publish so a cancelled request
+    // never leaves a committed document whose tail (the keepalive install
+    // and `ntp:` reconcile) never ran.
+    let (
+        old_enable,
+        tun_changed,
+        specs,
+        new_log_level,
+        logbook_enable,
+        geo_schedule_changed,
+        controller_changed,
+        listeners_changed,
+    ) = {
+        let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
         // any real listener-parameter change (`mtu`, `auto-route`,
@@ -3474,70 +4581,12 @@ async fn swap_config_and_reconcile_tun(
         // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
         // spellings that parse to the same `TunStack`) and warn-only
         // ignored fields (`strict-route`, `auto-detect-interface`, …)
-        // do not.
-        // When either side fails to parse, fall back to the raw diff —
-        // a broken candidate stays conservative: restart → spawn fails
-        // → `enable` rolls back.
-        let tun_changed = if guard.tun == candidate.tun
-            && guard.max_connections == candidate.max_connections
-            // The TUN carries the sniffer it was spawned with — and the
-            // deprecated `tproxy-sni` alias feeds the same parse, so it
-            // belongs to this tuple too: an alias flip is a real sniffer
-            // change (synthesised-enable ↔ default-disabled) that must
-            // reach the slow path (review #887).
-            && guard.sniffer == candidate.sniffer
-            && guard.tproxy_sni == candidate.tproxy_sni
-            // The default device address derives from it.
-            && guard.fake_ip_range() == candidate.fake_ip_range()
-        {
-            // Fast path: identical raw sections cannot differ
-            // semantically — and skipping the parse avoids re-warn!ing
-            // on every commit that never touched `tun:` (upstream-only
-            // fields like `strict-route:` and `stack:`'s warn-and-fall-
-            // back spellings all warn at parse).
-            false
-        } else {
-            match (
-                meow_config::parse_tun_config(
-                    guard.tun.as_ref(),
-                    guard.max_connections,
-                    guard.fake_ip_range(),
-                ),
-                meow_config::parse_tun_config(
-                    candidate.tun.as_ref(),
-                    candidate.max_connections,
-                    candidate.fake_ip_range(),
-                ),
-            ) {
-                // The TUN also carries the sniffer it was spawned with:
-                // a sniffer-only diff must restart it too — compared
-                // semantically, like `TunConfig`, so a no-op respelling
-                // does not (review #887).
-                (Ok(o), Ok(n)) => {
-                    o != n
-                        || match (
-                            meow_config::sniffer_config_from_raw(&guard),
-                            meow_config::sniffer_config_from_raw(&candidate),
-                        ) {
-                            // A disabled sniffer's remaining fields are
-                            // dead config — `enable: false` with a
-                            // different timeout or port list is the same
-                            // off state, not a restart-worthy change
-                            // (review #887).
-                            (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
-                            _ => guard.sniffer != candidate.sniffer,
-                        }
-                }
-                // Raw sections already known to differ — a broken
-                // candidate stays conservative: restart → spawn fails
-                // → `enable` rolls back.
-                _ => true,
-            }
-        };
-        let snapshot = (new_enable && !old).then(|| candidate.clone());
-        // Extract health-check specs straight from the candidate before it
-        // is moved into the lock — no second read of `raw_config` and no
-        // deep clone of the group section (issue #514 review).
+        // do not. Shared with the forced-commit fallbacks above as
+        // [`tun_reconcile_differs`].
+        let tun_changed = tun_reconcile_differs(&guard, &candidate);
+        // Extract health-check specs straight from the candidate — no
+        // second read of `raw_config` and no deep clone of the group
+        // section (issue #514 review).
         let specs = meow_config::extract_health_check_specs(
             candidate.proxy_groups.as_deref().unwrap_or(&[]),
         );
@@ -3553,33 +4602,466 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
-        // Commit point: a rejected candidate never reaches here.
-        meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
-        // Commit point (mihomo re-applies `routing-mark` on every load); a
-        // change under pinned managed rules was refused before this.
-        // meow-openwrt: auto-redirect supplies a mark when none is configured.
-        meow_common::set_routing_mark(meow_config::effective_routing_mark(&candidate));
-        let ledger = candidate.traffic_ledger.as_ref();
-        let ledger = (
-            meow_config::raw::RawTrafficLedger::enabled(ledger),
-            meow_config::raw::RawTrafficLedger::options(ledger),
-        );
-        *guard = candidate;
+        // The geo update schedule is a startup snapshot (`auto_update_loop`
+        // captured it at boot) — a committed change lands on restart; flag
+        // that to the operator rather than letting it sit silently stale.
+        let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
+            != meow_config::geodata::update_schedule(&candidate);
+        // The controller listener surface — addresses, CORS, the `tls:`
+        // identity — is a startup snapshot like the geo schedule: the PUT
+        // commits the raw document but listeners/CORS only re-evaluate on
+        // restart, so flag it rather than let it sit silently stale
+        // (issue #974).
+        let controller_changed = guard.external_controller != candidate.external_controller
+            || guard.external_controller_tls != candidate.external_controller_tls
+            || guard.external_controller_unix != candidate.external_controller_unix
+            || guard.external_controller_pipe != candidate.external_controller_pipe
+            || guard.external_controller_cors != candidate.external_controller_cors
+            || guard.tls != candidate.tls;
+        // `listeners:` is likewise a startup snapshot — but the EFFECTIVE
+        // set is what `resolve_named_listeners` produces, and a raw
+        // `listeners:` array that did not change can still resolve
+        // differently when shared inputs move: the `allow-lan`/bind
+        // default, global `max-connections`, `sniffer:` (which deadens
+        // `tproxy-sni` synthesis), proxy names behind `listeners[].proxy`,
+        // `rule:` overrides, `routing-mark` — none live under the
+        // `listeners:` key (F18). Compare the resolved lists both ways:
+        // a raw diff that resolves identically is a respelling (no warn),
+        // an inherited change still warns. A failed old-side resolve
+        // counts as "changed" — conservative, since the committed doc
+        // already built once.
+        let listeners_changed = {
+            let effective_keepalive = |raw: &meow_config::raw::RawConfig| {
+                raw.tcp_keepalive.unwrap_or(true).then(|| {
+                    (
+                        raw.tcp_keepalive_idle
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS),
+                        raw.tcp_keepalive_interval
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS),
+                        raw.tcp_keepalive_probes
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES),
+                    )
+                })
+            };
+            let has_top_level_tcp_inbound = |raw: &meow_config::raw::RawConfig| {
+                raw.port.unwrap_or(0) != 0
+                    || raw.socks_port.unwrap_or(0) != 0
+                    || raw.mixed_port.unwrap_or(0) != 0
+                    || raw.redir_port.unwrap_or(0) != 0
+                    || raw.tproxy_port.unwrap_or(0) != 0
+            };
+            let projection = |raw: &meow_config::raw::RawConfig| {
+                let list = meow_config::resolve_named_listeners(raw).ok()?;
+                let has_tcp_listener = has_top_level_tcp_inbound(raw)
+                    || list.iter().any(|l| {
+                        !matches!(
+                            l.spec,
+                            meow_config::ListenerSpec::WireGuard(_)
+                                | meow_config::ListenerSpec::Tun(_)
+                        )
+                    });
+                let keepalive = has_tcp_listener.then(|| effective_keepalive(raw));
+                serde_json::to_value((list, keepalive)).ok()
+            };
+            projection(&guard) != projection(&candidate)
+        };
         (
             old,
             tun_changed,
-            snapshot,
             specs,
             new_log_level,
-            (logbook_enable, ledger),
+            logbook_enable,
+            geo_schedule_changed,
+            controller_changed,
+            listeners_changed,
         )
     };
+
+    // The standalone `dns.listen` bind — fallible socket I/O — belongs
+    // to the candidate-side await phase like every other settle; the
+    // handle itself installs inside the commit section.
+    let dns_plan = match &publish.dns {
+        Some(dns) => Some(plan_dns_listen(&state.dns_server, dns).await),
+        None => None,
+    };
+    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
+    // and DnsGuard when the stack is built; after a resolver swap those are
+    // stale — restart it so either fake-ip range or enhanced-mode changes
+    // take effect instead of blackholing the new pool (issue #514).
+    // Nothing is installed yet: the fake-IP inputs of the resolver being
+    // replaced come from `prior_resolver`, the candidate's from the
+    // publish payload's `dns.resolver` (issue #533 review).
+    let fake_ip_changed = publish
+        .dns
+        .as_ref()
+        .is_some_and(|dns| tun_fake_ip_changed(&prior_resolver, &dns.resolver));
+    // The resolver the (re)spawn derives its device gateway and fake-IP
+    // routes from — the candidate generation, unpublished until the
+    // commit section. Without a DNS publish there is no new resolver
+    // generation, so the live one already is the candidate's (Codex
+    // review: snapshotting `tunnel.resolver()` inside the listener used
+    // the OLD geometry whenever `publish.dns` carried a new pool).
+    let setup_resolver = publish
+        .dns
+        .as_ref()
+        .map_or_else(|| state.tunnel.resolver(), |dns| Arc::clone(&dns.resolver));
+
+    // Windows DNS→TUN `:53` handoff (Codex review): a `Remove` plan
+    // retires the standalone `dns.listen` socket only inside the commit
+    // section — after the spawn — while a spawning TUN whose hijack
+    // shape calls `local_dns::bind` claims `127.0.0.1:53`/`[::1]:53`
+    // first and fails `EADDRINUSE`; the rollback then turns `tun.enable`
+    // off while the document still drops `dns.listen` — neither
+    // listener. A `Bound` plan (a `dns.listen` move — the replacement is
+    // already bound to its new addr) retires the old socket at the same
+    // point, so it needs the identical release. Retire + drain the held
+    // socket BEFORE the spawn when the sets collide, so the one PUT
+    // hands the port over. On every other target `local_dns::bind` is
+    // compiled out — the netstack answers `:53` internally — so nothing
+    // collides.
+    let tun_will_spawn = new_enable && (!old_enable || fake_ip_changed || tun_changed);
+    let windows_local_dns =
+        cfg!(target_os = "windows") && tun_wants_local_dns_bind(&candidate, &setup_resolver);
+    let held_listen = state.dns_server.read().as_ref().map(|h| h.listen);
+    if dns_retire_conflicts_with_tun_bind(&dns_plan, tun_will_spawn, windows_local_dns, held_listen)
+    {
+        release_standalone_dns_for_tun(&state.dns_server).await;
+    }
+
+    // The TUN transition is the last candidate-stage settle: `stop_tun`
+    // tears the previous listener down and a (re)spawn brings its device
+    // up, so both must resolve — and may fail — before the commit. A
+    // failed (re)spawn rolls `tun.enable` back inside the candidate, so
+    // the committed document lands exactly like the old in-place rollback.
+    // The spawned listener's handle is only stored inside the commit
+    // section (`install_tun_handle` is synchronous; `stop_tun`/`spawn`
+    // are not); `tun_result` picks `final_doc` and the receipt below.
+    let mut tun_handle: Option<meow_tunnel::TunHandle> = None;
+    // Whether the (re)spawned listener adopted the pre-installed global
+    // binding — the commit section then flushes sessions opened before
+    // its interface went live.
+    let mut adopted_binding: Option<bool> = None;
+    let tun_result = if old_enable == new_enable {
+        // on → on with changed fake-IP inputs or any real `tun:` parameter
+        // change: restart the listener so the running stack matches the
+        // committed raw (issue #543). No `has_tun()` gate — a dead
+        // but-enabled listener must attempt a respawn too, and a failed
+        // one rolls `enable` back so it self-limits to one attempt.
+        if old_enable && (fake_ip_changed || tun_changed) {
+            // The candidate's binding (if global) is already in effect, so
+            // the stop → spawn gap below is covered (issue #695).
+            state.tunnel.stop_tun().await;
+            let binding = preinstalled.take_binding();
+            let adopted = binding.is_some();
+            match spawn_tun_from_raw(
+                &state.tunnel,
+                &candidate,
+                binding,
+                setup_resolver.as_ref(),
+                &state.rule_providers,
+            )
+            .await
+            {
+                Ok(Some(handle)) => {
+                    tun_handle = Some(handle);
+                    adopted_binding = adopted.then(|| preinstalled.interface_changed());
+                    info!(
+                        fake_ip_changed,
+                        tun_changed, "TUN listener restarted via config reload"
+                    );
+                    Ok(())
+                }
+                // Unreachable like the off→on arm — `enable` is still true
+                // in the candidate. Roll back the same way rather than
+                // persist `enable: true` with nothing running.
+                Ok(None) => {
+                    warn!("TUN listener restart returned no handle (config rolled back)");
+                    if let Some(ref mut tun) = candidate.tun {
+                        tun.enable = false;
+                    }
+                    Err("TUN did not restart and was turned off".into())
+                }
+                Err(e) => {
+                    warn!("TUN listener failed to restart: {e} (config rolled back)");
+                    let message = format!("TUN failed to restart and was turned off: {e}");
+                    tun_failed(message.clone());
+                    if let Some(ref mut tun) = candidate.tun {
+                        tun.enable = false;
+                    }
+                    Err(message)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    } else if new_enable {
+        // off → on. Defensive: if a handle somehow outlives a raw config
+        // that already says `enable: false`, stop it first — the new
+        // listener must never build a second lwIP core over a live one
+        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
+        // teardown timeout rather than stack two generations).
+        state.tunnel.stop_tun().await;
+        let binding = preinstalled.take_binding();
+        let adopted = binding.is_some();
+        match spawn_tun_from_raw(
+            &state.tunnel,
+            &candidate,
+            binding,
+            setup_resolver.as_ref(),
+            &state.rule_providers,
+        )
+        .await
+        {
+            Ok(Some(handle)) => {
+                tun_handle = Some(handle);
+                adopted_binding = adopted.then(|| preinstalled.interface_changed());
+                info!("TUN listener started via config reload");
+                Ok(())
+            }
+            Ok(None) => {
+                // Unreachable today — `spawn_tun_from_raw` only yields
+                // `Ok(None)` when `tun.enable` is false and this arm only
+                // runs for off→on. Roll back like the `Err` arm rather
+                // than persist `enable: true` with nothing running.
+                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
+                if let Some(ref mut tun) = candidate.tun {
+                    tun.enable = false;
+                }
+                Err("TUN did not start and was turned off".into())
+            }
+            Err(e) => {
+                // TUN failed to start — roll back tun.enable to false so
+                // nyanpasu / the dashboard don't show TUN as active when
+                // nothing is actually running.
+                warn!("TUN listener failed to start: {e} (config rolled back)");
+                let message = format!("TUN failed to start and was turned off: {e}");
+                tun_failed(message.clone());
+                if let Some(ref mut tun) = candidate.tun {
+                    tun.enable = false;
+                }
+                Err(message)
+            }
+        }
+    } else {
+        // on → off
+        state.tunnel.stop_tun().await;
+        info!("TUN listener stopped via config reload");
+        Ok(())
+    };
+
+    // The document the commit actually installs: on a failed TUN
+    // transition it is the caller's rollback document (the pre-patch
+    // one for PATCH — its riding fields never publish at all) or the
+    // candidate with `tun.enable` rolled back (PUT/warm lanes keep the
+    // rest of the committed edit). `keep-alive-*` and `ntp:` resolve
+    // from the same document that lands, so a failed PATCH cannot leak
+    // the rejected posture even transiently (issue #974, Codex review).
+    let final_doc = if tun_result.is_err() {
+        rollback_doc
+            .map(|mut doc| {
+                doc.tun = candidate.tun.take();
+                doc
+            })
+            .unwrap_or(candidate)
+    } else {
+        candidate
+    };
+    let keepalive = match meow_config::resolve_outbound_tcp_keepalive(&final_doc) {
+        Ok(ka) => Some(ka),
+        Err(e) => {
+            warn!("outbound keepalive resolution failed at commit: {e}");
+            None
+        }
+    };
+    // `ntp:` resolved against the same final document and reconciled once
+    // the commit below settles (issue #974 — the worker must never dial
+    // through a half-published commit, and the keepalive install above
+    // lands before it).
+    let ntp_resolved = meow_config::resolve_ntp(&final_doc);
+
+    // Commit point: a rejected candidate never reaches here. ONE
+    // synchronous section inside the write guard — no awaits — installs
+    // the document, the riding dial globals, the keepalive posture, the
+    // selection epoch, the resolver + DNS listener, the route table, the
+    // provider registries, the TUN handle and the binding flush together,
+    // so a request cancelled anywhere above leaves zero live change and
+    // no reader can observe a new document against stale globals or old
+    // routes (issue #974 review).
+    let PendingPublish { routing, dns } = publish;
+    let dns = dns.zip(dns_plan);
+    let mut dropped = 0;
+    {
+        let mut guard = state.raw_config.write();
+        // (mihomo re-applies `routing-mark` on every load); a change
+        // under pinned managed rules was refused before this.
+        meow_proxy::health::set_unified_delay(final_doc.unified_delay.unwrap_or(false));
+        meow_common::set_routing_mark(meow_config::effective_routing_mark(&final_doc));
+        // `interface-name` re-applies on every load the same way
+        // (issue #974); the setter normalizes — trimmed, empty meaning
+        // unset.
+        meow_common::set_global_interface_name(final_doc.interface_name.as_deref());
+        // `global-ua` likewise re-applies on every committed load — only
+        // here, after the candidate passed every gate, so a rejected
+        // rebuild never mutates the live override (issue #974).
+        meow_common::set_global_ua(final_doc.global_ua.as_deref());
+        // `tcp-concurrent` on the same lane: the accepted candidate's
+        // value (omission resets to the meow-rs default `true`); candidate
+        // fetches ran under the previous live policy — only the next
+        // candidate run sees this.
+        meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
+            final_doc.tcp_concurrent,
+        ));
+        // `find-process-mode` on the same lane: the accepted candidate's
+        // value (omission resets to the upstream default `strict`); flows
+        // already mid-resolution keep the mode they read (issue #974).
+        state
+            .tunnel
+            .set_process_lookup_mode(final_doc.find_process_mode.unwrap_or_default());
+        if let Some(ka) = keepalive {
+            meow_common::set_outbound_tcp_keepalive(ka);
+        }
+        if let Some(routing) = routing {
+            // Selection-persistence commit BEFORE the route swap exposes
+            // the candidate's groups (issue #974 review): the epoch flip
+            // must land before any live `select` can reach the new
+            // writers — an off→on select admitted in the gap would be
+            // acknowledged but fenced (in-memory only, lost on restart),
+            // and an on→off stale writer could still flush to the file.
+            // The pending store's adoption rides the same call.
+            state
+                .tunnel
+                .selection_backing()
+                .commit(routing.store_selected);
+            // The resolver swap precedes the route publish: the swap
+            // drops the old `RouteTable` and its dialer-registry cell, so
+            // every consumer — the tunnel slot, the host hook, a live
+            // `dns.listen` server, every `type: dns` outbound reading the
+            // shared cell — must already serve the new generation or
+            // chained `#name` upstreams fail closed in between
+            // (issue #533 review). The `else` arm covers the lanes that
+            // keep the previous route table — PATCH and the forced
+            // verbatim fallback — where the committed document's `dns:`
+            // verdict (enabled bit included) must still land or a
+            // verbatim `dns.enable: false` commit leaves the old enabled
+            // generation answering (issue #974 review).
+            if let Some((dns, plan)) = dns {
+                install_dns_publish(&state.tunnel, &state.dns_server, &dns, plan);
+            }
+            dropped = match routing.install {
+                RouteInstall::KeepTrackedTcp => {
+                    state.tunnel.update_routing(
+                        routing.proxies,
+                        routing.rules,
+                        routing.sub_rules,
+                        routing.dialer_registry,
+                    );
+                    0
+                }
+                RouteInstall::CancelTrackedTcp { mode } => {
+                    let n = state.tunnel.reload_routing(
+                        routing.proxies,
+                        routing.rules,
+                        routing.sub_rules,
+                        mode,
+                        routing.dialer_registry,
+                    );
+                    if n > 0 {
+                        tracing::warn!(
+                            connections_dropped = n,
+                            "connection closure requested for cold reload"
+                        );
+                    }
+                    n
+                }
+            };
+            state.tunnel.set_connection_notes(routing.connection_notes);
+            meow_tunnel::nftset::install(&state.tunnel, routing.nftset);
+            state.tunnel.set_tcp_idle_timeout(routing.tcp_idle_timeout);
+            // The candidate's provider sets become the live registries —
+            // the rules and DNS `rule-set:` matchers installed above
+            // already reference these Arcs (issue #533 review).
+            // `commit_registry` publishes the map *and* reconciles the
+            // interval refresh loops so providers added, removed, or
+            // re-intervalled by this commit gain/lose their task
+            // (issue #543).
+            state
+                .rule_provider_refresh
+                .commit_registry(&state.rule_providers, routing.rule_providers);
+            commit_proxy_providers(
+                &state.proxy_providers,
+                &routing.proxy_providers,
+                routing.strict,
+                routing.raw_proxy_providers.as_ref(),
+                &state.proxy_provider_refresh,
+            );
+            routing.dropped_providers.record();
+        } else if let Some((dns, plan)) = dns {
+            install_dns_publish(&state.tunnel, &state.dns_server, &dns, plan);
+        }
+        // The (re)spawned listener's device already runs — its handle
+        // joins the published runtime; a replaced straggler tears down
+        // on a detached task since nothing here may await it.
+        if let Some(handle) = tun_handle {
+            if let Some(prev) = state.tunnel.install_tun_handle(handle) {
+                let tunnel = state.tunnel.clone();
+                tokio::spawn(async move {
+                    tunnel.teardown_tun_handle(prev).await;
+                });
+            }
+        }
+        // The adopted binding's flush closes the sessions that predate
+        // its interface — after the provider registries so provider
+        // member roots resolve against the committed set.
+        if let Some(interface_changed) = adopted_binding {
+            outbound_binding_adopted(state, interface_changed, tracked_tcp);
+        }
+        // `profile.store-selected` committed above with the route
+        // publish; lanes that reach here without one (the verbatim
+        // fallback, a knobs-only PATCH) never carry a flag diff, so
+        // nothing remains to retire.
+        *guard = final_doc;
+        // Reconcile health-check tasks with the committed proxy-group
+        // section — groups added get a check, removed abort, changed
+        // specs respawn (issue #514). Sync; spawns under the lane lock
+        // are cheap.
+        state.tunnel.reconcile_health_checks(&specs);
+        // `ntp:` reconciles last — after the route publish, DNS install,
+        // dial globals, the keepalive posture, and the TUN transition
+        // (or its rollback) settle, so the worker never dials a
+        // half-published commit (issue #974). The supervisor sees every
+        // committed document's resolved service config and restarts
+        // only on a real change; a disabled/unchanged section never
+        // re-schedules.
+        if let Some(reconcile) = &state.ntp_reconcile {
+            match ntp_resolved {
+                Ok(cfg) => reconcile(cfg),
+                Err(e) => warn!("ntp resolution failed at commit: {e}"),
+            }
+        }
+    }
+
+    if geo_schedule_changed {
+        warn!(
+            "geodata update schedule changed (geo-auto-update / geo-update-interval / \
+             geodata.auto-update*): the running schedule is a startup snapshot — \
+             restart meow to apply it"
+        );
+    }
+    if controller_changed {
+        warn!(
+            "external-controller* / external-controller-cors / tls changed: the \
+             controller listener surface is a startup snapshot — restart meow to \
+             rebind or re-apply it"
+        );
+    }
+    if listeners_changed {
+        warn!(
+            "listeners: changed (mixed/socks5/http/tproxy/shadowsocks/wireguard/\
+             anytls/tun entries): inbounds are a startup snapshot — restart meow \
+             to apply the committed listener set"
+        );
+    }
     logbook::reconfigure(logbook_enable);
-    // Opening or closing the ledger waits on its database.
-    let _ = tokio::task::spawn_blocking(move || {
-        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
-    })
-    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
@@ -3595,127 +5077,29 @@ async fn swap_config_and_reconcile_tun(
         }
     }
 
-    // Reconcile health-check tasks with the committed proxy-group section
-    // — groups added get a check, removed abort, changed specs respawn
-    // (issue #514). Sync; spawns under the lane lock are cheap.
-    state.tunnel.reconcile_health_checks(&specs);
-
-    // Publish the rebuilt DNS runtime — independent of TUN transitions, so
-    // it must run before the equal-state early return (issue #514).
-    // The fake-IP inputs of the resolver being replaced come from
-    // `prior_resolver` — the caller already early-installed the candidate's
-    // resolver, so `tunnel.resolver()` would read the NEW generation and
-    // the on→on `fake_ip_changed` check below could never fire
-    // (issue #533 review).
-    let dns_rebuilt = dns.is_some();
-    if let Some(dns) = dns {
-        publish_dns(&state.tunnel, &state.dns_server, &dns).await;
+    // The ledger's sqlite open/close cannot join the synchronous section
+    // — it waits on its database — so it runs on the blocking pool, but
+    // the lane must hold until the apply lands: answering first would let
+    // a 204 acknowledge a `traffic-ledger` switch the old policy has not
+    // handed off yet (Codex review). The tuple is re-read from the
+    // COMMITTED document rather than a captured candidate, and this lane
+    // still holds it — the apply matches the document just installed.
+    let ledger = {
+        let guard = state.raw_config.read();
+        let raw = guard.traffic_ledger.as_ref();
+        (
+            meow_config::raw::RawTrafficLedger::enabled(raw),
+            meow_config::raw::RawTrafficLedger::options(raw),
+        )
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
+    PublishReceipt {
+        dropped,
+        tun: tun_result,
     }
-    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
-    // and DnsGuard when the stack is built; after a resolver swap those are
-    // stale — restart it so either fake-ip range or enhanced-mode changes
-    // take effect instead of blackholing the new pool (issue #514).
-    let fake_ip_changed =
-        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
-
-    if old_enable == new_enable {
-        // on → on with changed fake-IP inputs or any real `tun:` parameter
-        // change: restart the listener so the running stack matches the
-        // committed raw (issue #543). No `has_tun()` gate — a dead
-        // but-enabled listener must attempt a respawn too, and a failed
-        // one rolls `enable` back so it self-limits to one attempt.
-        if old_enable && (fake_ip_changed || tun_changed) {
-            // The candidate's binding (if global) is already in effect, so
-            // the stop → spawn gap below is covered (issue #695).
-            state.tunnel.stop_tun().await;
-            let raw = state.raw_config.read().clone();
-            let binding = preinstalled.take_binding();
-            let adopted = binding.is_some();
-            match spawn_tun_from_raw(&state.tunnel, &raw, binding, &state.rule_providers).await {
-                Ok(Some(handle)) => {
-                    state.tunnel.set_tun_handle(handle).await;
-                    info!(
-                        fake_ip_changed,
-                        tun_changed, "TUN listener restarted via config reload"
-                    );
-                    if adopted {
-                        outbound_binding_adopted(
-                            state,
-                            preinstalled.interface_changed(),
-                            tracked_tcp,
-                        );
-                    }
-                }
-                // Unreachable like the off→on arm — `enable` is still true
-                // in the committed raw. Roll back the same way rather than
-                // persist `enable: true` with nothing running.
-                Ok(None) => {
-                    warn!("TUN listener restart returned no handle (config rolled back)");
-                    if let Some(ref mut tun) = state.raw_config.write().tun {
-                        tun.enable = false;
-                    }
-                    return Err("TUN did not restart and was turned off".into());
-                }
-                Err(e) => {
-                    warn!("TUN listener failed to restart: {e} (config rolled back)");
-                    let message = format!("TUN failed to restart and was turned off: {e}");
-                    tun_failed(message.clone());
-                    if let Some(ref mut tun) = state.raw_config.write().tun {
-                        tun.enable = false;
-                    }
-                    return Err(message);
-                }
-            }
-        }
-        return Ok(());
-    }
-    if let Some(snapshot) = snapshot {
-        // off → on. Defensive: if a handle somehow outlives a raw config
-        // that already says `enable: false`, stop it first — the new
-        // listener must never build a second lwIP core over a live one
-        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
-        // teardown timeout rather than stack two generations).
-        state.tunnel.stop_tun().await;
-        let binding = preinstalled.take_binding();
-        let adopted = binding.is_some();
-        match spawn_tun_from_raw(&state.tunnel, &snapshot, binding, &state.rule_providers).await {
-            Ok(Some(handle)) => {
-                state.tunnel.set_tun_handle(handle).await;
-                info!("TUN listener started via config reload");
-                if adopted {
-                    outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
-                }
-            }
-            Ok(None) => {
-                // Unreachable today — `spawn_tun_from_raw` only yields
-                // `Ok(None)` when `tun.enable` is false and this arm only
-                // runs for off→on. Roll back like the `Err` arm rather
-                // than persist `enable: true` with nothing running.
-                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
-                if let Some(ref mut tun) = state.raw_config.write().tun {
-                    tun.enable = false;
-                }
-                return Err("TUN did not start and was turned off".into());
-            }
-            Err(e) => {
-                // TUN failed to start — roll back tun.enable to false so
-                // nyanpasu / the dashboard don't show TUN as active when
-                // nothing is actually running.
-                warn!("TUN listener failed to start: {e} (config rolled back)");
-                let message = format!("TUN failed to start and was turned off: {e}");
-                tun_failed(message.clone());
-                if let Some(ref mut tun) = state.raw_config.write().tun {
-                    tun.enable = false;
-                }
-                return Err(message);
-            }
-        }
-    } else {
-        // on → off
-        state.tunnel.stop_tun().await;
-        info!("TUN listener stopped via config reload");
-    }
-    Ok(())
 }
 
 /// Record a TUN listener that did not (re)start, at startup or on a config
@@ -3845,16 +5229,238 @@ async fn put_configs(
     // fetches, which dominate it. (The warm-path writers — subscription
     // add/refresh — keep resolving before the lane: they never change
     // `tun:`, so the running listener's binding already covers them.)
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
+    // Compare YAML fields to preserve reloads with a startup secret override.
+    let secret_changed = {
+        let live = state.raw_config.read();
+        raw_config.secret.as_deref().unwrap_or_default()
+            != live.secret.as_deref().unwrap_or_default()
+    };
+    if secret_changed {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            "changing the controller secret requires a restart",
+        );
+    }
+
     // Dropped on every rejection below, restoring the running listener's
     // binding; a TUN (re)spawn in the reconcile adopts it instead.
     if let Some(msg) = routing_mark_change_refused(&raw_config) {
         return reload_rejected(StatusCode::BAD_REQUEST, &msg);
     }
-    let preinstalled = preinstall_global_route_binding(&raw_config);
+    // One effective TUN, unbypassable by `force` like the lan-ACL gate:
+    // a candidate enabling `tun:` while a named `type: tun` device holds
+    // the slot — or whose own document stages one — must not bind,
+    // mutate, or persist.
+    if let Some(msg) = named_tun_enable_blocked(&state, &raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
+    // Document-shape admission, unbypassable by `?force` and placed
+    // BEFORE the rebuild's force early-return (which commits `raw_config`
+    // when nothing builds — a check after that arm could not gate the
+    // persisted document): the lan ACL and the `listeners:` shape —
+    // duplicate names/ports, `rule:` blocks, the one-TUN checks —
+    // are properties of the document itself, so they must never be
+    // committed malformed the way an environment failure may. The
+    // feature gate stays degradable later: whether THIS build serves a
+    // listener type is environment, not shape.
+    if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("lan ACL config error: {e}"),
+        );
+    }
+    let named_listeners = match meow_config::resolve_named_listeners(&raw_config) {
+        Ok(named) => named,
+        Err(e) => {
+            return reload_rejected(
+                StatusCode::BAD_REQUEST,
+                &format!("listeners config error: {e}"),
+            )
+        }
+    };
+    // The `type: anytls` feature gate is unbypassable, unlike the
+    // degradable gate below: a persisted entry this build cannot serve
+    // fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
+    // committing it is a Class-A defect like malformed shape — reject it
+    // identically even under `?force`.
+    let gate = crate::listener_gate();
+    if let Some(l) = named_listeners
+        .iter()
+        .find(|l| matches!(l.spec, meow_config::ListenerSpec::Anytls(_)) && gate(&l.spec).is_some())
+    {
+        let feature = gate(&l.spec).expect("find() already selected a missing feature");
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "listener '{}' (type anytls) requires cargo feature '{feature}', \
+                 which this build lacks — refusing to persist a config the next \
+                 startup could not serve",
+                l.name
+            ),
+        );
+    }
+    // A `listeners[].proxy` target the document itself never declares —
+    // not a `proxies:`/`proxy-groups:` name or a built-in — is a
+    // document-shape defect too: provider members are not registry keys,
+    // so the name can never resolve no matter how the build goes. Refused
+    // even when `force` would otherwise commit a candidate nothing builds
+    // (the map-level check inside the rebuild gates declared names that
+    // merely failed to build — that failure is environment, not shape).
+    if let Some(msg) = meow_config::listener_proxy_target_shape_err(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
 
+    // Local shape/range gates BEFORE the first candidate network work
+    // (issue #974): the ECH pre-resolution below opens sockets — a
+    // defect these resolvers would catch must reject the request before
+    // that, not after. Each gate also has to land before the rebuild's
+    // force early-return, which commits `raw_config` when nothing
+    // builds — a check placed after that arm could not gate the
+    // persisted document.
+    //
+    // `tcp-idle-timeout`: the rebuild never sees general fields, so its
+    // ceiling must gate persistence here — committed unchecked, the next
+    // boot's `build_config` would hard-error on a value this PUT
+    // accepted. `force` keeps the running bound, the same degrade the
+    // dns arm applies below — AND normalizes the committed field to that
+    // bound: the warm-path commits (`commit_raw_candidate` →
+    // `apply_raw_to_tunnel`) re-resolve this field on every mutation, so
+    // persisting the invalid value would make every later unrelated
+    // PATCH fail with this same error.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
+    // `tcp-keepalive*`: same boot-validity contract. The resolved posture
+    // is a startup snapshot like `listeners:` (no hot-apply), so under
+    // `force` there is no running value to keep — the degrade is warn +
+    // commit, matching the listeners arm. Unlike `tcp-idle-timeout` the
+    // committed value is NOT normalized (nothing running to normalize
+    // to): a forced bad value can still reach `save_config` and
+    // hard-error the next boot, the same exposure `listeners:`/`tun:`
+    // already carry.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
+    // `keep-alive-*` semantic admission — unbypassable by `?force` like
+    // the document-shape gates: the outbound socket policy is installed
+    // at commit, so a candidate that cannot resolve it must never
+    // persist. `keep-alive-idle`/`-interval` hold 0–32767 s even under
+    // `disable-keep-alive` (negative values already failed raw parse).
+    if let Err(e) = meow_config::resolve_outbound_tcp_keepalive(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+
+    // `ntp:` semantic admission on the same unbypassable footing
+    // (issue #974): ranges and server shape are validated even when the
+    // section is disabled, and the supervisor is reconciled at commit,
+    // so a candidate that cannot resolve must never persist. The named
+    // `dialer-proxy` target additionally resolves against the built
+    // candidate inside `rebuild_from_raw_impl` — under the verbatim
+    // fallback below the change-gate refuses an `ntp:` diff instead.
+    if let Err(e) = meow_config::resolve_ntp(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &format!("ntp config error: {e}"));
+    }
+
+    // `global-ua`: it is validated inside `rebuild_from_raw_impl`, but
+    // under `force` a candidate whose strict and lenient rebuilds both
+    // fail commits `raw_config` verbatim — and the value is re-validated
+    // on every warm mutation (`commit_raw_candidate` →
+    // `apply_raw_to_tunnel`) and on the next boot's `build_config`, so
+    // persisting an invalid UA would latch every later mutation to a 400
+    // and fail the reload. Under `force`, rewrite it to the live
+    // override — boot-valid by construction (None clears, matching
+    // `set_global_ua`'s own normalization).
+    if let Err(e) = meow_config::validate_global_ua(raw_config.global_ua.as_deref()) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+            raw_config.global_ua = meow_common::global_ua().map(|ua| ua.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
+    // The geo schedule resolves inside `parse_geodata`, which the rebuild
+    // reaches only when it gets that far — a forced fallback would commit
+    // the verbatim poison and the next boot's `build_config` hard-errors
+    // on it. So the gate is unconditional (like duplicate subscription
+    // names): `force` cannot push an invalid effective interval through.
+    if let Err(e) = meow_config::geodata::parse_geodata(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("geodata config error: {e}"),
+        );
+    }
+
+    // A `tun:` section the listener cannot parse must be rejected before
+    // commit (issue #543): admitted unchecked, the reconcile's restart
+    // would tear down a healthy listener and only then fail the spawn-side
+    // parse — leaving TUN down on a 204. `force` degrades to an error log
+    // like the dns arm below; the restart's rollback still prevents a
+    // false `enable`. This is a raw-level gate (section + `max-connections`
+    // + `fake-ip-range` — no built artifacts), so it runs with the other
+    // local gates BEFORE the ECH pre-resolution opens sockets.
+    if let Err(e) = meow_config::parse_tun_config(
+        raw_config.tun.as_ref(),
+        raw_config.max_connections,
+        raw_config.fake_ip_range(),
+    ) {
+        if force {
+            tracing::error!("config reload forced despite tun config error: {e}");
+            forced.push(format!("tun config error: {e}"));
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
+        }
+    }
+
+    let preinstalled = preinstall_global_route_binding(
+        &raw_config,
+        PreinstallScope::Mutation {
+            named_tun_running: matches!(
+                state.tunnel.tun_owner(),
+                Some(meow_tunnel::TunOwner::Named(_))
+            ),
+        },
+    );
+    // `smux:`/`mux:` blocks on the static leaves are the last local
+    // shape check before candidate network work — a malformed one must
+    // reject here, before the ECH pre-resolution opens sockets
+    // (issue #974 review). The gate mirrors the parse's strictness: a
+    // bad block is a node-level defect, so only `strict` rejects the
+    // document — and under `?force` it degrades leniently like every
+    // other strict defect class (the ECH retry just below): the lenient
+    // rebuild warn-drops the node and the PUT commits.
+    if let Err(e) = meow_config::proxy_parser::check_mux_shape(
+        &raw_config,
+        raw_config.strict.unwrap_or(false) && !force,
+    ) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &e);
+    }
     // Pre-resolve any DNS-sourced ECH configs into inline base64. Under
     // `force`, a strict-ECH defect is retried leniently so it degrades the
     // same way as every other strict defect class (issue #533 review).
@@ -3907,58 +5513,6 @@ async fn put_configs(
     // made it into the PUT.
     meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
 
-    // Same admission contract for `tcp-idle-timeout`: the rebuild never
-    // sees general fields either, so its ceiling must gate persistence
-    // here — committed unchecked, the next boot's `build_config` would
-    // hard-error on a value this PUT accepted. `force` keeps the running
-    // bound, the same degrade the dns arm applies below — AND normalizes
-    // the committed field to that bound: the warm-path commits
-    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
-    // field on every mutation, so persisting the invalid value would make
-    // every later unrelated PATCH fail with this same error. This gate
-    // must run BEFORE the rebuild — the force early-return below commits
-    // `raw_config` when nothing builds, so a check placed after that arm
-    // would leave the verbatim poison in the committed document.
-    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
-        Ok(timeout) => timeout,
-        Err(msg) => {
-            if force {
-                tracing::error!("config reload forced despite {msg}");
-                forced.push(msg);
-                let running = state.tunnel.inner().tcp_idle_timeout();
-                // Rewrite the invalid value to what is actually running —
-                // semantically equivalent for the next boot's
-                // `build_config` (0 = disabled) and boot-valid by
-                // construction.
-                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
-                running
-            } else {
-                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
-            }
-        }
-    };
-
-    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
-    // general fields either, so their semantic validation must gate
-    // persistence here — committed unchecked, the next boot's
-    // `build_config` would hard-error on a value this PUT accepted. The
-    // resolved posture is a startup snapshot like `listeners:` (no
-    // hot-apply), so under `force` there is no running value to keep —
-    // the degrade is warn + commit, matching the listeners arm. Unlike
-    // `tcp-idle-timeout` the committed value is NOT normalized (nothing
-    // running to normalize to): a forced bad value can still reach
-    // `save_config` and hard-error the next boot, the same exposure
-    // `listeners:`/`tun:` already carry — but hoisting the check above
-    // the rebuild at least records it in `forced` on every commit path.
-    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
-        if force {
-            tracing::error!("config reload forced despite {e}");
-            forced.push(e.to_string());
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
-        }
-    }
-
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later
     // `set_resolver` swaps (issue #514).
@@ -3985,6 +5539,8 @@ async fn put_configs(
         providers.clone(),
         cache_dir.clone(),
         state.provider_dialer_registry.clone(),
+        state.tunnel.selection_backing(),
+        state.tunnel.dns_outbound_cell(),
     )
     .await
     {
@@ -4007,8 +5563,10 @@ async fn put_configs(
                     lenient.clone(),
                     resolver_slot,
                     providers,
-                    cache_dir,
+                    cache_dir.clone(),
                     state.provider_dialer_registry.clone(),
+                    state.tunnel.selection_backing(),
+                    state.tunnel.dns_outbound_cell(),
                 )
                 .await
                 {
@@ -4035,21 +5593,334 @@ async fn put_configs(
     let Some(result) = result else {
         // The force contract accepts the config even when nothing in it
         // builds — persist the raw config but keep the previous routing,
-        // resolver, and provider registries untouched. Refresh tasks
-        // intentionally follow the *retained* registry (its providers
-        // still back the live route table), so no reconcile runs here.
+        // resolver, and provider registries untouched. One limit (issue
+        // #974): the verbatim commit installs live policy from the
+        // candidate, so a fallback that would *change* an effective
+        // profile/NTP/outbound-keepalive knob claims a switch it never
+        // earned — reject rather than publish.
+        let ntp_candidate = {
+            let committed = state.raw_config.read();
+            let profile_changed = meow_config::resolve_profile(&committed)
+                != meow_config::resolve_profile(&raw_config);
+            let keepalive_changed = match (
+                meow_config::resolve_outbound_tcp_keepalive(&committed),
+                meow_config::resolve_outbound_tcp_keepalive(&raw_config),
+            ) {
+                (Ok(old), Ok(new)) => old != new,
+                _ => true,
+            };
+            // `ntp:` on the same footing — compared on its effective
+            // service config (`enable` gates the rest), the shape the
+            // supervisor's reconcile actually sees.
+            let ntp_changed = match (
+                meow_config::resolve_ntp(&committed),
+                meow_config::resolve_ntp(&raw_config),
+            ) {
+                (Ok(old), Ok(new)) => old.enable.then_some(old) != new.enable.then_some(new),
+                _ => true,
+            };
+            // And the TUN reconcile: the verbatim commit below still runs
+            // `swap_config_and_reconcile_tun`, but with the PREVIOUS
+            // routing and resolver — an `enable` flip or a restart-worthy
+            // `tun:`/`fake-ip-range` diff would (re)spawn the device on a
+            // document whose pool geometry the kept resolver does not
+            // implement. The raw-checkable listener-dep half is already
+            // gated unconditionally above (`listener_proxy_target_shape_err`
+            // + `resolve_named_listeners`); the live-state half cannot be
+            // proven without a built candidate, so refuse it (issue #974).
+            let tun_changed = tun_transition_pending(&committed, &raw_config);
+            // `find-process-mode` is the same class: the commit installs
+            // the candidate's mode on the tunnel's live policy (issue
+            // #974 review).
+            let fpm_changed = committed.find_process_mode.unwrap_or_default()
+                != raw_config.find_process_mode.unwrap_or_default();
+            if profile_changed || keepalive_changed || ntp_changed || tun_changed || fpm_changed {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    "config validation failed under force, and the candidate \
+                     changes an effective profile/ntp/outbound-keepalive/tun/\
+                     find-process-mode policy — the fallback would claim a \
+                     switch it cannot apply; fix the defect and retry",
+                );
+            }
+            meow_config::resolve_ntp(&raw_config).ok()
+        };
+        // `sub-rules:` has no lenient arm — every block parse is strict,
+        // so a structurally broken section committed verbatim would fail
+        // the next boot and every warm mutation until then. Gate it like
+        // the other document checks; declared rule-provider names stand
+        // in for sets the failed builds could not produce (their
+        // availability is environment, not shape) — issue #974 review.
+        let stand_ins: meow_rules::RuleSets = raw_config
+            .rule_providers
+            .as_ref()
+            .map(|providers| {
+                providers
+                    .keys()
+                    .map(|name| {
+                        let set: Arc<dyn meow_rules::RuleSet> =
+                            Arc::from(meow_rules::build_rule_set(
+                                meow_rules::RuleSetBehavior::Classical,
+                                &[],
+                                &meow_rules::ParserContext::empty(),
+                            ));
+                        (name.clone(), set)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shape_ctx = meow_rules::ParserContext {
+            geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+            asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+            geosite: None,
+        };
+        // Run unconditionally — the rebuild's undefined-block gate does
+        // too (a `SUB-RULE` reference with no `sub-rules:` section fails
+        // the next boot the same way). The resolved blocks also feed the
+        // REMATCH-NAME check below, whose conditional
+        // `SUB-RULE,(cond),<name>` lines only parse block-aware
+        // (issue #974).
+        let empty_sub_map = HashMap::new();
+        let shape_blocks = match meow_config::sub_rules_parser::check_sub_rules_shape(
+            raw_config.rules.as_deref().unwrap_or(&[]),
+            raw_config.sub_rules.as_ref().unwrap_or(&empty_sub_map),
+            &stand_ins,
+            &shape_ctx,
+        ) {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                              sub-rules are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        };
+        // The rematch pair is strict in both modes the same way — a
+        // malformed `type: rematch` action or `REMATCH-NAME` predicate
+        // committed verbatim would hard-fail the next boot. Check them
+        // with or without a `sub-rules:` section; rule lines go through
+        // the build's block-aware parser, so a `(cond)` inside
+        // `SUB-RULE` and the legs inside logic groups get the same
+        // verdict as the build did (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+                if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             rematch nodes are structurally unsafe to commit verbatim: {e}"
+                        ),
+                    );
+                }
+            }
+        }
+        // `type: dns` carries the same verbatim-commit obligation: the
+        // force path never ran the build's structural gate, so a dns node
+        // missing `name` must be refused here — everything else the type
+        // tolerates by contract (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            if node.get("type").and_then(|v| v.as_str()) == Some("dns") {
+                if let Err(e) = meow_config::proxy_parser::check_dns_node(node) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             dns nodes are structurally unsafe to commit verbatim: {e}"
+                        ),
+                    );
+                }
+            }
+        }
+        // The name set the edges are judged against is the map the build
+        // produces — last-wins and built-in shadows included — not every
+        // raw `type: rematch` declaration: a rematch shadowed by a later
+        // same-named transport never becomes the leaf a member or
+        // `dialer-proxy` binds (issue #974).
+        let rematch_names =
+            meow_config::declared_rematch_names(raw_config.proxies.as_deref().unwrap_or(&[]));
+        // `type: dns` leaves fail the same two contracts a rematch does —
+        // neither can front a `dialer-proxy` hop nor carry a relay leg
+        // (issue #974) — so the edge/membership sweeps judge the union.
+        let dns_names =
+            meow_config::declared_dns_names(raw_config.proxies.as_deref().unwrap_or(&[]));
+        let non_transport_names =
+            |name: &str| rematch_names.contains(name) || dns_names.contains(name);
+        // The reverse edge is the same hard defect the build's
+        // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
+        // naming a statically known rematch leaf can never carry the
+        // hop — a rematch re-enters routing, it does not dial. Judge the
+        // edges that will actually bind — last-wins dedupe, built-in
+        // shadows and rematch nodes skipped like the build does — not
+        // every raw `dialer-proxy` key (issue #974).
+        match meow_config::declared_dialer_edges(raw_config.proxies.as_deref().unwrap_or(&[])) {
+            Ok(edges) => {
+                for (_, dialer) in edges {
+                    if non_transport_names(dialer.as_str()) {
+                        return reload_rejected(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "config validation failed under force, and the candidate's \
+                                 dialer-proxy edges are structurally unsafe to commit verbatim: \
+                                 dialer-proxy '{dialer}' is a control/resolver leaf",
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         dialer-proxy edges are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        }
+        // Relay membership is the same hard defect the build reports at
+        // `rebuild_from_raw`: a relay hop must dial and a rematch leaf
+        // never does — both a static `proxies:` member and an
+        // `include-all-proxies` expansion picking a declared leaf.
+        // A *group* member's dynamic rematch pick is the probe's
+        // business instead, exactly as in the build (issue #974).
+        for group in raw_config.proxy_groups.as_deref().unwrap_or(&[]) {
+            if group.group_type != "relay" {
+                continue;
+            }
+            for member in group.proxies.as_deref().unwrap_or(&[]) {
+                // Untrimmed like the build's `proxies.get(member)` — a
+                // padded member name the registry never binds must not
+                // collide with a leaf it never becomes.
+                if non_transport_names(member.as_str()) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' member '{member}' is a control/resolver \
+                             leaf",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+            if group.include_all_proxies.unwrap_or(false) {
+                let leaf = rematch_names.iter().chain(dns_names.iter()).next();
+                if let Some(leaf) = leaf {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' include-all-proxies supplies \
+                             control/resolver leaf '{leaf}'",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+        }
+        for line in raw_config.rules.as_deref().unwrap_or(&[]) {
+            if !meow_rules::line_mentions_rematch_name(line) {
+                continue;
+            }
+            if let Err(e) = meow_config::rule_parser::parse_one_rule_or_subrule(
+                line,
+                &stand_ins,
+                &shape_ctx,
+                &shape_blocks,
+            ) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         REMATCH-NAME rules are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        }
+        // An unchanged `ntp:` block escapes the diff gate even when
+        // the candidate deleted the dialer target itself — committing
+        // it verbatim would persist a reference the next startup's
+        // built-map check hard-fails. With no built candidate the
+        // name can only be proven against the candidate's own
+        // declared proxies/groups (issue #974 review). The declared
+        // provider mirror canonicalizes safe paths — real filesystem
+        // reads — so it runs on the blocking pool, after the raw read
+        // guard above has dropped.
+        if let Some(ntp) = ntp_candidate {
+            let raw = raw_config.clone();
+            let dir = cache_dir.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                meow_config::check_ntp_dialer_target_declared(&ntp, &raw, dir.as_deref())
+            })
+            .await;
+            match checked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+                }
+                Err(e) => {
+                    return reload_rejected(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("ntp dialer check failed: {e}"),
+                    );
+                }
+            }
+        }
         let prior_resolver = state.tunnel.resolver();
+        // The committed document's `dns:` verdict must still land on the
+        // verbatim lane: it keeps the previous route table but a skipped
+        // publish leaves the old resolver generation — `dns.enable: false`
+        // in particular — answering forever, and a later same-inputs PUT
+        // short-circuits on `dns_inputs_equal` so it can never reconcile
+        // (issue #974 review). Rebuild against the KEPT proxies, provider
+        // map and the live route table's own dialer-registry cell; a
+        // rebuild failure rejects rather than committing a `dns:` section
+        // nothing can serve.
+        let verbatim_dns = {
+            let live_route = state.tunnel.route_snapshot();
+            // Cloned rather than holding the read guard across the await —
+            // the commit's `commit_registry` write would deadlock on it.
+            let rule_providers = state.rule_providers.read().clone();
+            match reconcile_dns_config(
+                &state.raw_config,
+                &raw_config,
+                state.config_path.as_deref(),
+                live_route.proxies.as_ref(),
+                Some(&rule_providers),
+                None,
+                Some(Arc::clone(&prior_resolver)),
+                Some(&live_route.dialer_registry),
+            )
+            .await
+            {
+                Ok(dns) => dns,
+                Err((code, msg)) => return reload_rejected(code, &msg),
+            }
+        };
         // No `reload_routing` ran, so tracked TCP predating the binding
         // is still live. A TUN that fails to come up is rolled back and
         // recorded there; the document is committed, so the PUT succeeds.
-        let _ = swap_config_and_reconcile_tun(
-            &state,
-            raw_config,
-            None,
-            prior_resolver,
-            preinstalled,
-            TrackedTcp::Cancel,
-        )
+        let (_lane, ()) = run_owned_mutation(&state, mutation, |state| async move {
+            let _ = swap_config_and_reconcile_tun(
+                &state,
+                raw_config,
+                PendingPublish {
+                    routing: None,
+                    dns: verbatim_dns,
+                },
+                prior_resolver,
+                preinstalled,
+                TrackedTcp::Cancel,
+                None,
+            )
+            .await;
+        })
         .await;
         logbook::event(
             logbook::kind::CONFIG_RELOAD,
@@ -4066,6 +5937,7 @@ async fn put_configs(
     let meow_config::RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry,
         rule_providers,
         proxy_providers,
@@ -4073,36 +5945,17 @@ async fn put_configs(
         dropped_providers,
     } = result;
 
-    // A `tun:` section the listener cannot parse must be rejected before
-    // commit (issue #543): admitted unchecked, the reconcile's restart
-    // would tear down a healthy listener and only then fail the spawn-side
-    // parse — leaving TUN down on a 204. `force` degrades to an error log
-    // like the dns arm; the restart's rollback still prevents a false
-    // `enable`.
-    // Checked before `reconcile_dns_config` so a doomed PUT cannot trigger
-    // that path's provider-registry side effects.
-    if let Err(e) = meow_config::parse_tun_config(
-        raw_config.tun.as_ref(),
-        raw_config.max_connections,
-        raw_config.fake_ip_range(),
-    ) {
-        if force {
-            tracing::error!("config reload forced despite tun config error: {e}");
-            forced.push(format!("tun config error: {e}"));
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
-        }
-    }
-
     // Same admission contract for `sniffer:` (review #887): the TUN
     // carries the parsed `SnifferConfig` it was spawned with, and a
     // section `spawn_tun_from_raw` cannot parse fails the same restart a
     // sniffer diff triggers — tearing a healthy listener down on a 204
-    // exactly as an unparsable `tun:` did before the gate above. `force`
+    // exactly as an unparsable `tun:` did before its gate. `force`
     // degrades the same way; the restart's rollback still prevents a
     // false `enable`. The rebuild never sees this section either, so it
     // must gate here — committed unchecked, the next boot's
     // `build_config` would hard-error on a value this PUT accepted.
+    // Still ahead of `reconcile_dns_config` so a doomed PUT cannot
+    // trigger that path's provider-registry side effects.
     if let Err(e) = meow_config::sniffer_config_from_raw(&raw_config) {
         if force {
             tracing::error!("config reload forced despite sniffer config error: {e}");
@@ -4115,17 +5968,13 @@ async fn put_configs(
         }
     }
 
-    // Same contract for `listeners:` — an entry the startup parser rejects
-    // (bad type, duplicate port, `udp: true` + managed firewall, IPv6 UDP
-    // bind, …) must not be committed into `raw_config`: the next
-    // `load_config` would hard-error on boot. So is an entry this build
-    // cannot serve (e.g. `type: shadowsocks` without the
-    // `listener-shadowsocks` feature) — startup now hard-errors on it too.
-    // Listeners are still a startup snapshot (no hot-reload), this only
-    // gates persistence.
-    if let Err(e) = meow_config::resolve_named_listeners(&raw_config)
-        .and_then(|named| crate::ensure_listeners_supported(&named, crate::listener_gate()))
-    {
+    // The listener *shape* was already gated unconditionally above; what
+    // remains is the feature gate — whether THIS build serves a declared
+    // type (e.g. `type: shadowsocks` without `listener-shadowsocks`), an
+    // environment property `force` degrades like the other rebuild
+    // failures. Listeners are still a startup snapshot (no hot-reload),
+    // this only gates persistence.
+    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, crate::listener_gate()) {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
             forced.push(format!("listeners config error: {e}"));
@@ -4135,6 +5984,23 @@ async fn put_configs(
                 &format!("listeners config error: {e}"),
             );
         }
+    }
+
+    // The prospective-route dependency sweep — hard even under `force`:
+    // the candidate's own `listeners[].proxy`/`rule` references and every
+    // still-running listener's overrides must resolve against this map,
+    // or publishing would strand a live inbound (a PUT removing both the
+    // listener AND its dependency still has the running listener holding
+    // the reference). Before the DNS rebuild dials and before
+    // `reload_routing` publishes.
+    if let Err((status, msg)) = listener_route_deps_guard(
+        &state.listeners,
+        &raw_config,
+        &proxies,
+        &sub_rules,
+        &proxy_providers,
+    ) {
+        return reload_rejected(status, &msg);
     }
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
@@ -4164,7 +6030,7 @@ async fn put_configs(
                 // route swap below. In that case fall back to a dns-less
                 // candidate: a default resolver beats a dead one under the
                 // force contract (issue #533 review).
-                if dns_uses_runtime_refs(&state.raw_config.read()) {
+                let kept = if dns_uses_runtime_refs(&state.raw_config.read()) {
                     let mut stripped = dns_raw.clone().unwrap_or_else(|| raw_config.clone());
                     stripped.dns = None;
                     stripped.strict = Some(false);
@@ -4188,7 +6054,45 @@ async fn put_configs(
                     })
                 } else {
                     None
+                };
+                // A `None` keeps the previous resolver — whose fake-IP pool
+                // implements the COMMITTED document's persistence flag. When
+                // the candidate changed the effective flag
+                // (`profile.store-fake-ip` > `dns.store-fake-ip` > false),
+                // committing would claim a posture the kept pool never
+                // implements — reject instead (issue #974). A `Some` carries
+                // the dns-less build above: no fake-IP pool, nothing to
+                // diverge.
+                let resolver_kept = kept.is_none();
+                if resolver_kept
+                    && meow_config::resolve_profile(&state.raw_config.read()).store_fake_ip
+                        != meow_config::resolve_profile(&raw_config).store_fake_ip
+                {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        "config validation failed under force, and the candidate \
+                         changes the effective store-fake-ip flag while the \
+                         kept resolver still implements the old one — \
+                         fix the defect and retry",
+                    );
                 }
+                // Same exposure for the TUN reconcile (issue #974): with
+                // the previous resolver kept, `swap_config_and_reconcile_tun`
+                // below would still fire an `enable` flip or a `tun:`-tuple
+                // restart — respawning the device on a document whose
+                // fake-IP geometry (`fake-ip-range` feeds both the device
+                // address and the pool) the kept generation does not
+                // implement.
+                if resolver_kept && tun_transition_pending(&state.raw_config.read(), &raw_config) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        "config validation failed under force, and the candidate \
+                         fires a tun transition while the kept resolver still \
+                         implements the old fake-IP geometry — fix the defect \
+                         and retry",
+                    );
+                }
+                kept
             } else {
                 return reload_rejected(status, &msg);
             }
@@ -4201,62 +6105,62 @@ async fn put_configs(
         .mode
         .as_deref()
         .and_then(|mode| mode.parse().ok());
-    // Snapshot the resolver being replaced BEFORE the early install — the
-    // TUN reconcile compares its fake-IP inputs against the new
-    // generation's (issue #533 review).
+    // Snapshot the resolver being replaced before the commit — the swap
+    // compares its fake-IP inputs against the publish payload's new
+    // generation (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
-    // Same early-install as the warm path: `reload_routing` drops the old
-    // route table — and its registry cell — before `publish_dns` runs
-    // below, so every resolver consumer (tunnel, host hook, live
-    // `dns.listen` server) must be on the new generation first.
+    // The named-TUN fake-IP pin gates first — unbypassable by `force`,
+    // like the enable check above. Nothing else installs until the
+    // swap's synchronous commit section (issue #974 review).
     if let Some(dns) = &dns {
-        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
+        if let Err((status, msg)) = named_tun_fake_ip_guard(&state, &prior_resolver, dns) {
+            return reload_rejected(status, &msg);
+        }
     }
-    let dropped = state
-        .tunnel
-        .reload_routing(proxies, rules, mode, dialer_registry);
-    state
-        .tunnel
-        .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
-    meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw_config));
-    meow_tunnel::nftset::install(&state.tunnel, meow_config::effective_nftset(&raw_config));
-    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
-    if dropped > 0 {
-        tracing::warn!(
-            connections_dropped = dropped,
-            "connection closure requested for cold reload"
-        );
-    }
-    // Commit point: install the candidate's provider sets — the rules and
-    // DNS `rule-set:` matchers above already reference these Arcs
-    // (issue #533 review). `commit_registry` publishes the map *and*
-    // reconciles the interval refresh loops in one step (issue #543).
-    state
-        .rule_provider_refresh
-        .commit_registry(&state.rule_providers, rule_providers);
-    commit_proxy_providers(
-        &state.proxy_providers,
-        &proxy_providers,
-        raw_config.strict.unwrap_or(false),
-        raw_config.proxy_providers.as_ref(),
-        &state.proxy_provider_refresh,
+    // The logbook event's section counts — the document moves into the
+    // swap before the publish's drop count is known.
+    let reload_counts = (
+        raw_config.proxies.as_ref().map_or(0, Vec::len),
+        raw_config.proxy_groups.as_ref().map_or(0, Vec::len),
+        raw_config.rules.as_ref().map_or(0, Vec::len),
     );
-    dropped_providers.record();
-
-    let reloaded = reload_succeeded(&raw_config, &forced, dropped);
-    // `reload_routing` above ran after the pre-install and cancelled every
-    // tracked TCP flow; any admitted since dialled under the binding. A TUN
+    let publish = PendingPublish {
+        routing: Some(PendingRouting {
+            proxies,
+            rules,
+            sub_rules,
+            dialer_registry,
+            rule_providers,
+            proxy_providers,
+            dropped_providers,
+            connection_notes: raw_config.connection_notes.unwrap_or(false),
+            nftset: meow_config::effective_nftset(&raw_config),
+            tcp_idle_timeout,
+            store_selected: meow_config::resolve_profile(&raw_config).store_selected,
+            strict: raw_config.strict.unwrap_or(false),
+            raw_proxy_providers: raw_config.proxy_providers.clone(),
+            install: RouteInstall::CancelTrackedTcp { mode },
+        }),
+        dns,
+    };
+    // `reload_routing` inside the commit section cancels every tracked
+    // TCP flow; any admitted since dialled under the binding. A TUN
     // that fails to come up is rolled back and recorded there; the
     // document is committed, so the PUT succeeds.
-    let _ = swap_config_and_reconcile_tun(
-        &state,
-        raw_config,
-        dns,
-        prior_resolver,
-        preinstalled,
-        TrackedTcp::AlreadyCancelled,
-    )
+    let (_lane, receipt) = run_owned_mutation(&state, mutation, |state| async move {
+        swap_config_and_reconcile_tun(
+            &state,
+            raw_config,
+            publish,
+            prior_resolver,
+            preinstalled,
+            TrackedTcp::AlreadyCancelled,
+            None,
+        )
+        .await
+    })
     .await;
+    let reloaded = reload_succeeded(reload_counts, &forced, receipt.dropped);
     reloaded.record();
 
     StatusCode::NO_CONTENT.into_response()
@@ -4276,10 +6180,11 @@ fn reload_rejected(status: StatusCode, message: &str) -> Response {
 
 /// The logbook event of a committed `PUT /configs`; a warning when `force`
 /// pushed past errors.
-fn reload_succeeded(raw: &RawConfig, forced: &[String], dropped: usize) -> logbook::Event {
-    let proxies = raw.proxies.as_ref().map_or(0, Vec::len);
-    let groups = raw.proxy_groups.as_ref().map_or(0, Vec::len);
-    let rules = raw.rules.as_ref().map_or(0, Vec::len);
+fn reload_succeeded(
+    (proxies, groups, rules): (usize, usize, usize),
+    forced: &[String],
+    dropped: usize,
+) -> logbook::Event {
     let counts = format!("{proxies} proxies, {groups} groups, {rules} rules");
     let event = if forced.is_empty() {
         logbook::event(
@@ -5035,12 +6940,34 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .listeners
         .iter()
         .map(|l| {
+            // A `type: tun` entry owns no socket — report name and type
+            // only; `port`/`listen` would claim an endpoint that does not
+            // exist.
             let mut item = serde_json::json!({
                 "name": l.name,
                 "type": l.spec.type_name(),
-                "port": l.port,
-                "listen": l.listen,
             });
+            if !matches!(l.spec, meow_config::ListenerSpec::Tun(_)) {
+                item["port"] = serde_json::json!(l.port);
+                item["listen"] = serde_json::json!(l.listen);
+            }
+            // A multi-address `type: anytls` reports every bound target
+            // in declaration order — `listen`/`port` above stay the
+            // first entry for single-address parity. Only `listen`/
+            // `port` is emitted: user digests, certificate material and
+            // the private key never appear in API output.
+            if let meow_config::ListenerSpec::Anytls(cfg) = &l.spec {
+                if cfg.addresses.len() > 1 {
+                    item["addresses"] = serde_json::json!(cfg
+                        .addresses
+                        .iter()
+                        .map(|a| serde_json::json!({
+                            "listen": a.listen,
+                            "port": a.port,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+            }
             // TProxy listeners disclose who owns the redirect rules — a
             // deployer checking whether the table/anchor they installed is
             // supposed to coexist with a meow-managed one reads this field
@@ -5479,9 +7406,9 @@ mod tests {
         std::fs::write(&path, "proxies: []\n").unwrap();
         let raw = RawProxyProvider {
             provider_type: "file".to_string(),
-            payload: None,
             url: None,
             path: Some("p.yaml".to_string()),
+            payload: None,
             interval: Some(1),
             filter: None,
             exclude_filter: None,
@@ -5492,6 +7419,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let provider = Arc::new(
             ProxyProvider::new(
@@ -5746,10 +7674,11 @@ mod outbound_flush_tests {
         let meow_config::RebuildResult {
             proxies,
             rules,
+            sub_rules,
             dialer_registry,
             ..
         } = meow_config::rebuild_from_raw(&raw).unwrap();
-        tunnel.update_routing(proxies, rules, dialer_registry);
+        tunnel.update_routing(proxies, rules, sub_rules, dialer_registry);
         Arc::new(AppState {
             tunnel,
             secret: None,
@@ -5763,6 +7692,7 @@ mod outbound_flush_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -5771,6 +7701,7 @@ mod outbound_flush_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
@@ -5863,6 +7794,184 @@ mod outbound_flush_tests {
     }
 }
 
+/// Codex review (Windows DNS→TUN `:53` handoff): a PUT that removes
+/// `dns.listen: 127.0.0.1:53` while enabling a fake-IP `auto-route` TUN
+/// with `dns-hijack` collides on the loopback `:53` pair — the spawn's
+/// `local_dns::bind` runs before the commit's `Remove` arm retires the
+/// standalone socket, so the bind fails, the rollback turns TUN off, and
+/// the document still drops `dns.listen` — no listener at all. The fix
+/// releases the retiring socket BEFORE the spawn; the actual bind is
+/// Windows-only, so the tests below prove the decision matrix and the
+/// release ordering on every target.
+#[cfg(test)]
+mod dns_tun_handoff_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// Serializes these tests against any sibling that retires into the
+    /// process-global [`DNS_RETIRING`] queue.
+    static HANDOFF_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn test_resolver() -> Arc<meow_dns::Resolver> {
+        Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ))
+    }
+
+    /// Only a `:53` loopback/wildcard standalone shares the socket set the
+    /// Windows `local_dns::bind` claims — a bound NIC address or any other
+    /// port leaves the standalone socket alone.
+    #[test]
+    fn standalone_listen_collision_matrix() {
+        for (addr, collides) in [
+            ("127.0.0.1:53", true),
+            ("0.0.0.0:53", true),
+            ("[::1]:53", true),
+            ("[::]:53", true),
+            ("127.0.0.1:1053", false),
+            ("127.0.0.2:53", true), // any loopback :53 still pins the pair
+            ("192.0.2.4:53", false),
+            ("203.0.113.9:53", false),
+        ] {
+            let listen: SocketAddr = addr.parse().unwrap();
+            assert_eq!(
+                standalone_listen_collides_with_tun_local_dns(listen),
+                collides,
+                "{addr}"
+            );
+        }
+    }
+
+    /// The early drain fires only when every arm of the handoff holds:
+    /// the plan retires the standalone listener (`Remove` or `Bound`),
+    /// a TUN spawn is queued, the spawn's shape binds loopback DNS
+    /// (Windows + hijack + auto-route + fake-IP gateway), and the held
+    /// socket collides.
+    #[test]
+    fn dns_retire_conflict_requires_the_full_handoff_shape() {
+        let remove = Some(DnsListenPlan::Remove);
+        let loopback53: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+
+        assert!(dns_retire_conflicts_with_tun_bind(
+            &remove,
+            true,
+            true,
+            Some(loopback53)
+        ));
+        // Keep/BindFailed/absent plans do not retire the socket at all.
+        for plan in [
+            &Some(DnsListenPlan::Keep),
+            &Some(DnsListenPlan::BindFailed),
+            &None,
+        ] {
+            assert!(
+                !dns_retire_conflicts_with_tun_bind(plan, true, true, Some(loopback53)),
+                "non-retiring plan must never hand off"
+            );
+        }
+        // No queued spawn, no Windows hijack shape, or no colliding
+        // socket each leave the standalone listener to the commit arm.
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &remove,
+            false,
+            true,
+            Some(loopback53)
+        ));
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &remove,
+            true,
+            false,
+            Some(loopback53)
+        ));
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &remove, true, true, None
+        ));
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &remove,
+            true,
+            true,
+            Some(other)
+        ));
+    }
+
+    /// A `dns.listen` move produces a `Bound` plan whose replacement
+    /// socket is already bound elsewhere — the retiring old socket still
+    /// collides with the TUN spawn's `:53` claim until the commit arm
+    /// runs, so the handoff must drain it exactly like `Remove`.
+    #[tokio::test]
+    async fn dns_bound_plan_hands_off_like_remove() {
+        let _gate = HANDOFF_GATE.lock().await;
+        let loopback53: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let resolver = test_resolver();
+        let bound = meow_dns::DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("replacement bind");
+        let slot = bound.resolver_slot();
+        let bound_plan = Some(DnsListenPlan::Bound(bound, slot));
+
+        assert!(dns_retire_conflicts_with_tun_bind(
+            &bound_plan,
+            true,
+            true,
+            Some(loopback53)
+        ));
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &bound_plan,
+            true,
+            true,
+            Some("127.0.0.1:5353".parse().unwrap())
+        ));
+    }
+
+    /// The handoff is an awaited release, not a detached retire: after
+    /// [`release_standalone_dns_for_tun`] returns, the old socket is
+    /// provably free and the same address binds immediately — the
+    /// ordering `local_dns::bind` needs inside the same PUT (the bind
+    /// stands in for the Windows-only TUN half; nothing strands either
+    /// side).
+    #[tokio::test]
+    async fn release_standalone_dns_frees_the_socket_before_the_next_bind() {
+        let _gate = HANDOFF_GATE.lock().await;
+        let dns_server: RwLock<Option<DnsServerHandle>> = RwLock::new(None);
+
+        let resolver = test_resolver();
+        let server =
+            meow_dns::DnsServer::new(Arc::clone(&resolver), "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.expect("standalone bind");
+        let listen = bound.local_addr().unwrap();
+        let slot = bound.resolver_slot();
+        let socket = bound.socket_weak();
+        let task = tokio::spawn(async move {
+            let _ = bound.run().await;
+        });
+        *dns_server.write() = Some(DnsServerHandle {
+            listen,
+            task,
+            resolver_slot: slot,
+            socket: Some(socket),
+        });
+        // Baseline: the retiring socket really holds the port.
+        assert!(tokio::net::UdpSocket::bind(listen).await.is_err());
+
+        release_standalone_dns_for_tun(&dns_server).await;
+
+        assert!(
+            dns_server.read().is_none(),
+            "the retired handle must be gone before the spawn is attempted"
+        );
+        tokio::net::UdpSocket::bind(listen).await.expect(
+            "the drained socket must rebind immediately — the TUN-side bind never sees EADDRINUSE",
+        );
+    }
+}
+
 /// Issue #695: a config mutation installs its candidate's global-route
 /// binding before its first dial, and gives it back on every exit that does
 /// not hand it to a running listener. Needs the real `OutboundBinding`
@@ -5894,10 +8003,14 @@ mod global_route_binding_tests {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        let meow_config::RebuildResult { proxies, rules, .. } =
-            meow_config::rebuild_from_raw(&raw).unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
         tunnel.update_proxies(proxies, Default::default());
-        tunnel.update_rules(rules);
+        tunnel.update_rules_with_sub_rules(rules, sub_rules);
         let dir = std::env::temp_dir().join(format!("meow-api-695-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(AppState {
@@ -5908,6 +8021,7 @@ mod global_route_binding_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -5916,6 +8030,7 @@ mod global_route_binding_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
@@ -5993,20 +8108,48 @@ mod global_route_binding_tests {
     /// cache file — the one an earlier PUT's fetch wrote would otherwise
     /// satisfy the rebuild without a request.
     fn candidate(tun: &str, origin: &RecordingOrigin, tail: &str) -> String {
+        candidate_with_rules(tun, origin, "", tail)
+    }
+
+    /// [`candidate`] with extra lines appended to the fixed `rules:` list —
+    /// the post-fetch rejection case below rides on a rule the document
+    /// itself declares.
+    fn candidate_with_rules(
+        tun: &str,
+        origin: &RecordingOrigin,
+        extra_rules: &str,
+        tail: &str,
+    ) -> String {
         static CANDIDATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = CANDIDATES.fetch_add(1, Ordering::Relaxed);
         format!(
             "mode: rule\n{tun}rule-providers:\n  p:\n    type: http\n    behavior: domain\n    \
              url: http://{}/rules.yaml\n    path: ./rule-providers/p-{n}.yaml\n\
-             rules:\n  - MATCH,DIRECT\n{tail}",
+             rules:\n  - MATCH,DIRECT\n{extra_rules}{tail}",
             origin.addr
         )
     }
 
-    /// Rejected after the rebuild (and so after its fetch) by the
-    /// `listeners:` admission check.
-    const BAD_LISTENERS: &str =
-        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7895\n    udp: true\n";
+    /// Rejected after the rebuild (and so after its fetch) by a
+    /// `listeners:` admission check — but not the document-shape one:
+    /// `resolve_named_listeners` now runs before the global-route
+    /// preinstall, so a malformed entry (the old `udp: true` + managed
+    /// firewall) is refused before the binding ever installs and this
+    /// test could no longer observe it. `proxy: ghost` is document-shape
+    /// *valid* — `ghost` is declared in `proxies:` — yet the leaf fails
+    /// to build (`type: bogus` parses in no feature build, and `strict:
+    /// false` pins the lenient warn-drop a strict default would turn
+    /// into a pre-fetch bail), so `validate_listener_proxy_targets`
+    /// inside the rebuild refuses it after the rule-provider prefetch.
+    /// The only later listeners gate, `ensure_listeners_supported`, is
+    /// unreachable here: tests get the permissive `listener_gate`.
+    // meow-openwrt: a parse-failed node stays as a dead placeholder
+    // (72a5c188) and every `listeners:` shape defect is now a pre-fetch
+    // gate (upstream moved `resolve_named_listeners` ahead of the
+    // preinstall), so the post-fetch rejection the binding test needs is
+    // a rule naming an undefined sub-rule block — caught inside the
+    // rebuild after the rule-provider fetch.
+    const BAD_RULE: &str = "  - SUB-RULE,nosuchblock\n";
 
     const GLOBAL_LO: &str =
         "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
@@ -6032,6 +8175,12 @@ mod global_route_binding_tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
+
+    /// A mutation-scope call with no named TUN running — what PUT/PATCH
+    /// pass while the slot is free or top-level-owned.
+    const MUT: PreinstallScope = PreinstallScope::Mutation {
+        named_tun_running: false,
+    };
 
     /// Stand-in for the running global-scope listener: owns a binding, and
     /// records the binding in effect right after giving its own up — i.e.
@@ -6064,19 +8213,21 @@ mod global_route_binding_tests {
             // A missing interface: not fatal here, nothing installed.
             "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: no-such-iface-zz9\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml));
+            let p = preinstall_global_route_binding(&raw(yaml), MUT);
             assert!(!p.is_installed() && !p.interface_changed(), "{yaml}");
             assert_eq!(iface(), None, "{yaml}");
         }
         // None → Some(lo) is a change; a second owner of the same
         // interface is not; a non-global candidate leaves it alone.
-        let first = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        let first = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(first.is_installed() && first.interface_changed());
         assert_eq!(iface().as_deref(), Some("lo"));
-        let second = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        let second = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(second.is_installed() && !second.interface_changed());
-        let fake_ip =
-            preinstall_global_route_binding(&raw("tun:\n  enable: true\n  auto-route: fake-ip\n"));
+        let fake_ip = preinstall_global_route_binding(
+            &raw("tun:\n  enable: true\n  auto-route: fake-ip\n"),
+            MUT,
+        );
         assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
         drop(second);
         assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
@@ -6087,7 +8238,7 @@ mod global_route_binding_tests {
             "tun:\n  enable: true\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml));
+            let p = preinstall_global_route_binding(&raw(yaml), MUT);
             assert!(p.is_installed() && p.interface_changed(), "{yaml}");
             assert_eq!(iface().as_deref(), Some("lo"), "{yaml}");
             drop(p);
@@ -6116,9 +8267,13 @@ mod global_route_binding_tests {
             )),
         );
         let listener_flow = state.tunnel.inner().udp_flush_watch();
-        let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
+        let (status, body) = put(
+            &state,
+            &candidate_with_rules(GLOBAL_LO, &origin, BAD_RULE, ""),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("listeners config error"), "{body}");
+        assert!(body.contains("nosuchblock"), "{body}");
         assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
         assert_eq!(iface(), None, "a rejected PUT must not leave a binding");
         assert!(state.tunnel.inner().nat_table.contains_key(&nat_key));
@@ -6127,7 +8282,11 @@ mod global_route_binding_tests {
         // ── Rejected PUT over a running global listener: its binding is
         // back in effect afterwards, and the PUT's own owner is gone.
         let running = meow_listener::OutboundBinding::install(Some("lo")).unwrap();
-        let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
+        let (status, body) = put(
+            &state,
+            &candidate_with_rules(GLOBAL_LO, &origin, BAD_RULE, ""),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
         assert_eq!(iface().as_deref(), Some("lo"));
@@ -6136,7 +8295,8 @@ mod global_route_binding_tests {
 
         // ── Non-global candidates never install (no behaviour change).
         for tun in ["", "tun:\n  enable: true\n  auto-route: fake-ip\n"] {
-            let (status, body) = put(&state, &candidate(tun, &origin, BAD_LISTENERS)).await;
+            let (status, body) =
+                put(&state, &candidate_with_rules(tun, &origin, BAD_RULE, "")).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(origin.take_seen(), vec![None], "{tun}");
             assert_eq!(iface(), None, "{tun}");
@@ -6160,6 +8320,7 @@ mod global_route_binding_tests {
                     let _old = old;
                     std::future::pending::<()>().await;
                 }),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
@@ -6185,5 +8346,240 @@ mod global_route_binding_tests {
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
+
+        // ── A staged named global-route TUN is next-boot only: no
+        // mutation may install its binding, so the rebuild's fetch and
+        // every dial before it stay unbound. Startup does take the same
+        // document's named arm.
+        const NAMED_GLOBAL_LO: &str = "listeners:\n  - name: ntun\n    type: tun\n    \
+                                     auto-route: global\n    outbound-interface: lo\n";
+        let p = preinstall_global_route_binding(&raw(NAMED_GLOBAL_LO), MUT);
+        assert!(!p.is_installed() && !p.interface_changed());
+        assert_eq!(iface(), None);
+        let p = preinstall_global_route_binding(&raw(NAMED_GLOBAL_LO), PreinstallScope::Startup);
+        assert!(p.is_installed() && p.interface_changed());
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(p);
+        assert_eq!(iface(), None);
+        // While a named TUN runs, even a global `tun:` candidate installs
+        // nothing — the running device's binding survives the reconcile.
+        // (Admission separately refuses `tun.enable` here; the scope gate
+        // is the hard backstop.)
+        let running = meow_listener::OutboundBinding::install(Some("lo")).unwrap();
+        let p = preinstall_global_route_binding(
+            &raw(GLOBAL_LO),
+            PreinstallScope::Mutation {
+                named_tun_running: true,
+            },
+        );
+        assert!(!p.is_installed());
+        assert_eq!(iface().as_deref(), Some("lo"), "running binding untouched");
+        drop(p);
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(running);
+        assert_eq!(iface(), None);
+        // The PUT-level pin: a candidate staging only the named device
+        // fetches unbound — the named arm is startup-only.
+        let (status, body) = put(&state, &candidate("", &origin, NAMED_GLOBAL_LO)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(origin.take_seen(), vec![None]);
+        assert_eq!(iface(), None);
+    }
+}
+
+#[cfg(test)]
+mod listener_deps_tests {
+    use super::*;
+
+    fn ov(proxy: Option<&str>, rule: Option<&str>) -> NamedListener {
+        NamedListener {
+            name: "nl".into(),
+            spec: meow_config::ListenerSpec::Mixed,
+            port: 0,
+            listen: "127.0.0.1".into(),
+            max_connections: 0,
+            route_override: meow_common::InboundRouteOverride::new(proxy, rule),
+            routing_mark: None,
+        }
+    }
+
+    fn raw_with(yaml: &str) -> RawConfig {
+        meow_config::parse_raw_yaml(yaml).unwrap()
+    }
+
+    fn proxies() -> HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> {
+        HashMap::from([(
+            smol_str::SmolStr::from("DIRECT"),
+            Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::DirectAdapter::new(),
+            ))) as Arc<dyn meow_common::Proxy>,
+        )])
+    }
+
+    #[test]
+    fn candidate_listener_references_must_resolve() {
+        let empty = meow_config::sub_rules_parser::SubRuleBlocks::new();
+        let providers = HashMap::new();
+        // A dangling `proxy:` target fails the candidate itself.
+        let raw =
+            raw_with("listeners:\n  - name: a\n    type: mixed\n    port: 0\n    proxy: ghost\n");
+        let (_s, msg) =
+            listener_route_deps_guard(&[], &raw, &proxies(), &empty, &providers).unwrap_err();
+        assert!(msg.contains("ghost"), "{msg}");
+        // As does a dangling `rule:` block.
+        let raw =
+            raw_with("listeners:\n  - name: a\n    type: mixed\n    port: 0\n    rule: blk\n");
+        let (_s, msg) =
+            listener_route_deps_guard(&[], &raw, &proxies(), &empty, &providers).unwrap_err();
+        assert!(msg.contains("blk"), "{msg}");
+    }
+
+    #[test]
+    fn running_listener_deps_survive_candidate_removal() {
+        // The PUT removes BOTH the listener and its target — the running
+        // inbound still holds the reference, so the publish must refuse.
+        let running = vec![ov(Some("DIRECT"), Some("blk"))];
+        let raw = raw_with("rules:\n  - MATCH,DIRECT\n");
+        let mut blocks = meow_config::sub_rules_parser::SubRuleBlocks::new();
+        let (_s, msg) =
+            listener_route_deps_guard(&running, &raw, &HashMap::new(), &blocks, &HashMap::new())
+                .unwrap_err();
+        assert!(msg.contains("DIRECT"), "{msg}");
+        // Once the forced proxy resolves, the missing block still refuses.
+        let (_s, msg) =
+            listener_route_deps_guard(&running, &raw, &proxies(), &blocks, &HashMap::new())
+                .unwrap_err();
+        assert!(msg.contains("blk"), "{msg}");
+        // And with both dependencies present the sweep passes.
+        blocks.insert("blk".to_string(), std::sync::Arc::new(vec![]));
+        listener_route_deps_guard(&running, &raw, &proxies(), &blocks, &HashMap::new())
+            .expect("all dependencies resolve");
+    }
+}
+
+/// `GET /listeners` for `type: anytls` — every bound address surfaces,
+/// user digests and TLS material never do.
+#[cfg(test)]
+mod anytls_listeners_api_tests {
+    use super::*;
+    use meow_config::{AnytlsListenerConfig, ListenerBind, ListenerSpec, NamedListener};
+
+    fn test_state(listeners: Vec<NamedListener>) -> Arc<AppState> {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let raw = meow_config::parse_raw_yaml("mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            dialer_registry,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_routing(proxies, rules, sub_rules, dialer_registry);
+        Arc::new(AppState {
+            tunnel,
+            secret: None,
+            config_path: None,
+            raw_config: Arc::new(RwLock::new(raw)),
+            log_tx: broadcast::channel(16).0,
+            proxy_providers: Arc::new(DashMap::new()),
+            provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
+            rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
+            proxy_provider_refresh: Default::default(),
+            listeners,
+            external_ui: None,
+            traffic_feed: TrafficFeed::default(),
+            dns_server: Default::default(),
+            ui_storage: Default::default(),
+            cors: Default::default(),
+        })
+    }
+
+    fn anytls_listener(addresses: &[(&str, u16)]) -> NamedListener {
+        let (listen, port) = addresses[0];
+        NamedListener {
+            name: "at".into(),
+            spec: ListenerSpec::Anytls(AnytlsListenerConfig {
+                users: vec![meow_config::AnytlsUser {
+                    name: "alice".into(),
+                    password_sha256: [0xAB; 32],
+                }],
+                certificate: Some("-----BEGIN CERTIFICATE-----".into()),
+                private_key: Some("-----BEGIN PRIVATE KEY-----".into()),
+                allow_insecure: false,
+                padding_scheme: None,
+                addresses: addresses
+                    .iter()
+                    .map(|(l, p)| ListenerBind {
+                        listen: (*l).to_string(),
+                        port: *p,
+                    })
+                    .collect(),
+            }),
+            port,
+            listen: listen.into(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_reports_every_anytls_address_and_no_secrets() {
+        let state = test_state(vec![anytls_listener(&[("127.0.0.1", 8443), ("::1", 8443)])]);
+        let Json(body) = get_listeners(State(state)).await;
+        let item = &body[0];
+        assert_eq!(item["name"], "at");
+        assert_eq!(item["type"], "anytls");
+        assert_eq!(item["listen"], "127.0.0.1");
+        assert_eq!(item["port"], 8443);
+        assert_eq!(
+            item["addresses"],
+            serde_json::json!([
+                {"listen": "127.0.0.1", "port": 8443},
+                {"listen": "::1", "port": 8443},
+            ])
+        );
+
+        // Nothing sensitive may appear — the username/password digest,
+        // PEM blocks and the padding scheme are config-only.
+        let serialized = body.to_string();
+        for secret in [
+            "alice",
+            "password",
+            "sha256",
+            "certificate",
+            "private",
+            "BEGIN",
+            "ABABAB",
+            "padding",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "GET /listeners leaked '{secret}': {serialized}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_single_address_anytls_omits_addresses_key() {
+        let state = test_state(vec![anytls_listener(&[("0.0.0.0", 9443)])]);
+        let Json(body) = get_listeners(State(state)).await;
+        let item = &body[0];
+        assert_eq!(item["type"], "anytls");
+        assert_eq!(item["listen"], "0.0.0.0");
+        assert_eq!(item["port"], 9443);
+        // `addresses` only disambiguates multi-address entries — a
+        // single-address item stays byte-identical to other listeners.
+        assert!(item.get("addresses").is_none(), "{item}");
     }
 }

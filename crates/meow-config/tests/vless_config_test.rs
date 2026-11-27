@@ -343,6 +343,30 @@ proxies:
     );
 }
 
+/// Issue #974: the verbatim-mihomo shape — `global-client-fingerprint`
+/// at the top level only, REALITY nodes omitting `client-fingerprint`.
+/// The node inherits the global and passes the uTLS gate.
+#[tokio::test]
+async fn global_client_fingerprint_satisfies_vless_reality_nodes() {
+    let yaml = r#"
+global-client-fingerprint: chrome
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    reality-opts:
+      public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo
+"#;
+    let config = load_config_from_str(yaml).await.expect("config must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "the REALITY node must inherit the global fingerprint"
+    );
+}
+
 #[tokio::test]
 async fn parse_vless_reality_opts_requires_tls_true() {
     let yaml = r#"
@@ -1354,11 +1378,12 @@ proxies:
     assert_eq!(mux_warns, 0, "no warn expected; captured lines: {lines:?}");
 }
 
-/// D16g: `statistic` / `brutal-opts` → accepted with a warn each
-/// (upstream fields meow-rs does not implement).
+/// D16g: `statistic` still warns as unimplemented; `brutal-opts` is now
+/// implemented — parsed into the mux options, so the old ignore warn is
+/// gone. Off Linux the enabled form earns the platform advisory instead.
 #[cfg(feature = "mux")]
 #[tokio::test]
-async fn parse_vless_mux_unsupported_fields_warn_and_ignore() {
+async fn parse_vless_mux_statistic_warns_and_brutal_opts_is_supported() {
     let yaml = r#"
 proxies:
   - name: v
@@ -1382,13 +1407,50 @@ proxies:
         .iter()
         .filter(|l| l.contains("mux option 'statistic'"))
         .count();
-    let brutal = lines
+    assert!(statistic >= 1, "expected the statistic warn; {lines:?}");
+    let ignored = lines
         .iter()
-        .filter(|l| l.contains("mux option 'brutal-opts'"))
+        .filter(|l| l.contains("brutal-opts") && l.contains("not supported"))
         .count();
+    assert_eq!(
+        ignored, 0,
+        "brutal-opts is implemented — the ignore warn must be gone; {lines:?}"
+    );
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     assert!(
-        statistic >= 1 && brutal >= 1,
-        "expected one warn per unsupported field; {lines:?}"
+        lines
+            .iter()
+            .any(|l| l.contains("brutal-opts") && l.contains("Linux")),
+        "non-Linux must advise that the socket rate cap is skipped; {lines:?}"
+    );
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    assert!(
+        !lines.iter().any(|l| l.contains("brutal-opts")),
+        "Linux is fully supported — no brutal-opts advisory; {lines:?}"
+    );
+}
+
+/// D16g companion: the canonical `smux:` spelling warns the same way —
+/// `mux_config_block` routes both keys through one warn path.
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_smux_statistic_warns_and_ignores() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    smux:
+      enabled: true
+      statistic: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("`statistic` must warn, not error");
+    assert!(
+        lines.iter().any(|l| l.contains("mux option 'statistic'")),
+        "expected the statistic warn under the canonical `smux:` key; {lines:?}"
     );
 }
 
@@ -1504,9 +1566,12 @@ proxies:
 ///
 /// `flow: "xtls-rprx-vision"` + `udp: true` + `tls: true` → parse succeeds;
 /// at least one warn mentioning both "UDP" and "Vision" (or lowercase equivalents).
-/// Class B per ADR-0002 row #7: Vision is TCP-only; UDP uses plain VLESS.
+/// Class B per ADR-0002 row #7: Vision is TCP-only; UDP rides a Mux.Cool
+/// substream carrying the flow addon (upstream clients' XUDP shape).
 /// NOT hard-error: crypto and routing are unchanged on the UDP path.
-/// upstream: upstream UDP also silently uses plain VLESS; we warn once at load.
+/// upstream: upstream sends UDP through the flow'd mux stream; we warn once
+/// at load because vision UDP takes that mux path rather than the plain
+/// `Cmd::Udp` the node configured (and a domain target still falls back).
 #[tokio::test]
 async fn parse_vless_vision_udp_true_warns_once() {
     let yaml = r#"

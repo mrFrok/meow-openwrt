@@ -12,7 +12,7 @@
 # dependents' `use anytls_rs::...` paths are unchanged.
 [package]
 name = "meow-anytls"
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Vendored AnyTLS protocol implementation (madeye fork) for the meow-rs proxy kernel."
@@ -39,11 +39,11 @@ server = [
     "dep:rcgen",
     "dep:notify",
     "dep:x509-parser",
-    "dep:chrono",
+    "dep:time",
 ]
 
 [dependencies]
-meow-common = { path = "../meow-common", version = "0.29.0" }
+meow-common = { path = "../meow-common", version = "0.30.0" }
 tokio = { version = "1.48", features = [
     "macros",
     "rt-multi-thread",
@@ -84,7 +84,8 @@ anyhow = "1.0"
 
 notify = { version = "8.2", optional = true }
 x509-parser = { version = "0.18", optional = true }
-chrono = { version = "0.4", optional = true }
+# (meow-rs RUSTSEC-2026-0543) `time` replaces upstream chrono for cert display.
+time = { workspace = true, optional = true }
 
 # libc is only used by the Android / OpenHarmony socket-protect helper (EINPROGRESS check on
 # the non-blocking connect). Off-Android the helper compiles down to a direct

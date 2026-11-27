@@ -1,7 +1,8 @@
 use crate::match_engine::DomainIndex;
 use ipnet::IpNet;
 use meow_common::{
-    ConnType, Metadata, Network, Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe,
+    ConnType, MatchDemand, Metadata, Network, Rule, RuleMatchHelper, RuleType, TargetCheck,
+    TargetProbe,
 };
 use meow_rules::{
     geoip::GeoIpRule,
@@ -14,6 +15,7 @@ use meow_rules::{
     rule_set::RuleSet,
     rule_set_rule::RuleSetRule,
     src_geoip::SrcGeoIpRule,
+    sub_rule::{StagedVerdict, SubRuleRule},
 };
 use regex::Regex;
 use smallvec::SmallVec;
@@ -103,6 +105,11 @@ enum TargetPlan {
     StaticAdapter,
     /// The target adapter can be returned by nested rule evaluation.
     DynamicAdapter,
+    /// A `SUB-RULE` whose evaluation is staged (issue #974): its own
+    /// condition, or a member's, is demand-aware, so the slot self-reports
+    /// per-predicate needs through `match_staged` instead of the slot's
+    /// static demand flags blocking the scan early.
+    StagedSubRule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +144,9 @@ enum RuleOp {
     Network(Network),
     Uid(u32),
     InName(Box<str>),
+    /// REMATCH-NAME — the transition marker's exact, case-sensitive
+    /// compare; reads no enrichable field, so it carries no demand.
+    RematchName(Box<str>),
     InType(InTypeMask),
     InUser(Box<str>),
     Match,
@@ -235,20 +245,29 @@ struct InTypeMask {
     socks5: bool,
     tproxy: bool,
     inner: bool,
+    anytls: bool,
 }
 
 struct MatchInput<'a> {
     metadata: &'a Metadata,
     host: &'a str,
+    /// Which metadata demands may stop a demand-driven scan. The strict
+    /// paths never consult it — `Default` (nothing actionable) is their
+    /// value.
+    gate: DemandGate,
 }
 
 /// Control-flow result of one scan pass over a slot range.
 enum ScanOutcome<'a> {
     Matched(CompiledMatchResult<'a>),
     /// Slot at `pos` demands metadata the input does not carry yet
-    /// (demand-stop scans only).
+    /// (demand-stop scans only). The flags are the slot's actual,
+    /// already-gated needs — a staged sub-rule reports them from inside
+    /// its evaluation rather than from static slot demands.
     Blocked {
         pos: usize,
+        needs_ip: bool,
+        needs_process: bool,
     },
     Exhausted,
 }
@@ -278,11 +297,36 @@ pub enum LazyMatchOutcome<'a> {
     NoMatch,
 }
 
+/// Which metadata demands a demand-stop scan may block on (`find-process-
+/// mode`, issue #974): `ip` only where the caller materializes `dst_ip`
+/// itself (lazy TCP); `process` under every mode but `off`, and only
+/// while the flow's one lookup has not run — callers fold the flow memo
+/// in when they build the gate, so a miss cannot re-block the next pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DemandGate {
+    pub ip: bool,
+    pub process: bool,
+}
+
+impl DemandGate {
+    /// Every demand actionable — the pre-`find-process-mode` lazy gate.
+    pub const ALL: Self = Self {
+        ip: true,
+        process: true,
+    };
+}
+
 /// The scan cannot evaluate this slot yet: its predicate demands a field
-/// that is missing from the metadata but can still be materialized.
-fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> bool {
-    (slot.demands_ip && ip_missing(input))
-        || (slot.demands_process && process_missing(input.metadata))
+/// that is missing from the metadata, still materializable, and enabled
+/// by `gate` (`off` never stops on a process demand; the eager dispatch
+/// never stops on an IP one). Returns the gated flags so the caller can
+/// report them verbatim — staged sub-rule slots carry zero static
+/// demands and self-report through their evaluation instead.
+fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> Option<(bool, bool)> {
+    let gate = input.gate;
+    let needs_ip = gate.ip && slot.demands_ip && ip_missing(input);
+    let needs_process = gate.process && slot.demands_process && process_missing(input.metadata);
+    (needs_ip || needs_process).then_some((needs_ip, needs_process))
 }
 
 /// `dst_ip` is absent but resolvable: there is a hostname the enricher can
@@ -297,21 +341,44 @@ fn ip_missing(input: &MatchInput<'_>) -> bool {
 
 /// Process info is absent but discoverable: a source socket exists to look
 /// up. Mirrors the guards in `match_engine::maybe_enrich_with_process`.
+///
+/// The demand is process-granular, not field-granular: a UID-only rule
+/// sets the same `demands_process` bit as a PROCESS-NAME one, so a flow
+/// carrying `uid` but no `process` still pays one scan for the name it
+/// may not need. Splitting the bit per field would mean threading a
+/// `should_find_process` field-set through every `Rule` impl, the
+/// composites and the provider sets — not worth it for a cost bounded at
+/// one scan per flow (issue #974).
 fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }
 
-/// Log a skipped match: the rule matched but its target is absent from the
-/// registry or unusable for this traffic (issue #513; mihomo's match loop
-/// also `continue`s a target without UDP support on UDP flows).
+/// Log a skipped match: the rule matched but its target is absent from
+/// the registry (issue #513; mihomo's `continue` in the match loop).
 /// Interpolated into the message itself because the /logs broadcast
 /// forwards only the `message` field. Keep the wording in sync with the
 /// legacy engine's copy in `match_engine::warn_missing_target`.
 fn warn_missing_target(m: &CompiledMatchResult<'_>) {
     warn!(
-        "rule {} matched target '{}' which is unavailable for this \
-         connection (absent from the registry, or no UDP support); \
+        "rule {} matched target '{}' which is absent from the registry; \
          skipping it",
+        m.rule_type.as_str(),
+        m.adapter_name,
+    );
+}
+
+/// Log a [`TargetCheck::Unusable`] verdict: the rule matched and the
+/// target exists, but it cannot carry this connection class — unlike a
+/// missing target the scan does not slide past it. The match is still
+/// returned (the dial then fails loudly); this warn records *why* the
+/// connection is about to fail rather than falling through to a later
+/// rule (issue #969). Keep the wording in sync with
+/// `match_engine::warn_unusable_target`.
+fn warn_unusable_target(m: &CompiledMatchResult<'_>) {
+    warn!(
+        "rule {} matched target '{}' which cannot carry this connection \
+         class (e.g. no UDP support on a UDP flow); failing closed \
+         instead of sliding to a later rule",
         m.rule_type.as_str(),
         m.adapter_name,
     );
@@ -405,6 +472,7 @@ impl CompiledRuleSet {
             let payload = rule.payload();
             let mut demands_ip = rule.should_resolve_ip();
             let mut demands_process = rule.should_find_process();
+            let target_plan = target_plan(rule.as_ref());
 
             if disabled(rule_index) {
                 continue;
@@ -424,6 +492,16 @@ impl CompiledRuleSet {
                 );
                 pruned_never_match += 1;
                 continue;
+            }
+
+            // A staged sub-rule self-reports per-predicate demands from
+            // inside its evaluation (issue #974 §3.3): the aggregate must
+            // neither block the slot early nor pin the set-level
+            // enrichment flags — a false condition means the block's DNS
+            // / process demand never fires.
+            if target_plan == TargetPlan::StagedSubRule {
+                demands_ip = false;
+                demands_process = false;
             }
 
             // Payload-pure lowering first; then state-carrying native
@@ -536,7 +614,7 @@ impl CompiledRuleSet {
                 rule_index: u32::try_from(rule_index).expect("rule index exceeds u32"),
                 rule_type,
                 adapter_index: u32::try_from(adapter_index).expect("adapter index exceeds u32"),
-                target_plan: target_plan(rule_type),
+                target_plan,
                 demands_ip,
                 demands_process,
                 op,
@@ -685,7 +763,13 @@ impl CompiledRuleSet {
         if let Some(slot) = hit_slot {
             let m = self.static_match(slot, rules);
             match check_target(probe, &m) {
-                TargetCheck::Usable => return Some(m),
+                // A rematch target is terminal for this pass like Usable —
+                // the probe stashed the transition for the caller.
+                TargetCheck::Usable | TargetCheck::Rematch => return Some(m),
+                TargetCheck::Unusable => {
+                    warn_unusable_target(&m);
+                    return Some(m);
+                }
                 TargetCheck::Pass => note_pass_skip(probe, &m),
                 TargetCheck::Missing => on_missing(m),
             }
@@ -716,11 +800,14 @@ impl CompiledRuleSet {
     /// whose target is absent are skipped and the scan continues — with the
     /// warn deferred so the strict re-scan after `NeedsEnrichment` is the
     /// single place it fires (skipping that re-run loses the warnings).
+    ///
+    /// `gate` caps which demands may stop the scan — see [`DemandGate`].
     pub fn match_rules_lazy<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
         probe: &dyn TargetProbe,
+        gate: DemandGate,
     ) -> LazyMatchOutcome<'a> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -738,7 +825,7 @@ impl CompiledRuleSet {
             let mut on_missing = |m: CompiledMatchResult<'a>| skipped.push(m);
 
             let helper = RuleMatchHelper;
-            let input = MatchInput::new(metadata);
+            let input = MatchInput::new(metadata).with_gate(gate);
             'scan: {
                 if self.execution_plan == ExecutionPlan::LinearScan {
                     break 'scan match self.scan_range_ctl::<true, true>(
@@ -750,7 +837,11 @@ impl CompiledRuleSet {
                         &mut on_missing,
                     ) {
                         ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                        ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                        ScanOutcome::Blocked {
+                            pos,
+                            needs_ip,
+                            needs_process,
+                        } => self.enrichment_needs(pos, needs_ip, needs_process),
                         ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                     };
                 }
@@ -786,8 +877,12 @@ impl CompiledRuleSet {
                     // A blocked slot before the trie hit may match and beat
                     // it, so enrichment is needed even though a domain rule
                     // stands ready.
-                    ScanOutcome::Blocked { pos } => {
-                        break 'scan self.enrichment_needs(pos, &input);
+                    ScanOutcome::Blocked {
+                        pos,
+                        needs_ip,
+                        needs_process,
+                    } => {
+                        break 'scan self.enrichment_needs(pos, needs_ip, needs_process);
                     }
                     ScanOutcome::Exhausted => {}
                 }
@@ -796,7 +891,11 @@ impl CompiledRuleSet {
                 if let Some(slot) = hit_slot {
                     let m = self.static_match(slot, rules);
                     match check_target(probe, &m) {
-                        TargetCheck::Usable => {
+                        TargetCheck::Usable | TargetCheck::Rematch => {
+                            break 'scan LazyMatchOutcome::Matched(m);
+                        }
+                        TargetCheck::Unusable => {
+                            warn_unusable_target(&m);
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
                         TargetCheck::Pass => note_pass_skip(probe, &m),
@@ -814,7 +913,11 @@ impl CompiledRuleSet {
                     &mut on_missing,
                 ) {
                     ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                    ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                    ScanOutcome::Blocked {
+                        pos,
+                        needs_ip,
+                        needs_process,
+                    } => self.enrichment_needs(pos, needs_ip, needs_process),
                     ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                 }
             }
@@ -828,18 +931,20 @@ impl CompiledRuleSet {
         outcome
     }
 
-    /// Union the demands of every slot at or after `from_pos`, filtered to
-    /// the fields actually missing from this connection's metadata, so one
-    /// enrichment round suffices before the strict re-match.
-    fn enrichment_needs(&self, from_pos: usize, input: &MatchInput<'_>) -> LazyMatchOutcome<'_> {
-        let mut needs_ip = false;
-        let mut needs_process = false;
-        for slot in &self.slots[from_pos..] {
-            needs_ip |= slot.demands_ip;
-            needs_process |= slot.demands_process;
-        }
-        needs_ip &= ip_missing(input);
-        needs_process &= process_missing(input.metadata);
+    /// The demand report of the slot the scan stopped at — that slot's
+    /// own missing-and-gated fields only (reported by `slot_blocked`, or
+    /// by a staged sub-rule's own evaluation). A *later* slot's demand is
+    /// deliberately not pulled forward: an IP-only block must not spend a
+    /// process scan on a rule the scan never reached, and the next pass
+    /// decides the demand from the slot it reaches then (upstream's
+    /// `strict` invokes the lookup callback from the reached predicate
+    /// itself — issue #974 `find-process-mode`).
+    fn enrichment_needs(
+        &self,
+        pos: usize,
+        needs_ip: bool,
+        needs_process: bool,
+    ) -> LazyMatchOutcome<'_> {
         debug_assert!(
             needs_ip || needs_process,
             "scan blocked without an actionable demand",
@@ -847,7 +952,7 @@ impl CompiledRuleSet {
         LazyMatchOutcome::NeedsEnrichment {
             needs_ip,
             needs_process,
-            blocked_rule: self.slots[from_pos].rule_index as usize,
+            blocked_rule: self.slots[pos].rule_index as usize,
         }
     }
 
@@ -918,6 +1023,8 @@ impl CompiledRuleSet {
     /// miss-scan hot path is unchanged (issue #513). The sink is a callback
     /// so the lazy path can defer warnings when a strict re-scan will
     /// re-emit them.
+    /// `input.gate` is consulted only under `STOP_ON_DEMAND`; the strict
+    /// scans build their input with [`DemandGate::default()`].
     fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool, const EVAL_TRIE: bool>(
         &'a self,
         range: Range<usize>,
@@ -929,10 +1036,14 @@ impl CompiledRuleSet {
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
-            if STOP_ON_DEMAND && slot_blocked(slot, input) {
-                return ScanOutcome::Blocked {
-                    pos: start + offset,
-                };
+            if STOP_ON_DEMAND {
+                if let Some((needs_ip, needs_process)) = slot_blocked(slot, input) {
+                    return ScanOutcome::Blocked {
+                        pos: start + offset,
+                        needs_ip,
+                        needs_process,
+                    };
+                }
             }
             let matched = match &slot.op {
                 // Owned by the domain index. Prefix scans skip it — the
@@ -965,13 +1076,86 @@ impl CompiledRuleSet {
                                 let adapter_index = self.adapter_lookup.get(adapter_name).copied();
                                 self.make_match(slot, rules, adapter_name, adapter_index)
                             }),
+                        // A staged SUB-RULE (issue #974): condition-first
+                        // evaluation where only *reached* predicates may
+                        // report a metadata demand — under STOP_ON_DEMAND
+                        // the report maps to the slot's own Blocked, under
+                        // the strict scans the gate is empty and every
+                        // unreachable demand simply reads false.
+                        TargetPlan::StagedSubRule => {
+                            match rule
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                            {
+                                Some(sub) => {
+                                    let demand = if STOP_ON_DEMAND {
+                                        MatchDemand {
+                                            ip: input.gate.ip,
+                                            process: input.gate.process,
+                                        }
+                                    } else {
+                                        MatchDemand::NONE
+                                    };
+                                    match sub.match_staged(input.metadata, helper, probe, &demand) {
+                                        StagedVerdict::Matched(adapter_name) => {
+                                            let adapter_index =
+                                                self.adapter_lookup.get(adapter_name).copied();
+                                            Some(self.make_match(
+                                                slot,
+                                                rules,
+                                                adapter_name,
+                                                adapter_index,
+                                            ))
+                                        }
+                                        StagedVerdict::Miss => None,
+                                        StagedVerdict::Need {
+                                            ip: needs_ip,
+                                            process: needs_process,
+                                        } => {
+                                            if STOP_ON_DEMAND {
+                                                return ScanOutcome::Blocked {
+                                                    pos: start + offset,
+                                                    needs_ip,
+                                                    needs_process,
+                                                };
+                                            }
+                                            // Under the empty gate a Need
+                                            // can never arise.
+                                            None
+                                        }
+                                    }
+                                }
+                                // `target_plan` took the same downcast; an
+                                // unreachable fallback keeps the scan sound.
+                                None => rule.match_and_resolve(input.metadata, helper, probe).map(
+                                    |adapter_name| {
+                                        let adapter_index =
+                                            self.adapter_lookup.get(adapter_name).copied();
+                                        self.make_match(slot, rules, adapter_name, adapter_index)
+                                    },
+                                ),
+                            }
+                        }
                     }
                 }
                 op => matches_op(op, input, helper).then(|| self.static_match(slot, rules)),
             };
             if let Some(m) = matched {
                 match check_target(probe, &m) {
-                    TargetCheck::Usable => return ScanOutcome::Matched(m),
+                    // A rematch target is terminal for this pass like
+                    // Usable — the probe stashed the transition it
+                    // commits for the caller's re-entry loop (issue #974).
+                    TargetCheck::Usable | TargetCheck::Rematch => {
+                        return ScanOutcome::Matched(m);
+                    }
+                    // An existing-but-unusable target terminates the scan
+                    // *on* this match — the dial fails loudly where a
+                    // `Missing` verdict would slide to a later rule
+                    // (issue #969).
+                    TargetCheck::Unusable => {
+                        warn_unusable_target(&m);
+                        return ScanOutcome::Matched(m);
+                    }
                     // A PASS-typed target silently skips the rule — the
                     // match loop's `continue GetRules` upstream. Distinct
                     // from `Missing`: never warned, never buffered.
@@ -1019,7 +1203,15 @@ impl<'a> MatchInput<'a> {
         Self {
             metadata,
             host: metadata.rule_host(),
+            gate: DemandGate::default(),
         }
+    }
+
+    /// The input with its demand gate set — [`Self::match_rules_lazy`]'s
+    /// callers decide which demands may stop the scan.
+    fn with_gate(mut self, gate: DemandGate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -1037,7 +1229,10 @@ impl CompiledRuleSlot {
     }
 
     pub fn has_dynamic_adapter(&self) -> bool {
-        self.target_plan == TargetPlan::DynamicAdapter
+        matches!(
+            self.target_plan,
+            TargetPlan::DynamicAdapter | TargetPlan::StagedSubRule
+        )
     }
 
     pub fn is_lowered(&self) -> bool {
@@ -1065,11 +1260,23 @@ fn intern_adapter(
     index
 }
 
-fn target_plan(rule_type: RuleType) -> TargetPlan {
-    match rule_type {
+fn target_plan(rule: &dyn Rule) -> TargetPlan {
+    match rule.rule_type() {
         // SUB-RULE returns the matched inner rule's adapter, not the outer
-        // rule's adapter/block name.
-        RuleType::SubRule => TargetPlan::DynamicAdapter,
+        // rule's adapter/block name. A staged reference (its own condition
+        // or a nested one, issue #974) additionally self-reports its
+        // per-predicate metadata demands during evaluation.
+        RuleType::SubRule => {
+            if rule
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                .is_some_and(SubRuleRule::is_staged)
+            {
+                TargetPlan::StagedSubRule
+            } else {
+                TargetPlan::DynamicAdapter
+            }
+        }
         _ => TargetPlan::StaticAdapter,
     }
 }
@@ -1103,6 +1310,7 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
         RuleOp::DomainRegex(_)
         | RuleOp::ProcessPath(_)
         | RuleOp::InName(_)
+        | RuleOp::RematchName(_)
         | RuleOp::InUser(_)
         | RuleOp::Match => Some(payload.to_string()),
         // `compile_op` stores the truncated network, so textual host-bit
@@ -1115,12 +1323,13 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
         RuleOp::Uid(uid) => Some(uid.to_string()),
         RuleOp::Network(network) => Some(format!("{network:?}")),
         RuleOp::InType(mask) => Some(format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             u8::from(mask.http),
             u8::from(mask.https),
             u8::from(mask.socks5),
             u8::from(mask.tproxy),
-            u8::from(mask.inner)
+            u8::from(mask.inner),
+            u8::from(mask.anytls)
         )),
         // Shared-state handles: pointer identity means the same immutable
         // trie/set, so the predicates are interchangeable. GEOSITE also keys
@@ -1484,6 +1693,7 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         RuleType::Network => compile_network(payload),
         RuleType::Uid => payload.trim().parse::<u32>().ok().map(RuleOp::Uid),
         RuleType::InName => Some(RuleOp::InName(payload.into())),
+        RuleType::RematchName => Some(RuleOp::RematchName(payload.into())),
         RuleType::InType => compile_in_type(payload).map(RuleOp::InType),
         RuleType::InUser => Some(RuleOp::InUser(payload.into())),
         RuleType::Match => Some(RuleOp::Match),
@@ -1498,6 +1708,13 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         | RuleType::SrcIpSuffix
         | RuleType::IpAsn
         | RuleType::SrcIpAsn
+        // The process-pattern batch (issue #974) evaluates through
+        // `match_metadata`: their compiled matchers live inside the rule
+        // object, so the fallback path costs one virtual call only.
+        | RuleType::ProcessNameRegex
+        | RuleType::ProcessPathRegex
+        | RuleType::ProcessNameWildcard
+        | RuleType::ProcessPathWildcard
         | RuleType::SubRule => None,
     }
 }
@@ -1657,6 +1874,22 @@ fn matches_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelper) -> 
         RuleOp::Uid(uid) => uid_matches(input.metadata, *uid),
         RuleOp::InName(name) => {
             !input.metadata.in_name.is_empty() && input.metadata.in_name.as_str() == &**name
+        }
+        // The payload is a `/`-separated alternative list, each token
+        // trimmed and compared exactly (case-sensitive) — the same
+        // semantics `RematchNameRule::match_metadata` applies. An unset
+        // marker matches nothing, including an empty alternative.
+        RuleOp::RematchName(payload) => {
+            input
+                .metadata
+                .rematch_name
+                .as_deref()
+                .is_some_and(|marker| {
+                    payload
+                        .split('/')
+                        .map(str::trim)
+                        .any(|alt| alt == marker.as_str())
+                })
         }
         RuleOp::InType(mask) => in_type_matches(*mask, input.metadata.conn_type),
         RuleOp::InUser(user) => input.metadata.in_user.as_deref() == Some(&**user),
@@ -1972,6 +2205,7 @@ fn compile_in_type(payload: &str) -> Option<InTypeMask> {
         socks5: false,
         tproxy: false,
         inner: false,
+        anytls: false,
     };
     match payload.to_ascii_uppercase().as_str() {
         "HTTP" => {
@@ -1982,6 +2216,7 @@ fn compile_in_type(payload: &str) -> Option<InTypeMask> {
         "SOCKS5" => mask.socks5 = true,
         "TPROXY" => mask.tproxy = true,
         "INNER" => mask.inner = true,
+        "ANYTLS" => mask.anytls = true,
         _ => return None,
     }
     Some(mask)
@@ -1994,6 +2229,7 @@ fn in_type_matches(mask: InTypeMask, conn_type: ConnType) -> bool {
         ConnType::Socks5 => mask.socks5,
         ConnType::TProxy => mask.tproxy,
         ConnType::Inner => mask.inner,
+        ConnType::Anytls => mask.anytls,
         _ => false,
     }
 }
@@ -2510,7 +2746,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "lazy scan must stop for resolution instead of falling through",
@@ -2679,7 +2915,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "sniff_host-only input must not stop for IP enrichment"
@@ -2697,7 +2933,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "a real host must still trigger IP enrichment"
@@ -2737,7 +2973,7 @@ mod tests {
         // And the lazy scan must not stop on it.
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "an unconditional-match slot must not demand enrichment"
@@ -3080,7 +3316,7 @@ mod tests {
                 .to_string()
         };
         let lazy = |host: &str| -> String {
-            match set.match_rules_lazy(&meta(host), &rules, &|_: &str| true) {
+            match set.match_rules_lazy(&meta(host), &rules, &|_: &str| true, DemandGate::ALL) {
                 LazyMatchOutcome::Matched(result) => result.adapter_name.to_string(),
                 LazyMatchOutcome::NeedsEnrichment { .. } => {
                     panic!("a domain set never demands enrichment")
@@ -3278,7 +3514,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -3291,37 +3527,292 @@ mod tests {
         }
     }
 
-    /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines; see
-    /// [`crate::install_capture_fallback`] for the process-wide part.
+    // ── Issue #974: staged (conditional) SUB-RULE slots ──────────────
+
+    /// Build a staged `SUB-RULE`: `cond` is the predicate tree (any rule
+    /// — the parser's leaf whitelist is a config concern, not the IR's),
+    /// `members` the block, `fallback` the optional fourth field.
+    fn staged_sub_rule(
+        cond: Box<dyn Rule>,
+        members: Vec<Box<dyn Rule>>,
+        fallback: Option<&str>,
+    ) -> SubRuleRule {
+        SubRuleRule::new_conditional(
+            "blk",
+            Arc::new(members),
+            cond,
+            "(DOMAIN,cond.example)",
+            fallback,
+        )
+    }
+
+    /// A staged slot contributes zero static demands: the whole set's
+    /// aggregate flags stay clear even though the cond tree and the
+    /// block carry both kinds — a false condition means none of them
+    /// can fire, so the engine must never pre-resolve every flow for it
+    /// (issue #974 §3.3).
+    #[test]
+    fn staged_sub_rule_pins_no_static_demands() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            Box::new(IpCidrRule::new("203.0.113.0/24", "unused", false, false).unwrap()),
+            vec![Box::new(ProcessRule::new("curl", "InnerProxy"))],
+            Some("FallbackProxy"),
+        );
+        assert!(sub.should_resolve_ip() && sub.should_find_process());
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+    }
+
+    /// A false condition skips the block *and its demands* — the lazy
+    /// scan must not stop for metadata the unreachable members would
+    /// want, and must not spend a lookup.
+    #[test]
+    fn staged_sub_rule_false_cond_never_demands() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            // Host does not match → false.
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![
+                // Both members would demand enrichment if reached.
+                Box::new(IpCidrRule::new("203.0.113.0/24", "IpProxy", false, false).unwrap()),
+                Box::new(ProcessRule::new("curl", "ProcProxy")),
+            ],
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "other.example".into(),
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::Matched(m) => {
+                assert_eq!(m.adapter_name, "DIRECT");
+                assert_eq!(m.rule_type, RuleType::Match);
+            }
+            _ => panic!("false cond must fall through, not demand enrichment"),
+        }
+    }
+
+    /// A true condition enters the block in order; a reached member's
+    /// process demand stops the lazy scan exactly like a top-level
+    /// process rule's would — and resolves the same way afterwards.
+    #[test]
+    fn staged_sub_rule_lazy_reports_member_process_demand() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![Box::new(ProcessRule::new("curl", "ProcProxy"))],
+            None,
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "cond.example".into(),
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(!needs_ip);
+                assert!(needs_process);
+            }
+            _ => panic!("reached process member must demand the lookup"),
+        }
+
+        // The strict scan (empty gate) reads the missing field as a miss
+        // and falls through — same as upstream's "not resolved → skip".
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("FINAL still matches");
+        assert_eq!(result.adapter_name, "DIRECT");
+
+        // After enrichment the inner rule matches and resolves its own
+        // target dynamically.
+        let mut enriched = meta.clone();
+        enriched.process = "curl".into();
+        let result = set
+            .match_rules(&enriched, &rules, &|_: &str| true)
+            .expect("inner process rule must match");
+        assert_eq!(result.adapter_name, "ProcProxy");
+        assert_eq!(result.rule_type, RuleType::SubRule);
+    }
+
+    /// A reached *condition* leaf's IP demand stops the scan before the
+    /// block is even looked at — resolution then decides the predicate.
+    #[test]
+    fn staged_sub_rule_lazy_reports_cond_ip_demand() {
+        // IpCidr as the cond stands in for a dst-GEOIP leaf: the IR only
+        // sees `should_resolve_ip`, the whitelist lives in the parser.
+        let sub = staged_sub_rule(
+            Box::new(IpCidrRule::new("203.0.113.0/24", "unused", false, false).unwrap()),
+            vec![Box::new(FinalRule::new("InnerProxy"))],
+            None,
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "resolve.example".into(),
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(needs_ip);
+                assert!(!needs_process);
+            }
+            _ => panic!("reached cond leaf must demand resolution"),
+        }
+
+        // In-range → cond true → inner hit; out-of-range → cond false →
+        // the block is never entered and the fallback cannot fire either.
+        for (ip, expected) in [("203.0.113.7", "InnerProxy"), ("198.51.100.9", "DIRECT")] {
+            let mut resolved = meta.clone();
+            resolved.dst_ip = Some(ip.parse::<IpAddr>().unwrap());
+            let result = set
+                .match_rules(&resolved, &rules, &|_: &str| true)
+                .expect("must match");
+            assert_eq!(result.adapter_name, expected, "ip={ip}");
+        }
+    }
+
+    /// The four-field fallback resolves as a dynamic adapter — never
+    /// interned at build, only produced by evaluation.
+    #[test]
+    fn staged_sub_rule_fallback_is_a_dynamic_target() {
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![], // empty block → exhausted on a true condition
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "cond.example".into(),
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("fallback must resolve");
+        assert_eq!(result.adapter_name, "FallbackProxy");
+        assert_eq!(result.adapter_index, None);
+        assert_eq!(result.rule_type, RuleType::SubRule);
+        assert_eq!(
+            result.rule_payload,
+            "(DOMAIN,cond.example),blk,FallbackProxy"
+        );
+    }
+
+    /// A false condition must *not* yield the fallback — the fourth
+    /// field only fires when the block was actually entered and
+    /// exhausted (issue #974 four-field semantics).
+    #[test]
+    fn staged_sub_rule_false_cond_skips_fallback() {
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![],
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "nope.example".into(),
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("FINAL must match");
+        assert_eq!(result.adapter_name, "DIRECT");
+    }
+
+    /// The new process pattern types are ordinary demand-pinning slots:
+    /// they aggregate `needs_process_lookup` like any process rule and
+    /// match once the field is materialized (issue #974).
+    #[test]
+    fn process_pattern_rules_demand_process_and_match() {
+        use meow_rules::process_pattern::ProcessPatternRule;
+
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(
+                ProcessPatternRule::new_regex(
+                    RuleType::ProcessNameRegex,
+                    r"^svchost\.exe$",
+                    "RegexProxy",
+                )
+                .unwrap(),
+            ),
+            Box::new(
+                ProcessPatternRule::new_glob(
+                    RuleType::ProcessPathWildcard,
+                    r"C:\Tools\*\bin\*.exe",
+                    "GlobProxy",
+                )
+                .unwrap(),
+            ),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert!(set.needs_process_lookup());
+        assert!(!set.needs_ip_resolution());
+
+        for (name, path, expected) in [
+            ("SVCHOST.EXE", r"C:\other.exe", "RegexProxy"), // case-insensitive
+            ("x", r"c:\tools\abc\bin\t.exe", "GlobProxy"),  // glob folds case
+            ("x", r"C:\Tools\abc\t.exe", "DIRECT"),         // missing literal `\bin\`
+        ] {
+            let meta = Metadata {
+                process: name.into(),
+                process_path: path.into(),
+                ..Default::default()
+            };
+            let result = set
+                .match_rules(&meta, &rules, &|_: &str| true)
+                .expect("must match");
+            assert_eq!(result.adapter_name, expected, "name={name} path={path}");
+        }
+
+        // Missing process info blocks the lazy scan at the first
+        // process-demanding slot.
+        let meta = Metadata {
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(!needs_ip);
+                assert!(needs_process);
+            }
+            _ => panic!("process-demanding slot must stop the lazy scan"),
+        }
+    }
+
     fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
-        crate::install_capture_fallback();
-        #[derive(Clone)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Sink {
-                self.clone()
-            }
-        }
-        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let captured = sink.0.lock().unwrap();
-        (out, String::from_utf8_lossy(&captured).into_owned())
+        crate::capture_warns(f)
     }
 
     // Issue #533 item 4: the lazy two-phase resolve used to warn about a
@@ -3345,7 +3836,8 @@ mod tests {
 
         // Phase 1: the dead-target domain rule matches and the IP-CIDR slot
         // blocks → NeedsEnrichment. The warn must be deferred to phase 2.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(
             matches!(
                 outcome,
@@ -3366,7 +3858,7 @@ mod tests {
             Some("CidrProxy"),
             "the dead-target rule is skipped and the CIDR rule wins"
         );
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "expected exactly one dead-target warn, got: {logs}"
@@ -3388,9 +3880,10 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "final outcome must emit the warn once, got: {logs}"
@@ -3419,7 +3912,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3462,7 +3956,8 @@ mod tests {
         assert_eq!(result.map(|m| m.adapter_name), Some("LIVE"));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "strict: {logs}");
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "lazy: {logs}");
     }
@@ -3486,7 +3981,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3511,9 +4007,10 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::NoMatch));
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "NoMatch must drain the buffered warn, got: {logs}"
@@ -3539,7 +4036,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3559,7 +4057,9 @@ mod tests {
     }
 
     /// Issue #533 probe stub: `PASS` classifies as `Pass`, `DEAD` as
-    /// `Missing`, everything else `Usable`; `PASS-RULE` and `SEL` answer
+    /// `Missing`, `CHAINED` as `Unusable` — a `dialer-proxy` chain over a
+    /// non-transparent inner, the only producer of that verdict on the
+    /// route probe (issue #969); `PASS-RULE` and `SEL` answer
     /// `is_pass_rule`. `SEL` stands in for a group whose member is a
     /// PASS-RULE adapter — usable at top level (a PassRule-typed hop is not
     /// a top-level skip), skipped only inside SUB-RULE scans.
@@ -3569,6 +4069,7 @@ mod tests {
             match name {
                 "PASS" => TargetCheck::Pass,
                 "DEAD" => TargetCheck::Missing,
+                "CHAINED" => TargetCheck::Unusable,
                 _ => TargetCheck::Usable,
             }
         }
@@ -3598,6 +4099,41 @@ mod tests {
             !logs.contains("PASS"),
             "PASS skip must never warn, got: {logs}"
         );
+    }
+
+    /// Issue #969: a matched rule whose target is a `dialer-proxy` chain
+    /// that cannot carry this connection class (`Unusable`) terminates the
+    /// scan on the match — the dial fails loudly — where a `Missing`
+    /// verdict warns and slides to a later rule (`DEAD` above proves that
+    /// arm still slides).
+    #[test]
+    fn unusable_target_stops_the_scan_on_the_match() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "CHAINED")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        for strict in [true, false] {
+            let result = if strict {
+                set.match_rules(&meta, &rules, &BuiltinProbe)
+                    .map(|m| m.adapter_name)
+            } else {
+                match set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL) {
+                    LazyMatchOutcome::Matched(m) => Some(m.adapter_name),
+                    _ => panic!("lazy scan must not defer or miss"),
+                }
+            };
+            assert_eq!(
+                result,
+                Some("CHAINED"),
+                "strict={strict}: Unusable must return the match, never slide to DIRECT"
+            );
+        }
     }
 
     /// `PATCH /rules/disable`: a disabled rule is skipped like a PASS
@@ -3726,7 +4262,8 @@ mod tests {
         };
         // Phase 1: PASS rule skipped, then the scan hits the IP-demanding
         // slot → NeedsEnrichment with no warns.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3755,7 +4292,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
@@ -3811,7 +4349,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DomainProxy"),
             _ => panic!("domain match must complete without enrichment"),
         }
@@ -3831,7 +4369,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("must fall through to FINAL without demanding enrichment"),
         }
@@ -3852,7 +4390,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("no-resolve rule must not demand enrichment"),
         }
@@ -3876,7 +4414,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -3907,7 +4445,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment { needs_ip, .. } => assert!(needs_ip),
             _ => panic!("blocked slot before the trie hit must demand enrichment"),
         }
@@ -4013,7 +4551,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "a GEOSITE hit must return Matched, not NeedsEnrichment"
@@ -4310,7 +4848,8 @@ mod tests {
         // exactly once on the terminal outcome (the hit-slot arm reports
         // through the same on_missing sink; dropping it silently loses
         // this warn since no strict re-scan runs on Matched).
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &present));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &present, DemandGate::ALL));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "REJECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
@@ -4645,7 +5184,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match compiled.match_rules_lazy(&unresolved, &rules, &|_: &str| true) {
+        match compiled.match_rules_lazy(&unresolved, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(result) => assert_eq!(result.adapter_name, "Src"),
             LazyMatchOutcome::NeedsEnrichment { .. } => {
                 panic!("a src RULE-SET must not demand dst_ip resolution")
@@ -4989,7 +5528,8 @@ mod tests {
             let strict = compiled
                 .match_rules(&metadata, &rules, &present)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
-            let lazy = match compiled.match_rules_lazy(&metadata, &rules, &present) {
+            let lazy = match compiled.match_rules_lazy(&metadata, &rules, &present, DemandGate::ALL)
+            {
                 LazyMatchOutcome::Matched(m) => Some((m.adapter_name, m.rule_type, m.rule_payload)),
                 LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => None,
             };

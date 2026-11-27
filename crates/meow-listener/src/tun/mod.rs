@@ -104,8 +104,13 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+// The sniff window/read helpers moved to `crate::stream_sniff`, shared
+// with the WireGuard inbound's smoltcp path — the aliases keep this file's
+// existing call sites and test imports unchanged.
+use crate::stream_sniff::sniff_first_payload;
+
 /// Bound on the first bytes gathered for a TLS sniff on lwIP flows.
-const TUN_SNIFF_GATHER_MAX: usize = 16 * 1024;
+const TUN_SNIFF_GATHER_MAX: usize = crate::stream_sniff::STREAM_SNIFF_GATHER_MAX;
 
 /// Post-handshake sniff window: how long an accepted TUN TCP flow may stay
 /// silent before it is dialed anyway with an empty prefix (#695).
@@ -121,10 +126,7 @@ const TUN_SNIFF_GATHER_MAX: usize = 16 * 1024;
 /// for a flow the tunnel cannot name (an unmapped fake IP):
 /// `meow_tunnel::tcp::handle_tcp` sniffs its SNI / `Host`, through the
 /// replayed prefix or its own short wait.
-const TUN_SNIFF_WINDOW: Duration = Duration::from_millis(200);
-/// First-read size when waiting for real traffic. Large enough to pull a
-/// TLS ClientHello record header + a bit of payload in one shot.
-const TUN_FIRST_READ: usize = 256;
+const TUN_SNIFF_WINDOW: Duration = crate::stream_sniff::STREAM_SNIFF_WINDOW;
 
 use route::RouteGuard;
 
@@ -439,6 +441,25 @@ pub struct TunListener {
     /// The top-level `sniffer:` (TLS SNI / HTTP Host), as mihomo applies it
     /// to TUN flows too.
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    /// `proxy`/`rule` override a `listeners: type: tun` entry declares —
+    /// stamped onto every flow's metadata before routing (upstream's
+    /// `Additions` shape). `None` on the top-level `tun:` device.
+    route_override: Option<meow_common::InboundRouteOverride>,
+    /// Divert TCP :53 flows into the in-process DNS service — part of the
+    /// top-level `tun:` section's `dns-hijack` contract (docs/tun.md), not
+    /// the named `type: tun` entry's: a named entry's `dns-hijack` admits
+    /// wildcard UDP targets only, so this stays `false` on that path.
+    tcp_dns_hijack: bool,
+    /// Fake-IP geometry (gateway, routed ranges) setup reads instead of
+    /// the tunnel's live slot. A reload that changes `dns.fake-ip-range*`
+    /// builds the candidate resolver before it is published;
+    /// [`Self::with_setup_resolver`] extracts this geometry eagerly so the
+    /// device's gateway/routes come from the generation being committed —
+    /// WITHOUT retaining the resolver itself: a listener that survives a
+    /// DNS-only reload must not pin the retired resolver's caches and
+    /// flush tasks for its whole life (Codex review). Live-traffic
+    /// readers keep following the tunnel slot.
+    setup_geometry: Option<FakeIpGeometry>,
 }
 
 impl TunListener {
@@ -450,7 +471,25 @@ impl TunListener {
             ready: None,
             outbound_binding: None,
             sniffer: None,
+            route_override: None,
+            tcp_dns_hijack: false,
+            setup_geometry: None,
         }
+    }
+
+    /// Stamp the named entry's `proxy`/`rule` override onto each flow
+    /// (`InboundRouteOverride::apply`), as every socket listener does.
+    pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
+        self.route_override = ov;
+        self
+    }
+
+    /// Whether this device also diverts TCP :53 into the DNS service —
+    /// the top-level `tun:` spawn paths pass their `dns_hijack` here; the
+    /// named `type: tun` path never calls it (UDP-only contract).
+    pub fn with_tcp_dns_hijack(mut self, on: bool) -> Self {
+        self.tcp_dns_hijack = on;
+        self
     }
 
     /// Name TCP flows with the configured sniffer (ignored when disabled).
@@ -458,6 +497,16 @@ impl TunListener {
         if sniffer.is_enabled() {
             self.sniffer = Some(sniffer);
         }
+        self
+    }
+
+    /// Override the resolver setup reads for fake-IP geometry — see the
+    /// field's comment. The geometry is extracted NOW so the resolver
+    /// itself is never retained by the listener; `None` (the default)
+    /// keeps reading the tunnel's live resolver, which is also what
+    /// post-setup traffic sees.
+    pub fn with_setup_resolver(mut self, resolver: Option<&meow_dns::Resolver>) -> Self {
+        self.setup_geometry = resolver.map(FakeIpGeometry::extract);
         self
     }
 
@@ -511,6 +560,18 @@ impl TunListener {
         info!("TUN listener '{}' starting...", self.name);
 
         let cfg = &self.cfg;
+        // Fake-IP gateway/range geometry is setup-time state: a reload
+        // that changes `dns.fake-ip-range*` hands the candidate resolver
+        // in via `with_setup_resolver`, which extracts the geometry so
+        // the device is built for the generation being committed — and
+        // so the resolver is not retained for the listener's life (a
+        // survivor of a DNS-only reload would otherwise pin the retired
+        // resolver's caches). The fallback snapshot reads the live slot
+        // once and drops the Arc the same way. Everything that serves
+        // live flows below keeps reading `self.tunnel`'s slot.
+        let geometry = self
+            .setup_geometry
+            .unwrap_or_else(|| FakeIpGeometry::extract(self.tunnel.resolver().as_ref()));
 
         // Windows: sidecar wintun.dll next to the exe / in cwd, else extract
         // the official DLL embedded in this binary. Fail before the retry
@@ -534,7 +595,7 @@ impl TunListener {
         const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
         let prefix = cfg.inet4_address.prefix_len();
-        let fake_ip_gateway = match self.tunnel.resolver().fake_ip_v4_gateway() {
+        let fake_ip_gateway = match geometry.v4_gateway {
             Some(std::net::IpAddr::V4(gateway)) => Some(gateway),
             _ => None,
         };
@@ -727,8 +788,8 @@ impl TunListener {
             v6: cfg.inet6_address,
             nat: None,
         };
-        let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
-        if cfg.inet6_address.is_none() && self.tunnel.resolver().fake_ip_v6_net().is_some() {
+        let fake_ip_nets = fake_ip_route_nets(&geometry, cfg.inet6_address.is_some());
+        if cfg.inet6_address.is_none() && geometry.v6_net.is_some() {
             warn!(
                 "tun '{}': 'dns.fake-ip-range6' is configured but the device has no \
                  'inet6-address' — fake AAAA answers have no route into '{dev_name}'. \
@@ -871,9 +932,7 @@ impl TunListener {
         // another resolver), this fails startup loudly instead of silently
         // leaving the whole machine with DNS aimed at a dead address.
         #[cfg(target_os = "windows")]
-        let local_dns_sockets = if cfg.dns_hijack
-            && cfg.auto_route
-            && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
+        let local_dns_sockets = if cfg.dns_hijack && cfg.auto_route && geometry.v4_gateway.is_some()
         {
             Some(local_dns::bind().await.map_err(|e| {
                 io::Error::other(format!("loopback DNS server startup failed: {e}"))
@@ -989,7 +1048,7 @@ impl TunListener {
         // Built before the pumps so the first SYN is already translated.
         let system = if cfg.stack == TunStack::System {
             if cfg!(target_os = "linux") {
-                match system::SystemStack::bind(tun_net, used_addr, used_addr6, cfg.dns_hijack)
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6, self.tcp_dns_hijack)
                     .await
                 {
                     Ok(sys) => Some(sys),
@@ -1062,6 +1121,7 @@ impl TunListener {
             tun_net,
             std::sync::Arc::clone(&udp_flows),
             self.sniffer.clone(),
+            self.route_override.clone(),
         ));
         if let Some(socket) = lwip_udp {
             tasks.spawn(udp::run_udp(
@@ -1073,6 +1133,7 @@ impl TunListener {
                 tun_net,
                 std::sync::Arc::clone(&udp_flows),
                 self.sniffer.clone(),
+                self.route_override.clone(),
             ));
         }
 
@@ -1150,18 +1211,20 @@ impl TunListener {
                     ));
                     match accepted {
                         Some(((stream, src, dst), permit)) => {
-                            // Same loop guard as the UDP path: a dial to the
-                            // TUN's own subnet routes back into the device.
-                            if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) {
+                            // A dial to the TUN's own subnet routes back into
+                            // the device — except TCP :53 when the top-level
+                            // DNS diversion is on.
+                            if tcp_loop_guard(dst, self.tcp_dns_hijack, tun_net) {
                                 debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
                                 drop(stream);
                                 continue;
                             }
-                            let dns_hijack = cfg.dns_hijack;
+                            let tcp_dns_hijack = self.tcp_dns_hijack;
                             let dns_budget = Arc::clone(&tcp_dns_budget);
                             let tunnel = self.tunnel.clone();
                             let name = self.name.clone();
                             let sniffer = self.sniffer.clone();
+                            let route_override = self.route_override.clone();
                             tasks.spawn(async move {
                                 let _permit = permit;
                                 // lwIP only delivers this stream after the
@@ -1188,7 +1251,7 @@ impl TunListener {
                                         return;
                                     }
                                 };
-                                if dns_hijack && dst.port() == 53 {
+                                if tcp_dns_hijack && dst.port() == 53 {
                                     let stream = TunTcpConn {
                                         prefix,
                                         pos: 0,
@@ -1212,6 +1275,7 @@ impl TunListener {
                                         dst,
                                         &name,
                                         sniffer.as_deref(),
+                                        route_override.as_ref(),
                                     )
                                     .await;
                                 }
@@ -1239,12 +1303,13 @@ impl TunListener {
                             dst,
                             guard,
                         } = accepted;
-                        if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) { continue; }
-                        let dns_hijack = cfg.dns_hijack;
+                        if tcp_loop_guard(dst, self.tcp_dns_hijack, tun_net) { continue; }
+                        let tcp_dns_hijack = self.tcp_dns_hijack;
                         let dns_budget = Arc::clone(&tcp_dns_budget);
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
+                        let route_override = self.route_override.clone();
                         tasks.spawn(async move {
                             let _guard = guard;
                             // The same post-handshake window as the lwIP
@@ -1267,7 +1332,7 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
-                            if dns_hijack && dst.port() == 53 {
+                            if tcp_dns_hijack && dst.port() == 53 {
                                 if let Err(e) = meow_dns::server::serve_tcp_stream(
                                     stream,
                                     tunnel.resolver_slot(),
@@ -1289,6 +1354,9 @@ impl TunListener {
                                 in_name: name.as_str().into(),
                                 ..Default::default()
                             };
+                            if let Some(ov) = route_override {
+                                ov.apply(&mut metadata);
+                            }
                             if let Some(rt) = sniffer.as_deref() {
                                 crate::sniffer::prefill_host(
                                     &tunnel.inner().resolver(),
@@ -1451,16 +1519,33 @@ async fn flow_slot(
     Ok(Some(permit))
 }
 
+/// The fake-IP geometry a TUN setup needs, snapshotted from the resolver
+/// generation being committed — so the listener never retains the
+/// resolver itself for its whole life.
+#[derive(Debug, Clone, Copy)]
+struct FakeIpGeometry {
+    v4_gateway: Option<std::net::IpAddr>,
+    v4_net: Option<ipnet::IpNet>,
+    v6_net: Option<ipnet::IpNet>,
+}
+
+impl FakeIpGeometry {
+    fn extract(resolver: &meow_dns::Resolver) -> Self {
+        Self {
+            v4_gateway: resolver.fake_ip_v4_gateway(),
+            v4_net: resolver.fake_ip_v4_net(),
+            v6_net: resolver.fake_ip_v6_net(),
+        }
+    }
+}
+
 /// Main-table fake-IP routes also capture forwarded LAN/container traffic,
 /// which Linux's host-originated policy rules deliberately leave untouched.
-fn fake_ip_route_nets(resolver: &meow_dns::Resolver, ipv6: bool) -> Vec<ipnet::IpNet> {
-    [
-        resolver.fake_ip_v4_net(),
-        ipv6.then(|| resolver.fake_ip_v6_net()).flatten(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn fake_ip_route_nets(geometry: &FakeIpGeometry, ipv6: bool) -> Vec<ipnet::IpNet> {
+    [geometry.v4_net, ipv6.then_some(geometry.v6_net).flatten()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// The split default routes of global route scope (#375): more specific
@@ -1616,48 +1701,18 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
     }
 }
 
-/// Sniff the client's first payload within [`TUN_SNIFF_WINDOW`] (the
-/// handshake is already done by lwIP).
-///
-/// - `Ok(bytes)` — the client spoke first; `bytes` is the relay prefix.
-/// - `Ok(empty)` — the window expired in silence: dial anyway, the server
-///   may be the one to speak first (#695). No allocation is kept.
-/// - `Err(_)` — EOF or reset before any payload: drop the flow.
-async fn sniff_first_payload<R>(tcp: &mut R) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    sniff_first_payload_within(tcp, TUN_SNIFF_WINDOW).await
-}
-
-/// [`sniff_first_payload`] with an explicit window. The stream stays usable
-/// after the window expires: lwIP's `TcpStream::poll_read` only consumes a
-/// chunk on the poll that returns it, so dropping the pending read loses
-/// nothing — the relay picks up whatever arrives later.
-async fn sniff_first_payload_within<R>(tcp: &mut R, window: Duration) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; TUN_FIRST_READ];
-    let Ok(read) = timeout(window, tcp.read(&mut buf)).await else {
-        return Ok(Vec::new());
-    };
-    let n = read?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "peer closed before sending payload",
-        ));
-    }
-    buf.truncate(n);
-    Ok(buf)
-}
-
 // Intercept DNS to the TUN address before rejecting subnet loopback traffic.
-fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
-    !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
+// `tcp_dns` is the top-level device's TCP :53 diversion only — a named
+// `type: tun` entry keeps the UDP-only hijack contract and drops a :53
+// subnet dial like any other port.
+fn tcp_loop_guard(dst: SocketAddr, tcp_dns: bool, nets: udp::TunNets) -> bool {
+    !(tcp_dns && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's TCP knobs, passed once per accepted flow"
+)]
 async fn handle_tcp_flow(
     tunnel: Tunnel,
     tcp: lwip::TcpStream,
@@ -1666,6 +1721,7 @@ async fn handle_tcp_flow(
     dst: SocketAddr, // original destination
     in_name: &str,
     sniffer: Option<&crate::sniffer::SnifferRuntime>,
+    route_override: Option<&meow_common::InboundRouteOverride>,
 ) {
     let mut metadata = Metadata {
         network: Network::Tcp,
@@ -1677,6 +1733,11 @@ async fn handle_tcp_flow(
         in_name: in_name.into(),
         ..Default::default()
     };
+    // The named entry's `proxy`/`rule` override stamps before sniffing
+    // and routing, as on every socket listener (upstream's `Additions`).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
+    }
     let mut tcp = tcp;
     let mut prefix = prefix;
     if let Some(rt) = sniffer {
@@ -2084,10 +2145,10 @@ fn peer_v4(net: Ipv4Net) -> Ipv4Addr {
 mod tests {
     use super::{
         device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v4, rotate_v6,
-        sniff_first_payload, sniff_first_payload_within, Ipv4Addr, Ipv6Net, TunTcpConn,
-        TUN_SNIFF_WINDOW,
+        sniff_first_payload, Ipv4Addr, Ipv6Net, TunTcpConn, TUN_SNIFF_WINDOW,
     };
     use super::{timeout, Arc, AtomicBool, Semaphore};
+    use crate::stream_sniff::sniff_first_payload_within;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -2116,11 +2177,54 @@ mod tests {
                 resolver.set_fakeip_v4(pool);
             }
         }
-        assert_eq!(super::fake_ip_route_nets(&resolver, true), vec![v4, v6]);
+        let geometry = super::FakeIpGeometry::extract(&resolver);
+        assert_eq!(super::fake_ip_route_nets(&geometry, true), vec![v4, v6]);
         assert_eq!(
-            super::fake_ip_route_nets(&resolver, false),
+            super::fake_ip_route_nets(&geometry, false),
             vec![v4],
             "an IPv4-only device must not claim IPv6 routes"
+        );
+    }
+
+    /// `with_setup_resolver` must snapshot the geometry without keeping
+    /// the resolver: a listener that outlives a DNS-only reload would
+    /// otherwise pin the retired resolver (caches, FileStore flush tasks)
+    /// for its whole lifetime (Codex review).
+    #[test]
+    fn setup_geometry_does_not_retain_the_resolver() {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let listener = super::TunListener::new(
+            crate::test_rule_tunnel(),
+            super::TunListenerConfig {
+                device: None,
+                mtu: 1500,
+                inet4_address: "172.19.0.1/30".parse().unwrap(),
+                inet6_address: None,
+                auto_route: true,
+                route_scope: super::TunRouteScope::Global,
+                outbound_interface: None,
+                dns_hijack: false,
+                udp_timeout: Duration::from_secs(60),
+                max_connections: 0,
+                stack: super::TunStack::Lwip,
+                auto_redirect: None,
+            },
+            "t".into(),
+        )
+        .with_setup_resolver(Some(resolver.as_ref()));
+        assert!(listener.setup_geometry.is_some());
+        drop(listener);
+        assert_eq!(
+            Arc::strong_count(&resolver),
+            1,
+            "the listener must not retain the setup resolver"
         );
     }
 
@@ -2245,6 +2349,9 @@ mod tests {
 
     #[test]
     fn tcp_dns_hijack_precedes_subnet_loop_guard() {
+        // On the top-level device the TCP :53 diversion must see a dial
+        // at the TUN's own subnet address before the loop guard drops it;
+        // a named device (tcp_dns off) drops it like any other port.
         let nets = super::udp::TunNets {
             v4: "172.19.0.1/30".parse().unwrap(),
             v6: Some("fd00::1/126".parse().unwrap()),

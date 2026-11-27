@@ -50,7 +50,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`/`simple-obfs`, `v2ray-plugin` (bundled with `ss`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature: all ship in `full`/default builds, none in `minimal`; enable with `--features <name>`, see the [feature-flags table](https://github.com/madeye/meow-rs/blob/main/docs/specs/cargo-feature-flags.md). A name the build lacks still loads, but the node stays unavailable and every dial through it fails with "not compiled into this build") |
+| `plugin` | string | | — | `obfs`/`simple-obfs` (behind `ss-obfs`), `v2ray-plugin` (behind `ss-v2ray-plugin`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature: all ship in `full`/default builds, `minimal` ships `ss-obfs` only; enable with `--features <name>`, see the [feature-flags table](https://github.com/madeye/meow-rs/blob/main/docs/specs/cargo-feature-flags.md). A name the build lacks still loads, but the node stays unavailable and every dial through it fails with "not compiled into this build") |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -243,7 +243,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | `skip-cert-verify` | bool | | `false` | |
 | `alpn` | list | | `[]` | e.g. `[h2, http/1.1]` |
 | `network` | string | | `tcp` | `tcp` · `ws` · `grpc` · `h2` · `httpupgrade` |
-| `client-fingerprint` | string | | — | uTLS profile (required for REALITY, where it shapes the ClientHello — see below) |
+| `client-fingerprint` | string | | — | uTLS profile (required for REALITY, where it shapes the ClientHello — see below). Omitted = inherit `global-client-fingerprint` |
 | `flow` | string | | — | `xtls-rprx-vision` (needs `network: tcp` + TLS or REALITY, and the `vless-vision` feature) |
 | `encryption` | string | | `none` | Must be `none`/empty |
 | `reality-opts` | map | | — | REALITY config (see below) |
@@ -439,6 +439,31 @@ A configurable direct outbound. Useful to pin specific DNS servers for a route.
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `dns` | string \| list | | — | Per-proxy DNS servers as `IP:port`, e.g. `192.168.1.1:53` |
+
+---
+
+## Rematch — `rematch`
+
+A control outbound, not a transport: it carries no `server`/`port` and never
+opens a socket. When a [rule](./rules#rematch-routing) selects it, the flow
+re-enters the rule scan with the named fields applied.
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target-rematch-name` | string | * | — | Stamps the flow's `rematchName` marker — what `REMATCH-NAME` rules compare. `""` clears the marker |
+| `target-sub-rule` | string | * | — | Makes the named `sub-rules:` block the active list. `""` returns to the top-level rules |
+
+\* At least one of the two is required. Omitted or `null` leaves the
+corresponding field unchanged; strings are used verbatim (quote numbers).
+`udp:` and socket options are ignored, and `dialer-proxy` is rejected — there
+is no connection to carry it.
+
+```yaml
+- name: inspect
+  type: rematch
+  target-rematch-name: stage1
+  target-sub-rule: second-pass
+```
 
 ---
 

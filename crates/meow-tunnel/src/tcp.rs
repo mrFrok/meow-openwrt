@@ -1,12 +1,13 @@
 use crate::relay::{
-    copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked_wg, proxy_conn_tcp_view, proxy_conn_write_bytes_view,
+    RELAY_BUF_SIZE,
 };
 use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
 use meow_common::traffic_ledger::Route;
-use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
+use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn, WriteBytes};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -482,6 +483,19 @@ fn inbound_tcp_view<C: std::any::Any>(conn: &C) -> Option<&tokio::net::TcpStream
     (conn as &dyn std::any::Any).downcast_ref()
 }
 
+/// The inbound's owned-`Bytes` write path when the listener hands over a
+/// boxed [`ProxyConn`] that has one — WireGuard's `WgStream`, boxed by the
+/// WG listener (`meow-listener/src/wireguard/actor.rs`) — so the relay can
+/// move its bulk buffer into the conn without `copy_from_slice`
+/// (perf-7 P7-1). Anything else — bare sockets, the remote's `dyn
+/// ProxyConn` — answers `None` and the direction stays on `poll_write`
+/// or splice.
+fn inbound_write_bytes_view<C: 'static>(conn: &mut C) -> Option<&mut dyn WriteBytes> {
+    (conn as &mut dyn std::any::Any)
+        .downcast_mut::<Box<dyn ProxyConn>>()
+        .and_then(|c| c.write_bytes())
+}
+
 async fn route_inbound_tcp_scoped<C>(
     inner: &TunnelInner,
     conn: &mut C,
@@ -603,12 +617,13 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked_splice_idle(
+                    match copy_bidirectional_buf_tracked_wg(
                         conn,
                         &mut *remote,
                         &mut buf_up,
                         &mut buf_dn,
                         (inbound_tcp_view, proxy_conn_tcp_view),
+                        (inbound_write_bytes_view, proxy_conn_write_bytes_view),
                         |n| {
                             inner
                                 .stats
@@ -738,13 +753,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         // Same configuration and mode across multiple reloads: a boolean
         // running flag (or config equality) must not admit the old decision.
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             0
         );
         assert!(late
@@ -784,7 +811,13 @@ mod tests {
         assert_eq!(tunnel.statistics().snapshot(), (123, 0));
 
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         assert!(guard
@@ -792,7 +825,13 @@ mod tests {
             .await
             .is_none());
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             0
         );
     }
@@ -813,7 +852,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         assert!(old.run_until_closed(async { "dial" }).await.is_none());
@@ -843,6 +888,149 @@ mod tests {
         assert_eq!(stats.close_all_connections_counted(), 0);
     }
 
+    /// Leaf stub for the route map: a name plus the `AdapterType` a
+    /// built leaf would report — enough for `track_named`'s chain and the
+    /// reload's dns-leaf filter.
+    struct TypedLeaf {
+        name: &'static str,
+        ty: meow_common::AdapterType,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for TypedLeaf {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            self.ty
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("stub".to_string()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported("stub".to_string()))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            static H: std::sync::OnceLock<meow_common::ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(meow_common::ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for TypedLeaf {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A flow committed to a `type: dns` leaf survives a cold reload on
+    /// BOTH tracking paths: its conn is an in-process pipe that re-reads
+    /// the shared resolver cell per query — the swap itself cannot
+    /// strand it. An ordinary leaf's flow is still cancelled, and the
+    /// dns-committed flow closes once the leaf is retyped or dropped from
+    /// the new map (issue #974 review).
+    #[tokio::test]
+    async fn cold_reload_spares_dns_leaf_flows() {
+        for headless in [false, true] {
+            let tunnel = test_tunnel();
+            if headless {
+                tunnel.statistics().set_headless();
+            }
+            let inner = tunnel.inner();
+            let dns_leaf = TypedLeaf {
+                name: "dns-out",
+                ty: meow_common::AdapterType::Dns,
+            };
+            let node = TypedLeaf {
+                name: "node",
+                ty: meow_common::AdapterType::Socks5,
+            };
+            let dns_flow = inner
+                .tcp_admission()
+                .track_named(&metadata(), "MATCH".into(), "".into(), &dns_leaf)
+                .unwrap();
+            let node_flow = inner
+                .tcp_admission()
+                .track_named(&metadata(), "MATCH".into(), "".into(), &node)
+                .unwrap();
+
+            let map: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+                std::collections::HashMap::from([
+                    (
+                        "dns-out".into(),
+                        Arc::new(TypedLeaf {
+                            name: "dns-out",
+                            ty: meow_common::AdapterType::Dns,
+                        }) as Arc<dyn Proxy>,
+                    ),
+                    (
+                        "node".into(),
+                        Arc::new(TypedLeaf {
+                            name: "node",
+                            ty: meow_common::AdapterType::Socks5,
+                        }) as Arc<dyn Proxy>,
+                    ),
+                ]);
+            assert_eq!(
+                tunnel.reload_routing(map, vec![], Default::default(), None, Default::default()),
+                1,
+                "headless={headless}: only the ordinary flow cancels"
+            );
+            assert!(node_flow.run_until_closed(async { "dial" }).await.is_none());
+            assert_eq!(
+                dns_flow.run_until_closed(async { "dial" }).await,
+                Some("dial"),
+                "headless={headless}: the dns-committed flow rides through"
+            );
+
+            // Same name retyped — it is no longer a dns leaf, so the
+            // exemption ends and the flow closes like any other.
+            let retyped: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+                std::collections::HashMap::from([(
+                    "dns-out".into(),
+                    Arc::new(TypedLeaf {
+                        name: "dns-out",
+                        ty: meow_common::AdapterType::Socks5,
+                    }) as Arc<dyn Proxy>,
+                )]);
+            assert_eq!(
+                tunnel.reload_routing(
+                    retyped,
+                    vec![],
+                    Default::default(),
+                    None,
+                    Default::default()
+                ),
+                1,
+                "headless={headless}: a retyped leaf loses the exemption"
+            );
+            assert!(dns_flow
+                .run_until_closed(async { panic!("closed flow must not dial") })
+                .await
+                .is_none());
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_registration_cannot_escape_cold_reload() {
         for headless in [false, true] {
@@ -866,7 +1054,13 @@ mod tests {
                         )
                     });
                     start.wait();
-                    tunnel.reload_routing(Default::default(), vec![], None, Default::default());
+                    tunnel.reload_routing(
+                        Default::default(),
+                        vec![],
+                        Default::default(),
+                        None,
+                        Default::default(),
+                    );
                     registration.join().unwrap()
                 });
                 if let Some(guard) = guard.as_ref() {
@@ -1036,7 +1230,12 @@ mod tests {
 
     fn noted_tunnel(rules: Vec<Box<dyn meow_common::Rule>>) -> crate::Tunnel {
         let tunnel = test_tunnel();
-        tunnel.update_routing(Default::default(), rules, Default::default());
+        tunnel.update_routing(
+            Default::default(),
+            rules,
+            Default::default(),
+            Default::default(),
+        );
         tunnel.set_connection_notes(true);
         tunnel
     }
@@ -1092,6 +1291,7 @@ mod tests {
         tunnel.update_routing(
             Default::default(),
             vec![rule("MATCH,DIRECT")],
+            Default::default(),
             Default::default(),
         );
         let server = echo_server().await;
@@ -1173,6 +1373,7 @@ mod tests {
             Default::default(),
             vec![rule("MATCH,DIRECT")],
             Default::default(),
+            Default::default(),
         );
         let server = echo_server().await;
         let meta = Metadata {
@@ -1238,6 +1439,7 @@ mod tests {
                     rule("MATCH,DIRECT"),
                 ],
                 Default::default(),
+                Default::default(),
             );
             for host in ["cats.invalid", "dogs.invalid"] {
                 let meta = Metadata {
@@ -1284,6 +1486,7 @@ mod tests {
             tunnel.update_routing(
                 proxies,
                 vec![rule("DOMAIN-SUFFIX,cats.invalid,Proxy"), rule("MATCH,Auto")],
+                Default::default(),
                 Default::default(),
             );
             for host in ["cats.invalid", "dogs.invalid"] {
@@ -1354,6 +1557,7 @@ mod tests {
             Default::default(),
             vec![rule("MATCH,DIRECT")],
             Default::default(),
+            Default::default(),
         );
         tunnel.set_connection_notes(true);
         let meta = Metadata {
@@ -1393,6 +1597,7 @@ proxy-groups:
                     rule("DOMAIN,leaf.invalid,JP-01"),
                     Box::new(meow_rules::final_rule::FinalRule::new("Proxy")),
                 ],
+                Default::default(),
                 Default::default(),
             );
             for host in ["group.invalid", "leaf.invalid"] {
@@ -1462,6 +1667,7 @@ proxy-groups:
         tunnel.update_routing(
             proxies.clone(),
             vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
+            Default::default(),
             Default::default(),
         );
 

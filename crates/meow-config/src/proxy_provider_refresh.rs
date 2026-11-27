@@ -376,6 +376,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         }
     }
 
@@ -612,6 +613,7 @@ mod tests {
                 timeout: None,
                 expected_status: None,
                 lazy: None,
+                extra: Default::default(),
             }),
             ..raw_provider(None)
         };
@@ -702,6 +704,7 @@ mod tests {
                     timeout: None,
                     expected_status: None,
                     lazy: None,
+                    extra: Default::default(),
                 },
             ),
             (
@@ -713,6 +716,7 @@ mod tests {
                     timeout: None,
                     expected_status: None,
                     lazy: None,
+                    extra: Default::default(),
                 },
             ),
             (
@@ -724,6 +728,7 @@ mod tests {
                     timeout: None,
                     expected_status: None,
                     lazy: None,
+                    extra: Default::default(),
                 },
             ),
             (
@@ -735,6 +740,7 @@ mod tests {
                     timeout: None,
                     expected_status: None,
                     lazy: None,
+                    extra: Default::default(),
                 },
             ),
         ] {

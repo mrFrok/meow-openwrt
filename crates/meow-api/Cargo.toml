@@ -9,7 +9,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = []
+default = ["api-tls"]
+# The `external-controller-tls` HTTPS endpoint: BoringSSL acceptor +
+# handshake driver plus axum's `http2` so ALPN-negotiated `h2` actually
+# serves (issue #974). Default-on; meow-app's `minimal` bundle leaves it
+# out (ADR-0007 caps) — a configured endpoint there parses fine and the
+# startup path warns that it is not compiled into this build.
+api-tls = ["dep:boring", "dep:tokio-boring", "dep:socket2", "axum/http2"]
 listener-tun = ["meow-listener/listener-tun"]
 
 [dependencies]
@@ -40,9 +46,27 @@ base64 = "0.22"
 prometheus-client = "0.22"
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }
+# Dual-stack controller binds clear IPV6_V6ONLY on the raw socket
+# (issue #974) — only the `api-tls` endpoint needs it.
+socket2 = { workspace = true, optional = true }
+# The `external-controller-tls` listener's BoringSSL acceptor + handshake
+# driver (issue #974). BoringSSL is the workspace TLS backend.
+boring = { workspace = true, optional = true }
+tokio-boring = { workspace = true, optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
+# `geteuid` for the unix-socket stale-reclaim ownership check (issue #974);
+# linux's rlimit probe rides the same dep.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `external-controller-pipe` installs a per-owner SDDL security descriptor
+# on every pipe instance (issue #974).
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
@@ -52,9 +76,15 @@ serde-saphyr = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # api_test opens a logbook.
 meow-common = { workspace = true, features = ["logbook", "traffic-ledger"] }
+# api_test PUTs a VLESS REALITY node to prove `global-client-fingerprint`
+# inheritance reaches the tunnel — the production dep stays feature-less.
+meow-config = { workspace = true, features = ["vless"] }
 meow-trie = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"
+# Wire-level h2 client for the ALPN-`h2` request test (issue #974).
+h2 = "0.4"
+bytes = "1"
 tempfile = "3"
 async-trait = { workspace = true }
 smallvec = { workspace = true }

@@ -431,19 +431,33 @@ where
 /// code otherwise under `--release`).
 #[cfg(all(feature = "encrypted", debug_assertions))]
 async fn start_doh_stub_with(framing: DohFraming) -> DohStub {
+    start_doh_stub_gated(framing, None).await
+}
+
+/// Optionally wait for a batch of TLS handshakes before answering any
+/// requests on those connections.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+async fn start_doh_stub_gated(framing: DohFraming, initial_batch: Option<usize>) -> DohStub {
     let (acceptor, root) = tls_acceptor(&["doh-stub.test"]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
     let server_accepts = Arc::clone(&accepts);
+    let barrier = initial_batch.map(|batch| Arc::new(tokio::sync::Barrier::new(batch)));
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let index = server_accepts.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
+            let barrier = barrier
+                .clone()
+                .filter(|_| initial_batch.is_some_and(|batch| index < batch));
             tokio::spawn(async move {
                 let Ok(mut stream) = tokio_boring::accept(&acceptor, tcp).await else {
                     return;
                 };
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                }
                 serve_doh_conn(&mut stream, framing).await;
             });
         }
@@ -1076,27 +1090,6 @@ async fn doh_pool_framing_matrix() {
     }
 }
 
-/// meow-openwrt: dozens of sequential DoH queries on one keep-alive conn
-/// (chunked and Content-Length bodies) never desync the response parser.
-#[cfg(feature = "encrypted")]
-#[tokio::test]
-async fn doh_pool_many_sequential_queries_on_one_conn() {
-    for framing in [DohFraming::Chunked, DohFraming::ContentLength] {
-        let stub = start_doh_stub_with(framing).await;
-        let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
-            .with_tls_additional_roots(stub.root.clone());
-        for i in 0..30 {
-            let name = format!("q{i}.example.com");
-            let msg = timeout(T, client.query(&name, RecordType::A))
-                .await
-                .expect("must not stall")
-                .unwrap_or_else(|e| panic!("query {i}: {e:?}"));
-            assert_example_answer(&msg);
-        }
-        assert_eq!(stub.accepts.load(Ordering::SeqCst), 1);
-    }
-}
-
 /// DoH dead-conn recovery, probe side (review M4): the upstream serves
 /// one poolable (`Content-Length` keep-alive) answer per conn then
 /// drops it, so the pooled conn is dead by the next checkout — the
@@ -1365,11 +1358,64 @@ async fn tls_pool_disabled_pays_full_price() {
     );
 }
 
-/// A DoH server that speaks only HTTP/2 (ALPN `h2` or a fatal alert), as
-/// some public resolvers do: they drop HTTP/1.1 outright. The client must
-/// negotiate h2 and keep one multiplexed session for every query.
-#[cfg(all(feature = "encrypted", debug_assertions))]
-async fn start_doh_h2_only_stub() -> DohStub {
+/// A DoH stub shaped like Yandex DNS (77.88.8.8): it accepts either ALPN
+/// and prefers `h2`, but closes every HTTP/1.1 request unanswered. The
+/// counters split accepted conns by negotiated protocol and count h2
+/// streams. [`H2StubOpts`] shapes the answers.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+struct H2DohStub {
+    addr: SocketAddr,
+    root: Vec<u8>,
+    http1_conns: Arc<AtomicUsize>,
+    h2_conns: Arc<AtomicUsize>,
+    h2_streams: Arc<AtomicUsize>,
+}
+
+/// How a [`H2DohStub`] codes its answers.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[derive(Clone, Copy, Default)]
+enum H2StubCoding {
+    /// Plain `application/dns-message` bodies.
+    #[default]
+    Identity,
+    /// gzip unless the request carries `accept-encoding: identity`, as a
+    /// compression-capable server may when the header is absent.
+    GzipUnlessIdentityAsked,
+    /// gzip whatever the request asks for.
+    AlwaysGzip,
+    /// gzip only the first answer.
+    FirstGzip,
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[derive(Clone, Copy, Default)]
+struct H2StubOpts {
+    /// Close a conn (GOAWAY) after this many answers.
+    streams_per_conn: Option<usize>,
+    /// Hold the stub's very first answer this long.
+    first_answer_delay: Option<Duration>,
+    /// Wait for this many streams before answering the initial batch.
+    initial_batch: Option<usize>,
+    coding: H2StubCoding,
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+async fn start_h2_doh_stub(streams_per_conn: Option<usize>) -> H2DohStub {
+    start_h2_doh_stub_with(H2StubOpts {
+        streams_per_conn,
+        ..H2StubOpts::default()
+    })
+    .await
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
+    let H2StubOpts {
+        streams_per_conn,
+        first_answer_delay,
+        initial_batch,
+        coding,
+    } = opts;
     let ck = rcgen::generate_simple_self_signed(vec!["doh-stub.test".to_string()]).unwrap();
     let cert = boring::x509::X509::from_der(ck.cert.der()).unwrap();
     let key = boring::pkey::PKey::private_key_from_der(&ck.key_pair.serialize_der()).unwrap();
@@ -1377,100 +1423,363 @@ async fn start_doh_h2_only_stub() -> DohStub {
         boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();
     builder.set_certificate(&cert).unwrap();
     builder.set_private_key(&key).unwrap();
-    builder.set_alpn_select_callback(|_, offered| {
-        boring::ssl::select_next_proto(b"\x02h2", offered)
-            .ok_or(boring::ssl::AlpnError::ALERT_FATAL)
+    builder.set_alpn_select_callback(|_, client| {
+        boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", client)
+            .ok_or(boring::ssl::AlpnError::NOACK)
     });
     let acceptor = builder.build();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let accepts = Arc::new(AtomicUsize::new(0));
-    let server_accepts = Arc::clone(&accepts);
+    let http1_conns = Arc::new(AtomicUsize::new(0));
+    let h2_conns = Arc::new(AtomicUsize::new(0));
+    let h2_streams = Arc::new(AtomicUsize::new(0));
+    let counters = (
+        Arc::clone(&http1_conns),
+        Arc::clone(&h2_conns),
+        Arc::clone(&h2_streams),
+    );
+    let barrier = initial_batch.map(|batch| Arc::new(tokio::sync::Barrier::new(batch)));
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            server_accepts.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
+            let barrier = barrier.clone();
+            let (h1, h2c, streams) = (
+                Arc::clone(&counters.0),
+                Arc::clone(&counters.1),
+                Arc::clone(&counters.2),
+            );
             tokio::spawn(async move {
-                let Ok(tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                let Ok(mut stream) = tokio_boring::accept(&acceptor, tcp).await else {
                     return;
                 };
-                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                if stream.ssl().selected_alpn_protocol() != Some(b"h2") {
+                    h1.fetch_add(1, Ordering::SeqCst);
+                    // Read the request, then close without a response.
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                h2c.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut conn) = h2::server::handshake(stream).await else {
                     return;
                 };
-                while let Some(Ok((req, mut respond))) = conn.accept().await {
+                let mut answered = 0usize;
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    assert_eq!(request.method(), http::Method::POST);
+                    assert_eq!(request.uri().path(), "/dns-query");
+                    let index = streams.fetch_add(1, Ordering::SeqCst);
+                    let barrier = barrier
+                        .clone()
+                        .filter(|_| initial_batch.is_some_and(|batch| index < batch));
+                    let gzip = match coding {
+                        H2StubCoding::Identity => false,
+                        H2StubCoding::GzipUnlessIdentityAsked => request
+                            .headers()
+                            .get("accept-encoding")
+                            .is_none_or(|v| v.as_bytes() != b"identity"),
+                        H2StubCoding::AlwaysGzip => true,
+                        H2StubCoding::FirstGzip => index == 0,
+                    };
+                    // Each stream answers on its own task, so concurrent
+                    // queries really share the conn.
                     tokio::spawn(async move {
-                        let ok = req.method() == http::Method::POST
-                            && req.uri().path() == "/dns-query"
-                            && req
-                                .headers()
-                                .get("content-type")
-                                .map(http::HeaderValue::as_bytes)
-                                == Some(b"application/dns-message".as_slice());
-                        let mut body = req.into_body();
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                        }
+                        if index == 0 {
+                            if let Some(delay) = first_answer_delay {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                        let mut body = request.into_body();
                         let mut wire = Vec::new();
                         while let Some(Ok(chunk)) = body.data().await {
                             let _ = body.flow_control().release_capacity(chunk.len());
                             wire.extend_from_slice(&chunk);
                         }
-                        let Some(answer) = Message::from_bytes(&wire)
-                            .ok()
-                            .filter(|_| ok)
-                            .and_then(|m| answer_for(&m).to_bytes().ok())
-                        else {
-                            let resp = http::Response::builder().status(400).body(()).unwrap();
-                            let _ = respond.send_response(resp, true);
+                        let Ok(req_msg) = Message::from_bytes(&wire) else {
                             return;
                         };
-                        let resp = http::Response::builder()
+                        let mut answer = answer_for(&req_msg).to_bytes().unwrap();
+                        let mut response = http::Response::builder()
                             .status(200)
-                            .header("content-type", "application/dns-message")
-                            .body(())
-                            .unwrap();
-                        if let Ok(mut tx) = respond.send_response(resp, false) {
-                            let _ = tx.send_data(bytes::Bytes::from(answer), true);
+                            .header("content-type", "application/dns-message");
+                        if gzip {
+                            // Not a real gzip stream: any coded body is
+                            // undecodable as DNS, which is the point.
+                            answer.splice(0..0, [0x1f, 0x8b, 8, 0]);
+                            response = response.header("content-encoding", "gzip");
                         }
+                        let response = response.body(()).unwrap();
+                        let Ok(mut send) = respond.send_response(response, false) else {
+                            return;
+                        };
+                        let _ = send.send_data(bytes::Bytes::from(answer), true);
                     });
+                    answered += 1;
+                    if streams_per_conn.is_some_and(|limit| answered >= limit) {
+                        conn.graceful_shutdown();
+                    }
                 }
             });
         }
     });
-    DohStub {
+    H2DohStub {
         addr,
         root: ck.cert.der().to_vec(),
-        accepts,
+        http1_conns,
+        h2_conns,
+        h2_streams,
     }
 }
 
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+async fn query_ok(client: &DnsClient, name: &str) {
+    let msg = timeout(T, client.query(name, RecordType::A))
+        .await
+        .expect("must not stall")
+        .expect("DoH query must succeed over h2");
+    assert_example_answer(&msg);
+}
+
+/// A server that answers only over h2 (Yandex DNS closes HTTP/1.1
+/// requests) is reached by offering `h2` in ALPN, and every query after
+/// the first, sequential or concurrent, is a stream on the same conn.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
-async fn doh_h2_only_server_shares_one_session() {
-    let stub = start_doh_h2_only_stub().await;
+async fn doh_negotiates_h2_and_shares_one_connection() {
+    let stub = start_h2_doh_stub(None).await;
     let client = Arc::new(
         DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
             .with_tls_additional_roots(stub.root.clone()),
     );
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    let burst = futures::future::join_all((0..8).map(|index| {
+        let client = Arc::clone(&client);
+        async move { query_ok(&client, &format!("n{index}.example.com")).await }
+    }));
+    timeout(T, burst).await.expect("burst must not stall");
+
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        stub.h2_conns.load(Ordering::SeqCst),
+        1,
+        "every query after the first rides the shared h2 conn"
+    );
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), 11);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_cold_burst_shares_one_connection_before_any_answers() {
+    const BURST: usize = 16;
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        initial_batch: Some(BURST),
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    futures::future::join_all((0..BURST).map(|index| {
+        let client = &client;
+        async move { query_ok(client, &format!("cold-{index}.example.com")).await }
+    }))
+    .await;
+
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), BURST);
+    query_ok(&client, "warm.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_http1_cold_burst_dials_before_first_answer() {
+    const BURST: usize = 8;
+    let stub = start_doh_stub_gated(DohFraming::ContentLength, Some(BURST)).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    futures::future::join_all((0..BURST).map(|index| {
+        let client = &client;
+        async move {
+            let msg = client
+                .query(&format!("cold-{index}.example.com"), RecordType::A)
+                .await
+                .unwrap();
+            assert_example_answer(&msg);
+        }
+    }))
+    .await;
+
+    assert_eq!(stub.accepts.load(Ordering::SeqCst), BURST);
+}
+
+/// The same over a `?proxy=` dial: one proxied dial serves every query.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_via_proxy_dials_once() {
+    let stub = start_h2_doh_stub(None).await;
+    let dialed = Arc::new(Mutex::new(Vec::<DialRecord>::new()));
+    let proxy = mock_proxy(&dialed, stub.addr);
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_proxy(proxy)
+        .with_tls_additional_roots(stub.root.clone());
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(dialed.lock().len(), 1, "the shared h2 conn is dialed once");
+}
+
+/// A server that ends the h2 conn after each answer (GOAWAY) costs a
+/// redial, never a failed query.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_redials_after_server_goaway() {
+    let stub = start_h2_doh_stub(Some(1)).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    for index in 0..4 {
+        query_ok(&client, &format!("n{index}.example.com")).await;
+        // Let the GOAWAY reach the client between queries part of the
+        // time; the reuse path's retry covers the rest.
+        if index % 2 == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), 4);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 4);
+}
+
+/// `reset_connections` retires the shared h2 conn: the next query dials.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_reset_connections_redials() {
+    let stub = start_h2_doh_stub(None).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    query_ok(&client, "a.example.com").await;
+    assert_eq!(client.reset_connections(), 1, "the shared h2 conn closes");
+    query_ok(&client, "b.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 2);
+}
+
+/// Mutation control for the sharing assertions: with the pool disabled
+/// every h2 query dials its own conn.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_pool_disabled_dials_per_query() {
+    let stub = start_h2_doh_stub(None).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone())
+        .with_tls_pool_disabled();
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 3);
+}
+
+/// The h2 path asks for `identity` like HTTP/1.1 does: a server that
+/// would otherwise gzip the answer sends it plain.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_requests_identity_encoding() {
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        coding: H2StubCoding::GzipUnlessIdentityAsked,
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+    query_ok(&client, "a.example.com").await;
+}
+
+/// A coded answer the client did not ask for is refused, never decoded as
+/// DNS, as on HTTP/1.1.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_refuses_a_content_coding() {
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        coding: H2StubCoding::AlwaysGzip,
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
     for name in ["a.example.com", "b.example.com"] {
-        let msg = timeout(T, client.query(name, RecordType::A))
+        let err = timeout(T, client.query(name, RecordType::A))
             .await
             .expect("must not stall")
-            .expect("h2-only DoH query must succeed");
-        assert_example_answer(&msg);
+            .expect_err("a gzip answer must be refused");
+        assert!(
+            err.to_string().contains("unsupported content-encoding"),
+            "unexpected error: {err}"
+        );
     }
-    let concurrent = (0..4).map(|i| {
-        let client = Arc::clone(&client);
-        tokio::spawn(async move {
-            client
-                .query(&format!("c{i}.example.com"), RecordType::A)
-                .await
-        })
-    });
-    for task in concurrent {
-        let msg = timeout(T, task).await.unwrap().unwrap().unwrap();
-        assert_example_answer(&msg);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_can_reuse_with_one_validated_cold_response() {
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        initial_batch: Some(2),
+        coding: H2StubCoding::FirstGzip,
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    let (first, second) = tokio::join!(
+        client.query("a.example.com", RecordType::A),
+        client.query("b.example.com", RecordType::A)
+    );
+    let (response, error) = match (first, second) {
+        (Ok(response), Err(error)) | (Err(error), Ok(response)) => (response, error),
+        outcomes => panic!("expected one valid response and one failure, got {outcomes:?}"),
+    };
+    assert_example_answer(&response);
+    assert!(error.to_string().contains("unsupported content-encoding"));
+    query_ok(&client, "warm.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+}
+
+/// A shared conn whose first answer was too slow to reuse (est. RTT at or
+/// above half the timeout) gives its slot up: the next fresh conn answers
+/// fast, is installed, and the query after it reuses that one.
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_slow_conn_gives_its_slot_to_a_fresh_one() {
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        first_answer_delay: Some(Duration::from_millis(600)),
+        ..H2StubOpts::default()
+    })
+    .await;
+    // `tls_reuse_budget(1 s, 600 ms)` is `None`: the first conn is never
+    // reused.
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_timeout(Duration::from_secs(1))
+        .with_tls_additional_roots(stub.root.clone());
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
     }
     assert_eq!(
-        stub.accepts.load(Ordering::SeqCst),
-        1,
-        "every query must ride the one negotiated h2 session"
+        stub.h2_conns.load(Ordering::SeqCst),
+        2,
+        "the second (fast) conn replaces the slow one and serves the third query"
     );
 }

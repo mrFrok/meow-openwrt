@@ -98,6 +98,7 @@ fn save_roundtrip_with_subscriptions() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
 
     save_raw_config(path_str, &raw).unwrap();
@@ -138,6 +139,86 @@ fn save_roundtrip_with_proxy_groups() {
     assert_eq!(groups[0].name, "auto");
     assert_eq!(groups[0].group_type, "url-test");
     assert_eq!(groups[0].tolerance, Some(150));
+}
+
+/// Issue #974: `global-client-fingerprint` / `global-ua` are typed
+/// top-level fields — a committed save keeps them under their mihomo
+/// kebab-case names instead of dropping into the `extra` unknown-key
+/// bucket, and the reload restores both verbatim.
+#[test]
+fn save_roundtrips_global_client_fingerprint_and_global_ua() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let path_str = path.to_str().unwrap();
+
+    let mut raw = minimal_raw_config();
+    raw.global_client_fingerprint = Some("chrome".into());
+    raw.global_ua = Some("mihomo/v1.18.0".into());
+    save_raw_config(path_str, &raw).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("global-client-fingerprint: chrome"),
+        "{content}"
+    );
+    assert!(content.contains("global-ua: mihomo/v1.18.0"), "{content}");
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
+    assert_eq!(loaded.global_client_fingerprint.as_deref(), Some("chrome"));
+    assert_eq!(loaded.global_ua.as_deref(), Some("mihomo/v1.18.0"));
+    assert!(!loaded.extra.contains_key("global-client-fingerprint"));
+    assert!(!loaded.extra.contains_key("global-ua"));
+}
+
+/// Issue #974: the flat `geo-*` aliases and the nested `geodata:` block
+/// are typed fields — a committed save keeps both spellings under their
+/// mihomo kebab-case names and the reload restores them, including an
+/// explicit `auto-update: false` (an `Option<bool>` now, so absence and
+/// `false` differ in the merge).
+#[test]
+fn save_roundtrips_geo_flat_aliases_and_nested() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let path_str = path.to_str().unwrap();
+
+    let mut raw = minimal_raw_config();
+    raw.geo_auto_update = Some(true);
+    raw.geo_update_interval = Some(12);
+    raw.geodata_mode = Some(false);
+    raw.geodata_loader = Some("memconservative".into());
+    raw.geosite_matcher = Some("succinct".into());
+    raw.geodata = Some(serde_saphyr::from_str("auto-update: false").unwrap());
+    save_raw_config(path_str, &raw).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    for want in [
+        "geo-auto-update: true",
+        "geo-update-interval: 12",
+        "geodata-mode: false",
+        "geodata-loader: memconservative",
+        "geosite-matcher: succinct",
+        "auto-update: false",
+    ] {
+        assert!(content.contains(want), "missing '{want}' in: {content}");
+    }
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
+    assert_eq!(loaded.geo_auto_update, Some(true));
+    assert_eq!(loaded.geo_update_interval, Some(12));
+    assert_eq!(loaded.geodata_mode, Some(false));
+    assert_eq!(loaded.geodata_loader.as_deref(), Some("memconservative"));
+    assert_eq!(loaded.geosite_matcher.as_deref(), Some("succinct"));
+    assert_eq!(loaded.geodata.unwrap().auto_update, Some(false));
+    for key in [
+        "geo-auto-update",
+        "geo-update-interval",
+        "geodata-mode",
+        "geodata-loader",
+        "geosite-matcher",
+    ] {
+        assert!(
+            !loaded.extra.contains_key(key),
+            "{key} is typed — it must not land in the unknown-key bucket"
+        );
+    }
 }
 
 #[test]
@@ -325,6 +406,34 @@ rules:
     }
 }
 
+/// A rematch leaf that sorts before DIRECT would open the member list —
+/// and `members[0]` is the auto-GLOBAL selector's default pick. A control
+/// outbound can never be the default: the first non-rematch member opens
+/// the list instead, while the leaf stays selectable like upstream
+/// `proxyList` members (issue #974 review).
+#[test]
+fn auto_global_default_never_lands_on_a_rematch_leaf() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        r#"
+proxies:
+  - {name: "AAA-rm", type: rematch, target-rematch-name: stage1}
+rules:
+  - DOMAIN,example.com,DIRECT
+"#,
+    )
+    .unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
+    let global = proxies.get("GLOBAL").expect("auto-created GLOBAL");
+
+    assert_eq!(global.current().as_deref(), Some("DIRECT"));
+    let members = global.members().expect("GLOBAL selector members");
+    assert_eq!(members.first().map(String::as_str), Some("DIRECT"));
+    assert!(
+        members.iter().any(|m| m == "AAA-rm"),
+        "the rematch leaf stays a member"
+    );
+}
+
 /// Issue #533: a `proxies:` leaf named after a built-in must not shadow
 /// it — a shadowed `PASS` would silently invert "skip this rule" into
 /// "proxy it". The built-in survives; the shadowing leaf is dropped with
@@ -443,6 +552,51 @@ fn raw_config_serialize_deserialize_roundtrip() {
     assert_eq!(loaded.rules, raw.rules);
 }
 
+/// The `#[serde(flatten)]` `extra` maps serialize back: unknown keys the
+/// loader warned on must survive a save round-trip verbatim — and in
+/// sorted order (`BTreeMap`, no diff noise across saves).
+#[test]
+fn raw_config_extra_keys_roundtrip_sorted() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        "mixed-port: 7890\nzebra-key: 1\nalpha-key: {nested: true}\ndns:\n  bogus-dns: x\n",
+    )
+    .unwrap();
+    assert!(raw.extra.contains_key("zebra-key"));
+
+    let yaml = to_yaml(&raw);
+    assert!(yaml.contains("alpha-key"), "{yaml}");
+    assert!(yaml.contains("zebra-key"), "{yaml}");
+    assert!(yaml.contains("bogus-dns"), "{yaml}");
+    assert!(
+        yaml.find("alpha-key") < yaml.find("zebra-key"),
+        "extra keys must save in sorted order: {yaml}"
+    );
+
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+    assert_eq!(
+        loaded.dns.as_ref().unwrap().extra,
+        raw.dns.as_ref().unwrap().extra
+    );
+}
+
+/// Non-string scalar keys inside an unknown-key subtree must not fail the
+/// parse — serde's flatten buffer hands typed keys to the extra map, which
+/// `serde_json::Value`'s own visitor rejects (review F1). They stringify
+/// (`123` → `"123"`) and write back as ordinary string keys.
+#[test]
+fn raw_config_extra_nested_scalar_keys_roundtrip() {
+    let raw: RawConfig = serde_saphyr::from_str("x-tpl: {123: 1.1.1.1, true: x}\n").unwrap();
+    assert_eq!(
+        raw.extra["x-tpl"].0,
+        serde_json::json!({"123": "1.1.1.1", "true": "x"})
+    );
+
+    let yaml = to_yaml(&raw);
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+}
+
 #[test]
 fn raw_subscription_serde() {
     let sub = RawSubscription {
@@ -454,6 +608,7 @@ fn raw_subscription_serde() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(
@@ -487,6 +642,7 @@ fn raw_subscription_serde_applied_fields() {
         applied_proxies: vec!["node-1".into(), "node-2".into()],
         applied_groups: vec!["g".into()],
         applied_rules: vec!["MATCH,DIRECT".into()],
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("applied-proxies:"), "{yaml}");
@@ -516,6 +672,7 @@ fn raw_subscription_serde_proxy() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("proxy: front"), "{yaml}");
@@ -535,6 +692,7 @@ fn raw_config_clone() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let cloned = raw.clone();
     assert_eq!(cloned.mixed_port, raw.mixed_port);

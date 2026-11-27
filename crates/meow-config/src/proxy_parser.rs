@@ -13,6 +13,8 @@ use meow_proxy::{
 };
 #[cfg(feature = "vless")]
 use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
+#[cfg(feature = "wireguard")]
+use meow_proxy::{WireGuardAdapter, WireGuardConfig};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +39,14 @@ pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
     /// The `dialer-proxy` the adapter dials its server through.
     hop: Option<DialerHop>,
+    /// The `proxies:` entry's per-node dialer fields (issue #974):
+    /// `routing-mark`, `interface-name`, `ip-version`, `tfo`, `mptcp`.
+    /// Resolved over [`meow_common::global_dialer_opts`] at dial time and
+    /// installed as the task-local [`meow_common::dialer_opts_scope`]
+    /// around every adapter dial — so the socket helpers see the node's
+    /// own options wherever the dial leads, including the WireGuard
+    /// endpoint socket bound inside `ensure_pump`.
+    node_opts: meow_common::NodeDialerOpts,
 }
 
 /// An outbound's injected `dialer-proxy` dialer, and the server it dials
@@ -49,7 +59,27 @@ struct DialerHop {
 
 impl WrappedProxy {
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
-        Self { adapter, hop: None }
+        Self {
+            adapter,
+            hop: None,
+            node_opts: meow_common::NodeDialerOpts::default(),
+        }
+    }
+
+    /// Attach the dialer fields the leaf's `proxies:` block declared
+    /// (issue #974). Every leaf parse path calls this; the built-in
+    /// DIRECT/REJECT wrappers keep the default — no config block exists
+    /// to parse them from.
+    pub fn with_node_dialer_opts(mut self, opts: meow_common::NodeDialerOpts) -> Self {
+        self.node_opts = opts;
+        self
+    }
+
+    /// The node's fields resolved over the *live* globals — read per
+    /// dial, so a `PATCH /configs` `interface-name`/`routing-mark` lands
+    /// on the next dial rather than the next reload.
+    fn effective_dialer_opts(&self) -> meow_common::DialerOpts {
+        meow_common::DialerOpts::resolve(&self.node_opts, &meow_common::global_dialer_opts())
     }
 
     /// `self`, whose adapter the block `config` built with `dialer`
@@ -64,6 +94,18 @@ impl WrappedProxy {
         let port = config
             .get("port")
             .and_then(serde_json::Value::as_u64)
+            .filter(|&port| port > 0)
+            .or_else(|| {
+                // A `ports`-only node (hysteria2's hopping range, which may
+                // carry `port: 0` or none at all) still dials one concrete
+                // endpoint: the range's first port, same as the adapter.
+                config
+                    .get("ports")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|ports| ports.split([',', '-']).next())
+                    .and_then(|first| first.trim().parse::<u64>().ok())
+                    .filter(|&port| port > 0)
+            })
             .and_then(|port| u16::try_from(port).ok());
         if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
             self.hop = Some(DialerHop {
@@ -91,17 +133,35 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.support_udp()
     }
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        self.adapter.dial_tcp(metadata).await
+        // The node's resolved dialer opts scope the whole adapter call:
+        // server/target resolution, the TCP socket, and — for WireGuard —
+        // the endpoint UDP socket bound lazily inside `ensure_pump`
+        // (issue #974; `dialer_opts_scope` REPLACES on nesting, so a
+        // chained front hop installs its own opts for the socket it
+        // opens rather than inheriting this node's).
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.dial_tcp(metadata),
+        )
+        .await
     }
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        self.adapter.dial_udp(metadata).await
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.dial_udp(metadata),
+        )
+        .await
     }
     async fn connect_over(
         &self,
         stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        self.adapter.connect_over(stream, metadata).await
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.connect_over(stream, metadata),
+        )
+        .await
     }
 
     /// Forward the peek/commit walk — a wrapped group-typed adapter would
@@ -128,6 +188,14 @@ impl ProxyAdapter for WrappedProxy {
         self.hop.is_some()
     }
 
+    /// Transparent like every other leaf signal here — a wrapped
+    /// `type: rematch` leaf must still report its action to the
+    /// match-time probe or it reads as an ordinary dialable target
+    /// (issue #974).
+    fn rematch_action(&self) -> Option<meow_common::RematchAction<'_>> {
+        self.adapter.rematch_action()
+    }
+
     fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
         self.adapter.dialer_hop_network(flow)
     }
@@ -140,6 +208,11 @@ impl ProxyAdapter for WrappedProxy {
 
     fn health(&self) -> &ProxyHealth {
         self.adapter.health()
+    }
+
+    /// Transparent wrapper — the baked fingerprint is the leaf's.
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.adapter.client_fingerprint()
     }
 }
 
@@ -165,23 +238,350 @@ impl Proxy for WrappedProxy {
     }
 }
 
+/// Marks a `proxies:` leaf whose `dialer-proxy` was applied by *injection* —
+/// its adapter threads every dial through the chained front hop itself, so
+/// no `DialerProxyAdapter` wrapper exists to carry the chain signal the UDP
+/// probe reads (issue #969).
+///
+/// Every `Proxy` / `ProxyAdapter` method delegates to `inner` verbatim — the
+/// marker is observational only: `support_udp` still propagates the inner
+/// advertisement (an `http` node reports `false`; a `ss`/`socks5` node folds
+/// the front's live capability), `as_any` still resolves the inner concrete
+/// type so existing downcasts land exactly as they did on the bare entry,
+/// and the health/delay/member views are untouched.
+///
+/// The one override is `is_dialer_proxy_non_transparent` →
+/// `!inner.support_udp()`: the #969 fail-closed verdict is exactly the
+/// `support_udp` condition, matching `DialerProxyAdapter`'s
+/// `!transparent`. An injected leaf whose chained transport carries UDP
+/// — hysteria2 over the front's UDP association, WireGuard, or anytls
+/// `udp: true` (UoT rides the chained TCP session) — is *not*
+/// non-transparent: its UDP flow rides the declared chain, so there is
+/// nothing to fail closed on. `type: direct` rejects the injected dialer
+/// inside [`parse_proxy_with_dialer`] (`reject_unthreaded_dialer`), and
+/// `ss` with an external SIP003 plugin bails on its own inline check —
+/// either way the leaf lands in the relay-based
+/// `DialerProxyAdapter` fallback instead, which computes its own
+/// transparency — so reaching this wrapper already proves the inner owns a
+/// server transport. A UDP flow matched to a rule targeting a
+/// UDP-incapable chained node then fails closed on the match instead of
+/// sliding to a later rule the way a plain `udp: false` node does.
+pub struct ChainedProxy {
+    inner: Arc<dyn Proxy>,
+}
+
+impl ChainedProxy {
+    pub fn new(inner: Arc<dyn Proxy>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ChainedProxy {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn adapter_type(&self) -> AdapterType {
+        self.inner.adapter_type()
+    }
+    fn addr(&self) -> &str {
+        self.inner.addr()
+    }
+    fn support_udp(&self) -> bool {
+        self.inner.support_udp()
+    }
+    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        self.inner.dial_tcp(metadata).await
+    }
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        self.inner.dial_udp(metadata).await
+    }
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        self.inner.connect_over(stream, metadata).await
+    }
+
+    /// Forward the peek/commit walk like `WrappedProxy` — a chained entry
+    /// whose inner resolved (theoretical today: injected entries are leaves)
+    /// must not hide PASS/PASS-RULE members from the match-time probe.
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        self.inner.unwrap_proxy(metadata, touch)
+    }
+
+    /// Transparent — a chained rematch leaf keeps reporting its action
+    /// to the match-time probe (issue #974).
+    fn rematch_action(&self) -> Option<meow_common::RematchAction<'_>> {
+        self.inner.rematch_action()
+    }
+
+    /// The injected leaf answers the front hop itself; forward so the
+    /// answer keeps reaching the probe through this wrapper.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        self.inner.dialer_hop(metadata)
+    }
+
+    /// The injected leaf already reports the configured chain; forward.
+    fn has_configured_dialer(&self) -> bool {
+        self.inner.has_configured_dialer()
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.inner.dialer_hop_network(flow)
+    }
+
+    /// Forward the session flush (issue #695) — a marker that hid it would
+    /// strand the inner adapter's pooled transport sessions.
+    fn reset_sessions(&self) {
+        self.inner.reset_sessions();
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        self.inner.health()
+    }
+
+    /// Transparent marker — the baked fingerprint is the leaf's.
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.inner.client_fingerprint()
+    }
+}
+
+impl Proxy for ChainedProxy {
+    fn alive(&self) -> bool {
+        self.inner.alive()
+    }
+    fn alive_for_url(&self, url: &str) -> bool {
+        self.inner.alive_for_url(url)
+    }
+    fn last_delay(&self) -> u16 {
+        self.inner.last_delay()
+    }
+    fn last_delay_for_url(&self, url: &str) -> u16 {
+        self.inner.last_delay_for_url(url)
+    }
+    fn delay_history(&self) -> Vec<DelayHistory> {
+        self.inner.delay_history()
+    }
+
+    /// Transparent to concrete-type downcasts: callers still reach the
+    /// injected leaf (`WrappedProxy`, the group types) — the registry entry
+    /// answers `as_any` exactly as the bare inner did before marking.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+
+    /// The marker's single verdict (issue #969): an injected leaf is the
+    /// non-transparent chain shape only when the chain cannot carry UDP
+    /// — `!inner.support_udp()`, the same condition
+    /// `DialerProxyAdapter` answers with `!transparent` and the only case
+    /// the route probe consults this marker for. A leaf whose chained
+    /// transport does carry UDP (injected hysteria2/WireGuard, anytls
+    /// `udp: true`) answers `false` so a group pick forwarding this
+    /// verdict stays truthful.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        !self.inner.support_udp()
+    }
+
+    fn members(&self) -> Option<Vec<String>> {
+        self.inner.members()
+    }
+
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        self.inner.member_proxies()
+    }
+
+    fn current(&self) -> Option<String> {
+        self.inner.current()
+    }
+
+    fn selection(&self) -> Option<&dyn meow_common::ProxySelection> {
+        self.inner.selection()
+    }
+
+    fn test_url(&self) -> Option<&str> {
+        self.inner.test_url()
+    }
+
+    fn expected_status(&self) -> Option<&str> {
+        self.inner.expected_status()
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        self.inner.group_display()
+    }
+
+    fn usage_generation(&self) -> u64 {
+        self.inner.usage_generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<meow_common::chain_health::ChainHealth>> {
+        self.inner.chain_health()
+    }
+}
+
+/// The mihomo per-node dialer fields shared by every leaf `type:`
+/// (issue #974): `routing-mark`, `interface-name`, `ip-version`, `tfo`,
+/// `mptcp`. Parsed once from the `proxies:` map and carried on the leaf's
+/// [`WrappedProxy`]; `proxy-groups:` entries never reach here, so a group
+/// cannot carry dialer fields at all — matching mihomo v1.19, which
+/// removed group-level dialer options.
+///
+/// Normalization lands here, before [`meow_common::NodeDialerOpts`] sees
+/// it: `routing-mark: 0` and an empty/`null` `interface-name` mean
+/// "unset" (inherit the global); a non-string field or an unknown
+/// `ip-version` is a hard parse error — mihomo fails the node the same
+/// way rather than defaulting.
+fn parse_node_dialer_opts(
+    config: &HashMap<String, serde_json::Value>,
+    name: &str,
+) -> std::result::Result<meow_common::NodeDialerOpts, String> {
+    let routing_mark = match config.get("routing-mark") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| format!("{name}: `routing-mark` must be a non-negative integer"))?;
+            let mark = u32::try_from(raw)
+                .map_err(|_| format!("{name}: `routing-mark` {raw} exceeds u32::MAX"))?;
+            (mark != 0).then_some(mark)
+        }
+    };
+    let interface_name = match config.get("interface-name") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| format!("{name}: `interface-name` must be a string"))?;
+            let trimmed = raw.trim();
+            // A NUL is a hard error, not normalization: Linux
+            // `SO_BINDTODEVICE` would silently truncate the name at it
+            // and bind the wrong interface (spec §1.2).
+            if trimmed.contains('\0') {
+                return Err(format!(
+                    "{name}: `interface-name` must not contain NUL bytes"
+                ));
+            }
+            (!trimmed.is_empty()).then(|| std::sync::Arc::from(trimmed))
+        }
+    };
+    let ip_version = match config.get("ip-version") {
+        None | Some(serde_json::Value::Null) => meow_common::IpVersion::Dual,
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| format!("{name}: `ip-version` must be a string"))?;
+            meow_common::IpVersion::from_name(raw).ok_or_else(|| {
+                format!(
+                    "{name}: unknown `ip-version` '{raw}' — expected \
+                     dual|ipv4|ipv6|ipv4-prefer|ipv6-prefer"
+                )
+            })?
+        }
+    };
+    let tfo = match config.get("tfo") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{name}: `tfo` must be a boolean"))?,
+    };
+    let mptcp = match config.get("mptcp") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{name}: `mptcp` must be a boolean"))?,
+    };
+    Ok(meow_common::NodeDialerOpts {
+        routing_mark,
+        interface_name,
+        ip_version,
+        tfo,
+        mptcp,
+    })
+}
+
+/// Normalize a raw `global-client-fingerprint` or per-node
+/// `client-fingerprint` value: trim whitespace and ASCII-lowercase.
+/// Empty or `"none"` returns `None` (issue #974, mihomo's `len == 0`).
+pub fn normalize_client_fingerprint(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(s.to_ascii_lowercase())
+}
+
+/// Resolve a node's `client-fingerprint` against the top-level
+/// `global-client-fingerprint` (issue #974, mihomo's per-constructor
+/// `option.ClientFingerprint == ""` fallback — applied at parse time):
+/// absent / `null` / `""` / whitespace-only inherits the (normalized)
+/// global; an explicit `none` opts out — except under `keep_none_literal`
+/// (vless+REALITY, where no uTLS hello exists to send unshaped) which
+/// passes `"none"` through so `HelloProfile::resolve` warns and uses
+/// Chrome. Non-string values are a hard error, as `trusttunnel`/`anytls`
+/// already did.
+// Every consumer arm is feature-gated; a `default-features = false`
+// downstream (meow-api) compiles them all out.
+#[cfg_attr(
+    not(any(
+        feature = "ss",
+        feature = "trusttunnel",
+        feature = "vless",
+        feature = "anytls",
+        feature = "vmess"
+    )),
+    allow(dead_code)
+)]
+fn resolve_node_client_fingerprint(
+    config: &HashMap<String, serde_json::Value>,
+    context: &str,
+    global_client_fingerprint: Option<&str>,
+    keep_none_literal: bool,
+) -> std::result::Result<Option<String>, String> {
+    match config.get("client-fingerprint") {
+        None | Some(serde_json::Value::Null) => {
+            Ok(normalize_client_fingerprint(global_client_fingerprint))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(normalize_client_fingerprint(global_client_fingerprint))
+            } else if trimmed.eq_ignore_ascii_case("none") {
+                if keep_none_literal {
+                    Ok(Some("none".to_string()))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(Some(trimmed.to_ascii_lowercase()))
+            }
+        }
+        Some(_) => Err(format!("{context}: client-fingerprint must be a string")),
+    }
+}
+
 pub fn parse_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
         std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
-    parse_proxy_with_dialer(config, &dialer, ipv6)
+    parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, None, None)
 }
 
 /// [`parse_proxy`] for a static `proxies:` entry. A `type: direct` entry
 /// without its own `dns:` also follows `resolver`'s
 /// `dns.direct-nameserver`, like the built-in DIRECT
 /// ([`DirectAdapter::with_direct_resolver_slot`]).
+/// `global_client_fingerprint` is the config's top-level
+/// `global-client-fingerprint` (issue #974).
 pub(crate) fn parse_static_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
     resolver: Option<&meow_dns::ResolverSlot>,
+    global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     match (config.get("type").and_then(|v| v.as_str()), resolver) {
         (Some("direct"), Some(slot)) => {
@@ -190,9 +590,22 @@ pub(crate) fn parse_static_proxy(
                 .and_then(|v| v.as_str())
                 .ok_or("missing proxy name")?;
             let adapter = parse_direct(name, config, ipv6, Some(slot))?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(parse_node_dialer_opts(config, name)?),
+            ))
         }
-        _ => parse_proxy(config, ipv6),
+        _ => {
+            let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+                std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+            parse_proxy_with_dialer_and_fp(
+                config,
+                &dialer,
+                ipv6,
+                global_client_fingerprint,
+                dns_cell,
+            )
+        }
     }
 }
 
@@ -334,6 +747,24 @@ pub fn parse_proxy_provider_node(
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_provider_node_with_fp(config, ipv6, allow_external_plugin, dialer, None, None)
+}
+
+/// [`parse_proxy_provider_node`] honoring the config's top-level
+/// `global-client-fingerprint` (issue #974): the provider snapshot is
+/// parsed under the fingerprint committed for that config load, so a
+/// fingerprint change forces the provider adapters to rebuild.
+/// `dns_cell` is the provider's live-resolver indirection — provider
+/// `type: dns` leaves bind it so the commit's populated slot reaches
+/// conns parsed before DNS existed (issue #974).
+pub fn parse_proxy_provider_node_with_fp(
+    config: &HashMap<String, serde_json::Value>,
+    ipv6: bool,
+    allow_external_plugin: bool,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
@@ -345,18 +776,31 @@ pub fn parse_proxy_provider_node(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy_with_dialer(config, dialer, ipv6)
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, global_client_fingerprint, dns_cell)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
-/// into every adapter. Used by apply_dialer_proxies — and by provider node
-/// parsing (issue #489) — to inject a [meow_proxy::dialer::NamedProxyDialer]
-/// so that dialer-proxy chaining works for all protocols without requiring
-/// connect_over.
+/// into every adapter. Used by the `dialer-proxy` single-parse path in
+/// `insert_parsed_leaves` — and by provider node parsing (issue #489) — to
+/// inject a [meow_proxy::dialer::NamedProxyDialer] so that dialer-proxy
+/// chaining works for all protocols without requiring connect_over.
 pub fn parse_proxy_with_dialer(
     config: &HashMap<String, serde_json::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, None, None)
+}
+
+/// [`parse_proxy_with_dialer`] honoring the config's top-level
+/// `global-client-fingerprint` (issue #974). The fingerprint is baked
+/// into the adapters this call constructs — there is no runtime global.
+pub fn parse_proxy_with_dialer_and_fp(
+    config: &HashMap<String, serde_json::Value>,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ipv6: bool,
+    global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
@@ -366,10 +810,48 @@ pub fn parse_proxy_with_dialer(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or("missing proxy type")?;
+    // `type: rematch` — a control outbound consumed by the rule
+    // scanner, not a transport (issue #974). Dispatch before the
+    // transport-only option parse: a rematch node owns no
+    // `routing-mark`/`interface-name`/`tfo` semantics, so a malformed
+    // value there is warn-ignored by `parse_rematch`'s ignored-key
+    // warnings — not a hard node error that drops the flow's routing
+    // decision on a relaxed build. No server/port, no node dialer opts,
+    // no chain wrapper: `collect_dialer_edges` already rejects a
+    // `dialer-proxy` on it structurally, and `parse_rematch` re-rejects
+    // the key for the provider paths this dispatch also serves.
+    if proxy_type == "rematch" {
+        reject_unthreaded_dialer(name, "rematch", dialer)?;
+        let adapter = parse_rematch(name, config)?;
+        return Ok(Arc::new(WrappedProxy::new(Box::new(adapter))));
+    }
+    // `type: dns` — an in-process resolver leaf, not a transport (issue
+    // #974). Same dispatch position as rematch: a dns node owns no
+    // `server`/`port`/socket semantics, so its endpoint and dialer
+    // fields must not reach the transport-only option parse — the
+    // warn-ignored verdict lives in `parse_dns_node` instead. No chain
+    // wrapper: `collect_dialer_edges` skips `type: dns` like rematch,
+    // and a provider-level `dialer-proxy` is peeled off before this
+    // parse runs.
+    if proxy_type == "dns" {
+        reject_unthreaded_dialer(name, "dns", dialer)?;
+        let adapter = parse_dns_node(name, config, dns_cell)?;
+        return Ok(Arc::new(WrappedProxy::new(Box::new(adapter))));
+    }
+    // The shared per-node dialer fields (issue #974) — protocol-agnostic,
+    // so they parse once before the type dispatch and attach to whichever
+    // wrapper the leaf produces. Provider nodes reach the same fields
+    // through this single parse path.
+    let node_opts = parse_node_dialer_opts(config, name)?;
+    // Every consumer arm below is feature-gated; a build with none of the
+    // uTLS-aware protocols compiled in would otherwise warn it unused.
+    let _ = global_client_fingerprint;
 
     match proxy_type {
         #[cfg(feature = "trusttunnel")]
-        "trusttunnel" => parse_trusttunnel(name, config, dialer),
+        "trusttunnel" => {
+            parse_trusttunnel(name, config, dialer, node_opts, global_client_fingerprint)
+        }
         #[cfg(feature = "ss")]
         "ss" => {
             let server = config
@@ -400,14 +882,14 @@ pub fn parse_proxy_with_dialer(
                 Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
             };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
-            let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
+            let client_fingerprint =
+                resolve_node_client_fingerprint(config, "ss", global_client_fingerprint, false)?;
 
             // A SIP003 *external* plugin is a local subprocess spawned by
             // `ShadowsocksAdapter::new`, and the adapter deliberately dials it
             // over loopback without the pluggable dialer.  Bail out *before*
-            // constructing so the re-parse in `apply_dialer_proxies` does not
-            // spawn a second copy of the plugin process (the first one stays
-            // alive as long as any group still holds the original Arc), and so
+            // constructing so the chained parse never spawns a copy of the
+            // plugin process the direct re-parse then spawns again, and so
             // the user learns their `dialer-proxy` has no effect here.
             if dialer.is_proxy() && is_external_sip003_plugin(plugin) {
                 return Err(format!(
@@ -423,8 +905,12 @@ pub fn parse_proxy_with_dialer(
                     "ss[{name}]: external plugins are disabled by process policy"
                 ));
             }
-            // Validation constructs adapters, but must never execute a plugin.
-            let plugin = if crate::is_offline_validate() && is_external_sip003_plugin(plugin) {
+            // Validation constructs adapters, but must never execute a plugin —
+            // a dry-run mirror parse suppresses the same spawn
+            // (`plugin_spawn_suppressed`) for its verdict-only needs.
+            let plugin = if (crate::is_offline_validate() || plugin_spawn_suppressed())
+                && is_external_sip003_plugin(plugin)
+            {
                 None
             } else {
                 plugin
@@ -440,7 +926,7 @@ pub fn parse_proxy_with_dialer(
                 udp,
                 plugin,
                 plugin_opts_str.as_deref(),
-                client_fingerprint,
+                client_fingerprint.as_deref(),
                 Arc::clone(dialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
@@ -460,7 +946,9 @@ pub fn parse_proxy_with_dialer(
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "trojan")]
@@ -511,65 +999,135 @@ pub fn parse_proxy_with_dialer(
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "vless")]
         "vless" => {
-            let adapter = parse_vless(name, config, dialer)?;
+            let adapter = parse_vless(name, config, dialer, global_client_fingerprint)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "http" => {
             let adapter = parse_http(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "socks5" => {
             let adapter = parse_socks5(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
             let adapter = parse_direct(name, config, ipv6, None)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).with_node_dialer_opts(node_opts),
+            ))
         }
+        // `type: rematch` dispatched above `parse_node_dialer_opts` — a
+        // control outbound owns no transport-only options to validate.
         #[cfg(feature = "anytls")]
         "anytls" => {
-            reject_unthreaded_dialer(name, "anytls", dialer)?;
-            let adapter = parse_anytls(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            let adapter = parse_anytls(name, config, global_client_fingerprint)?;
+            // WireGuard-shaped injection: a proxy dialer becomes the
+            // client's per-session transport dialer — the raw chained
+            // stream the client layers its own TLS + session pool on — so
+            // injected sessions pool like direct ones and `udp: true` UoT
+            // rides the chain. The no-op `DirectDialer` keeps the built-in
+            // connect path.
+            let adapter = if dialer.is_proxy() {
+                adapter.with_dialer(Arc::clone(dialer))
+            } else {
+                adapter
+            };
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
+            ))
         }
-        #[cfg(all(feature = "wireguard", target_os = "linux"))]
+        #[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
         "wireguard" => {
             reject_unthreaded_dialer(name, "wireguard", dialer)?;
-            let cfg = parse_wireguard(name, config)?;
+            let cfg = parse_wireguard_kernel(name, config)?;
             let inner = parse_direct(name, config, ipv6, None)?;
-            let adapter = meow_proxy::wireguard::WireGuardAdapter::new(cfg, inner);
+            let adapter = meow_proxy::wireguard_kernel::WireGuardAdapter::new(cfg, inner);
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "hysteria2")]
         "hysteria2" => {
-            reject_unthreaded_dialer(name, "hysteria2", dialer)?;
-            let adapter = parse_hysteria2(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // A `dialer-proxy` chain carries the QUIC endpoint's UDP
+            // transport through the front hop's UDP association (issue
+            // #899 follow-up, the WireGuard precedent). Any proxy dialer
+            // is accepted here — no `supports_udp` gate: that flag
+            // answers `false` for an unresolved group target, which would
+            // kill legal group fronts at parse time. A UDP-less front
+            // fails `dial_udp_conn` at runtime, closed like any other
+            // endpoint bind error.
+            let adapter = parse_hysteria2(name, config, dialer)?;
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
-            let adapter = parse_vmess(name, config, dialer)?;
+            let adapter = parse_vmess(name, config, dialer, global_client_fingerprint)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "snell")]
         "snell" => {
             let adapter = parse_snell(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
+            ))
+        }
+        // WireGuard accepts the mihomo spellings "wireguard" and
+        // "WireGuard" (docs/wireguard.md field table). The fork's kernel
+        // arm above wins when it is compiled in.
+        #[cfg(all(
+            feature = "wireguard",
+            not(all(feature = "wireguard-kernel", target_os = "linux"))
+        ))]
+        "wireguard" | "WireGuard" => {
+            let adapter = parse_wireguard(name, config)?;
+            // A `dialer-proxy` chain carries the WG endpoint's UDP
+            // transport through the front hop's UDP association (issue
+            // #899). Any proxy dialer is accepted here — no
+            // `supports_udp` gate: that flag answers `false` for an
+            // unresolved group target, which would kill legal group
+            // fronts at parse time. A UDP-less front fails
+            // `dial_udp_conn` at runtime, closed like any other
+            // endpoint bind error. `dialing_through` attaches the
+            // DialerHop so `front_hop` metrics name the member.
+            let adapter = if dialer.is_proxy() {
+                adapter.with_dialer(Arc::clone(dialer))
+            } else {
+                adapter
+            };
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(not(feature = "trusttunnel"))]
@@ -588,6 +1146,11 @@ pub fn parse_proxy_with_dialer(
         "vmess" => Err(feature_gated_proxy_type("vmess")),
         #[cfg(not(feature = "snell"))]
         "snell" => Err(feature_gated_proxy_type("snell")),
+        #[cfg(all(
+            not(feature = "wireguard"),
+            not(all(feature = "wireguard-kernel", target_os = "linux"))
+        ))]
+        "wireguard" | "WireGuard" => Err(feature_gated_proxy_type("wireguard")),
         // `node_is_trusttunnel` trims and ignores case; this dispatch is
         // exact, like mihomo's. Without this arm a ` trusttunnel ` or
         // `TrustTunnel` node reports a generic "unsupported proxy type"
@@ -605,28 +1168,211 @@ pub fn parse_proxy_with_dialer(
     }
 }
 
+// Depth-counted suppression of the external SIP003 subprocess spawn —
+// set by a dry-run parse that needs `ShadowsocksAdapter::new`'s verdict
+// without a plugin process the candidate may never use (the NTP
+// dialer-target mirror parses every declared leaf; Codex review).
+// Thread-local because the mirror is synchronous code a `spawn_blocking`
+// owns outright; a counter, not a bool, so nested scopes compose.
+#[cfg(feature = "ss")]
+thread_local! {
+    static PLUGIN_SPAWN_DRY_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a scope where the `ss` arm skips the external `Plugin::start`
+/// subprocess — every other check (the `dialer-proxy` bail, process
+/// policy, field validation, built-in plugin construction) still runs,
+/// so the parse keeps its verdict modulo the spawn itself. The returned
+/// guard resets on drop. Compiled only with `ss`: without the feature
+/// there is no spawn to suppress, and callers gate the call the same way.
+#[cfg(feature = "ss")]
+pub(crate) fn plugin_spawn_dry_run() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() - 1));
+        }
+    }
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() + 1));
+    Guard
+}
+
+#[cfg(feature = "ss")]
+fn plugin_spawn_suppressed() -> bool {
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.get() > 0)
+}
+
 /// Whether `plugin` names a SIP003 plugin that runs as an external subprocess
 /// (as opposed to one of the built-in, in-process plugin implementations).
 ///
 /// Mirrors the dispatch in `ShadowsocksAdapter::new`: anything not recognised
 /// as built-in is handed to `Plugin::start`, which spawns a child process.
+/// A name that is feature-reserved but compiled out (`obfs-local` under an
+/// `ss`-only build, see `FEATURE_GATED_PLUGINS`) is *not* external here: it
+/// can never reach `Plugin::start` — the adapter's "not compiled" Config
+/// error fires first — so the spawn-suppression, process-policy and
+/// provider gates must not mask that verdict.
 #[cfg(feature = "ss")]
 fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
-    plugin
-        .filter(|p| !p.is_empty())
-        .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
+    plugin.filter(|p| !p.is_empty()).is_some_and(|p| {
+        !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p)
+            && meow_proxy::shadowsocks_adapter::missing_plugin_feature(p).is_none()
+    })
+}
+
+/// The structural verdict on one `type: rematch` node (issue #974):
+/// `name` present, at least one `target-*` field supplied, both fields
+/// strings-or-null, and no `dialer-proxy`. `build_proxy_layer` runs this
+/// ahead of the per-node parse so a malformed rematch action fails the
+/// whole load instead of warn-dropping the node, and `parse_rematch`
+/// re-checks it so provider payloads get the same verdict node-by-node.
+pub fn check_rematch_node(
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let name = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("rematch node requires a `name`")?;
+    // A `dialer-proxy` on a rematch node has no hop to carry — reject the
+    // key itself so every parse surface agrees.
+    match config.get("dialer-proxy") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(v) if v.as_str().is_some_and(|s| s.trim().is_empty()) => {}
+        Some(_) => {
+            return Err(format!(
+                "rematch[{name}]: `dialer-proxy` is not supported — a rematch \
+                 node is a routing control, not a transport the chain can ride"
+            ));
+        }
+    }
+    let rematch_name = rematch_opt_str(config, "target-rematch-name", name)?;
+    let sub_rule = rematch_opt_str(config, "target-sub-rule", name)?;
+    if rematch_name.is_none() && sub_rule.is_none() {
+        return Err(format!(
+            "rematch[{name}]: set `target-rematch-name` and/or `target-sub-rule` — \
+             a rematch node with neither changes nothing"
+        ));
+    }
+    Ok(())
+}
+
+/// The structural verdict on one `type: dns` node (issue #974): `name`
+/// present. Everything else is tolerated — a dns leaf carries no
+/// endpoint/protocol parameters, so `server`/`port`/`udp` and the
+/// transport family are ignored with warnings rather than rejected,
+/// even ill-typed (mihomo `C.Dns` reads no node options at all).
+/// `parse_dns_node` re-runs this so provider payloads get the same
+/// verdict node-by-node.
+pub fn check_dns_node(
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|_| ())
+        .ok_or_else(|| "dns node requires a `name`".to_string())
+}
+
+/// `type: dns` — `name` is the whole node (issue #974). The leaf binds
+/// `dns_cell`, the config-scoped live-resolver indirection the commit
+/// populates with the tunnel's shared slot: provider-sourced nodes are
+/// parsed before DNS exists and persist across rebuilds, so they cannot
+/// capture a slot directly. `None` — a standalone parse with no build
+/// context — leaves the leaf unbound, i.e. SERVFAIL, never a fallback
+/// upstream.
+fn parse_dns_node(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
+) -> std::result::Result<meow_proxy::DnsAdapter, String> {
+    check_dns_node(config)?;
+    // Keys that would claim an effect the leaf never has — warn rather
+    // than silently honor them. `server`/`port`/`udp` and the
+    // TLS/mux/plugin family already warn through the unknown-key
+    // inventory (`DNS_NODE_KEYS` is empty); these are the common keys
+    // that inventory accepts for real transports.
+    for key in [
+        "dialer-proxy",
+        "routing-mark",
+        "interface-name",
+        "ip-version",
+        "tfo",
+        "mptcp",
+    ] {
+        if config.get(key).is_some_and(|v| !v.is_null()) {
+            tracing::warn!(
+                "proxy '{name}': `{key}` is ignored on type: dns — the leaf \
+                 answers locally and owns no transport"
+            );
+        }
+    }
+    let cell = dns_cell
+        .cloned()
+        .unwrap_or_else(meow_dns::new_dns_outbound_cell);
+    Ok(meow_proxy::DnsAdapter::new(name, cell))
+}
+
+/// `type: rematch` — the two `target-*` fields are the whole node
+/// (issue #974). [`check_rematch_node`] already ran the structural gate;
+/// this parse adds the ignored-option warnings and builds the adapter.
+fn parse_rematch(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<meow_proxy::RematchAdapter, String> {
+    check_rematch_node(config)?;
+    // Recognized socket options would claim an effect a control node can
+    // never have — warn rather than silently honoring them (issue #974).
+    for key in [
+        "routing-mark",
+        "interface-name",
+        "ip-version",
+        "tfo",
+        "mptcp",
+    ] {
+        if config.get(key).is_some_and(|v| !v.is_null()) {
+            tracing::warn!(
+                "proxy '{name}': `{key}` is ignored on type: rematch — it opens no sockets"
+            );
+        }
+    }
+    let rematch_name = rematch_opt_str(config, "target-rematch-name", name)?;
+    let sub_rule = rematch_opt_str(config, "target-sub-rule", name)?;
+    Ok(meow_proxy::RematchAdapter::new(
+        name,
+        rematch_name,
+        sub_rule,
+    ))
+}
+
+/// One `target-*` field of a rematch node: absent/`null` → `None` (leave
+/// the flow's field untouched); a string keeps its exact bytes — `""` is
+/// the explicit clear form and nothing is trimmed, folded or split;
+/// anything else is a type error — quote numeric identifiers (issue #974).
+fn rematch_opt_str<'a>(
+    config: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+    name: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("rematch[{name}]: `{key}` must be a string")),
+    }
 }
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
-/// `anytls` dials via `meow_common::connect_tcp_host` internally and
-/// `hysteria2` owns its QUIC socket; `direct` is a raw egress by definition.
-/// None of them can honour an injected dialer, so accepting one here would
-/// silently drop the user's `dialer-proxy` and egress from the real source
-/// path — a Class A silent divergence (ADR-0002).  Returning `Err` instead
-/// lets `apply_dialer_proxies` fall back to the relay-based
-/// `DialerProxyAdapter` wrapper, which fails loudly at dial time rather
-/// than pretending the chain was applied or dialing direct.
+/// `direct` is a raw egress by definition — a resolver-threaded dial
+/// belongs on the real source path — so accepting an injected dialer here
+/// would silently drop the user's `dialer-proxy` and egress from the real
+/// source path — a Class A silent divergence (ADR-0002).  Returning `Err`
+/// instead lets the `dialer-proxy` leaf parse fall back to the
+/// relay-based `DialerProxyAdapter` wrapper, which fails loudly at dial
+/// time rather than pretending the chain was applied or dialing direct.
 ///
 /// A `DirectDialer` is always accepted: it is the no-op default, so nothing
 /// is lost by ignoring it.
@@ -657,7 +1403,8 @@ fn reject_unthreaded_dialer(
     feature = "hysteria2",
     feature = "vmess",
     feature = "snell",
-    feature = "trusttunnel"
+    feature = "trusttunnel",
+    feature = "wireguard"
 )))]
 fn feature_gated_proxy_type(proxy_type: &str) -> String {
     if proxy_type == "trusttunnel" {
@@ -889,7 +1636,7 @@ fn parse_http(
         (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
         (None, None) => None,
         _ => {
-            return Err("http: both 'username' and 'password' must be set, or neither".to_string())
+            return Err("http: both 'username' and 'password' must be set, or neither".to_string());
         }
     };
 
@@ -962,7 +1709,7 @@ fn parse_socks5(
         _ => {
             return Err(
                 "socks5: both 'username' and 'password' must be set, or neither".to_string(),
-            )
+            );
         }
     };
 
@@ -1090,6 +1837,8 @@ fn parse_trusttunnel(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    node_opts: meow_common::NodeDialerOpts,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let required = |key: &str| {
         config
@@ -1111,11 +1860,13 @@ fn parse_trusttunnel(
     if quic {
         return Err("trusttunnel: `quic: true` selects the HTTP/3 transport, which is not compiled into this build; rebuild with `--features trusttunnel-h3`".into());
     }
-    if quic {
-        // QUIC carries its own UDP socket, so there is no TCP connection for
-        // a `dialer-proxy` chain to carry (same reason hysteria2 refuses it).
-        reject_unthreaded_dialer(name, "trusttunnel", dialer)?;
-    }
+    // A `quic: true` node's `dialer-proxy` chain carries the QUIC
+    // endpoint's UDP transport through the front hop's UDP association
+    // (issue #899 follow-up — `TrustTunnelAdapter` hands the dialer to
+    // `QuicConnector::with_dialer`); H2 keeps its TCP dialer path. No
+    // `supports_udp` gate: that flag answers `false` for an unresolved
+    // group target, and a UDP-less front fails `dial_udp_conn` at dial,
+    // closed.
     let nonempty = |field: &str| {
         config.get(field).is_some_and(|value| match value {
             serde_json::Value::Null => false,
@@ -1192,9 +1943,13 @@ fn parse_trusttunnel(
     tls.verify_name = text("name-cert-verify")?
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    tls.fingerprint = text("client-fingerprint")?
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    // `quic: true` already rejected a per-node `client-fingerprint` above;
+    // the global fallback is TCP uTLS-only and does not apply to H3 either.
+    tls.fingerprint = if quic {
+        None
+    } else {
+        resolve_node_client_fingerprint(config, "trusttunnel", global_client_fingerprint, false)?
+    };
     let mut options = meow_proxy::trusttunnel::Options::new(
         required("username")?.into(),
         required("password")?.into(),
@@ -1278,7 +2033,10 @@ fn parse_trusttunnel(
             .map_err(|e| format!("trusttunnel: {e}"))?;
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
-        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions");
+        tracing::warn!(
+            name,
+            "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions"
+        );
     }
     #[cfg(feature = "trusttunnel-h3")]
     let transport = if quic {
@@ -1300,7 +2058,9 @@ fn parse_trusttunnel(
     )
     .map_err(|error| error.to_string())?;
     Ok(Arc::new(
-        WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+        WrappedProxy::new(Box::new(adapter))
+            .with_node_dialer_opts(node_opts)
+            .dialing_through(config, dialer),
     ))
 }
 
@@ -1324,6 +2084,7 @@ fn parse_trusttunnel(
 fn parse_anytls(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<meow_proxy::AnytlsAdapter, String> {
     let server = config
         .get("server")
@@ -1368,7 +2129,12 @@ fn parse_anytls(
         skip_cert_verify,
         fingerprint: optional_string("fingerprint")?,
         name_cert_verify: optional_string("name-cert-verify")?,
-        client_fingerprint: optional_string("client-fingerprint")?,
+        client_fingerprint: resolve_node_client_fingerprint(
+            config,
+            &format!("anytls[{name}]"),
+            global_client_fingerprint,
+            false,
+        )?,
         alpn,
     };
     meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
@@ -1436,10 +2202,11 @@ fn reject_unsupported_anytls_options(
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
 /// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`,
-/// `fast-open`, and the four `*-receive-window` keys (bytes; `0`/absent
-/// is unset — a present non-integer value is a hard error); meow's own
-/// `connections` (parallel QUIC connections, 1-8, unset = one per CPU up
-/// to 4).
+/// `fast-open`, the four `*-receive-window` keys (bytes; `0`/absent
+/// is unset — a present non-integer value is a hard error), and the
+/// K-way QUIC pool: `quic-connections` (upstream's meow-rs extension)
+/// with the fork's `connections` accepted as an alias (absent = one
+/// connection per CPU, at most 4).
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1453,13 +2220,13 @@ fn reject_unsupported_anytls_options(
 /// upstream: `adapter/outbound/hysteria2.go`
 /// mihomo's `type: wireguard` node (meow-openwrt stage 8): one peer, from
 /// the top level or `peers[0]`, plus `amnezia-wg-option` for AmneziaWG.
-#[cfg(all(feature = "wireguard", target_os = "linux"))]
-fn parse_wireguard(
+#[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
+fn parse_wireguard_kernel(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
-) -> std::result::Result<meow_proxy::wireguard::WireGuardConfig, String> {
+) -> std::result::Result<meow_proxy::wireguard_kernel::WireGuardConfig, String> {
     use base64::Engine as _;
-    use meow_proxy::wireguard::{Amnezia, HRange, WireGuardConfig};
+    use meow_proxy::wireguard_kernel::{Amnezia, HRange, WireGuardConfig};
     use serde_json::Value;
     use std::net::IpAddr;
 
@@ -1723,6 +2490,7 @@ fn parse_wireguard(
 fn parse_hysteria2(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::Hy2Adapter, String> {
     use meow_proxy::{Hy2HopInterval, Hy2Options};
 
@@ -1757,7 +2525,20 @@ fn parse_hysteria2(
         return Err(format!("hysteria2[{name}]: missing obfs-password"));
     }
 
-    let hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut ports = ports;
+    // A `dialer-proxy` chain binds the QUIC connection to one front UDP
+    // association — a connected endpoint has no second port to hop to.
+    // Hopping config is legal beside it, so warn and drop it rather than
+    // reject: the driver also skips `HopState` on an injected endpoint.
+    if dialer.is_proxy() && (ports.is_some() || hop_interval.is_some()) {
+        tracing::warn!(
+            "hysteria2[{name}]: `ports`/`hop-interval` are ignored with `dialer-proxy` \
+             — a front association is bound to a single peer port and cannot hop"
+        );
+        ports = None;
+        hop_interval = None;
+    }
     let fingerprint = parse_hy2_fingerprint(name, config.get("fingerprint"))?;
     let fast_open = config
         .get("fast-open")
@@ -1765,13 +2546,6 @@ fn parse_hysteria2(
         .unwrap_or(true);
     validate_hy2_alpn(name, config.get("alpn"))?;
     reject_unsupported_hy2_options(name, config)?;
-    let connections = match config.get("connections") {
-        None => 0,
-        Some(v) => match v.as_u64() {
-            Some(n @ 1..=8) => n as usize,
-            _ => return Err(format!("hysteria2[{name}]: connections must be 1-8")),
-        },
-    };
     // mihomo treats an absent or zero window as unset; a present value of
     // the wrong type is a config error, not a silent default.
     let window = |key: &str| -> std::result::Result<Option<u64>, String> {
@@ -1789,27 +2563,75 @@ fn parse_hysteria2(
         initial_conn: window("initial-connection-receive-window")?,
         max_conn: window("max-connection-receive-window")?,
     };
+    let quic_connections = parse_hy2_quic_connections(name, config.get("quic-connections"))?;
 
-    meow_proxy::Hy2Adapter::new(Hy2Options {
-        name: name.to_string(),
-        server: server.to_string(),
-        port,
-        password: password.to_string(),
-        sni: sni.map(str::to_string),
-        skip_cert_verify,
-        udp,
-        up_bps,
-        down_bps,
-        obfs,
-        obfs_password,
-        ports,
-        hop_interval: hop_interval
-            .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
-        fingerprint,
-        fast_open,
-        windows,
-        connections,
-    })
+    // `quic-connections` wins; the fork's older `connections` key is
+    // still accepted (absent on both = one per CPU, at most 4).
+    let legacy_connections = match config.get("connections") {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=8) => Some(n as usize),
+            _ => return Err(format!("hysteria2[{name}]: connections must be 1-8")),
+        },
+    };
+    let quic_connections = quic_connections.or(legacy_connections);
+    meow_proxy::Hy2Adapter::new(
+        Hy2Options {
+            name: name.to_string(),
+            server: server.to_string(),
+            port,
+            password: password.to_string(),
+            sni: sni.map(str::to_string),
+            skip_cert_verify,
+            udp,
+            up_bps,
+            down_bps,
+            obfs,
+            obfs_password,
+            ports,
+            hop_interval: hop_interval
+                .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
+            fingerprint,
+            fast_open,
+            windows,
+            quic_connections,
+        },
+        Some(Arc::clone(dialer)),
+    )
+}
+
+/// `quic-connections` — the K-way QUIC connection-pool width: `K`
+/// independent connections, each with its own quiche driver task,
+/// round-robin new streams and UDP sessions. Absent resolves to the
+/// fork's automatic width (one per CPU, at most 4); a present
+/// non-integer is a hard error. The value clamps to
+/// `1..=MAX_QUIC_CONNECTIONS`, warning when the clamp bites or above 4 —
+/// extra driver tasks rarely pay off past that.
+#[cfg(feature = "hysteria2")]
+fn parse_hy2_quic_connections(
+    name: &str,
+    value: Option<&serde_json::Value>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let n = value.as_u64().ok_or_else(|| {
+        format!("hysteria2[{name}]: 'quic-connections' must be an unsigned integer")
+    })?;
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
+    let clamped = n.clamp(1, meow_proxy::MAX_QUIC_CONNECTIONS);
+    if clamped != n {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {n} out of range, clamped to {clamped}"
+        );
+    }
+    if clamped > 4 {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {clamped} exceeds 4 — each connection \
+             costs a driver task; larger pools rarely add aggregate throughput"
+        );
+    }
+    Ok(Some(clamped))
 }
 
 #[cfg(feature = "hysteria2")]
@@ -2214,12 +3036,331 @@ fn reject_nonzero_hy2_option(
     Ok(())
 }
 
+/// Parse a `type: wireguard` proxy block into a [`WireGuardAdapter`]
+/// (issue #899 Phase-1; `WireGuard` is accepted too, per docs/wireguard.md).
+///
+/// Required fields: `server`, `port`, `private-key`, `public-key` (base64,
+/// standard encoding, exactly 32 bytes decoded). Optional: `ip`, `ipv6`
+/// (tunnel interface addresses — bare address or CIDR; the prefix is
+/// meaningless on a point-to-point WG interface and is stripped),
+/// `allowed-ips` (list of CIDRs; absent/empty → the adapter applies the
+/// catch-all `0.0.0.0/0` + `::/0`), `pre-shared-key`, `reserved` (3-byte
+/// list or base64 → 3 bytes), `mtu`, `udp`, `remote-dns-resolve`,
+/// `persistent-keepalive`, `dns`, `ip-stack`.
+///
+/// # Hard errors (Class A per ADR-0002)
+///
+/// - `amnezia-wg-option` present — AmneziaWG is not in this build.
+/// - `dialer-proxy` — accepted since issue #899: the WG endpoint's UDP
+///   transport dials through the front hop's UDP association. Any proxy
+///   dialer passes the gate (a group front's UDP capability is only
+///   decidable at dial time); a UDP-less front fails `dial_udp_conn` at
+///   runtime, closed like any other endpoint bind error.
+/// - missing `server`, `port`, `private-key`, or `public-key`.
+/// - a key that is not base64, or decodes to other than 32 bytes.
+/// - `ip`/`ipv6` that is neither an address nor a CIDR of that family.
+/// - an `allowed-ips` entry that is not a CIDR.
+/// - `reserved` that is not a 3-element list or base64 → 3 bytes.
+/// - `mtu` outside 640–9000 (the floor keeps the inner IP MTU —
+///   `mtu - 64` WG overhead — at or above the 576 IPv4 minimum;
+///   `WireGuardAdapter::new` keeps the same floor as a backstop).
+/// - `ip-stack` other than `"gvisor"`/`"system"`.
+///
+/// Phase-1 accepts-but-ignores: `dns` (warns once; `remote-dns-resolve`
+/// covers tunnel-side lookups) and `ip-stack` (`gvisor` maps to the
+/// built-in smoltcp stack; `system` warns once then does the same).
+///
+/// upstream: `adapter/outbound/wireguard.go`
+#[cfg(feature = "wireguard")]
+fn parse_wireguard(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<WireGuardAdapter, String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // AmneziaWG obfuscation is Phase-3 — name the field instead of
+    // silently running the standard session the operator did not ask for.
+    if config
+        .get("amnezia-wg-option")
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(format!(
+            "wireguard[{name}]: 'amnezia-wg-option' is not supported in this build"
+        ));
+    }
+
+    let required_str = |field: &str| -> std::result::Result<&str, String> {
+        config
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("wireguard[{name}]: missing {field}"))
+    };
+    let opt_str = |field: &str| -> std::result::Result<Option<&str>, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| format!("wireguard[{name}]: '{field}' must be a string")),
+        }
+    };
+    let boolean = |field: &str, default: bool| -> std::result::Result<bool, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("wireguard[{name}]: '{field}' must be boolean")),
+        }
+    };
+    let opt_u16 = |field: &str, default: u16| -> std::result::Result<u16, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    format!("wireguard[{name}]: '{field}' must be an unsigned integer")
+                })?;
+                u16::try_from(n)
+                    .map_err(|_| format!("wireguard[{name}]: '{field}' {n} exceeds 65535"))
+            }
+        }
+    };
+
+    let server = required_str("server")?;
+    let port = required_port(config, &format!("wireguard[{name}]"))?;
+    let private_key = parse_wg_key(name, config, "private-key")?;
+    let public_key = parse_wg_key(name, config, "public-key")?;
+    let pre_shared_key = match opt_str("pre-shared-key")? {
+        None => None,
+        Some(_) => Some(parse_wg_key(name, config, "pre-shared-key")?),
+    };
+
+    // `ip`/`ipv6` are the tunnel interface addresses. A bare address or a
+    // CIDR is accepted; the prefix has no meaning on a point-to-point WG
+    // interface (the adapter assigns /32 resp. /128), so it is stripped.
+    let parse_tunnel_addr = |field: &str| -> std::result::Result<Option<std::net::IpAddr>, String> {
+        let Some(raw) = opt_str(field)? else {
+            return Ok(None);
+        };
+        if let Ok(addr) = raw.parse::<std::net::IpAddr>() {
+            return Ok(Some(addr));
+        }
+        if let Ok(net) = raw.parse::<ipnet::IpNet>() {
+            return Ok(Some(net.addr()));
+        }
+        Err(format!(
+            "wireguard[{name}]: '{field}' must be an IP address or CIDR"
+        ))
+    };
+    let ip: Option<Ipv4Addr> = match parse_tunnel_addr("ip")? {
+        None => None,
+        Some(std::net::IpAddr::V4(a)) => Some(a),
+        Some(std::net::IpAddr::V6(_)) => {
+            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"));
+        }
+    };
+    let ipv6: Option<Ipv6Addr> = match parse_tunnel_addr("ipv6")? {
+        None => None,
+        Some(std::net::IpAddr::V6(a)) => Some(a),
+        Some(std::net::IpAddr::V4(_)) => {
+            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"));
+        }
+    };
+
+    let allowed_ips = parse_wg_allowed_ips(name, config)?;
+    let reserved = parse_wg_reserved(name, config)?;
+
+    let mtu = opt_u16("mtu", 1420)?;
+    if !(640..=9000).contains(&mtu) {
+        return Err(format!(
+            "wireguard[{name}]: 'mtu' must be in 640..=9000 (outer MTU; \
+             inner = mtu - 64 WG overhead must be >= 576)"
+        ));
+    }
+    let udp = boolean("udp", true)?;
+    let remote_dns_resolve = boolean("remote-dns-resolve", true)?;
+    let persistent_keepalive = opt_u16("persistent-keepalive", 0)?;
+
+    // `dns` is parsed and stored but ignored in Phase-1 — tunnel-side
+    // resolution goes through `remote-dns-resolve` and the injected
+    // resolver. Warn once per parse so generated mihomo configs keep
+    // loading without pretending per-node tunnel DNS works.
+    let dns_present = config.get("dns").is_some_and(|v| !v.is_null());
+    let dns: Vec<String> = match config.get("dns") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("wireguard[{name}]: 'dns' entries must be strings"))
+            })
+            .collect::<std::result::Result<_, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "wireguard[{name}]: 'dns' must be a nameserver string or list"
+            ));
+        }
+    };
+    if dns_present {
+        tracing::warn!(
+            "wireguard {name}: 'dns' is accepted but ignored in Phase-1 \
+             (remote-dns-resolve covers tunnel-side lookups)"
+        );
+    }
+
+    // Phase-1 runs one userspace stack — smoltcp. `gvisor` is the same
+    // role in mihomo terms, so it is accepted silently; `system` maps to
+    // smoltcp with a warn rather than a hard error so such configs keep
+    // loading (docs/wireguard.md). Every other value — including
+    // mihomo's `{mode, congestion-controller}` object form — is a named
+    // error instead of a silent semantic change.
+    match config.get("ip-stack") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(stack)) => match stack.as_str() {
+            "" | "gvisor" => {}
+            "system" => tracing::warn!(
+                "wireguard {name}: 'ip-stack: system' maps to the built-in \
+                 smoltcp stack — no kernel WireGuard mode in Phase-1"
+            ),
+            other => {
+                return Err(format!(
+                    "wireguard[{name}]: 'ip-stack' \"{other}\" is not supported — \
+                     this build runs the smoltcp userspace stack \
+                     (accepted: \"gvisor\", \"system\")"
+                ));
+            }
+        },
+        Some(_) => {
+            return Err(format!(
+                "wireguard[{name}]: 'ip-stack' must be \"gvisor\" or \"system\""
+            ));
+        }
+    }
+
+    WireGuardAdapter::new(WireGuardConfig {
+        name: name.to_string(),
+        server: server.to_string(),
+        port,
+        private_key,
+        public_key,
+        pre_shared_key,
+        ip,
+        ipv6,
+        allowed_ips,
+        reserved,
+        mtu,
+        udp,
+        remote_dns_resolve,
+        persistent_keepalive,
+        dns,
+    })
+    .map_err(|e| format!("wireguard[{name}]: {e}"))
+}
+
+/// Decode a required WireGuard key field: base64 (standard alphabet, as
+/// every WG tool emits) that must come out to exactly 32 bytes.
+#[cfg(feature = "wireguard")]
+fn parse_wg_key(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<[u8; 32], String> {
+    use base64::Engine;
+    let raw = config
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("wireguard[{name}]: missing {field}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|_| format!("wireguard[{name}]: '{field}' must be base64"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("wireguard[{name}]: '{field}' must decode to exactly 32 bytes"))
+}
+
+/// `allowed-ips`: each entry must be a CIDR (`addr/prefix`). An absent or
+/// empty list is *not* an error — [`WireGuardAdapter::new`] substitutes
+/// the catch-all `0.0.0.0/0` + `::/0` default at construction.
+#[cfg(feature = "wireguard")]
+fn parse_wg_allowed_ips(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Vec<ipnet::IpNet>, String> {
+    match config.get("allowed-ips") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                let s = v.as_str().ok_or_else(|| {
+                    format!("wireguard[{name}]: 'allowed-ips' entries must be CIDR strings")
+                })?;
+                s.parse::<ipnet::IpNet>().map_err(|_| {
+                    format!("wireguard[{name}]: 'allowed-ips' entry '{s}' is not a valid CIDR")
+                })
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "wireguard[{name}]: 'allowed-ips' must be a list of CIDR strings"
+        )),
+    }
+}
+
+/// `reserved` — the 3-byte Cloudflare WARP client identifier: a YAML list
+/// of three bytes (`[13, 53, 133]`) or a base64 string decoding to exactly
+/// 3 bytes (`"DTWF"`). The pump overwrites bytes 1–4 of each outbound WG
+/// datagram with it after encapsulation.
+#[cfg(feature = "wireguard")]
+fn parse_wg_reserved(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<[u8; 3]>, String> {
+    use base64::Engine;
+    match config.get("reserved") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(list)) => {
+            if list.len() != 3 {
+                return Err(format!(
+                    "wireguard[{name}]: 'reserved' must be a list of exactly 3 bytes"
+                ));
+            }
+            let mut out = [0u8; 3];
+            for (i, v) in list.iter().enumerate() {
+                let n = v.as_u64().ok_or_else(|| {
+                    format!("wireguard[{name}]: 'reserved' entries must be bytes (0-255)")
+                })?;
+                out[i] = u8::try_from(n).map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' entries must be bytes (0-255)")
+                })?;
+            }
+            Ok(Some(out))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' must be a 3-byte list or base64")
+                })?;
+            <[u8; 3]>::try_from(bytes.as_slice())
+                .map(Some)
+                .map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' base64 must decode to exactly 3 bytes")
+                })
+        }
+        Some(_) => Err(format!(
+            "wireguard[{name}]: 'reserved' must be a 3-byte list or base64"
+        )),
+    }
+}
+
 /// Parse the `strategy` field for a `load-balance` group.
 ///
 /// Hard error on unknown values (Class A per ADR-0002): unknown strategy means
 /// the user may get different distribution behaviour than intended.
 /// Upstream also rejects (`errStrategy` in adapter/outboundgroup/loadbalance.go).
-fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
+pub(crate) fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
     match strategy.unwrap_or("round-robin") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
         // Upstream maps "" to consistent-hashing (`case "",
@@ -2282,7 +3423,9 @@ fn ws_max_early_data(ws_opts: Option<&serde_json::Value>) -> usize {
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
 /// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
-/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
+/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP rides
+///   a Mux.Cool substream with the flow addon (or reports unsupported
+///   without the `mux` feature)
 /// - `reality-opts.short-id` given as a bare YAML number (e.g. `0x1f`) —
 ///   coerced to its decimal digits before hex-decoding (matching mihomo),
 ///   which can silently reinterpret the value; quote it to preserve the
@@ -2292,6 +3435,7 @@ fn parse_vless(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<VlessAdapter, String> {
     let server = config
         .get("server")
@@ -2342,10 +3486,19 @@ fn parse_vless(
         .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or("tcp");
-    let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
     // ── Reality opts ──────────────────────────────────────────────────────
     let reality = parse_vless_reality_opts(name, config)?;
+    // `global-client-fingerprint` (issue #974) fills an omitted node
+    // fingerprint; under REALITY an explicit `none` stays the literal
+    // "none" so `HelloProfile::resolve` warns and falls back to Chrome —
+    // mihomo's behavior, since no unshaped hello exists to send there.
+    let client_fingerprint = resolve_node_client_fingerprint(
+        config,
+        "vless",
+        global_client_fingerprint,
+        reality.is_some(),
+    )?;
     if reality.is_some() {
         if !tls {
             return Err("vless: reality-opts requires `tls: true`".into());
@@ -2368,11 +3521,6 @@ fn parse_vless(
     let vless_encryption = parse_vless_encryption(encryption)?;
     #[cfg(not(feature = "vless-encryption"))]
     parse_vless_encryption(encryption)?;
-
-    // ── client-fingerprint ──────────────────────────────────────────────
-    // Passed through to TlsConfig.fingerprint; the TLS layer selects the
-    // BoringSSL backend when the `boring-tls` feature is compiled in,
-    // otherwise falls back to rustls with a stub warning.
 
     // ── Flow parsing ──────────────────────────────────────────────────────
     let flow_str = config.get("flow").and_then(|v| v.as_str()).unwrap_or("");
@@ -2470,8 +3618,10 @@ fn parse_vless(
         tracing::warn!(
             proxy = %name,
             "flow: xtls-rprx-vision applies to TCP only; UDP relays on \
-             this proxy will use plain VLESS (Vision's inner-TLS splice \
-             is not defined for UDP datagrams). (Class B divergence)"
+             this proxy ride a per-association Mux.Cool substream carrying \
+             the flow addon (as upstream clients do — strict servers reject \
+             a bare Cmd::Udp on vision accounts). Without the `mux` feature \
+             this node reports `udp: false`. (Class B divergence)"
         );
     }
 
@@ -2488,7 +3638,7 @@ fn parse_vless(
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
         tls_cfg.alpn = default_transport_alpn(network, alpn);
-        tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
+        tls_cfg.fingerprint = client_fingerprint;
         tls_cfg.reality = reality;
 
         // ── ECH opts ────────────────────────────────────────────────────
@@ -2748,10 +3898,35 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
-    let Some(mux_cfg) = mux_config_block(name, config)? else {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the advisory warnings silenced — used by
+/// the early shape gate (`check_mux_shape`) so they only emit once, from
+/// the real parse below.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
+    let Some(mux_cfg) = mux_config_block(name, config, quiet)? else {
         return Ok(None);
     };
     let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
+    // `brutal-opts` shape-decodes eagerly — upstream mapstructure walks
+    // the whole `smux` map even when `smux.enabled` is false, so a
+    // malformed block is a node defect either way (verified upstream:
+    // garbage under `enabled: false` still errors).
+    let brutal = parse_brutal_opts(name, mux_cfg)?;
     if !enabled {
         return Ok(None);
     }
@@ -2762,7 +3937,7 @@ fn parse_mux_options(
         Some(other) => {
             return Err(format!(
                 "{name}: mux option 'protocol' must be a string, got {other:?}"
-            ))
+            ));
         }
     };
     let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
@@ -2772,29 +3947,38 @@ fn parse_mux_options(
             "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
-    // max-connections=0 AND max-streams=0 means one physical connection
-    // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
-    // operator wants, so say so.
-    let max_connections = mux_usize_field(name, mux_cfg, "max-connections", 4)?;
-    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", 4)?;
-    if max_connections == 0 && max_streams == 0 {
+    // The shipped 4/4/4 defaults live on `MuxOptions::default` — the parse
+    // fallbacks read it so the two sources can never drift apart.
+    let defaults = meow_proxy::mux::MuxOptions::default();
+    let max_connections =
+        mux_usize_field(name, mux_cfg, "max-connections", defaults.max_connections)?;
+    let min_streams = mux_usize_field(name, mux_cfg, "min-streams", defaults.min_streams)?;
+    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", defaults.max_streams)?;
+    // All three at 0 turns off pooling across busy carriers: an idle
+    // session is still reused, but one already carrying a stream is never
+    // shared, so every *concurrent* stream dials its own carrier — almost
+    // never what an operator wants, so say so.
+    if !quiet && max_connections == 0 && min_streams == 0 && max_streams == 0 {
         tracing::warn!(
             proxy = %name,
-            "mux: max-connections and max-streams are both 0 — every stream dials its own \
-             physical connection (mirrors mihomo); consider the 4/4/4 defaults"
+            "mux: max-connections, min-streams and max-streams are all 0 — a carrier that \
+             already holds a stream is never shared, so concurrent streams each dial their \
+             own connection; consider the 4/4/4 defaults"
         );
     }
-    // Parsed but unsupported upstream fields: `statistic` (per-connection
-    // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
-    // Linux-only upstream).  Warn once so operators know the divergence.
-    for unsupported in ["statistic", "brutal-opts"] {
-        if mux_cfg.get(unsupported).is_some() {
-            tracing::warn!(
-                proxy = %name,
-                "mux option '{}' is not supported in meow-rs and will be ignored",
-                unsupported
-            );
-        }
+    // `statistic` opts into mihomo's per-carrier traffic attribution, which
+    // meow does not model — the logical-flow APIs (`GET /connections`,
+    // `GET /traffic`, `GET /statistics`) already report the same totals.
+    // Validate the flag so a malformed value is a node defect like every
+    // other mux bool, but warn rather than fail when set: the node still
+    // works, just without carrier-level accounting.
+    if mux_bool_field(name, mux_cfg, "statistic", false)? && !quiet {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'statistic' is not supported in meow-rs (carrier-level traffic \
+             accounting is not modeled); use GET /connections or GET /statistics for \
+             per-flow counters"
+        );
     }
     // Padding is a sing-mux session layer; Mux.Cool has none, so honouring
     // the flag is impossible and ignoring it would send the unpadded traffic
@@ -2807,13 +3991,37 @@ fn parse_mux_options(
              or pick a sing-mux protocol"
         ));
     }
+    // The bandwidth exchange lives on a sing-mux control stream
+    // (`_BrutalBwExchange`); Mux.Cool's frame layer has no such stream,
+    // so the combination can never negotiate — a node defect, same class
+    // as padding+above rather than a silent no-op.
+    if brutal.is_some() && protocol == meow_proxy::mux::Protocol::MuxCool {
+        return Err(format!(
+            "{name}: mux option 'brutal-opts' is sing-mux only (smux/yamux/h2mux); \
+             Mux.Cool (`protocol: muxcool`) has no bandwidth exchange"
+        ));
+    }
+    // The exchange itself runs on every platform (the server caps its own
+    // send side) — only the client socket's rate cap needs Linux's
+    // tcp-brutal module. Say so once per enabled node rather than
+    // silently applying half the feature.
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    if !quiet && brutal.is_some() {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'brutal-opts': the TCP Brutal rate cap applies only on Linux — \
+             the _BrutalBwExchange negotiation still runs, but this platform skips the \
+             carrier socket's rate cap"
+        );
+    }
     Ok(Some(meow_proxy::mux::MuxOptions {
         protocol,
         padding,
         max_connections,
-        min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
+        min_streams,
         max_streams,
         only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
+        brutal,
     }))
 }
 
@@ -2834,12 +4042,31 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
-    if let Some(mux_cfg) = mux_config_block(name, config)? {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the not-compiled warning silenced for the
+/// early shape gate (`check_mux_shape`).
+#[cfg(all(
+    not(feature = "mux"),
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<(), String> {
+    if let Some(mux_cfg) = mux_config_block(name, config, quiet)? {
         let enabled = mux_cfg
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if enabled {
+        if enabled && !quiet {
             tracing::warn!(
                 proxy = %name,
                 "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
@@ -2858,15 +4085,18 @@ fn parse_mux_options(
 fn mux_config_block<'a>(
     name: &str,
     config: &'a HashMap<String, serde_json::Value>,
+    quiet: bool,
 ) -> std::result::Result<Option<&'a serde_json::Value>, String> {
     let block = match (config.get("smux"), config.get("mux")) {
         (Some(_), Some(_)) => {
             // Migration-friendly: prefer the canonical key and say so,
             // instead of rejecting the node for a likely leftover.
-            tracing::warn!(
-                proxy = %name,
-                "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
-            );
+            if !quiet {
+                tracing::warn!(
+                    proxy = %name,
+                    "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
+                );
+            }
             config.get("smux")
         }
         (Some(config), None) | (None, Some(config)) => Some(config),
@@ -2933,6 +4163,179 @@ fn mux_usize_field(
         )),
     }
 }
+
+/// mihomo `smux.brutal-opts` — `SingMuxOption.BrutalOpts BrutalOption`
+/// (`{enabled, up, down}`), decoded with upstream's eager-shape contract:
+/// a scalar/list `brutal-opts` and a non-stringable `up`/`down` are hard
+/// errors **even under `smux.enabled: false`** — the caller runs this
+/// before its `!enabled` early return for exactly that reason. `null`
+/// and absent decode to defaults; unknown sub-keys (`debug:`) are
+/// tolerated.
+///
+/// Returns `Some(MuxBrutal)` whenever `enabled` is set — including
+/// `enabled: true` with zero/unparseable rates, where the negotiation
+/// still runs (the kernel just gets rate 0, upstream parity).
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_brutal_opts(
+    name: &str,
+    mux_cfg: &serde_json::Value,
+) -> std::result::Result<Option<meow_proxy::mux::MuxBrutal>, String> {
+    let Some(raw) = mux_cfg.get("brutal-opts") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(map) = raw.as_object() else {
+        return Err(format!(
+            "{name}: mux option 'brutal-opts' expected a map, got {raw:?}"
+        ));
+    };
+    // `enabled` weak-decodes a bool or a number — upstream's
+    // WeaklyTypedInput treats any nonzero as true; a string `enabled`
+    // is a hard error there, so it is one here.
+    let enabled = match map.get("enabled") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
+        Some(other) => {
+            return Err(format!(
+                "{name}: mux option 'brutal-opts.enabled' must be a boolean or number, got {other:?}"
+            ));
+        }
+    };
+    let up = brutal_weak_string(name, map.get("up"), "brutal-opts.up")?;
+    let down = brutal_weak_string(name, map.get("down"), "brutal-opts.down")?;
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(meow_proxy::mux::MuxBrutal {
+        send_bps: meow_proxy::mux::brutal::string_to_bps(&up),
+        receive_bps: meow_proxy::mux::brutal::string_to_bps(&down),
+    }))
+}
+
+/// One `brutal-opts` rate field under mihomo's weak string decoder
+/// (`up`/`down` are Go `string` fields): string verbatim, `null`/absent
+/// → `""`, number → its rendered value (`50`→`"50"`, `50.5`→`"50.5"`,
+/// integral `50.0`→`"50"`); bool/list/map hard-error like upstream's
+/// "expected type 'string'" failure. What the rendered text means —
+/// Mbps, Bps, garbage — is `string_to_bps`'s call, not this layer's.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn brutal_weak_string(
+    name: &str,
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<String, String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => {
+            let rendered = match n.as_f64() {
+                // Go renders the weak-decoded float without a fraction —
+                // `50.0` decodes to "50". Only normalize inside the
+                // exactly-representable integer range (|f| ≤ 2^53): a
+                // larger float's raw repr stands, and the rate parser's
+                // verdict on it is identical either way.
+                Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 => {
+                    format!("{}", f as i64)
+                }
+                _ => n.to_string(),
+            };
+            Ok(rendered)
+        }
+        other => Err(format!(
+            "{name}: mux option '{key}' must be a string or number, got {other:?}"
+        )),
+    }
+}
+
+/// Cheap `smux:`/`mux:` shape gate over the static `proxies:` list, run
+/// before ECH pre-resolution so a malformed block rejects the document
+/// without the network fetches ever opening a socket (issue #974
+/// review — local shape/range checks precede candidate network work).
+/// Only the mux-capable leaf types are checked — the same arms that
+/// parse the block at build time. The gate runs quiet: advisory
+/// warnings belong to the real parse below, which re-runs the same
+/// validation.
+///
+/// `strict` mirrors the real parse's strictness: a malformed block is a
+/// *node-level* defect, which only `strict` promotes to a document
+/// error — the rejection this gate exists to order before ECH I/O.
+/// Lenient mode warn-drops the node in the real parse and the document
+/// succeeds, so the gate skips the scan entirely.
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+))]
+pub fn check_mux_shape(
+    raw: &crate::raw::RawConfig,
+    strict: bool,
+) -> std::result::Result<(), String> {
+    if !strict {
+        return Ok(());
+    }
+    let Some(proxies) = raw.proxies.as_deref() else {
+        return Ok(());
+    };
+    for node in proxies {
+        let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        // Exactly the types whose parse arms consume the block — other
+        // protocols never reach it, so their `smux:` key is not ours to
+        // reject here.
+        let capable = (kind == "ss" && cfg!(feature = "ss"))
+            || (kind == "trojan" && cfg!(feature = "trojan"))
+            || (kind == "vless" && cfg!(feature = "vless"))
+            || (kind == "vmess" && cfg!(feature = "vmess"));
+        if !capable {
+            continue;
+        }
+        let name = node
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        parse_mux_options_impl(name, node, true)?;
+    }
+    Ok(())
+}
+
+/// [`check_mux_shape`] when no mux-capable protocol is compiled in.
+#[cfg(not(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+)))]
+pub fn check_mux_shape(
+    _raw: &crate::raw::RawConfig,
+    _strict: bool,
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 #[cfg(feature = "vless")]
 fn parse_vless_xhttp_config(
     config: &HashMap<String, serde_json::Value>,
@@ -3377,6 +4780,9 @@ fn parse_vless_reality_opts(
         public_key,
         short_id,
         support_x25519_mlkem768,
+        // The REALITY timestamp is a protocol field; ride the shared
+        // protocol clock so `ntp:` offsets apply (issue #974).
+        protocol_clock: Some(meow_common::protocol_now),
     }))
 }
 
@@ -3534,6 +4940,7 @@ fn parse_vmess(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<meow_proxy::VmessAdapter, String> {
     use meow_proxy::vmess::header::Security;
 
@@ -3614,7 +5021,8 @@ fn parse_vmess(
         .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or("tcp");
-    let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
+    let client_fingerprint =
+        resolve_node_client_fingerprint(config, "vmess", global_client_fingerprint, false)?;
 
     // Build transport chain (same pattern as VLESS)
     let mut chain = TransportChain::empty();
@@ -3629,7 +5037,7 @@ fn parse_vmess(
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
         tls_cfg.alpn = default_transport_alpn(network, alpn);
-        tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
+        tls_cfg.fingerprint = client_fingerprint;
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vmess: TLS layer error: {e}"))?;
         chain.push(Box::new(tls_layer));
@@ -3720,7 +5128,7 @@ pub fn parse_proxy_group_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -3762,7 +5170,7 @@ pub fn parse_proxy_group_lenient_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -3780,7 +5188,7 @@ fn parse_proxy_group_inner(
     include_all_proxies: &[Arc<dyn Proxy>],
     strict: bool,
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selector_store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
 
@@ -3882,7 +5290,7 @@ fn parse_proxy_group_inner(
             let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots)
                 .with_display(group_display(config));
             if let Some(store) = selector_store {
-                group = group.with_store(Arc::clone(store));
+                group = group.with_store(store.clone());
             }
             Ok(Arc::new(group))
         }
@@ -4071,6 +5479,21 @@ fn parse_relay_group(
         ));
     }
 
+    // Hard-error: a statically declared `type: rematch` hop can never
+    // carry the chain — the leaf's only action is a routing re-entry,
+    // not a dial (issue #974: "Rematch is not a meow relay transport
+    // hop; reject statically known uses"). A *group* member's dynamic
+    // rematch pick is the probe's business: `RelayGroup::unwrap_proxy`
+    // surfaces it so the scan transitions, and the cycle guard then
+    // closes the loop fail-closed.
+    if let Some(hop) = proxies.iter().find(|p| p.rematch_action().is_some()) {
+        return Err(format!(
+            "relay group '{name}': member '{}' is a rematch control outbound — \
+             it cannot be a relay transport hop",
+            hop.name()
+        ));
+    }
+
     // Warn-once on inert fields (Class B — relay has no probe loop and
     // consumes no provider slots).
     warn_inert_health_fields("relay", name, config);
@@ -4108,6 +5531,299 @@ mod tests {
         serde_saphyr::from_str(yaml).unwrap()
     }
 
+    /// Omitted `smux:` pool fields resolve to `MuxOptions::default` — the
+    /// parser must not carry a second copy of the 4/4/4 constants that can
+    /// drift from the runtime source of truth.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_omitted_pool_fields_use_muxoptions_default() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts, meow_proxy::mux::MuxOptions::default());
+    }
+
+    /// A single explicit field overrides only that field; the rest still
+    /// come from `MuxOptions::default`.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_partial_override_keeps_other_defaults() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  max-streams: 2\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        let expected = meow_proxy::mux::MuxOptions {
+            max_streams: 2,
+            ..Default::default()
+        };
+        assert_eq!(opts, expected);
+    }
+
+    /// The legacy `mux:` alias feeds the same parse; `smux:` wins when both
+    /// are present.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_key_takes_precedence_over_mux_alias() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\n\
+             smux:\n  enabled: true\n  max-streams: 2\n\
+             mux:\n  enabled: true\n  max-streams: 9\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts.max_streams, 2);
+    }
+
+    // ─── smux.brutal-opts (issue #974) ──────────────────────────────────
+
+    /// String rates parse through `string_to_bps` at parse time; the
+    /// weak decoder also accepts numbers and integral floats.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_parses_rates_and_weak_shapes() {
+        let brutal_of = |block: &str| -> Option<meow_proxy::mux::MuxBrutal> {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  {block}\n"
+            ));
+            parse_mux_options("n", &node).unwrap().unwrap().brutal
+        };
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 100 Mbps\n    down: 1 Gbps"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 12_500_000,
+                receive_bps: 125_000_000,
+            })
+        );
+        // Numbers coerce through the weak string decoder — `100` is the
+        // bare-int Mbps form, not bytes.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 100\n    down: 200"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 12_500_000,
+                receive_bps: 25_000_000,
+            })
+        );
+        // Integral floats normalize to the integer repr.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 50.0"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 6_250_000,
+                receive_bps: 0,
+            })
+        );
+        // `enabled` accepts the upstream 0/1 numeric forms.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: 1\n    up: 10 Mbps"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 1_250_000,
+                receive_bps: 0,
+            })
+        );
+        assert_eq!(brutal_of("brutal-opts:\n    enabled: 0"), None);
+    }
+
+    /// `enabled: true` yields `Some` even when both rates are zero or
+    /// unparseable — the exchange still runs upstream.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_enabled_with_zero_or_garbage_rates_is_some() {
+        let brutal_of = |block: &str| -> Option<meow_proxy::mux::MuxBrutal> {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  {block}\n"
+            ));
+            parse_mux_options("n", &node).unwrap().unwrap().brutal
+        };
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+        // Unparseable rates silently fall to 0 — never a parse error.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: abc\n    down: -5"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+        // Unknown sub-keys are tolerated.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    debug: true"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+    }
+
+    /// The eager shape contract: a scalar/list `brutal-opts`, a bool or
+    /// structured `up`/`down`, and a string `enabled` are hard errors —
+    /// including under `smux.enabled: false`.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_malformed_shapes_hard_error() {
+        let err_of = |mux: &str, smux_enabled: bool| -> String {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: {smux_enabled}\n  {mux}\n"
+            ));
+            parse_mux_options("n", &node).unwrap_err()
+        };
+        for smux_enabled in [true, false] {
+            for bad in ["brutal-opts: true", "brutal-opts: [1]", "brutal-opts: 5"] {
+                assert!(
+                    err_of(bad, smux_enabled).contains("'brutal-opts' expected a map"),
+                    "enabled={smux_enabled}, {bad}"
+                );
+            }
+            for bad in [
+                "brutal-opts:\n    up: true",
+                "brutal-opts:\n    up: [1]",
+                "brutal-opts:\n    down:\n      a: 1",
+            ] {
+                assert!(
+                    err_of(bad, smux_enabled).contains("must be a string or number"),
+                    "enabled={smux_enabled}, {bad}"
+                );
+            }
+            assert!(
+                err_of("brutal-opts:\n    enabled: \"yes\"", smux_enabled)
+                    .contains("'brutal-opts.enabled'"),
+                "enabled={smux_enabled} string enabled"
+            );
+        }
+        // `smux.enabled: false` with a *well-formed* block still parses
+        // clean — the eager shape check is the only part that runs.
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: false\n  brutal-opts:\n    enabled: true\n    up: 10\n",
+        );
+        assert!(parse_mux_options("n", &node).unwrap().is_none());
+    }
+
+    /// `brutal-opts` + `protocol: muxcool` is a node defect — the frame
+    /// mux has no `_BrutalBwExchange` stream to negotiate over.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_rejects_muxcool() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  protocol: muxcool\n  brutal-opts:\n    enabled: true\n    up: 10 Mbps\n",
+        );
+        let err = parse_mux_options("n", &node).unwrap_err();
+        assert!(err.contains("sing-mux only"), "{err}");
+    }
+
+    /// The quiet early gate (`check_mux_shape`) runs the same eager
+    /// shape decode — a malformed `brutal-opts` under `smux.enabled:
+    /// false` must reject the document there too, before ECH I/O, not
+    /// only in the real parse below it.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn check_mux_shape_propagates_brutal_opts_errors() {
+        // `check_mux_shape` filters nodes on their compiled `type` — pick
+        // whichever mux-capable protocol this build carries (the gate
+        // never inspects credentials, so a stub `password` satisfies all).
+        let kind = if cfg!(feature = "trojan") {
+            "trojan"
+        } else if cfg!(feature = "vless") {
+            "vless"
+        } else if cfg!(feature = "ss") {
+            "ss"
+        } else {
+            "vmess"
+        };
+        let raw_of = |smux: &str| -> crate::raw::RawConfig {
+            serde_saphyr::from_str(&format!(
+                "proxies:\n  - name: n\n    type: {kind}\n    server: s\n    port: 443\n    password: p\n    smux:\n      {smux}\n"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "enabled: false\n      brutal-opts: [1]",
+            "enabled: false\n      brutal-opts:\n        up: true",
+            "enabled: true\n      brutal-opts: 5",
+        ] {
+            let err = check_mux_shape(&raw_of(bad), true).unwrap_err();
+            assert!(
+                err.contains("brutal-opts"),
+                "the quiet gate must surface the shape error: {bad} -> {err}"
+            );
+        }
+        // A well-formed block under a disabled smux still passes.
+        check_mux_shape(
+            &raw_of("enabled: false\n      brutal-opts:\n        enabled: true\n        up: 10"),
+            true,
+        )
+        .unwrap();
+        // Lenient mode skips the gate entirely — malformed nodes are
+        // warn-dropped by the real parse instead.
+        check_mux_shape(&raw_of("enabled: false\n      brutal-opts: [1]"), false).unwrap();
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn lenient_base64_accepts_noncanonical_trailing_bits() {
@@ -4118,6 +5834,246 @@ mod tests {
         assert_eq!(decoded.len(), 32);
         // Garbage is still rejected.
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
+    }
+
+    // ─── global-client-fingerprint (issue #974) ─────────────────────────
+
+    #[test]
+    fn normalize_client_fingerprint_trims_lowercases_and_clears() {
+        for (raw, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("   "), None),
+            (Some("none"), None),
+            (Some(" NoNe "), None),
+            (Some(" Chrome "), Some("chrome")),
+            (Some("FIREFOX120"), Some("firefox120")),
+            (Some("random"), Some("random")),
+        ] {
+            assert_eq!(
+                normalize_client_fingerprint(raw).as_deref(),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// The per-node resolution contract (mihomo's `ClientFingerprint == ""`
+    /// fallback): absent/null/empty/whitespace inherits the normalized
+    /// global, an explicit `none` opts out — literally under REALITY, where
+    /// no unshaped hello exists — and an explicit value always wins.
+    #[test]
+    fn resolve_node_client_fingerprint_precedence() {
+        let node = |extra: &str| -> HashMap<String, serde_json::Value> {
+            serde_saphyr::from_str(&format!("name: n\ntype: socks5\n{extra}")).unwrap()
+        };
+        for cfg in [
+            node(""),
+            node("client-fingerprint: null\n"),
+            node("client-fingerprint: \"\"\n"),
+            node("client-fingerprint: \"  \"\n"),
+        ] {
+            assert_eq!(
+                resolve_node_client_fingerprint(&cfg, "ss", Some(" Chrome "), false)
+                    .unwrap()
+                    .as_deref(),
+                Some("chrome"),
+                "{cfg:?} must inherit the global"
+            );
+            assert_eq!(
+                resolve_node_client_fingerprint(&cfg, "ss", None, false).unwrap(),
+                None,
+                "{cfg:?} must stay unset with no global"
+            );
+        }
+        let opt_out = node("client-fingerprint: none\n");
+        assert_eq!(
+            resolve_node_client_fingerprint(&opt_out, "ss", Some("chrome"), false).unwrap(),
+            None,
+            "explicit none must opt out of the global"
+        );
+        assert_eq!(
+            resolve_node_client_fingerprint(&opt_out, "vless", Some("chrome"), true)
+                .unwrap()
+                .as_deref(),
+            Some("none"),
+            "REALITY keeps the literal so profile resolution warns + falls back"
+        );
+        let winner = node("client-fingerprint: Safari\n");
+        assert_eq!(
+            resolve_node_client_fingerprint(&winner, "ss", Some("chrome"), false)
+                .unwrap()
+                .as_deref(),
+            Some("safari"),
+            "an explicit node value wins, normalized"
+        );
+    }
+
+    #[test]
+    fn resolve_node_client_fingerprint_rejects_non_string() {
+        let cfg: HashMap<String, serde_json::Value> =
+            serde_saphyr::from_str("name: n\ntype: vmess\nclient-fingerprint: [chrome]\n").unwrap();
+        assert_eq!(
+            resolve_node_client_fingerprint(&cfg, "vmess", None, false).unwrap_err(),
+            "vmess: client-fingerprint must be a string"
+        );
+    }
+
+    /// VLESS + REALITY is the headline contract: a verbatim mihomo config
+    /// declares the fingerprint only at the top level, so the node must
+    /// inherit it — while the same node with neither a node nor a global
+    /// fingerprint keeps the uTLS hard error.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_reality_inherits_global_client_fingerprint() {
+        const NODE: &str = "name: v\ntype: vless\nserver: example.com\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\nreality-opts:\n  public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo\n";
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+
+        let bare = proxy_config(NODE);
+        let err = parse_proxy_with_dialer_and_fp(&bare, &direct, false, None, None)
+            .err()
+            .expect("REALITY without any fingerprint must stay refused");
+        assert!(
+            err.contains("REALITY is based on uTLS, please set a client-fingerprint"),
+            "{err}"
+        );
+        parse_proxy_with_dialer_and_fp(&bare, &direct, false, Some("chrome"), None)
+            .expect("the global fingerprint must satisfy REALITY");
+
+        // An explicit node fingerprint wins over the global; an explicit
+        // `none` stays the REALITY literal (warn + Chrome fallback), which
+        // counts as set for the uTLS gate.
+        let own = proxy_config(&format!("{NODE}client-fingerprint: firefox\n"));
+        parse_proxy_with_dialer_and_fp(&own, &direct, false, Some("chrome"), None)
+            .expect("the node fingerprint must apply");
+        let none = proxy_config(&format!("{NODE}client-fingerprint: none\n"));
+        parse_proxy_with_dialer_and_fp(&none, &direct, false, Some("chrome"), None)
+            .expect("explicit none stays the REALITY literal, not a parse error");
+    }
+
+    /// `quic: true` runs over quiche — no uTLS exists to shape, so the
+    /// global must not be inherited there, while a per-node
+    /// `client-fingerprint` keeps its "cannot honor" rejection.
+    #[cfg(feature = "trusttunnel-h3")]
+    #[test]
+    fn trusttunnel_quic_ignores_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let quic = proxy_config(
+            "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\n",
+        );
+        let adapter = parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"), None)
+            .expect("the global fingerprint is TCP-only — H3 must not inherit it");
+        assert_eq!(
+            adapter.client_fingerprint(),
+            None,
+            "quiche has no uTLS to shape: the adapter must report no baked fingerprint"
+        );
+        let with_node = proxy_config(
+            "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\nclient-fingerprint: chrome\n",
+        );
+        let err = parse_proxy_with_dialer_and_fp(&with_node, &direct, false, Some("chrome"), None)
+            .err()
+            .expect("a per-node fingerprint under H3 stays refused");
+        assert!(err.contains("cannot honor client-fingerprint"), "{err}");
+    }
+
+    /// Hysteria2's `fingerprint` is certificate pinning, a different field —
+    /// the global uTLS fallback must not reach it.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_is_unaffected_by_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let cfg =
+            proxy_config("name: h\ntype: hysteria2\nserver: h.test\nport: 443\npassword: p\n");
+        parse_proxy_with_dialer_and_fp(&cfg, &direct, false, Some("chrome"), None)
+            .expect("hysteria2 must ignore the uTLS global entirely");
+    }
+
+    /// The per-site wiring (issue #974): the normalized global must reach
+    /// each protocol's own TLS config — `client_fingerprint()` reads what
+    /// the adapter actually baked, so a call site that dropped the global
+    /// argument cannot fake it. shadow-tls v1 keeps its upstream TLS 1.2
+    /// cap: even an inherited fingerprint is dropped there.
+    #[cfg(any(
+        feature = "vmess",
+        feature = "anytls",
+        feature = "shadow-tls",
+        feature = "trusttunnel"
+    ))]
+    #[tokio::test]
+    async fn protocol_sites_inherit_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let baked = |yaml: &str, global: Option<&str>| {
+            parse_proxy_with_dialer_and_fp(&proxy_config(yaml), &direct, false, global, None)
+                .map(|proxy| proxy.client_fingerprint().map(str::to_string))
+        };
+
+        #[cfg(feature = "vmess")]
+        {
+            // `tls: true` — the fingerprint lands on the TLS layer.
+            assert_eq!(
+                baked(
+                    "name: v\ntype: vmess\nserver: v.test\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\n",
+                    Some(" Chrome "),
+                ),
+                Ok(Some("chrome".to_string())),
+                "vmess: the normalized global must reach the TLS config"
+            );
+            // The node's own value still wins over the global.
+            assert_eq!(
+                baked(
+                    "name: v\ntype: vmess\nserver: v.test\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\nclient-fingerprint: firefox\n",
+                    Some("chrome"),
+                ),
+                Ok(Some("firefox".to_string()))
+            );
+        }
+        #[cfg(feature = "anytls")]
+        assert_eq!(
+            baked(
+                "name: a\ntype: anytls\nserver: a.test\nport: 443\npassword: p\n",
+                Some("chrome"),
+            ),
+            Ok(Some("chrome".to_string())),
+            "anytls: the global must reach the TLS config"
+        );
+        #[cfg(feature = "shadow-tls")]
+        {
+            const SS: &str = "name: s\ntype: ss\nserver: s.test\nport: 8388\ncipher: aes-256-gcm\npassword: pw\nplugin: shadow-tls\n";
+            assert_eq!(
+                baked(
+                    &format!(
+                        "{SS}plugin-opts:\n  host: cover.test\n  version: 3\n  password: psk\n"
+                    ),
+                    Some("chrome"),
+                ),
+                Ok(Some("chrome".to_string())),
+                "shadow-tls: the global must reach the cover handshake"
+            );
+            // v1's TLS 1.2 cap drops even an inherited fingerprint.
+            assert_eq!(
+                baked(
+                    &format!(
+                        "{SS}plugin-opts:\n  host: cover.test\n  version: 1\n  password: psk\n"
+                    ),
+                    Some("chrome"),
+                ),
+                Ok(None),
+            );
+        }
+        #[cfg(feature = "trusttunnel")]
+        assert_eq!(
+            baked(
+                "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\n",
+                Some("chrome"),
+            ),
+            Ok(Some("chrome".to_string())),
+            "trusttunnel h2: the global must reach the TLS config"
+        );
     }
 
     /// `support-x25519mlkem768` reaches `RealityConfig` verbatim; absent
@@ -4755,7 +6711,7 @@ tls: true
         let slot = meow_dns::new_resolver_slot(Arc::new(main));
 
         let cfg = direct_config("name: 直连\ntype: direct\n");
-        let proxy = parse_static_proxy(&cfg, true, Some(&slot)).unwrap();
+        let proxy = parse_static_proxy(&cfg, true, Some(&slot), None, None).unwrap();
         let meta = Metadata {
             network: meow_common::Network::Udp,
             host: "node.test".into(),
@@ -4877,6 +6833,41 @@ tls: true
             "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\nudp: true\n",
         );
         assert!(parse_proxy(&on).unwrap().support_udp());
+    }
+
+    /// `dialer-proxy` injects into anytls (Batch 2): the vendored client
+    /// threads every session's transport through the chained dialer, so
+    /// the parse accepts it and `dialing_through` records the hop. A
+    /// `NamedProxyDialer` reports `is_proxy()` without resolving — target
+    /// lookup only happens at dial time.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_accepts_dialer_proxy_injection() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}dialer-proxy: front\n"));
+        let chained = super::parse_proxy_with_dialer(&cfg, &dialer, false)
+            .expect("anytls must accept an injected dialer");
+        assert!(chained.has_configured_dialer());
+
+        // `udp: true` still advertises UDP over the chain — UoT rides the
+        // same chained session, so it only needs the front to carry TCP.
+        let cfg_udp = anytls_config(&format!("{ANYTLS_BASE}udp: true\ndialer-proxy: front\n"));
+        let chained_udp = super::parse_proxy_with_dialer(&cfg_udp, &dialer, false)
+            .expect("anytls + udp must accept an injected dialer");
+        assert!(chained_udp.support_udp());
+        assert!(chained_udp.has_configured_dialer());
+
+        // The no-op `DirectDialer` leaves the plain parse untouched: no
+        // chain is reported for an unchained node.
+        let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::DirectDialer);
+        let plain = super::parse_proxy_with_dialer(&cfg, &direct, false).expect("unchained parse");
+        assert!(!plain.has_configured_dialer());
     }
 
     #[cfg(feature = "anytls")]
@@ -5003,10 +6994,10 @@ tls: true
         serde_saphyr::from_str(yaml).unwrap()
     }
 
-    #[cfg(all(feature = "wireguard", target_os = "linux"))]
+    #[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
     #[test]
     fn parse_wireguard_with_amnezia_option() {
-        use meow_proxy::wireguard::HRange;
+        use meow_proxy::wireguard_kernel::HRange;
         let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
         let cfg = hy2_config(&format!(
             "name: w\ntype: wireguard\nserver: 1.2.3.4\nport: 51820\nip: 172.16.0.2/32\n\
@@ -5014,7 +7005,7 @@ tls: true
              amnezia-wg-option: {{jc: 4, jmin: 40, jmax: 70, s1: 10, s3: 5, h1: 1, h2: '2', \
              h3: 3-10, h4: 4, i1: '<b 0xf6ab>', j1: x}}\n"
         ));
-        let w = super::parse_wireguard("w", &cfg).unwrap();
+        let w = super::parse_wireguard_kernel("w", &cfg).unwrap();
         assert_eq!(w.ip, Some(("172.16.0.2".parse().unwrap(), 32)));
         assert!(w.udp);
         assert_eq!(w.mtu, 1408);
@@ -5027,7 +7018,7 @@ tls: true
         assert!(parse_proxy(&cfg).is_ok());
     }
 
-    #[cfg(all(feature = "wireguard", target_os = "linux"))]
+    #[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
     #[test]
     fn parse_wireguard_peer_from_peers_list() {
         let key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -5035,12 +7026,12 @@ tls: true
             "name: w\ntype: wireguard\nipv6: fd01::2\nprivate-key: {key}\n\
              peers:\n  - {{server: wg.example, port: 2408, public-key: {key}, allowed-ips: ['0.0.0.0/0', '::/0']}}\n"
         ));
-        let w = super::parse_wireguard("w", &cfg).unwrap();
+        let w = super::parse_wireguard_kernel("w", &cfg).unwrap();
         assert_eq!((w.server.as_str(), w.port), ("wg.example", 2408));
         assert_eq!(w.allowed_ips.len(), 2);
         assert!(w.ip.is_none() && w.ipv6.is_some());
         let bad = hy2_config("name: w\ntype: wireguard\nserver: a\nport: 1\nprivate-key: eA==\npublic-key: eA==\nip: 10.0.0.2\n");
-        assert!(super::parse_wireguard("w", &bad)
+        assert!(super::parse_wireguard_kernel("w", &bad)
             .err()
             .unwrap()
             .contains("32-byte"));
@@ -5053,6 +7044,49 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    /// `quic-connections` — the K-way pool knob (spec ITEM A): absent is
+    /// `None` (adapter default), a present integer clamps to 1..=8, a
+    /// non-integer is a hard error like the window fields.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_quic_connections() {
+        use serde_json::json;
+
+        let parse = |value: serde_json::Value| parse_hy2_quic_connections("t", Some(&value));
+        assert_eq!(parse(json!(1)).unwrap(), Some(1));
+        assert_eq!(parse(json!(4)).unwrap(), Some(4));
+        assert_eq!(parse(json!(8)).unwrap(), Some(8));
+        assert_eq!(
+            parse(json!(0)).unwrap(),
+            Some(1),
+            "0 clamps up to the pool floor"
+        );
+        assert_eq!(
+            parse(json!(42)).unwrap(),
+            Some(meow_proxy::MAX_QUIC_CONNECTIONS),
+            "past the ceiling clamps down"
+        );
+        assert!(parse(json!("two")).is_err(), "non-integer is a hard error");
+        assert_eq!(
+            parse_hy2_quic_connections("t", None).unwrap(),
+            None,
+            "absent stays unset for the adapter default"
+        );
+
+        // End to end through the proxy block.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: 3\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: two\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("a non-integer quic-connections must not be ignored");
+        };
+        assert!(err.contains("quic-connections"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -5221,6 +7255,96 @@ tls: true
         assert!(parse_proxy(&cfg).is_ok());
     }
 
+    /// A `dialer-proxy` chain binds the QUIC endpoint to one front UDP
+    /// association, so `ports`/`hop-interval` can never take effect: the
+    /// parser warns once and drops them instead of rejecting a config the
+    /// operator may share with an unchained build.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_dialer_proxy_warns_and_drops_hopping_fields() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (parsed, logs) = capture_warns(|| super::parse_proxy_with_dialer(&cfg, &dialer, true));
+        parsed.expect("hopping fields under dialer-proxy warn, not error");
+        assert!(
+            logs.contains("ports`/`hop-interval` are ignored"),
+            "expected the hopping warning, got: {logs}"
+        );
+        // Without the chain the same fields stay: direct builds keep the
+        // hop behaviour the config asked for.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (_, logs) = capture_warns(|| parse_proxy(&cfg).unwrap());
+        assert!(
+            !logs.contains("ports`/`hop-interval"),
+            "an unchained node must not warn, got: {logs}"
+        );
+    }
+
+    /// A `ports`-only hysteria2 node (and the `port: 0` spelling of one)
+    /// has no `port` field for the hop record — but the chain still dials
+    /// one endpoint, the range's first port. `dialing_through` must fall
+    /// back to it or `dialer_hop`/`has_configured_dialer` lose the chain.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_ports_only_chain_records_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        for yaml in [
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443-8446'\npassword: secret\n",
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        ] {
+            let cfg = hy2_config(yaml);
+            let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+                .unwrap_or_else(|e| panic!("ports-only chain must parse: {e}"));
+            assert!(
+                parsed.has_configured_dialer(),
+                "the declared chain must survive a `ports`-only config"
+            );
+            let wrapped = parsed
+                .as_any()
+                .and_then(|any| any.downcast_ref::<WrappedProxy>())
+                .expect("a parsed leaf sits behind WrappedProxy");
+            assert_eq!(
+                wrapped.hop.as_ref().map(|hop| hop.port),
+                Some(443),
+                "the hop endpoint is the range's first port"
+            );
+        }
+    }
+
+    /// An explicit `port:` always wins over the `ports:` range — the hop
+    /// must record the address the QUIC socket actually dials.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_explicit_port_beats_ports_range_for_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 9443\nports: '443,8443'\npassword: secret\n",
+        );
+        let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+            .unwrap_or_else(|e| panic!("explicit-port chain must parse: {e}"));
+        let wrapped = parsed
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WrappedProxy>())
+            .expect("a parsed leaf sits behind WrappedProxy");
+        assert_eq!(wrapped.hop.as_ref().map(|hop| hop.port), Some(9443));
+    }
+
     #[cfg(feature = "hysteria2")]
     #[test]
     fn parse_hysteria2_accepts_zero_and_positive_windows() {
@@ -5361,6 +7485,65 @@ tls: true
             };
             assert!(err.contains(needle), "{yaml:?} → {err}");
         }
+    }
+
+    /// The `ChainedProxy` marker forwards every `Proxy` view to the
+    /// injected leaf — only `is_dialer_proxy_non_transparent` differs
+    /// (issue #969). Exercised over a `SelectorGroup` inner so the member
+    /// views have observable values; a leaf inner answers `None` for those
+    /// either way and would prove nothing about the delegation.
+    #[test]
+    fn chained_proxy_delegates_alive_and_member_proxies() {
+        let member: Arc<dyn Proxy> = Arc::new(WrappedProxy::new(Box::new(DirectAdapter::new())));
+        let group = SelectorGroup::new("front", vec![Arc::clone(&member)]);
+        let chained = ChainedProxy::new(Arc::new(group));
+
+        assert!(chained.alive(), "delegated liveness starts alive");
+        member.health().set_alive(false);
+        assert!(
+            !chained.alive(),
+            "a dead inner must read dead through the marker"
+        );
+        assert!(!chained.alive_for_url("http://x"));
+        member.health().record_delay(321);
+        assert_eq!(chained.last_delay(), 321, "delay delegates");
+        assert_eq!(chained.delay_history().len(), 1, "history delegates");
+
+        assert_eq!(
+            chained.members().expect("members delegate"),
+            vec!["DIRECT".to_string()]
+        );
+        let members = chained.member_proxies().expect("member_proxies delegate");
+        assert_eq!(members.len(), 1);
+        assert!(
+            Arc::ptr_eq(&members[0], &member),
+            "the marker must hand back the inner's own member list"
+        );
+        assert_eq!(chained.current().as_deref(), Some("DIRECT"));
+
+        // Verbatim delegation, not invention: the inner's capability,
+        // group-only views and `as_any` target all survive the wrap —
+        // `as_any` still resolves the *inner* concrete type.
+        assert!(
+            chained.support_udp(),
+            "support_udp propagates the inner advertisement"
+        );
+        assert!(!chained.has_configured_dialer());
+        assert!(chained.selection().is_some(), "selection delegates");
+        assert!(
+            chained
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SelectorGroup>())
+                .is_some(),
+            "as_any must reach the inner SelectorGroup, not the marker"
+        );
+
+        // The marker's single verdict (issue #969): the chained entry
+        // reports `!inner.support_udp()` — this inner advertises UDP, so
+        // the marker is `false` (a UDP flow rides the chain; there is
+        // nothing to fail closed on). A UDP-incapable inner marks `true`
+        // — see the leaf-level tests for that half.
+        assert!(!chained.is_dialer_proxy_non_transparent());
     }
 
     // ─── Load-balance strategy parser (F1-F7) ────────────────────────────────
@@ -6144,6 +8327,7 @@ tls: true
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider = crate::proxy_provider::ProxyProvider::new(
@@ -6494,11 +8678,16 @@ tls: true
     #[cfg(all(feature = "ss", feature = "trojan"))]
     #[test]
     fn provider_node_allows_builtin_plugins_and_other_types() {
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: obfs\nplugin-opts:\n  mode: http\n",
-        );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
+        // The `obfs` leg needs the transport compiled in — under an
+        // `ss`-only build `plugin: obfs` errors naming `ss-obfs` instead.
+        #[cfg(feature = "ss-obfs")]
+        {
+            let cfg = proxy_config(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: obfs\nplugin-opts:\n  mode: http\n",
+            );
+            assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
+        }
 
         // A stray `plugin:` on a trojan node is ignored by its parser —
         // the gate must not reject it either.
@@ -6510,7 +8699,7 @@ tls: true
 
     /// v2ray-plugin is a built-in in-process plugin — the gate must let it
     /// through on provider nodes too.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "ss-v2ray-plugin")]
     #[test]
     fn provider_node_allows_v2ray_plugin() {
         let cfg = proxy_config(
@@ -6607,6 +8796,9 @@ tls: true
     #[test]
     fn disabled_builtin_plugins_error_cleanly_and_stay_reserved() {
         for name in [
+            "obfs",
+            "simple-obfs",
+            "v2ray-plugin",
             "gost-plugin",
             "shadow-tls",
             "restls",
@@ -6657,6 +8849,48 @@ tls: true
                 }
             }
         }
+    }
+
+    /// `obfs-local` is the SIP003 *binary* name, not a built-in spelling —
+    /// but without `ss-obfs` it joins the reserved names all the same: the
+    /// adapter errors naming the feature, the spawn gates no longer
+    /// classify it as external, and the node binds an ss placeholder.
+    #[cfg(all(feature = "ss", not(feature = "ss-obfs")))]
+    #[test]
+    fn obfs_local_without_ss_obfs_errors_like_a_reserved_name() {
+        assert!(!is_external_sip003_plugin(Some("obfs-local")));
+        assert_eq!(
+            meow_proxy::shadowsocks_adapter::missing_plugin_feature("obfs-local"),
+            Some("ss-obfs")
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: obfs-local\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("compiled-out obfs-local must not parse")
+        };
+        assert!(err.contains("not compiled into this build"), "{err}");
+        assert!(err.contains("obfs-local"), "{err}");
+        assert!(err.contains("ss-obfs"), "{err}");
+        assert_eq!(
+            placeholder_adapter_type(&cfg),
+            Some(meow_common::AdapterType::Shadowsocks),
+            "a compiled-out obfs-local node binds an ss placeholder"
+        );
+    }
+
+    /// The flip side: with `ss-obfs` compiled in `obfs-local` reverts to a
+    /// plain external name — the provider/dry-run spawn gates see it and
+    /// `missing_plugin_feature` never claims it.
+    #[cfg(feature = "ss-obfs")]
+    #[test]
+    fn obfs_local_with_ss_obfs_is_external_again() {
+        assert!(is_external_sip003_plugin(Some("obfs-local")));
+        assert_eq!(
+            meow_proxy::shadowsocks_adapter::missing_plugin_feature("obfs-local"),
+            None
+        );
     }
 
     /// A `plugin:` value that is not a string is a malformed node — never
@@ -6717,5 +8951,497 @@ tls: true
             Some(meow_common::AdapterType::Shadowsocks),
             "the lenient classifier still lands the node on the placeholder arm"
         );
+    }
+
+    // ─── per-node dialer opts (issue #974) ─────────────────────────────────
+
+    /// Downcast a parsed leaf to its `WrappedProxy` — every `proxies:`
+    /// entry lands in one.
+    fn wrapped(proxy: &Arc<dyn Proxy>) -> &WrappedProxy {
+        proxy
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WrappedProxy>())
+            .expect("a parsed leaf is a WrappedProxy")
+    }
+
+    /// Every field a `proxies:` entry carries reaches the wrapper.
+    #[test]
+    fn node_dialer_opts_parse_onto_the_leaf_wrapper() {
+        let cfg = proxy_config(
+            "name: d\ntype: direct\nrouting-mark: 8888\ninterface-name: en0\n\
+             ip-version: ipv4-prefer\ntfo: true\nmptcp: true\n",
+        );
+        let proxy = parse_proxy(&cfg).expect("dialer fields parse");
+        let opts = &wrapped(&proxy).node_opts;
+        assert_eq!(opts.routing_mark, Some(8888));
+        assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv4Prefer);
+        assert!(opts.tfo);
+        assert!(opts.mptcp);
+    }
+
+    /// `routing-mark: 0` and an empty `interface-name` normalize to
+    /// "inherit the global", matching mihomo's zero-means-unset.
+    #[test]
+    fn node_dialer_opts_normalization() {
+        for (yaml, want_mark, want_iface) in [
+            ("routing-mark: 0\ninterface-name: ''\n", None, None),
+            ("routing-mark: 0\n", None, None),
+            ("interface-name: '  '\n", None, None),
+            (
+                "routing-mark: 1\ninterface-name: lo0\n",
+                Some(1),
+                Some("lo0"),
+            ),
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\n{yaml}"));
+            let proxy = parse_proxy(&cfg).expect("normalizing fields parse");
+            let opts = &wrapped(&proxy).node_opts;
+            assert_eq!(opts.routing_mark, want_mark, "{yaml}");
+            assert_eq!(opts.interface_name.as_deref(), want_iface, "{yaml}");
+        }
+        // Absent fields keep the defaults.
+        let cfg = proxy_config("name: d\ntype: direct\n");
+        let binding = parse_proxy(&cfg).unwrap();
+        let opts = &wrapped(&binding).node_opts;
+        assert_eq!(opts.routing_mark, None);
+        assert_eq!(opts.interface_name, None);
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Dual);
+        assert!(!opts.tfo && !opts.mptcp);
+    }
+
+    /// An unknown `ip-version` is a hard parse error — mihomo fails the
+    /// node the same way rather than silently keeping `dual`.
+    #[test]
+    fn node_dialer_opts_rejects_unknown_ip_version() {
+        let cfg = proxy_config("name: d\ntype: direct\nip-version: quad\n");
+        let err = parse_proxy(&cfg)
+            .err()
+            .expect("unknown ip-version must error");
+        assert!(err.contains("unknown `ip-version`"), "{err}");
+        // A non-string value is malformed the same way.
+        let cfg = proxy_config("name: d\ntype: direct\nip-version: 4\n");
+        assert!(parse_proxy(&cfg).is_err());
+        // And each accepted spelling lands (the `from_name` table).
+        for (spelling, want) in [
+            ("dual", meow_common::IpVersion::Dual),
+            ("ipv4", meow_common::IpVersion::Ipv4),
+            ("ipv6", meow_common::IpVersion::Ipv6),
+            ("ipv4-prefer", meow_common::IpVersion::Ipv4Prefer),
+            ("ipv6-prefer", meow_common::IpVersion::Ipv6Prefer),
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\nip-version: {spelling}\n"));
+            let proxy = parse_proxy(&cfg).expect(spelling);
+            assert_eq!(wrapped(&proxy).node_opts.ip_version, want, "{spelling}");
+        }
+    }
+
+    /// Malformed dialer fields fail the node rather than parsing past
+    /// them — non-integer marks, non-string names, non-bool flags.
+    #[test]
+    fn node_dialer_opts_rejects_malformed_fields() {
+        for yaml in [
+            "routing-mark: -1\n",
+            "routing-mark: 'abc'\n",
+            "routing-mark: 4294967296\n",
+            "interface-name: 7\n",
+            "tfo: 'yes'\n",
+            "mptcp: 1\n",
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\n{yaml}"));
+            assert!(parse_proxy(&cfg).is_err(), "{yaml}");
+        }
+    }
+
+    /// A NUL-bearing `interface-name` is a hard parse error, not the
+    /// empty-means-unset normalization: Linux `SO_BINDTODEVICE` would
+    /// silently truncate the name at the NUL and bind the *wrong*
+    /// interface — the one misconfiguration worse than a missing one.
+    #[test]
+    fn node_dialer_opts_rejects_nul_interface_name() {
+        let mut cfg = proxy_config("name: d\ntype: direct\n");
+        cfg.insert(
+            "interface-name".to_string(),
+            serde_json::Value::String("en0\0x".to_string()),
+        );
+        match parse_proxy(&cfg) {
+            Err(err) => assert!(err.contains("NUL"), "{err}"),
+            Ok(_) => panic!("a NUL interface-name must error"),
+        }
+    }
+
+    /// A `dialer-proxy` chain keeps the leaf's own opts — the wrapper
+    /// carries them even when the injected dialer is a proxy. The leaf
+    /// hop's socket is opened by the front under its own scope.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn node_dialer_opts_survive_dialer_proxy_parse() {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let target = meow_proxy::dialer::DialerTarget::new("front", &registry);
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target));
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 192.0.2.1\nport: 8388\npassword: p\n\
+             cipher: aes-128-gcm\ndialer-proxy: front\nrouting-mark: 42\n",
+        );
+        let proxy =
+            super::parse_proxy_with_dialer(&cfg, &dialer, true).expect("chained leaf parses");
+        assert_eq!(wrapped(&proxy).node_opts.routing_mark, Some(42));
+    }
+
+    /// A `proxy-groups:` entry never carries dialer fields — mihomo
+    /// removed group-level dialer options in v1.19. The group schema has
+    /// no such keys at all, so they drop at deserialization and nothing
+    /// calls `parse_node_dialer_opts` for a group block.
+    #[test]
+    fn groups_do_not_parse_dialer_opts() {
+        let raw: crate::raw::RawProxyGroup = serde_saphyr::from_str(
+            "name: g\ntype: select\nproxies: [a]\ninterface-name: en0\n\
+             ip-version: ipv4\nrouting-mark: 7\ntfo: true\nmptcp: true\n",
+        )
+        .expect("unknown keys on a group block are ignored");
+        let member = parse_proxy(&proxy_config("name: a\ntype: direct\n")).unwrap();
+        let proxies = HashMap::from([(SmolStr::from("a"), member)]);
+        let group = parse_proxy_group(&raw, &proxies, &[], &Default::default());
+        assert!(group.is_ok(), "group blocks ignore dialer fields");
+    }
+
+    /// Records the [`meow_common::dialer_opts`] a dial ran under — the
+    /// scope probe every `WrappedProxy`/`ChainedProxy` coverage test
+    /// shares (issue #974).
+    type Seen = std::sync::Arc<parking_lot::Mutex<Option<meow_common::DialerOpts>>>;
+
+    struct Capture {
+        health: ProxyHealth,
+        seen: Seen,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for Capture {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn connect_over(
+            &self,
+            _stream: Box<dyn meow_common::ProxyConn>,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    fn scoped_leaf(seen: &Seen) -> WrappedProxy {
+        WrappedProxy::new(Box::new(Capture {
+            health: ProxyHealth::new(),
+            seen: std::sync::Arc::clone(seen),
+        }))
+        .with_node_dialer_opts(meow_common::NodeDialerOpts {
+            ip_version: meow_common::IpVersion::Ipv6,
+            routing_mark: Some(4242),
+            ..Default::default()
+        })
+    }
+
+    fn test_metadata() -> Metadata {
+        Metadata {
+            host: "h.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        }
+    }
+
+    /// The wrapper installs its resolved opts as the task-local scope
+    /// around the adapter's dial — the mechanism every socket helper
+    /// reads (issue #974). The stub captures `dialer_opts()` mid-dial to
+    /// prove the scope landed and did not leak past it.
+    #[tokio::test]
+    async fn wrapped_dial_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
+        // Both dial paths install the node's resolved opts.
+        assert!(proxy.dial_tcp(&metadata).await.is_err());
+        {
+            let captured = seen.lock();
+            let opts = captured.as_ref().expect("the dial ran under the scope");
+            assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+            assert_eq!(opts.routing_mark, Some(4242));
+        }
+        *seen.lock() = None;
+        assert!(proxy.dial_udp(&metadata).await.is_err());
+        assert_eq!(
+            seen.lock().as_ref().map(|o| o.ip_version),
+            Some(meow_common::IpVersion::Ipv6)
+        );
+        // …and nothing leaks past the call.
+        assert_eq!(
+            meow_common::dialer_opts().ip_version,
+            meow_common::IpVersion::Dual
+        );
+    }
+
+    /// `connect_over` — the relay-chain dial path — installs the same
+    /// scope (issue #974): an injected leaf's transport handshake and any
+    /// socket it opens run under the node's fields too.
+    #[tokio::test]
+    async fn wrapped_connect_over_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let stream: Box<dyn meow_common::ProxyConn> = Box::new(stream);
+        assert!(proxy.connect_over(stream, &metadata).await.is_err());
+        let captured = seen.lock();
+        let opts = captured.as_ref().expect("connect_over ran under the scope");
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+        assert_eq!(opts.routing_mark, Some(4242));
+    }
+
+    /// `ChainedProxy` is observational only: it must not install a
+    /// (default) scope of its own over the inner `WrappedProxy`'s —
+    /// every method delegates verbatim, so a chained dial still sees the
+    /// leaf's resolved opts, never the empty defaults a re-scope would
+    /// leave (issue #974 review).
+    #[tokio::test]
+    async fn chained_proxy_delegates_without_rescoping() {
+        let seen: Seen = Default::default();
+        let inner: Arc<dyn Proxy> = Arc::new(scoped_leaf(&seen));
+        let chained = ChainedProxy::new(inner);
+        let metadata = test_metadata();
+        assert!(chained.dial_tcp(&metadata).await.is_err());
+        {
+            let captured = seen.lock();
+            let opts = captured
+                .as_ref()
+                .expect("the chained dial reached the leaf's scope");
+            assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+            assert_eq!(opts.routing_mark, Some(4242));
+        }
+        *seen.lock() = None;
+        assert!(chained.dial_udp(&metadata).await.is_err());
+        assert_eq!(
+            seen.lock().as_ref().map(|o| o.ip_version),
+            Some(meow_common::IpVersion::Ipv6)
+        );
+    }
+
+    /// `type: rematch` structural gate (issue #974): `name` plus at least
+    /// one `target-*` field, both strings-or-null, and never a
+    /// `dialer-proxy` — a control outbound has no hop to carry.
+    #[test]
+    fn rematch_node_structural_gate() {
+        for (yaml, why) in [
+            ("type: rematch\ntarget-rematch-name: x", "missing name"),
+            ("name: r\ntype: rematch", "neither target field"),
+            (
+                "name: r\ntype: rematch\ntarget-rematch-name: 1",
+                "unquoted numeric target",
+            ),
+            (
+                "name: r\ntype: rematch\ntarget-sub-rule:\n  - a",
+                "non-scalar target",
+            ),
+            (
+                "name: r\ntype: rematch\ntarget-rematch-name: x\ndialer-proxy: front",
+                "dialer-proxy on a control leaf",
+            ),
+        ] {
+            let node = proxy_config(yaml);
+            assert!(
+                check_rematch_node(&node).is_err(),
+                "{why} must fail the gate"
+            );
+        }
+        for yaml in [
+            "name: r\ntype: rematch\ntarget-rematch-name: stage1",
+            "name: r\ntype: rematch\ntarget-sub-rule: blk",
+            "name: r\ntype: rematch\ntarget-rematch-name: \"\"\ntarget-sub-rule: \"\"",
+            // `null` means leave the field unchanged — same as omitted.
+            "name: r\ntype: rematch\ntarget-rematch-name:\ntarget-sub-rule: blk",
+        ] {
+            let node = proxy_config(yaml);
+            check_rematch_node(&node).unwrap_or_else(|e| panic!("'{yaml}' must pass: {e}"));
+        }
+    }
+
+    /// The dispatch path builds the control leaf verbatim: no server,
+    /// `udp: false` ignored, fields reach `rematch_action` untouched.
+    #[test]
+    fn rematch_dispatch_builds_control_leaf() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: ' stage1 '\n\
+             target-sub-rule: second-pass\nudp: false\n",
+        );
+        let proxy = parse_proxy(&node).expect("rematch node parses");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Rematch);
+        let action = proxy.rematch_action().expect("action reported");
+        assert_eq!(action.rematch_name, Some(" stage1 "));
+        assert_eq!(action.sub_rule, Some("second-pass"));
+    }
+
+    /// Transport-only keys on a rematch node are warn-ignored, never
+    /// validated: the control leaf opens no sockets, so a value that
+    /// would fail `parse_node_dialer_opts` on a real transport must not
+    /// error the node here (issue #974).
+    #[test]
+    fn rematch_ignores_transport_only_options() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: stage1\n\
+             routing-mark: bogus\ninterface-name: 7\ntfo: maybe\nip-version: mars\n",
+        );
+        let proxy = parse_proxy(&node).expect("rematch node parses despite bogus socket opts");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Rematch);
+        let action = proxy.rematch_action().expect("action reported");
+        assert_eq!(action.rematch_name, Some("stage1"));
+    }
+
+    /// `dialer-proxy` on rematch fails through the same dispatcher the
+    /// ordinary nodes use — the provider payload path included.
+    #[test]
+    fn rematch_dialer_proxy_rejected_at_dispatch() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: x\ndialer-proxy: front\n",
+        );
+        let err = parse_proxy(&node).err().expect("must reject");
+        assert!(err.contains("dialer-proxy"), "{err}");
+    }
+
+    /// `type: dns` structural gate (issue #974): `name` is the whole
+    /// contract — everything else is tolerated, even ill-typed.
+    #[test]
+    fn dns_node_structural_gate() {
+        for yaml in [
+            "type: dns",
+            "name: ''\ntype: dns",
+            "name: 7\ntype: dns",
+            "name: [x]\ntype: dns",
+        ] {
+            let node = proxy_config(yaml);
+            assert!(
+                check_dns_node(&node).is_err(),
+                "'{yaml}' must fail the gate"
+            );
+        }
+        for yaml in [
+            "name: dns-out\ntype: dns",
+            // Endpoint and transport keys are tolerated — warn-ignored,
+            // never part of the structural verdict.
+            "name: dns-out\ntype: dns\nserver: 8.8.8.8\nport: 53\nudp: false",
+            "name: dns-out\ntype: dns\nserver: [bogus]\nport: not-a-port\nudp: nope",
+            "name: dns-out\ntype: dns\ntls: true\nws-opts:\n  path: /\nsmux:\n  enabled: true",
+        ] {
+            let node = proxy_config(yaml);
+            check_dns_node(&node).unwrap_or_else(|e| panic!("'{yaml}' must pass: {e}"));
+        }
+    }
+
+    /// The dispatch builds an in-process resolver leaf: `AdapterType::Dns`,
+    /// no address, no transport wrapper — even with endpoint keys present
+    /// (mihomo's `C.Dns` reads no node options at all).
+    #[test]
+    fn dns_dispatch_builds_resolver_leaf() {
+        let node =
+            proxy_config("name: dns-out\ntype: dns\nserver: 8.8.8.8\nport: 53\nudp: false\n");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Dns);
+        assert_eq!(proxy.addr(), "", "a dns leaf owns no endpoint address");
+        assert!(
+            proxy.support_udp(),
+            "UDP is the leaf's own datagram path, not a transport flag"
+        );
+    }
+
+    /// `dialer-proxy` on a dns node is warn-ignored — mihomo never reads
+    /// it, and `collect_dialer_edges` never emits an edge for the type —
+    /// so the dispatch itself must accept the key rather than error.
+    /// Malformed values are equally inert.
+    #[test]
+    fn dns_dialer_proxy_key_is_ignored() {
+        for yaml in [
+            "name: dns-out\ntype: dns\ndialer-proxy: front",
+            "name: dns-out\ntype: dns\ndialer-proxy: 7",
+            "name: dns-out\ntype: dns\ndialer-proxy: [a, b]",
+            "name: dns-out\ntype: dns\ndialer-proxy: '   '",
+        ] {
+            let node = proxy_config(yaml);
+            let proxy = parse_proxy(&node).unwrap_or_else(|e| panic!("'{yaml}' must parse: {e}"));
+            assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Dns);
+        }
+    }
+
+    /// A dns node parsed without a build context binds no resolver slot —
+    /// the leaf must fail closed (SERVFAIL) rather than pick an upstream.
+    #[tokio::test]
+    async fn dns_leaf_unbound_cell_fails_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let node = proxy_config("name: dns-out\ntype: dns");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let mut stream = proxy.dial_tcp(&metadata).await.expect("dial succeeds");
+        // RFC 1035 framing: 2-byte length + a minimal A query for
+        // example.com (id 0x1234).
+        let query: &[u8] = &[
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let len = (query.len() as u16).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(query).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut body).await.unwrap();
+        // RCODE is the low nibble of the second flags byte.
+        assert_eq!(body[3] & 0x0f, 2, "unbound leaf answers SERVFAIL");
+        assert_eq!(&body[..2], &query[..2], "SERVFAIL echoes the query id");
+    }
+
+    /// `connect_over` must fail — a dns leaf owns no transport to chain a
+    /// front hop's exchange through.
+    #[tokio::test]
+    async fn dns_leaf_connect_over_fails() {
+        let node = proxy_config("name: dns-out\ntype: dns");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        let metadata = meow_common::Metadata::default();
+        let conn = proxy.dial_tcp(&metadata).await.expect("dial succeeds");
+        let err = proxy
+            .connect_over(conn, &metadata)
+            .await
+            .err()
+            .expect("connect_over on a dns leaf must fail");
+        assert!(err.to_string().contains("dns"), "{err}");
     }
 }

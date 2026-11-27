@@ -68,6 +68,9 @@ pub(super) mod flow {
         pub udp_timeout: Duration,
         pub in_name: String,
         pub in_port: u16,
+        /// The named listener's `proxy:`/`rule:` route override, shared
+        /// with every sibling flow (Arc bump per flow).
+        pub route_override: Option<Arc<meow_common::InboundRouteOverride>>,
     }
 
     /// Route `orig_dst` through the tunnel, dial the outbound, then pump
@@ -91,6 +94,7 @@ pub(super) mod flow {
             udp_timeout,
             in_name,
             in_port,
+            route_override,
         } = ctx;
         // The flow key and metadata dst are the ORIGINAL destination — which
         // may be a fake-IP — never the post-resolution address: two fake-IPs
@@ -107,6 +111,10 @@ pub(super) mod flow {
             in_port,
             ..Default::default()
         };
+        // The named listener's `proxy:`/`rule:` override stamps before
+        // the fake-IP guard and the route scan (upstream Additions order)
+        // — shared, not cloned: the ctx Arc is dead after this point.
+        metadata.special_route = route_override;
 
         let inner = tunnel.inner();
         if matches!(
@@ -115,18 +123,11 @@ pub(super) mod flow {
         ) {
             return Err("unmapped fake-ip destination".into());
         }
-        // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
-        // packet API needs a resolved dst_ip regardless of what the rules
-        // demand — including after a fake-IP was rewritten back to a hostname.
+        // UDP keeps the eager pre_resolve (no lazy enrichment): transports
+        // dial `dst_ip` regardless of what the rules demand — including
+        // after a fake-IP was rewritten back to a hostname.
         inner.pre_resolve(&mut metadata).await;
-        inner.resolve_udp_dst(&mut metadata).await;
-        let Some(dst_ip) = metadata.dst_ip else {
-            return Err(format!(
-                "dst_ip not resolved for {}",
-                metadata.remote_address()
-            ));
-        };
-        let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
+        let probed = inner.resolve_udp_dst(&mut metadata).await;
 
         // Port 53 follows ordinary routing — no implicit DNS hijack here
         // (external rules feed queries to the standalone DNS server if
@@ -135,17 +136,40 @@ pub(super) mod flow {
         // flow dies and the datagrams drop; a UDP-incapable outbound errors
         // at dial. Either way datagrams are never silently diverted to
         // DIRECT.
+        // When `resolve_udp_dst` probed it produced the committed
+        // decision — use it so the direct-nameserver verdict and the
+        // route agree (issue #974).
+        let resolved = match probed {
+            Some(target) => Some(target),
+            None => inner.resolve_proxy_flow(&mut metadata).await,
+        };
         let Some(meow_tunnel::ResolvedTarget {
             adapter: proxy,
             rule_name,
             rule_payload,
             route: _route,
-        }) = inner.resolve_proxy(&metadata).await
+        }) = resolved
         else {
             return Err(format!(
                 "no matching rule for {}",
                 metadata.remote_address()
             ));
+        };
+        // A `type: dns` leaf never contacts the destination — its conn only
+        // echoes this addr back as the reply source, so mandatory
+        // pre-resolution must not gate it and the ORIGINAL destination is
+        // what gets stamped (issue #974 review). Transports keep requiring
+        // `dst_ip` — they actually dial it.
+        let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+            metadata.dns_udp_dst(Some(orig_dst))
+        } else {
+            let Some(dst_ip) = metadata.dst_ip else {
+                return Err(format!(
+                    "dst_ip not resolved for {}",
+                    metadata.remote_address()
+                ));
+            };
+            SocketAddr::new(dst_ip, metadata.dst_port)
         };
         info!(
             "UDP {client} --> {orig_dst} match {} using {}",
@@ -338,6 +362,9 @@ mod linux {
         udp_timeout: Duration,
         in_name: String,
         in_port: u16,
+        /// Shared `proxy:`/`rule:` override carried into every spawned
+        /// flow's `FlowCtx`.
+        route_override: Option<Arc<meow_common::InboundRouteOverride>>,
         sweep_countdown: u32,
         /// Last time a flow-cap drop was `warn!`-logged — rate-limited so a
         /// saturated `max-connections` is visible at default log levels
@@ -352,6 +379,7 @@ mod linux {
             udp_timeout: Duration,
             in_name: String,
             in_port: u16,
+            route_override: Option<Arc<meow_common::InboundRouteOverride>>,
         ) -> Self {
             Self {
                 flows: HashMap::new(),
@@ -360,6 +388,7 @@ mod linux {
                 udp_timeout,
                 in_name,
                 in_port,
+                route_override,
                 sweep_countdown: SWEEP_INTERVAL,
                 cap_warned_at: None,
             }
@@ -480,6 +509,7 @@ mod linux {
                 udp_timeout: self.udp_timeout,
                 in_name: self.in_name.clone(),
                 in_port: self.in_port,
+                route_override: self.route_override.clone(),
             };
             spawn_flow(tunnel.clone(), rx, queued_bytes, self.reply_tx.clone(), ctx);
             true
@@ -833,6 +863,10 @@ mod linux {
     /// `local_addrs` is the listener's interface-address snapshot — the
     /// self-target half of `is_safe_orig_dst`; `None` keeps the
     /// conservative same-port rule.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the listener's UDP knobs, passed once at task spawn"
+    )]
     pub async fn run_udp(
         tunnel: Tunnel,
         socket: UdpSocket,
@@ -841,12 +875,19 @@ mod linux {
         in_name: String,
         in_port: u16,
         local_addrs: Option<Arc<std::collections::HashSet<IpAddr>>>,
+        route_override: Option<meow_common::InboundRouteOverride>,
     ) {
         let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
         let _dispatcher = AbortOnDrop(tokio::spawn(reply_dispatch(reply_rx)).abort_handle());
 
-        let mut dispatch =
-            FlowDispatch::new(reply_tx, max_flows, udp_timeout, in_name.clone(), in_port);
+        let mut dispatch = FlowDispatch::new(
+            reply_tx,
+            max_flows,
+            udp_timeout,
+            in_name.clone(),
+            in_port,
+            route_override.map(Arc::new),
+        );
         let mut buf = vec![0u8; DATAGRAM_BUF];
         let local_addr = socket
             .local_addr()
@@ -899,6 +940,7 @@ mod linux {
                     Duration::from_secs(60),
                     "t".into(),
                     7894,
+                    None,
                 ),
                 reply_rx,
             )
@@ -1401,6 +1443,7 @@ mod tests {
             udp_timeout: Duration::from_secs(timeout_secs),
             in_name: "tproxy".into(),
             in_port: 7894,
+            route_override: None,
         }
     }
 
@@ -1535,6 +1578,7 @@ mod tests {
                 udp_timeout: Duration::from_secs(60),
                 in_name: "tproxy-fake".into(),
                 in_port: 7895,
+                route_override: None,
             },
         ));
 
@@ -1588,7 +1632,7 @@ mod tests {
 
     /// A `REJECT` verdict must route to the REJECT-named adapter — never a
     /// silent DIRECT fallback (the issue's hard requirement). The map key
-    /// is what `resolve_proxy` looks up, so the recording stub stands in
+    /// is what `resolve_proxy_flow` looks up, so the recording stub stands in
     /// for the real reject adapter; a DIRECT fallback leaves the dial
     /// counter at zero, while the reject path dials it exactly once and
     /// then parks on the drop conn until idle eviction.

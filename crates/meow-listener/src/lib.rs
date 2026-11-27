@@ -11,7 +11,8 @@ pub mod sniffer;
 #[cfg(any(
     feature = "listener-mixed",
     feature = "listener-tproxy",
-    feature = "listener-shadowsocks"
+    feature = "listener-shadowsocks",
+    feature = "listener-anytls"
 ))]
 mod keepalive;
 
@@ -20,7 +21,11 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Process-wide monotonic timestamp in milliseconds. Used by UDP flow tables
 /// (SOCKS5-UDP and the shadowsocks listener) for idle eviction. The `START`
 /// instant is lazily initialized on the first call and never changes.
-#[cfg(any(feature = "listener-socks5", feature = "listener-shadowsocks"))]
+#[cfg(any(
+    feature = "listener-socks5",
+    feature = "listener-shadowsocks",
+    feature = "listener-anytls"
+))]
 pub(crate) fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START
@@ -29,6 +34,10 @@ pub(crate) fn monotonic_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[cfg(feature = "listener-anytls")]
+pub mod anytls;
+#[cfg(feature = "listener-anytls")]
+pub(crate) mod anytls_uot;
 #[cfg(feature = "listener-http")]
 pub mod http_proxy;
 #[cfg(feature = "listener-mixed")]
@@ -43,7 +52,17 @@ mod socks5_udp;
 pub mod tproxy;
 #[cfg(feature = "listener-tun")]
 pub mod tun;
+#[cfg(feature = "listener-wireguard")]
+pub mod wireguard;
 
+/// First-payload sniff window shared by the userspace-stack inbounds
+/// (TUN lwIP, WireGuard smoltcp): the client's opening bytes double as
+/// the relay prefix after a TLS/HTTP sniff pass.
+#[cfg(any(feature = "listener-tun", feature = "listener-wireguard"))]
+pub(crate) mod stream_sniff;
+
+#[cfg(feature = "listener-anytls")]
+pub use anytls::{AnytlsListener, AnytlsListenerSpec};
 #[cfg(feature = "listener-mixed")]
 pub use mixed::MixedListener;
 #[cfg(feature = "listener-shadowsocks")]
@@ -58,6 +77,8 @@ pub use tun::{
     AutoRedirect, AutoRedirectRanges, AutoRedirectSource, OutboundBinding, Ranges, TunListener,
     TunListenerConfig, TunReady, TunRouteScope, TunStack, V4Range, V6Range,
 };
+#[cfg(feature = "listener-wireguard")]
+pub use wireguard::{WgListenerSpec, WgPeerSpec, WireGuardListener, WireGuardListenerGuard};
 
 #[cfg(all(
     test,

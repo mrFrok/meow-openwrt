@@ -100,6 +100,12 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_DATAGRAM: usize = 65535;
 
 /// Connect, authenticate and start the driver.
+/// The quiche driver's ACK-coalescing knob has no counterpart here (quinn
+/// schedules ACKs itself): the type exists so the shared client compiles on
+/// big-endian targets, and is ignored.
+#[derive(Default)]
+pub(crate) struct AckCoalesce;
+
 pub(crate) async fn spawn(
     cfg: &Config,
     socket: UdpSocket,

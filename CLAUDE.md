@@ -18,7 +18,7 @@ meow-rs is a Rust implementation of the [mihomo](https://github.com/MetaCubeX/mi
 ## Build Commands
 
 ```bash
-# Build (requires Rust 1.89+ via workspace rust-version; the checkout
+# Build (requires Rust 1.91+ via workspace rust-version; the checkout
 # resolves the pinned channel in rust-toolchain.toml automatically)
 cargo build --release
 
@@ -73,7 +73,7 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN)
 
 ### Workspace Crates
 
-The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
+The workspace has 17 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
 
 | Crate | Purpose |
 |-------|---------|
@@ -81,12 +81,14 @@ The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-trie` | Domain trie for efficient pattern matching |
 | `meow-anytls` | Vendored fork of `anytls-rs` (lib name `anytls_rs`); MIT-licensed, in-tree to provide `Stream::close()` (see [#262](https://github.com/madeye/meow-rs/issues/262)). Pulled in only by `meow-proxy`'s opt-in `anytls` feature |
 | `meow-lwip` | Vendored fork of `lwip` (madeye/lwip); MIT/Apache-2.0 bindings over BSD-3 lwIP C sources, in-tree because crates.io forbids `git` deps. Lib name `lwip`; pulled in only by `meow-listener`'s `listener-tun` feature |
+| `meow-wireguard` | Vendored fork of `boringtun` 0.7.1 (BSD-3, Cloudflare): `noise/` + serialization only, `ring` patched onto workspace RustCrypto crates — see `PATCHES.md` for the replay list. Pulled in by `meow-proxy`'s opt-in `wireguard` feature and `meow-listener`'s `listener-wireguard` |
+| `meow-wgstack` | Shared smoltcp/Tokio plumbing for WireGuard adapters/listeners (channel-backed smoltcp `Device`, per-conn `WgStream` AsyncRead/AsyncWrite shim, queue/buffer constants, endpoint `SO_RCVBUF` enlarger); consumed by `meow-proxy`'s opt-in `wireguard` feature and the WG inbound listener |
 | `meow-transport` | Composable stream-transport layers (TLS, WebSocket, gRPC, HTTP/2, HTTP Upgrade) — protocol-agnostic, no dep on other meow-rs crates (see [ADR-0001](docs/adr/0001-meow-transport-crate.md)) |
 | `meow-proxy` | Proxy protocol implementations (SS, Trojan, VLESS, Direct, Reject), groups (Selector, URLTest, Fallback, LoadBalance, Relay), and health probing |
 | `meow-rules` | Rule matching engine and parser (domain, IP-CIDR, GeoIP, process, logic composition) |
 | `meow-dns` | DNS resolver, cache, DNS snooping (IP→domain reverse table), UDP server |
 | `meow-tunnel` | Core routing engine: TCP/UDP relay, rule matching dispatch, connection statistics |
-| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind the opt-in `listener-tun` feature) |
+| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind the opt-in `listener-tun` feature and the WireGuard responder behind `listener-wireguard`) |
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
@@ -106,6 +108,10 @@ A `tproxy` listener can opt into **UDP TPROXY** (`udp: true`, Linux/IPv4 only, r
 ### TUN inbound (Windows transparent proxy)
 
 The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bundle) provides transparent proxying via an L3 device — the only transparent option on Windows, also usable on Linux/macOS. Implementation: `meow-listener/src/tun/` (tun-rs device + lwIP userspace stack + route_manager auto-route). On Windows the device is Wintun (`wintun.dll` sidecar or the official DLL embedded in the binary). `auto-route: true` (the default; `global` is an alias) captures everything the host sends on Linux/macOS/Windows, with meow's own sockets bound to the physical interface against loops (`OutboundBinding`); on Linux the device's default routes sit in a table of their own behind policy rules that only take the host's own unsourced flows (`tun/policy_route.rs`, priorities 9200-9205), so replies to accepted connections and forwarded traffic keep the main table, elsewhere (and on a kernel without policy routing) split `/1` routes go in the main table. `auto-route: fake-ip` routes only the fake-ip range, loop-free by construction but blind to IP literals. `dns-hijack` defaults on (`[]` turns it off). TCP accept is post-handshake; a flow then gets a 200 ms sniff window for the client's first bytes (the relay prefix) — silence dials with an empty prefix (server-first protocols, #695), while EOF/RST inside the window drops the flow before `handle_tcp`; UDP is one packet-level netstack socket demuxed by a listener-owned flow table (per-flow tasks mirroring the SOCKS5-UDP routing, idle-evicted after `udp-timeout`); `dns-hijack` answers UDP :53 via `DnsServer::handle_query`. Setup guide: [docs/tun.md](docs/tun.md).
+
+### WireGuard inbound (responder listener)
+
+`listeners: - type: wireguard` (feature `listener-wireguard`, in `full`, never `minimal`) makes meow a static multi-peer WireGuard *server* — "a TUN carried over WireGuard". Implementation: `meow-listener/src/wireguard/` (`mod.rs` socket + spec, `peer.rs`/`demux.rs` peer table + dispatch, `actor.rs` the single-threaded wire loop + smoltcp AnyIP stack + listen pool, `inner_udp.rs` the per-flow UDP path). One UDP socket per listener; handshake-init datagrams dispatch on the anonymous-decrypted static pubkey, everything else on `receiver_idx >> 8` (each peer's `Tunn` owns a disjoint index namespace). The listener-level `RateLimiter` verifies mac1/cookies before any per-peer work; peers roam only on ACL-admitted inner packets; `allowed-ips` is the inner-source ACL. Inner TCP terminates in a lazy 64-entry smoltcp listen pool and routes through `route_inbound_tcp` (with the shared `stream_sniff` window); inner UDP goes through `TunnelInner::dial_udp` keyed on `(peer, inner src, inner dst)`. `metadata.type` reports `"wireguard"`. Docs: [docs/wireguard.md](docs/wireguard.md), spec [docs/specs/proxy-wireguard-server.md](docs/specs/proxy-wireguard-server.md).
 
 ### Key Patterns
 
@@ -187,6 +193,40 @@ cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --test 
 cargo test -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test
 cargo test -p meow-config --features trusttunnel-h3 --lib
 
+# WireGuard (issue #899) is opt-in behind `wireguard` in `full` only: the
+# vendored boringtun, the smoltcp pump and both parser legs compile only
+# under explicit feature runs. The crypto crate must stay ring-free —
+# `cargo tree` below must print nothing.
+cargo clippy -p meow-wireguard --all-targets -- -D warnings
+cargo clippy -p meow-proxy --no-default-features --features wireguard --all-targets -- -D warnings
+cargo tree -p meow-wireguard --edges normal | grep -wE 'ring|ring_compat|aws-lc'
+cargo test -p meow-wireguard
+# `mock-instant` un-gates the vendored rekey/retransmission timer tests.
+cargo test -p meow-wireguard --features mock-instant --lib
+cargo test -p meow-config --features wireguard --test wireguard_config_test
+cargo test -p meow-config --no-default-features --test wireguard_config_test
+cargo test -p meow-proxy --features wireguard --lib --test wireguard_integration
+# `minimal` must not pull the WG stack: must print nothing.
+cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -wE 'meow-wireguard|meow-wgstack|smoltcp'
+
+# `minimal` must not pull the HTTPS controller's TLS edge (`api-tls`, issue
+# #974): boring/tokio-boring stay in the graph via meow-transport, so this
+# checks meow-api's *direct* deps — must print nothing.
+cargo tree -p meow-api --no-default-features --depth 1 --edges normal | grep -wE 'boring|tokio-boring|socket2'
+
+# The WireGuard *inbound* (`listeners: - type: wireguard`) is a second opt-in
+# behind meow-listener's `listener-wireguard` (meow-app `full`): responder
+# demux, AnyIP smoltcp stack and the inner-UDP reply builder compile only
+# under these runs. The two `cargo tree` greps must print nothing — the
+# inbound links the same ring-free noise crate as the outbound.
+cargo clippy -p meow-listener --no-default-features --features listener-wireguard --all-targets -- -D warnings
+cargo clippy -p meow-wgstack --all-targets -- -D warnings
+cargo tree -p meow-listener --no-default-features --features listener-wireguard --edges normal | grep -wE 'ring|ring_compat|aws-lc'
+cargo tree -p meow-wgstack --edges normal | grep -wE 'ring|ring_compat|aws-lc'
+cargo test -p meow-listener --features listener-wireguard --lib --test wireguard_listener
+cargo test -p meow-config --features wireguard --test wireguard_listener_config_test
+cargo test -p meow-config --no-default-features --test wireguard_listener_config_test
+
 # The official TrustTunnel test peer is required for the e2e target.
 # Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,
 # then export TRUSTTUNNEL_SERVER_BIN=/tmp/meow-tt-peer/trusttunnel_endpoint.
@@ -209,7 +249,8 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test direct_udp_binding \
   --test common_test --test dns_cache_test --test dns_response_rules --test config_test \
   --test tun_config_test --test sniffer_config_test --test dialer_proxy_group \
-  --test statistics_test --test rules_test --test api_test --test meow_cli_test \
+  --test statistics_test --test rules_test \
+  --test api_test --test api_endpoint_test --test api_logs_ws_test --test meow_cli_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test launchd_config_test \

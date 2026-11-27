@@ -7,11 +7,11 @@
 //! [`crate::rule_provider_refresh::RefreshSupervisor`].
 //!
 //! HTTP payloads load cache-first: a provider with an on-disk cache starts
-//! from it without a request, and the ones without download concurrently
-//! (bounded by [`crate::provider_fetch_deadline`]). Whatever the load left
-//! owing — a cache to revalidate, an empty set to fill, a download still
-//! running at the deadline — is fetched in the background once the provider
-//! is committed ([`RuleProvider::spawn_initial_fetch`]).
+//! from it without a request, and the ones without download with bounded
+//! concurrency. The load waits up to [`crate::provider_fetch_deadline`].
+//! Once a provider is committed, [`RuleProvider::spawn_initial_fetch`]
+//! revalidates a cache, retries a failed fetch, or adopts an unfinished
+//! download from the prefetch worker.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ enum InitialFetch {
     Revalidate,
     /// Loaded empty: fetch until a payload lands.
     Retry,
-    /// Loaded empty while its startup download was still running at the
+    /// Loaded empty while its startup download was unfinished at the
     /// fetch deadline: adopt that download before fetching again.
     Adopt(PendingFetch),
 }
@@ -319,9 +319,14 @@ impl RuleProvider {
         let format = self.format;
         let cache_path = self.cache_path.clone();
         let cache_write_lock = Arc::clone(&self.cache_write_lock);
+        // A file provider's refresh re-reads user-authored bytes, so the
+        // REMATCH-NAME gate that armed at load applies again; http bytes
+        // stay third-party content (issue #974).
+        let local = self.provider_type == ProviderType::File;
         let (boxed, parsed_as) = crate::spawn_blocking_with_current_dispatcher(move || {
-            let parsed =
-                parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
+            let parsed = parse_bytes_to_ruleset_with_format(
+                &bytes, behavior, format, &ctx_clone, strict, local,
+            )?;
             // Persist the payload only *after* the parse succeeds so the
             // cache always holds the last usable payload — a cache-first
             // restart then picks up the newest refresh rather than the
@@ -411,7 +416,7 @@ impl RuleProvider {
     ///   loop with the cached rules installed;
     /// - loaded empty: retry with backoff (5 s doubling to 5 min) until a
     ///   payload lands;
-    /// - its startup download was still running at the fetch deadline: wait
+    /// - its startup download was unfinished at the fetch deadline: wait
     ///   for that download first, so it is not requested twice.
     ///
     /// Ends early once any refresh — an `interval` tick or a manual one —
@@ -581,11 +586,27 @@ async fn initial_fetch_loop(provider: Weak<RuleProvider>, owed: InitialFetch) {
 #[derive(Default)]
 pub struct PrefetchedPayloads {
     entries: HashMap<String, Prefetched>,
+    /// The `User-Agent` [`prefetch_payloads`] sent on this set's downloads
+    /// — the *candidate's* `global-ua` on a config-build lane, where
+    /// `GLOBAL_UA` still holds the committed value until the commit point
+    /// installs the new one (issue #974 review). `None` means "use
+    /// [`meow_common::effective_user_agent`]", which is right on lanes
+    /// whose global is already installed. `load_http`'s blocking fallback
+    /// fetch sends the same override so every fetch on a lane speaks one
+    /// UA.
+    user_agent: Option<Arc<str>>,
 }
 
 impl PrefetchedPayloads {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The UA override this set's downloads ran under (`None` → the
+    /// process-global effective UA) — the load pass's own fetch sends
+    /// the same one.
+    fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
     }
 
     /// Record `bytes` as `name`'s payload; the load passes parse it as-is.
@@ -640,8 +661,8 @@ impl Prefetched {
 
 type DownloadResult = Result<Arc<Vec<u8>>, Arc<str>>;
 
-/// A download the fetch deadline left running. It keeps going on its own
-/// thread; the provider built for it adopts the result when it lands.
+/// An unfinished download at the fetch deadline. The worker still runs
+/// it and the provider built for it adopts the result when it lands.
 #[derive(Clone)]
 struct PendingFetch(tokio::sync::watch::Receiver<Option<DownloadResult>>);
 
@@ -665,7 +686,7 @@ struct Download {
 }
 
 enum DownloadState {
-    Running,
+    Unfinished,
     Done(Result<Vec<u8>, String>),
     /// The deadline passed first: the result goes to whoever adopts it.
     Detached(tokio::sync::watch::Sender<Option<DownloadResult>>),
@@ -685,7 +706,7 @@ impl DownloadBoard {
             DownloadState::Detached(adopter) => {
                 adopter.send_replace(Some(result.map(Arc::new).map_err(Arc::from)));
             }
-            DownloadState::Running => {
+            DownloadState::Unfinished => {
                 states[index] = DownloadState::Done(result);
                 self.changed.notify_all();
             }
@@ -694,7 +715,7 @@ impl DownloadBoard {
     }
 }
 
-/// Fails every download still running when the worker exits, however it
+/// Fails every unfinished download when the worker exits, however it
 /// exits — the prefetch must never wait on a result that cannot come.
 struct AbandonRemaining(Arc<DownloadBoard>, usize);
 
@@ -707,9 +728,13 @@ impl Drop for AbandonRemaining {
     }
 }
 
-/// Download every payload concurrently on one worker thread and wait for
-/// them until `deadline`. Downloads still running then keep going and are
-/// returned as [`Prefetched::Pending`].
+/// Bound in-flight requests on the prefetch worker. Completed payloads
+/// remain available to both load passes.
+const MAX_CONCURRENT_RULE_DOWNLOADS: usize = 4;
+
+/// Download the payloads on one worker thread and wait until `deadline`.
+/// Queued and running downloads continue on that worker and are returned
+/// as [`Prefetched::Pending`].
 fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(String, Prefetched)> {
     if downloads.is_empty() {
         return Vec::new();
@@ -717,7 +742,7 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
     let count = downloads.len();
     let names: Vec<String> = downloads.iter().map(|d| d.name.clone()).collect();
     let board = Arc::new(DownloadBoard {
-        states: parking_lot::Mutex::new((0..count).map(|_| DownloadState::Running).collect()),
+        states: parking_lot::Mutex::new((0..count).map(|_| DownloadState::Unfinished).collect()),
         changed: parking_lot::Condvar::new(),
     });
     let deadline_at = deadline.and_then(|d| std::time::Instant::now().checked_add(d));
@@ -739,20 +764,26 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                     }
                 };
                 runtime.block_on(async {
+                    let mut downloads = downloads.into_iter().enumerate();
                     let mut tasks = tokio::task::JoinSet::new();
-                    let mut indexes = HashMap::with_capacity(count);
-                    for (index, d) in downloads.into_iter().enumerate() {
-                        let task = tasks.spawn(async move {
-                            internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
-                        });
-                        indexes.insert(task.id(), index);
-                    }
-                    while let Some(joined) = tasks.join_next_with_id().await {
+                    let mut indexes = HashMap::with_capacity(MAX_CONCURRENT_RULE_DOWNLOADS);
+                    loop {
+                        let slots = MAX_CONCURRENT_RULE_DOWNLOADS - tasks.len();
+                        for (index, d) in downloads.by_ref().take(slots) {
+                            let task = tasks.spawn(async move {
+                                internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
+                            });
+                            indexes.insert(task.id(), index);
+                        }
+                        let Some(joined) = tasks.join_next_with_id().await else {
+                            break;
+                        };
                         let (id, result) = match joined {
                             Ok((id, result)) => (id, result.map_err(|e| format!("{e:#}"))),
                             Err(e) => (e.id(), Err(format!("download task failed: {e}"))),
                         };
-                        worker_board.complete(indexes[&id], result);
+                        let index = indexes.remove(&id).expect("each download has a board slot");
+                        worker_board.complete(index, result);
                     }
                 });
             });
@@ -766,7 +797,10 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
     }
 
     let mut states = board.states.lock();
-    while states.iter().any(|s| matches!(s, DownloadState::Running)) {
+    while states
+        .iter()
+        .any(|s| matches!(s, DownloadState::Unfinished))
+    {
         match deadline_at {
             None => board.changed.wait(&mut states),
             Some(at) => {
@@ -789,7 +823,7 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                     debug!("rule-provider '{name}': download failed: {e}");
                     Prefetched::Failed(e)
                 }
-                DownloadState::Running => {
+                DownloadState::Unfinished => {
                     let (adopter, pending) = tokio::sync::watch::channel(None);
                     *state = DownloadState::Detached(adopter);
                     Prefetched::Pending(PendingFetch(pending))
@@ -842,9 +876,9 @@ fn effective_download_proxy(
 /// - An http provider with an on-disk cache is served from it without a
 ///   request (mihomo's fetcher reads its local file first too); the load
 ///   marks it for a background revalidation.
-/// - The remaining http payloads download concurrently. The wait is bounded
-///   by [`crate::provider_fetch_deadline`] (unbounded by default); a download
-///   still running then keeps going and is handed to its provider.
+/// - The remaining http payloads download with bounded concurrency. The wait
+///   is bounded by [`crate::provider_fetch_deadline`] (unbounded by default).
+///   The worker finishes queued and running downloads for their providers.
 ///
 /// Failures are recorded (and logged at debug — the load pass reports them),
 /// so `load_providers_prefetched` registers those providers empty instead of
@@ -853,17 +887,29 @@ fn effective_download_proxy(
 /// prefetch layer can be absent when the caller had no need to build it)
 /// skips the provider quietly — the load pass acquires it against the full
 /// registry.
+///
+/// `user_agent` overrides the `User-Agent` the downloads send —
+/// `internal_http`'s request builder falls back to the process-global
+/// `effective_user_agent()`, which on a config-build lane still holds the
+/// *committed* value until the commit point installs the candidate's
+/// `global-ua` (issue #974 review). Build lanes therefore pass the
+/// candidate's validated UA explicitly; `None` keeps the static fallback.
+/// A provider's own `header:` User-Agent still wins. The override is
+/// recorded on the returned set so the load pass's fallback fetch sends
+/// the same one.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
+    user_agent: Option<&str>,
 ) -> PrefetchedPayloads {
     prefetch_payloads_within(
         raw_providers,
         cache_dir,
         default_proxy,
         lookup,
+        user_agent,
         crate::provider_fetch_deadline(),
     )
 }
@@ -875,9 +921,13 @@ pub fn prefetch_payloads_within(
     cache_dir: Option<&Path>,
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
+    user_agent: Option<&str>,
     deadline: Option<Duration>,
 ) -> PrefetchedPayloads {
-    let mut out = PrefetchedPayloads::default();
+    let mut out = PrefetchedPayloads {
+        user_agent: user_agent.map(Arc::from),
+        ..PrefetchedPayloads::default()
+    };
     let mut downloads = Vec::new();
     for (name, cfg) in raw_providers {
         let entry = match cfg.provider_type.as_str() {
@@ -906,7 +956,7 @@ pub fn prefetch_payloads_within(
                                 name: name.clone(),
                                 url: url.to_string(),
                                 proxy,
-                                headers: provider_headers(cfg),
+                                headers: with_user_agent(provider_headers(cfg), user_agent),
                             });
                             continue;
                         }
@@ -1018,7 +1068,7 @@ pub fn load_providers(
 }
 
 /// Same as [`load_providers`] but reuses the payloads [`prefetch_payloads`]
-/// acquired; a download it recorded as failed or still running registers the
+/// acquired; a download it recorded as failed or unfinished registers the
 /// provider empty without another request. Providers absent from
 /// `prefetched` acquire their payload themselves (cache first).
 /// `dialer_registry` should be the registry generation the resolved download
@@ -1073,6 +1123,7 @@ pub fn load_providers_prefetched(
             ctx,
             download_proxy.as_ref(),
             payload,
+            prefetched.user_agent(),
             dialer_registry,
             strict,
         ) {
@@ -1104,7 +1155,7 @@ pub fn load_providers_prefetched(
                 // upstream's failed-provider registration both prefer the
                 // retryable shape.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
-                // A download still running at the deadline is not a
+                // A download unfinished at the deadline is not a
                 // failure; the adopted download records its own outcome.
                 if !matches!(*provider.initial_fetch.lock(), InitialFetch::Adopt(_)) {
                     *provider.load_note.lock() = Some(LoadNote::Failed(format!("{e:#}")));
@@ -1199,6 +1250,11 @@ fn load_one(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&Prefetched>,
+    // The UA the prefetch's downloads ran under — the candidate's
+    // `global-ua` on a build lane; `load_http` sends it on a fallback
+    // fetch of its own so the lane speaks one UA before `GLOBAL_UA` is
+    // installed (issue #974 review). `None` → the static effective UA.
+    fetch_user_agent: Option<&str>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -1225,6 +1281,7 @@ fn load_one(
             ctx,
             download_proxy,
             prefetched,
+            fetch_user_agent,
             dialer_registry,
             strict,
         ),
@@ -1243,6 +1300,40 @@ fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn Rul
     build_rule_set(behavior, &[], ctx)
 }
 
+/// A line naming `REMATCH-NAME` that fails entry validation is a
+/// structural defect on a *local* payload, mirroring the `rules:` gate in
+/// `rule_parser` — silently warn-skipping it would route the flow's
+/// first decision by a different rule than written (issue #974). Drop it
+/// line-wise like the lenient build does every other entry: one
+/// malformed marker must not veto the sibling rules a provider
+/// legitimately supplies (issue #974 review). Remote payloads keep the
+/// lenient skip: feed noise must not veto the build.
+fn filter_malformed_rematch_entries(
+    entries: &[String],
+    behavior: RuleSetBehavior,
+    ctx: &ParserContext,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| rematch_entry_ok(entry, behavior, ctx))
+        .cloned()
+        .collect()
+}
+
+/// [`filter_malformed_rematch_entries`]'s per-entry predicate, shared with
+/// the streaming parser.
+fn rematch_entry_ok(entry: &str, behavior: RuleSetBehavior, ctx: &ParserContext) -> bool {
+    if !meow_rules::line_mentions_rematch_name(entry) {
+        return true;
+    }
+    let owned = entry.to_owned();
+    let valid = build_rule_set_checked(behavior, std::slice::from_ref(&owned), ctx).is_ok();
+    if !valid {
+        warn!("rule-set payload: dropping malformed REMATCH-NAME entry '{entry}'");
+    }
+    valid
+}
+
 /// Parse payload bytes into a rule set, honoring `strict` per-entry: strict
 /// uses [`build_rule_set_checked`] so one malformed line fails the payload
 /// instead of installing a partial set (issue #533).
@@ -1256,7 +1347,10 @@ fn entries_to_rule_set(
         build_rule_set_checked(behavior, entries, ctx)
             .map_err(|e| LoadError::Payload(anyhow!("{e}")))
     } else {
-        Ok(build_rule_set(behavior, entries, ctx))
+        // Inline `payload:` is authored in the config itself — local: a
+        // malformed REMATCH-NAME line drops itself, not the payload.
+        let entries = filter_malformed_rematch_entries(entries, behavior, ctx);
+        Ok(build_rule_set(behavior, &entries, ctx))
     }
 }
 
@@ -1364,8 +1458,11 @@ fn load_file(
             }
         },
     };
-    let parsed = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
-        .map_err(LoadError::Payload)?;
+    // A file provider's payload is user-authored bytes — local for the
+    // REMATCH-NAME structural gate (issue #974).
+    let parsed =
+        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict, true)
+            .map_err(LoadError::Payload)?;
     provider.fill_fresh(parsed);
     Ok(provider)
 }
@@ -1382,6 +1479,7 @@ fn load_http(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&Prefetched>,
+    fetch_user_agent: Option<&str>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -1427,11 +1525,20 @@ fn load_http(
             let fetched = match read_cache(cache_path.as_deref()) {
                 Some(cached) => Ok(cached),
                 None if crate::is_offline_validate() => Err(anyhow!(offline_miss(url))),
-                None => fetch_http_blocking(url, download_proxy, &headers).map(|bytes| {
-                    Prefetched::Downloaded {
-                        bytes,
-                        persisted: AtomicBool::new(false),
-                    }
+                // Same UA the prefetch's downloads ran under — a
+                // candidate lane's `GLOBAL_UA` still holds the previous
+                // config's value (issue #974 review); the provider's own
+                // `header:` still wins. `fetch.headers` above stays clean:
+                // refresh fetches run post-commit, where the static is
+                // already the committed UA.
+                None => fetch_http_blocking(
+                    url,
+                    download_proxy,
+                    &with_user_agent(headers, fetch_user_agent),
+                )
+                .map(|bytes| Prefetched::Downloaded {
+                    bytes,
+                    persisted: AtomicBool::new(false),
                 }),
             };
             match fetched {
@@ -1447,7 +1554,7 @@ fn load_http(
         }
     };
     let parse = |bytes: &[u8]| {
-        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
+        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict, false)
     };
     match entry {
         // Caller-supplied bytes for an http provider are still remote
@@ -1619,6 +1726,27 @@ fn provider_headers(cfg: &RawRuleProvider) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// `headers` plus `fetch_user_agent` as `User-Agent` — the explicit UA
+/// override for a config-build lane, whose `GLOBAL_UA` still holds the
+/// previous (or none) value until the commit point (issue #974 review).
+/// A provider's own `header:` User-Agent still wins, matching the
+/// custom-UA precedence `internal_http`'s request builder applies.
+fn with_user_agent(
+    headers: Vec<(String, String)>,
+    fetch_user_agent: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out = headers;
+    if let Some(ua) = fetch_user_agent {
+        if !out
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
+        {
+            out.push(("User-Agent".to_string(), ua.to_string()));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Format detection + parsing
 // ---------------------------------------------------------------------------
@@ -1632,13 +1760,16 @@ fn parse_explicit_format(cfg: &RawRuleProvider) -> Result<Option<RuleSetFormat>>
 
 /// Parse payload bytes into a rule set, returned with the format they
 /// parsed as: MRS when declared or when the bytes carry the MRS magic,
-/// otherwise the declared format (YAML when undeclared).
+/// otherwise the declared format (YAML when undeclared). `local` marks
+/// user-authored payload (file providers) — it arms the REMATCH-NAME
+/// structural gate remote feeds are exempt from (issue #974).
 fn parse_bytes_to_ruleset_with_format(
     bytes: &[u8],
     behavior: RuleSetBehavior,
     explicit_format: Option<RuleSetFormat>,
     ctx: &ParserContext,
     strict: bool,
+    local: bool,
 ) -> Result<(Box<dyn RuleSet>, RuleSetFormat)> {
     let use_mrs = explicit_format == Some(RuleSetFormat::Mrs) || is_mrs_bytes(bytes);
     if use_mrs {
@@ -1650,21 +1781,28 @@ fn parse_bytes_to_ruleset_with_format(
     let format = explicit_format.unwrap_or(RuleSetFormat::Yaml);
     // Entries stream from the payload into the set builder: no per-entry
     // `String` list (for 80k domains that list and its growth copies were
-    // ~5 MiB of the load peak).
-    let built = match format {
+    // ~5 MiB of the load peak). A local, lenient payload drops a malformed
+    // REMATCH-NAME line before the build (upstream's issue #974 rule);
+    // remote feeds keep the plain lenient skip.
+    let drop_rematch = local && !strict;
+    let check = |entry: &str| !drop_rematch || rematch_entry_ok(entry, behavior, ctx);
+    match format {
         RuleSetFormat::Yaml => {
             let root = parse_yaml_root(text)?;
             let payload = yaml_payload(&root, strict)?;
-            meow_rules::build_rule_set_streamed(behavior, yaml_entries(payload), ctx, strict)
+            let entries = yaml_entries(payload).filter(|e| check(e));
+            meow_rules::build_rule_set_streamed(behavior, entries, ctx, strict)
+                .map(|rules| (rules, format))
+                .map_err(|e| anyhow!("rule-set entry error: {e}"))
         }
         RuleSetFormat::Text => {
-            meow_rules::build_rule_set_streamed(behavior, text_entries(text), ctx, strict)
+            let entries = text_entries(text).filter(|e| check(e));
+            meow_rules::build_rule_set_streamed(behavior, entries, ctx, strict)
+                .map(|rules| (rules, format))
+                .map_err(|e| anyhow!("rule-set entry error: {e}"))
         }
         RuleSetFormat::Mrs => unreachable!("handled above"),
-    };
-    built
-        .map(|rules| (rules, format))
-        .map_err(|e| anyhow!("rule-set entry error: {e}"))
+    }
 }
 
 fn parse_yaml_root(raw: &str) -> Result<serde_json::Value> {
@@ -1708,6 +1846,32 @@ fn text_entries(raw: &str) -> impl Iterator<Item = &str> {
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// Decode prefetched provider bytes into rule lines for geo discovery —
+/// the declared `format:` governs, so a YAML `payload:` list yields its
+/// entries rather than raw `- "GEOIP,CN"` source text (which the geo
+/// regexes would scan with the list-marker still attached). `None` when
+/// the declared format cannot decode — the caller falls back to scanning
+/// the raw text lines (conservative; the build stage owns the error).
+pub(crate) fn payload_entries_for_scan(cfg: &RawRuleProvider, text: &str) -> Option<Vec<String>> {
+    let format = parse_explicit_format(cfg)
+        .ok()
+        .flatten()
+        .unwrap_or(RuleSetFormat::Yaml);
+    match format {
+        RuleSetFormat::Yaml => match parse_yaml_root(text) {
+            Ok(root) => yaml_payload(&root, false)
+                .ok()
+                .map(|payload| yaml_entries(payload).map(str::to_string).collect()),
+            Err(_) => None,
+        },
+        RuleSetFormat::Text => Some(text_entries(text).map(str::to_string).collect()),
+        // MRS bytes are skipped upstream of this call; a declared-mrs
+        // provider whose bytes are not MRS decodes as nothing the geo
+        // regexes could read anyway — let the caller scan raw text.
+        RuleSetFormat::Mrs => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,12 +1978,18 @@ fn fetch_http_blocking(
     let thread_url = url.clone();
     let proxy = proxy.cloned();
     let headers = headers.to_vec();
+    // The spawn sees no caller context — carry the scoped dispatcher so
+    // warns inside the fetch reach the subscriber in effect here (same
+    // propagation `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building temporary tokio runtime for rule-provider fetch")?;
-        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        tracing::dispatcher::with_default(&dispatch, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building temporary tokio runtime for rule-provider fetch")?;
+            rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        })
     })
     .join()
     .map_err(|payload| {
@@ -1936,6 +2106,7 @@ mod tests {
             proxy: proxy.map(str::to_string),
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2033,6 +2204,7 @@ mod tests {
                 proxy: Some("NoSuch".to_string()),
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2058,6 +2230,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2083,6 +2256,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2104,6 +2278,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
         let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx(), false)
             .map(|_| ())
@@ -2133,6 +2308,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2153,6 +2329,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2275,6 +2452,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2297,6 +2475,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2321,6 +2500,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2378,6 +2558,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2490,6 +2671,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2568,6 +2750,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2604,6 +2787,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string()]),
+                extra: Default::default(),
             },
         );
         providers.insert(
@@ -2618,6 +2802,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2850,6 +3035,7 @@ header:
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
 
         // No cache dir (the `PUT /configs` rebuild context): previously a
@@ -2997,6 +3183,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, Some(dir.path()), &parse_ctx, None, false)
@@ -3072,6 +3259,7 @@ header:
                 Some(&dir),
                 None,
                 &|_| None,
+                None,
                 deadline,
             ))
         })
@@ -3230,34 +3418,44 @@ header:
         );
     }
 
-    /// A download still running at the deadline keeps going, and the
-    /// provider adopts it when it lands instead of requesting it again.
+    /// Work queued or running at the deadline stays on the bounded worker.
+    /// Each provider adopts the result once.
     #[tokio::test]
-    async fn deadline_hands_the_running_download_to_the_provider() {
+    async fn deadline_hands_queued_and_running_downloads_to_providers() {
         let origin = Origin::spawn(Some(NEW_RULES), false).await;
         let dir = tempfile::tempdir().unwrap();
-        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+        let raw = (0..=MAX_CONCURRENT_RULE_DOWNLOADS)
+            .map(|i| (format!("p{i}"), http_provider(&origin.url, 0)))
+            .collect();
 
         let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::from_millis(100))).await;
         let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
-        let p = &providers["p"];
-        assert_eq!(p.rule_count(), 0);
+        eventually("the in-flight window to start", || {
+            origin.hits() >= MAX_CONCURRENT_RULE_DOWNLOADS
+        })
+        .await;
+        assert_eq!(origin.hits(), MAX_CONCURRENT_RULE_DOWNLOADS);
 
-        let fetch = p
-            .spawn_initial_fetch()
-            .expect("the running download is owed");
+        let fetches: Vec<_> = providers
+            .values()
+            .map(|p| {
+                assert_eq!(p.rule_count(), 0);
+                p.spawn_initial_fetch().expect("the download is still owed")
+            })
+            .collect();
         origin.gate.send_replace(true);
-        fetch.await.unwrap();
-        assert_eq!(p.rule_count(), 2);
-        assert_eq!(
-            origin.hits(),
-            1,
-            "the straggler is adopted, not re-requested"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cache_file(dir.path(), "p")).unwrap(),
-            NEW_RULES
-        );
+        for fetch in fetches {
+            fetch.await.unwrap();
+        }
+        assert_eq!(origin.hits(), raw.len());
+        for (name, provider) in providers {
+            assert_eq!(provider.rule_count(), 2);
+            assert!(provider.spawn_initial_fetch().is_none());
+            assert_eq!(
+                std::fs::read_to_string(cache_file(dir.path(), &name)).unwrap(),
+                NEW_RULES
+            );
+        }
     }
 
     /// Logbook: a provider's first payload is its load. Adopted after the
@@ -3551,5 +3749,98 @@ header:
             providers["fast-bad"].rule_count() == 2
         })
         .await;
+    }
+
+    /// A local payload line naming `REMATCH-NAME` that fails to parse
+    /// drops itself — a structural defect, not feed noise — but it does
+    /// not veto the sibling entries the provider legitimately supplies
+    /// (issue #974 review). Remote bytes keep the lenient skip
+    /// (issue #974).
+    #[test]
+    fn local_payloads_filter_malformed_rematch_predicates() {
+        let ctx = ParserContext::empty();
+        let bytes = b"payload:\n  - DOMAIN,x.com\n  - REMATCH-NAME,a//b\n";
+
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            bytes,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            true,
+        )
+        .expect("a malformed REMATCH-NAME line drops itself, not the payload");
+        assert_eq!(set.len(), 1, "only the DOMAIN entry installs");
+
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            bytes,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            false,
+        )
+        .expect("remote feeds keep the lenient skip");
+        assert_eq!(set.len(), 1, "only the DOMAIN entry installs");
+
+        let ok = b"payload:\n  - REMATCH-NAME,stage1/alt\n";
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            ok,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            true,
+        )
+        .expect("a well-formed REMATCH-NAME entry is not gated");
+        assert_eq!(set.len(), 1);
+    }
+
+    /// The provider-level shape of the same verdict: a file or inline
+    /// payload with a malformed REMATCH-NAME entry still registers — the
+    /// valid sibling installs while only the malformed line drops — and
+    /// strict fails the build.
+    #[test]
+    fn local_providers_drop_line_on_malformed_rematch_entry() {
+        let classical =
+            |provider_type: &str, path: Option<String>, payload: Option<Vec<String>>| {
+                RawRuleProvider {
+                    provider_type: provider_type.to_string(),
+                    behavior: "classical".to_string(),
+                    format: None,
+                    url: None,
+                    path,
+                    interval: None,
+                    proxy: None,
+                    header: None,
+                    payload,
+                    extra: Default::default(),
+                }
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rules.yaml");
+        std::fs::write(&file, "payload:\n  - REMATCH-NAME,a//b\n  - DOMAIN,x.com\n").unwrap();
+        let entries = vec!["REMATCH-NAME,/a".to_string(), "DOMAIN,y.com".to_string()];
+        let providers = HashMap::from([
+            (
+                "file".to_string(),
+                classical("file", Some(file.to_string_lossy().to_string()), None),
+            ),
+            (
+                "inline".to_string(),
+                classical("inline", None, Some(entries)),
+            ),
+        ]);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None, false)
+            .expect("lenient registers providers, dropping only the bad line");
+        assert_eq!(out.len(), 2, "both providers register");
+        assert_eq!(
+            out["file"].rule_count() + out["inline"].rule_count(),
+            2,
+            "one valid entry survives on each provider"
+        );
+        let err = load_providers(&providers, Some(dir.path()), &ctx(), None, true)
+            .expect_err("strict fails the build");
+        assert!(err.to_string().contains("REMATCH-NAME"), "{err}");
     }
 }

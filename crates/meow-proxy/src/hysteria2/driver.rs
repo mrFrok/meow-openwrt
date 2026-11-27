@@ -16,11 +16,13 @@ use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::udp_io;
 use super::{Config, Error, Result};
+use meow_transport::datagram::{try_poll_recv_once, SocketIo};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -90,8 +92,10 @@ const UDP_SESSION_QUEUE: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Datagrams fed to quiche per socket wakeup before the driver flushes. One
 /// flush then acknowledges the whole batch, where a flush per datagram sent
-/// an ACK (and a syscall) for every packet of a download.
-const RECV_BATCH: usize = 32;
+/// an ACK (and a syscall) for every packet of a download. 128 keeps a
+/// saturated download draining the socket inside one wakeup — at ~1400 B a
+/// pass is ~180 KB, the same order as the queues feeding it.
+const RECV_BATCH: usize = 128;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
 /// ACK coalescing (upstream #866): an ACK-only flush is held back until
@@ -111,6 +115,25 @@ const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
 /// A `Sleep` cannot be disarmed: a hold that ends early parks the ACK timer
 /// this far out instead of leaving a deadline that only wakes the loop.
 const ACK_TIMER_PARKED: Duration = Duration::from_secs(86400);
+
+/// The ACK-coalescing thresholds a [`State`] runs with — a parameter rather
+/// than the raw constants so a test can pin them: `driver_tests`'s download
+/// test holds `delay` open for a whole transfer, leaving [`ACK_COALESCE_PKTS`]
+/// the only hold-ender and the measured ACK ratio independent of how fast
+/// the runner's timer is. Production always takes `Self::default()`.
+pub(crate) struct AckCoalesce {
+    pkts: u32,
+    delay: Duration,
+}
+
+impl Default for AckCoalesce {
+    fn default() -> Self {
+        Self {
+            pkts: ACK_COALESCE_PKTS,
+            delay: ACK_COALESCE_DELAY,
+        }
+    }
+}
 /// Largest payload chunk handed to a stream's reader in one channel item;
 /// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -210,10 +233,117 @@ impl Drop for StreamState {
     }
 }
 
+/// The driver's datagram transport.
+///
+/// `Raw` is the direct path: an *unconnected* bound socket so port hopping
+/// can retarget each send and received datagrams report their real source.
+/// `Io` is an injected connected endpoint — a `dialer-proxy` front UDP
+/// association bridged by `PacketConnSocket` — whose peer is implicit:
+/// `send` ignores `dest`, `recv` reports the association's bound peer, and
+/// there is nothing for `HopState` to hop (the parser clears `ports` /
+/// `hop_interval` for an injected dialer; [`spawn`] also skips `HopState`
+/// construction on this arm).
+pub(crate) enum DriverSocket {
+    Raw(UdpSocket),
+    Io {
+        io: Box<dyn SocketIo>,
+        /// The address quiche sees as this path's peer — the association's
+        /// `UdpTarget` (or a locally-resolved cosmetic stand-in for a
+        /// `Name` target). Received datagrams report it as `from`.
+        peer: SocketAddr,
+    },
+}
+
+impl DriverSocket {
+    /// Await one datagram. `Raw` reports the real source; `Io` reports the
+    /// association's bound peer — its reads are connected-mode and carry
+    /// no source address.
+    async fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Raw(socket) => socket.recv_from(buf).await,
+            Self::Io { io, peer } => {
+                let mut rb = ReadBuf::new(buf);
+                std::future::poll_fn(|cx| io.poll_recv(cx, &mut rb)).await?;
+                Ok((rb.filled().len(), *peer))
+            }
+        }
+    }
+
+    /// Non-blocking companion to [`Self::recv_from`], for the drain pass
+    /// after the select arm's awaited read. `Ok(None)` ends the batch.
+    fn try_recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<Option<(usize, SocketAddr)>> {
+        match self {
+            Self::Raw(socket) => match socket.try_recv_from(buf) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            },
+            Self::Io { io, peer } => {
+                // The noop-waker contract this relies on — the enclosing
+                // select re-polls `poll_recv` on its next wakeup — lives
+                // on `try_poll_recv_once`.
+                try_poll_recv_once(&mut **io, buf).map(|o| o.map(|n| (n, *peer)))
+            }
+        }
+    }
+
+    /// One datagram out. `Io` ignores `dest` — the endpoint is bound to the
+    /// association's peer, so `debug_assert` it matches what quiche asked
+    /// for rather than silently routing elsewhere.
+    async fn send_to(&mut self, buf: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(socket) => socket.send_to(buf, dest).await,
+            Self::Io { io, peer } => {
+                debug_assert_eq!(
+                    *peer, dest,
+                    "injected endpoint must only send to its bound peer"
+                );
+                std::future::poll_fn(|cx| io.poll_send(cx, buf)).await
+            }
+        }
+    }
+
+    /// Grow-aware receive: a raw socket returns one GRO run (`seg` set when
+    /// the kernel coalesced); an injected endpoint has no GRO and behaves
+    /// like a plain non-blocking read. `None` means "nothing queued".
+    fn try_recv_gro(
+        &mut self,
+        buf: &mut [u8],
+    ) -> std::io::Result<Option<(usize, SocketAddr, Option<usize>)>> {
+        match self {
+            Self::Raw(socket) => match udp_io::try_recv_gro(socket, buf) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            },
+            Self::Io { .. } => Ok(self.try_recv_from(buf)?.map(|(n, from)| (n, from, None))),
+        }
+    }
+
+    /// Send a GSO run: one `sendmsg` on a raw socket, per-datagram on an
+    /// injected endpoint (its `SocketIo` has no segment API).
+    async fn send_batch(
+        &mut self,
+        buf: &[u8],
+        seg: usize,
+        dest: SocketAddr,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Raw(socket) => udp_io::send_segments(socket, buf, seg, dest).await,
+            Self::Io { .. } => {
+                for datagram in buf.chunks(seg.max(1)) {
+                    self.send_to(datagram, dest).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Driver state that is NOT the `quiche::Connection`, so helpers can borrow it
 /// alongside `&mut conn`.
 struct State {
-    socket: UdpSocket,
+    socket: DriverSocket,
     local: SocketAddr,
     obfs: Option<Obfs>,
     hop: Option<HopState>,
@@ -230,10 +360,11 @@ struct State {
     closed: Arc<AtomicBool>,
     /// Received datagrams dropped on a full session queue.
     udp_dropped: u64,
+    /// ACK-coalescing thresholds — see [`AckCoalesce`].
+    coalesce: AckCoalesce,
     /// Batched UDP I/O ([`udp_io`]): GSO sends until a send proves the
     /// path cannot take them, GRO receives when the kernel has it.
     gso: bool,
-    gro: bool,
     /// Pending GSO run: equal-sized datagrams for `batch_dest`.
     batch: Vec<u8>,
     batch_seg: usize,
@@ -250,23 +381,39 @@ struct AuthCtx {
 /// Resolves once authentication succeeds, returning a live handle.
 pub(crate) async fn spawn(
     cfg: &Config,
-    socket: UdpSocket,
+    socket: DriverSocket,
     local: SocketAddr,
     peer: SocketAddr,
     conn: super::QuicConn,
+    coalesce: AckCoalesce,
 ) -> Result<ConnHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
     let read_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
     let obfs = cfg.obfs.as_ref().map(Obfs::new);
-    let hop = HopState::new(
-        peer,
-        &cfg.hop_ports,
-        cfg.hop_interval_min_secs,
-        cfg.hop_interval_max_secs,
-    )?;
+    let hop = match &socket {
+        // An injected connected endpoint is bound to one front association —
+        // there is no second port to hop to. The parser already clears
+        // `ports`/`hop_interval` when a proxy dialer is present; skipping
+        // `HopState` here keeps an unthreaded config harmless anyway.
+        DriverSocket::Io { .. } => None,
+        DriverSocket::Raw(_) => HopState::new(
+            peer,
+            &cfg.hop_ports,
+            cfg.hop_interval_min_secs,
+            cfg.hop_interval_max_secs,
+        )?,
+    };
 
-    let gro = udp_io::enable_gro(&socket);
+    // GSO/GRO need the raw syscall surface: an injected `dialer-proxy`
+    // association (`DriverSocket::Io`) is a `SocketIo`, so it takes the
+    // one-datagram path.
+    let raw = matches!(socket, DriverSocket::Raw(_));
+    if let DriverSocket::Raw(socket) = &socket {
+        // The option is what makes `try_recv_gro` coalesce; the bool only
+        // says whether this kernel has GRO.
+        let _ = udp_io::enable_gro(socket);
+    }
     let state = State {
         socket,
         local,
@@ -283,8 +430,8 @@ pub(crate) async fn spawn(
         udp_out: Vec::new(),
         closed: Arc::clone(&closed),
         udp_dropped: 0,
-        gso: udp_io::GSO_SUPPORTED,
-        gro,
+        coalesce,
+        gso: udp_io::GSO_SUPPORTED && raw,
         batch: Vec::new(),
         batch_seg: 0,
         batch_count: 0,
@@ -370,9 +517,18 @@ async fn run(
         let mut woke_on_cmd = false;
         let mut woke_on_notify = false;
         tokio::select! {
-            r = st.socket.readable() => {
-                match r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
-                    Ok(n) => received = n,
+            r = st.socket.recv_from(&mut buf) => {
+                match r {
+                    Ok((n, from)) => {
+                        received = accept(&mut st, &mut conn, &mut buf[..n], from);
+                        match recv_batch(&mut st, &mut conn, &mut buf) {
+                            Ok(more) => received += more,
+                            Err(e) => {
+                                fail(&mut ready_tx, &mut st, Error::Io(e));
+                                break;
+                            }
+                        }
+                    }
                     Err(e) => {
                         fail(&mut ready_tx, &mut st, Error::Io(e));
                         break;
@@ -461,7 +617,7 @@ async fn run(
                 ack_pending += received;
                 if ack_since.is_none() {
                     ack_since = Some(now);
-                    ack_timer.as_mut().reset(now + ACK_COALESCE_DELAY);
+                    ack_timer.as_mut().reset(now + st.coalesce.delay);
                 }
             }
             if let Some(since) = ack_since {
@@ -469,8 +625,8 @@ async fn run(
                     && !queued
                     && !conn.is_closed()
                     && !conn.is_draining()
-                    && ack_pending < ACK_COALESCE_PKTS
-                    && now.duration_since(since) < ACK_COALESCE_DELAY
+                    && ack_pending < st.coalesce.pkts
+                    && now.duration_since(since) < st.coalesce.delay
                 {
                     continue;
                 }
@@ -967,7 +1123,7 @@ async fn flush_batch(st: &mut State) -> std::io::Result<()> {
     let result = if count == 1 {
         st.socket.send_to(&st.batch, dest).await.map(drop)
     } else {
-        match udp_io::send_segments(&st.socket, &st.batch, seg, dest).await {
+        match st.socket.send_batch(&st.batch, seg, dest).await {
             Err(e) if udp_io::gso_unsupported(&e) => {
                 tracing::debug!("hysteria2: UDP GSO unavailable ({e}); sending per packet");
                 st.gso = false;
@@ -987,6 +1143,28 @@ async fn flush_batch(st: &mut State) -> std::io::Result<()> {
     result
 }
 
+/// Feed one received datagram to quiche, undoing obfs and port-hopping.
+/// Returns 1 when quiche accepted it (counts toward ACK coalescing), 0 when
+/// the datagram was rejected.
+fn accept(st: &mut State, conn: &mut super::QuicConn, pkt: &mut [u8], from: SocketAddr) -> u32 {
+    let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+    let info = quiche::RecvInfo { from, to: st.local };
+    let accepted = match st.obfs.as_mut() {
+        Some(obfs) => match obfs.decode(pkt, from) {
+            Some(mut dgram) => conn.recv(&mut dgram, info),
+            None => return 0,
+        },
+        None => conn.recv(pkt, info),
+    };
+    match accepted {
+        Ok(_) => 1,
+        Err(e) => {
+            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+            0
+        }
+    }
+}
+
 /// Feed the datagrams queued on the socket to quiche, at most
 /// [`RECV_BATCH`] reads of them (each read a GRO run of several when the
 /// kernel coalesced them), undoing obfs and port-hopping.
@@ -994,17 +1172,8 @@ async fn flush_batch(st: &mut State) -> std::io::Result<()> {
 fn recv_batch(st: &mut State, conn: &mut super::QuicConn, buf: &mut [u8]) -> std::io::Result<u32> {
     let mut accepted = 0u32;
     for _ in 0..RECV_BATCH {
-        let read = if st.gro {
-            udp_io::try_recv_gro(&st.socket, buf)
-        } else {
-            st.socket
-                .try_recv_from(buf)
-                .map(|(n, from)| (n, from, None))
-        };
-        let (n, from, seg) = match read {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(accepted),
-            Err(e) => return Err(e),
+        let Some((n, from, seg)) = st.socket.try_recv_gro(buf)? else {
+            return Ok(accepted);
         };
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };

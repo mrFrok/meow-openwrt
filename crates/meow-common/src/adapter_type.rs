@@ -18,7 +18,9 @@ pub enum AdapterType {
     Vless,
     Trojan,
     Hysteria2,
-    /// meow-openwrt: kernel WireGuard / AmneziaWG link (mihomo `wireguard`).
+    /// WireGuard outbound (mihomo `type: wireguard`): the fork's kernel
+    /// WireGuard/AmneziaWG link, or upstream's userspace boringtun-over-
+    /// smoltcp client — one adapter type, chosen by build feature.
     WireGuard,
     TrustTunnel,
     Anytls,
@@ -33,6 +35,14 @@ pub enum AdapterType {
     /// Direct-dialing built-in named `COMPATIBLE` — upstream registers it
     /// as GLOBAL's default member (upstream `C.Compatible`).
     Compatible,
+    /// `type: rematch` control outbound (issue #974) — re-enters the rule
+    /// scan with `Metadata.rematch_name`/`special_rules` updated. Carries
+    /// no address and can never open a socket (upstream `C.Rematch`).
+    Rematch,
+    /// `type: dns` outbound (issue #974, upstream `C.Dns`) — answers the
+    /// flow's DNS payload from the kernel's own resolver; the nominal
+    /// destination is never contacted.
+    Dns,
 }
 
 impl fmt::Display for AdapterType {
@@ -60,6 +70,8 @@ impl fmt::Display for AdapterType {
             AdapterType::Pass => write!(f, "Pass"),
             AdapterType::PassRule => write!(f, "PassRule"),
             AdapterType::Compatible => write!(f, "Compatible"),
+            AdapterType::Rematch => write!(f, "Rematch"),
+            AdapterType::Dns => write!(f, "Dns"),
         }
     }
 }
@@ -81,6 +93,16 @@ pub enum ConnType {
     Tuic,
     Hysteria2,
     Inner,
+    /// WireGuard inbound listener (`type: wireguard`): an inner TCP/UDP
+    /// flow terminated from a WG-encapsulated datagram. Serializes as
+    /// `"wireguard"` in `/connections` `metadata.type` (errata U4 —
+    /// pinned by an API test); the alias keeps the first shipped
+    /// spelling readable on deserialize.
+    #[serde(rename = "wireguard", alias = "WireGuard")]
+    WireGuard,
+    /// AnyTLS inbound listener (`type: anytls`): a per-SYN logical flow
+    /// demuxed out of an authenticated AnyTLS session.
+    Anytls,
 }
 
 impl fmt::Display for ConnType {
@@ -101,6 +123,8 @@ impl fmt::Display for ConnType {
             ConnType::Tuic => write!(f, "Tuic"),
             ConnType::Hysteria2 => write!(f, "Hysteria2"),
             ConnType::Inner => write!(f, "Inner"),
+            ConnType::WireGuard => write!(f, "WireGuard"),
+            ConnType::Anytls => write!(f, "AnyTLS"),
         }
     }
 }

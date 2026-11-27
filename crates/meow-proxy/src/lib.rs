@@ -1,8 +1,8 @@
 //! Outbound proxy protocol implementations and groups for the meow-rs kernel.
 //!
 //! Adapters for Shadowsocks, Trojan, VLESS, VMess, Hysteria2, Snell, AnyTLS,
-//! HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest, Fallback,
-//! LoadBalance, and Relay groups.
+//! WireGuard, HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest,
+//! Fallback, LoadBalance, and Relay groups.
 
 /// BoringSSL record-layer AEAD shared by Snell, VMess and VLESS encryption.
 #[cfg(any(feature = "snell", feature = "vmess", feature = "vless-encryption"))]
@@ -16,7 +16,8 @@ mod aead;
 mod certificate_pin;
 pub mod dialer;
 pub mod direct;
-#[cfg(feature = "ss")]
+pub mod dns_adapter;
+#[cfg(feature = "ss-obfs")]
 mod first_flight;
 pub mod group;
 pub mod health;
@@ -24,6 +25,7 @@ pub mod http_adapter;
 #[cfg(feature = "mux")]
 pub mod mux;
 pub mod reject;
+pub mod rematch;
 pub mod socks5_adapter;
 pub mod stream_conn;
 #[cfg(any(feature = "vmess", feature = "vless-encryption"))]
@@ -32,8 +34,8 @@ pub mod transport_chain;
 #[cfg(feature = "trusttunnel")]
 pub mod trusttunnel;
 pub mod unavailable;
-#[cfg(all(feature = "wireguard", target_os = "linux"))]
-pub mod wireguard;
+#[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
+pub mod wireguard_kernel;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
@@ -43,7 +45,17 @@ pub mod gost_plugin;
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
-#[cfg(feature = "ss")]
+// The shared SIP003 opts helpers are consumed only by the built-in plugin
+// transports — each an opt-in feature on top of `ss`.
+#[cfg(any(
+    feature = "ss-v2ray-plugin",
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "jls",
+    feature = "kcptun",
+    feature = "ech-tls-tunnel"
+))]
 mod plugin_util;
 #[cfg(feature = "restls")]
 pub mod restls_plugin;
@@ -51,7 +63,7 @@ pub mod restls_plugin;
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-v2ray-plugin")]
 pub mod v2ray_plugin;
 
 /// `uot.AddrParser` per-packet address headers — shared by the anytls and
@@ -79,7 +91,15 @@ pub mod hysteria2_adapter;
 #[cfg(feature = "hysteria2")]
 pub use hysteria2::ReceiveWindows as Hy2ReceiveWindows;
 #[cfg(feature = "hysteria2")]
+pub use hysteria2::{DEFAULT_QUIC_CONNECTIONS, MAX_QUIC_CONNECTIONS};
+#[cfg(feature = "hysteria2")]
 pub use hysteria2_adapter::{Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options};
+/// WireGuard outbound (`type: wireguard`), userspace boringtun + smoltcp —
+/// opt-in feature `wireguard` (issue #899 Phase-1).
+#[cfg(feature = "wireguard")]
+pub mod wireguard;
+#[cfg(feature = "wireguard")]
+pub use wireguard::{WireGuardAdapter, WireGuardConfig};
 
 #[cfg(feature = "vless")]
 pub(crate) mod vless;
@@ -90,15 +110,17 @@ pub mod vless_adapter;
 pub mod vmess;
 
 pub use direct::DirectAdapter;
+pub use dns_adapter::DnsAdapter;
 pub use group::dialer_proxy::DialerProxyAdapter;
 pub use group::fallback::FallbackGroup;
 pub use group::load_balance::{LbStrategy, LoadBalanceGroup};
 pub use group::relay::RelayGroup;
 pub use group::selector::SelectorGroup;
-pub use group::selector_store::SelectorStore;
+pub use group::selector_store::{SelectionBacking, SelectorStore, SelectorWriter};
 pub use group::urltest::UrlTestGroup;
 pub use http_adapter::HttpAdapter;
 pub use reject::RejectAdapter;
+pub use rematch::RematchAdapter;
 #[cfg(feature = "ss")]
 pub use shadowsocks_adapter::ShadowsocksAdapter;
 pub use socks5_adapter::Socks5Adapter;

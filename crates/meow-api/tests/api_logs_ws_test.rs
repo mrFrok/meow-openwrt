@@ -42,6 +42,7 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
         log_tx: log_tx.clone(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -50,6 +51,7 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
     (state, log_tx)
 }
@@ -80,6 +82,31 @@ async fn spawn_server(state: Arc<AppState>) -> (std::net::SocketAddr, tokio::tas
 async fn ws_connect(url: &str) -> WsStream {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     ws
+}
+
+#[tokio::test]
+async fn logs_websocket_without_secret_requires_a_same_origin_browser() {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::StatusCode, Error};
+
+    let (state, _) = make_state();
+    let (addr, server) = spawn_server(state).await;
+    let url = format!("ws://{addr}/logs");
+
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (ws, response) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    drop(ws);
+
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", "https://dashboard.example".parse().unwrap());
+    let result = tokio_tungstenite::connect_async(req).await;
+    server.abort();
+    assert!(
+        matches!(result, Err(Error::Http(response)) if response.status() == StatusCode::FORBIDDEN)
+    );
 }
 
 /// Receive one text frame, timing out at 500 ms.

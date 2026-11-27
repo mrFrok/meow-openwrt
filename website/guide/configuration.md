@@ -24,12 +24,20 @@ Use it as a pre-flight check.
 | `ipv6` | bool | `false` | Enable IPv6 (AAAA) resolution |
 | `strict` | bool | `false` | Fail on unparseable entries instead of warn-and-skip |
 | `external-controller` | string | — | REST API listen address, e.g. `127.0.0.1:9090` |
+| `external-controller-tls` | string | — | Additional HTTPS API listen address, coexisting with the plain one; identity comes from `tls.certificate`/`tls.private-key` (inline PEM pair or paths under the daemon home/`SAFE_PATHS`), or an ephemeral self-signed cert when both are unset. Needs the `api-tls` build feature (in `full`/`default`, not `minimal` — there it warns "not compiled into this build") |
+| `external-controller-unix` | string | — | API over a Unix socket (relative resolves under the daemon home); owner-only `0600`, same Bearer auth, only a verified stale socket is reclaimed |
+| `external-controller-pipe` | string | — | API over a Windows named pipe (parsed everywhere, served on Windows only; warn-ignored elsewhere) |
+| `external-controller-cors` | map | — | API CORS policy: `allow-origins` (list of origins/globs, `[]` = allow-all) and `allow-private-network` (default `true`), in upstream's configured `cors.New` wire shape (max-age 300, per-header echo). An *absent* map resolves the same `["*"]`/`true` defaults — needs a `secret` for any CORS at all (deliberate divergence; upstream's `secret: ""` permissive mode is not served) |
+| `tls` | map | — | `certificate`/`private-key` feed `external-controller-tls` only (both or neither); `client-auth-type`, `client-auth-certificates`, `ech-key`, `custom-certifactes` are parsed but ignored with a warning |
+| `external-controller-routing-mark` | u32 | — | Parsed, ignored with a warning (controller-socket `SO_MARK` not implemented) |
 | `secret` | string | — | API bearer-token secret (empty = no auth) |
 | `external-ui` | string | — | Directory of static dashboard files served at `/ui` |
 | `external-ui-name` | string | — | Sub-directory within `external-ui` holding the files |
 | `external-ui-url` | string | — | URL the UI archive can be fetched from (recorded only) |
 | `tproxy-sni` | bool | `true` | SNI sniffing on the TProxy listener (deprecated — use `sniffer`) |
 | `routing-mark` | u32 | — | Linux `SO_MARK` for transparent-proxy loop avoidance |
+| `global-client-fingerprint` | string | — | Default uTLS ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting `client-fingerprint` (`chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `random`, …; node value wins, an omitted/empty node value inherits the global, `none` opts out). Baked into adapters at parse — changes ride a full config load |
+| `global-ua` | string | `clash.meta/<version>` | `User-Agent` on internal HTTP fetches (providers, subscriptions, geodata, external-ui) and latency probes; `""` clears, `PATCH /configs` applies live |
 | `max-connections` | usize | `256` | Global cap on concurrent inbound connections (`0` = unlimited); inherited by the TUN listener |
 | `tcp-keepalive` | bool | `true` | `SO_KEEPALIVE` on every accepted inbound socket (listener-startup snapshot) |
 | `tcp-keepalive-idle` | u64 (s) | `300` | Socket silence before the first keepalive probe (`1`–`32767`) |

@@ -48,7 +48,7 @@ struct Meow {
 
 impl Meow {
     async fn start() -> Self {
-        Self::start_with(CONFIG).await
+        Self::start_with(&format!("secret: {SECRET}\n{CONFIG}")).await
     }
 
     async fn start_with(config: &str) -> Self {
@@ -76,6 +76,7 @@ impl Meow {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -84,6 +85,7 @@ impl Meow {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

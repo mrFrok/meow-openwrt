@@ -1,4 +1,4 @@
-use super::selector_store::SelectorStore;
+use super::selector_store::SelectorWriter;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, GroupDisplay, MeowError, Metadata, ProviderSlot, Proxy,
@@ -18,7 +18,7 @@ pub struct SelectorGroup {
     /// DIRECT either way, so the divergence is cosmetic.)
     selected: RwLock<Option<SmolStr>>,
     /// Optional write-through persistence; primed at construction.
-    store: Option<Arc<SelectorStore>>,
+    store: Option<SelectorWriter>,
     health: ProxyHealth,
     display: GroupDisplay,
 }
@@ -52,14 +52,15 @@ impl SelectorGroup {
         }
     }
 
-    /// Attach a persistent store. The previously-saved choice (if any) is
-    /// loaded into `selected` immediately so the group dials it on first use.
-    /// Subsequent successful `select()` calls flush back through the store.
+    /// Attach the epoch-fenced persistence writer. The saved choice is
+    /// not copied out here: `selected_proxy` asks the store lazily, so
+    /// the group serves the exact map the backing's `commit` adopts —
+    /// adoption re-reads the file, and a build-time snapshot could name
+    /// whatever it read before the file changed (issue #974 review).
+    /// `select()` writes still flush through while the writer's
+    /// generation owns the persistence epoch.
     #[must_use]
-    pub fn with_store(mut self, store: Arc<SelectorStore>) -> Self {
-        if let Some(prev) = store.get(&self.name) {
-            *self.selected.write() = Some(SmolStr::from(prev));
-        }
+    pub fn with_store(mut self, store: SelectorWriter) -> Self {
         self.store = Some(store);
         self
     }
@@ -99,11 +100,23 @@ impl SelectorGroup {
         }
     }
 
+    /// The name this group would dial: a `select()`/`force_set` pick in
+    /// the lock first, else the store's saved choice — read lazily so it
+    /// always reflects the map the persistence backing serves.
+    fn effective_selection(&self) -> Option<SmolStr> {
+        self.selected.read().clone().or_else(|| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.get(&self.name))
+                .map(SmolStr::from)
+        })
+    }
+
     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
     /// first proxy if `selected` is unset or names something no longer present.
     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
-        let sel: Option<SmolStr> = self.selected.read().clone();
+        let sel: Option<SmolStr> = self.effective_selection();
         let mut first_any: Option<Arc<dyn Proxy>> = None;
         if let Some(name) = sel {
             for p in &self.static_proxies {
@@ -190,6 +203,10 @@ impl ProxyAdapter for SelectorGroup {
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| MeowError::Proxy("no proxy selected".into()))?;
+        // Report the member the dial goes through *now* — a later
+        // re-selection must not rename the flow that already committed
+        // (issue #974 review).
+        super::note_dial_pick(&proxy);
         proxy.dial_tcp(metadata).await
     }
 
@@ -197,6 +214,7 @@ impl ProxyAdapter for SelectorGroup {
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| MeowError::Proxy("no proxy selected".into()))?;
+        super::note_dial_pick(&proxy);
         proxy.dial_udp(metadata).await
     }
 
@@ -224,6 +242,14 @@ impl Proxy for SelectorGroup {
 
     fn alive_for_url(&self, url: &str) -> bool {
         self.health.alive() && self.selected_proxy().is_some_and(|p| p.alive_for_url(url))
+    }
+
+    /// Forward to the same member `support_udp` consults — the selected
+    /// pick a UDP flow would dial. `false` when nothing is selected:
+    /// `Missing` (the slide) is the safe failure side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.selected_proxy()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
     }
 
     fn last_delay(&self) -> u16 {
@@ -381,7 +407,9 @@ mod tests {
 
         let a = MockProxy::new("a");
         let b = MockProxy::new("b");
-        let g = SelectorGroup::new("sel", vec![a, b]).with_store(Arc::clone(&store));
+        let g = SelectorGroup::new("sel", vec![a, b]).with_store(
+            crate::group::selector_store::SelectorWriter::standalone(Arc::clone(&store)),
+        );
         assert_eq!(
             g.selected_proxy().unwrap().name(),
             "b",
@@ -402,6 +430,47 @@ mod tests {
         assert!(!g.support_udp(), "default selection is tcp-only");
         assert!(g.select("udp-able"));
         assert!(g.support_udp(), "switching selection updates udp support");
+    }
+
+    /// A `dialer-proxy`-chained member that cannot carry UDP, in the
+    /// production shape: the relay-based `DialerProxyAdapter` over a
+    /// non-transparent inner. The front name never resolves — the
+    /// verdicts here are construction-time, registry-free.
+    fn chained_udp_incapable(name: &str) -> Arc<dyn Proxy> {
+        Arc::new(crate::DialerProxyAdapter::new(
+            MockProxy::new_udp_unsupported(name, AdapterType::Snell),
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ))
+    }
+
+    /// Issue #969: a selector whose *pick* is a chained UDP-incapable
+    /// member must answer the pair the match probe reads —
+    /// `support_udp() == false` and `is_dialer_proxy_non_transparent()
+    /// == true` — so the scan stops on the matched rule instead of
+    /// sliding to a later target. The verdict follows the selected
+    /// member exactly like `support_udp` does.
+    #[test]
+    fn selector_pick_chained_udp_incapable_fails_closed() {
+        let chained = chained_udp_incapable("chained");
+        let g = SelectorGroup::new("sel", vec![MockProxy::new_udp("udp-ok"), chained]);
+
+        // Default pick is the first member: UDP-capable and unchained.
+        assert!(g.support_udp());
+        assert!(!g.is_dialer_proxy_non_transparent());
+
+        assert!(g.select("chained"));
+        assert!(
+            !g.support_udp(),
+            "the chained pick cannot carry UDP — it advertises the pick's own capability"
+        );
+        assert!(
+            g.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must follow the selected member, \
+             not the member set"
+        );
     }
 
     /// Issue #681: `record_dial_failure` escalation and probe sweeps write

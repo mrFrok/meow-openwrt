@@ -23,7 +23,15 @@
 //! run the exit's datagram protocol through the hops before it; only
 //! `dialer-proxy` injects a dialer, and it does so when the config is
 //! parsed. After flattening, DIRECT/COMPATIBLE hops are dropped as upstream
-//! does, and the proxy hops that remain decide where UDP goes:
+//! does — except a `dialer-proxy` wrapper at the *entry* position, which
+//! `flatten_hops` preserves at hop 0 so TCP traverses its configured
+//! front. Although its `adapter_type()` delegates to the inner and reads
+//! `Direct` when the inner is transparent, it counts as a proxy hop for
+//! UDP routing anyway to prevent split-path bypass: `relay:
+//! [dialer-proxy, exit]` must fail closed rather than send the exit's
+//! UDP past the front TCP traverses (issue #971). At any other
+//! position the wrapper is a `connect_over` no-op and stays ignored. The
+//! proxy hops that remain decide where UDP goes:
 //!
 //! - none: the chain is a direct path, and a DIRECT hop sends the UDP;
 //! - one: that hop is the exit and sends the UDP itself, so
@@ -33,11 +41,12 @@
 //!
 //! `support_udp` gives the same answer from a non-touching peek, so the rule
 //! engine skips a UDP rule that targets an unchainable relay, as upstream's
-//! `SupportUDP` check does. Chaining UDP across several proxy hops is a
-//! follow-up. Until then, `dialer-proxy` on the exit node chains its UDP:
-//! Shadowsocks and SOCKS5 open their association through the front's own
-//! UDP relay, and Trojan, VLESS, Snell and mux sessions carry UDP inside the
-//! chained TCP stream.
+//! `SupportUDP` check does. Running the exit's datagrams through the hops
+//! before it — upstream's `ListenPacketWithDialer` composition — remains
+//! the follow-up. Until then, `dialer-proxy` on the exit node chains its
+//! UDP: Shadowsocks and SOCKS5 open their association through the front's
+//! own UDP relay, and Trojan, VLESS, Snell and mux sessions carry UDP
+//! inside the chained TCP stream.
 //!
 //! upstream: adapter/outbound/relay.go
 
@@ -50,7 +59,7 @@ use meow_common::{
 };
 use smol_str::SmolStr;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -396,6 +405,17 @@ pub(crate) async fn relay_tcp(
     Ok(conn)
 }
 
+/// Whether `hop` is a `DialerProxyAdapter` — the same downcast
+/// `flatten_hops_at` performs to keep the wrapper at the global first
+/// hop. The wrapper delegates `adapter_type()` to its inner, so a
+/// transparent inner makes it read `Direct` — the one shape
+/// `is_transparent_hop` cannot see through.
+fn is_dialer_proxy(hop: &Arc<dyn Proxy>) -> bool {
+    hop.as_any()
+        .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+        .is_some()
+}
+
 /// The hop that sends a flattened chain's UDP, or `None` when UDP cannot be
 /// sent without chaining it (see the module docs).
 ///
@@ -403,8 +423,20 @@ pub(crate) async fn relay_tcp(
 /// sends the UDP. With one proxy hop, that hop is the exit. With two or
 /// more, UDP would have to be chained, which no adapter supports yet.
 /// Upstream `relay.go` makes the same split before `ListenPacketWithDialer`.
+///
+/// An entry-position `DialerProxyAdapter` counts even when its inner is
+/// transparent and it reads `Direct`: `flatten_hops` keeps the wrapper at
+/// hop 0 so TCP dials its configured front, and letting the exit split
+/// skip it would send UDP out of a different path than TCP — a split-path
+/// bypass of the declared chain (issue #971). Non-entry DPAs keep the
+/// transparent treatment: `connect_over` delegates to the inner adapter,
+/// so inside a chain the wrapper is a no-op.
 fn udp_exit(hops: &[Arc<dyn Proxy>]) -> Option<&Arc<dyn Proxy>> {
-    let mut proxied = hops.iter().filter(|hop| !is_transparent_hop(hop));
+    let mut proxied = hops
+        .iter()
+        .enumerate()
+        .filter(|&(i, hop)| !is_transparent_hop(hop) || (i == 0 && is_dialer_proxy(hop)))
+        .map(|(_, hop)| hop);
     match (proxied.next(), proxied.next()) {
         (None, _) => hops.first(),
         (Some(exit), None) => Some(exit),
@@ -514,6 +546,18 @@ impl ProxyAdapter for RelayGroup {
             network: meow_common::Network::Udp,
             ..Default::default()
         };
+        // A chain resolved to a `type: rematch` leaf is a control hop,
+        // not a transport — the transition decides the flow's route, so
+        // the capability bit must not filter it first (issue #974).
+        // `flatten_hops` still rejects the hop as undialable, which stays
+        // the dial path's correct verdict for a chain that skipped the
+        // transition.
+        if self
+            .unwrap_proxy(&peek, false)
+            .is_some_and(|leaf| leaf.rematch_action().is_some())
+        {
+            return true;
+        }
         flatten_hops(&self.proxies, &peek, false)
             .is_ok_and(|hops| udp_exit(&hops).is_some_and(|exit| exit.support_udp()))
     }
@@ -539,17 +583,65 @@ impl ProxyAdapter for RelayGroup {
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
+
+    /// A relay resolves its hops lazily per-dial (metadata may differ per
+    /// connection), so there is no single member to report — upstream
+    /// `Relay` likewise never overrode `Unwrap`, and a PASS hop deep in a
+    /// chain still surfaces as a loud `RelayHopFailed` at dial rather
+    /// than a silent rule skip.
+    ///
+    /// The one hop this walk must surface is a resolved `type: rematch`
+    /// leaf: it can never act as a transport hop, and reporting it lets
+    /// the match-time probe commit the transition instead of scanning
+    /// the chain as a dialable target (issue #974). A re-pick of the
+    /// same chain after the transition then trips the visited-name
+    /// cycle guard — fail-closed, the same verdict the dial path's
+    /// undialable-hop gate would reach.
+    ///
+    /// The walk is always a peek (`touch` ignored): `flatten_hops` owns
+    /// member resolution on the real dial, and committing here would
+    /// advance round-robin picks a second time when the splice later
+    /// resolves the same members. Member picks are popped DFS in
+    /// declared order so the answer is the *first* rematch hop; nested
+    /// relays splice their members inline through the downcast, and the
+    /// shared pop budget bounds hand-built cyclic graphs config already
+    /// rejects (`resolve_proxy` carries the same assumption).
+    fn unwrap_proxy(&self, metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+        const MAX_PROBE_POPS: usize = 256;
+        let mut stack: Vec<Arc<dyn Proxy>> = self.proxies.iter().rev().cloned().collect();
+        for _ in 0..MAX_PROBE_POPS {
+            let cur = stack.pop()?;
+            if cur.rematch_action().is_some() {
+                return Some(cur);
+            }
+            if let Some(relay) = cur.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
+                stack.extend(relay.proxies.iter().rev().cloned());
+                continue;
+            }
+            if let Some(next) = cur.unwrap_proxy(metadata, false) {
+                stack.push(next);
+            } else if !is_transparent_hop(&cur) && cur.addr().is_empty() {
+                // A resolved hop that can never dial (REJECT, an
+                // unresolvable group) fails the whole chain at
+                // `flatten_hops_at` — the walk must not skip it and
+                // report a later rematch leaf the flow cannot reach.
+                return None;
+            }
+        }
+        // Ran out of pops with work outstanding — `None` reads as
+        // "no rematch hop" to the probe, but it is the budget's answer,
+        // not the chain's: say so loudly rather than let the dial meet
+        // a leaf the probe pretended was absent (issue #974 review).
+        warn!(
+            "{}: relay probe truncated after {MAX_PROBE_POPS} pops; \
+             reporting no rematch leaf",
+            self.name
+        );
+        None
+    }
 }
 
 impl Proxy for RelayGroup {
-    // Deliberately no `unwrap_proxy` override: a relay resolves its hops
-    // lazily per-dial (metadata may differ per connection), so a
-    // match-time peek cannot name "the" member. Upstream `Relay` likewise
-    // never overrode `Unwrap` — a PASS hop deep in a chain surfaces as a
-    // loud `RelayHopFailed` at dial (flattening rejects nop hops) rather
-    // than a silent rule skip. Match-time `unwraps_to(Pass)` therefore
-    // sees a relay group as opaque — the rule materializes and fails
-    // closed at dial.
     fn alive(&self) -> bool {
         self.health.alive()
     }
@@ -576,6 +668,35 @@ impl Proxy for RelayGroup {
         Some(self)
     }
 
+    /// The same peek `support_udp` makes — flatten without touching — so
+    /// the verdict names the exit member a UDP flow would dial. No exit
+    /// (two or more proxy hops, or a flatten error) leaves nothing the
+    /// chain pinned for this flow, so `false` keeps the slide as the
+    /// safe failure side (issue #969).
+    ///
+    /// The one no-exit case that still answers `true`: the count reached
+    /// two only because the *entry-position* transparent `dialer-proxy`
+    /// counted (issue #971) — the real proxy hops left over are at most
+    /// one, so the chain would have an exit without the entry wrapper.
+    /// That flow is pinned to a declared chain UDP cannot honour, the
+    /// same `Unusable` a chained leaf reports. A no-exit on two or more
+    /// *bare* proxy hops keeps `false` — generic multi-hop is the
+    /// relay's own limitation, not a declared pin a slide would bypass.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        let peek = Metadata {
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        flatten_hops(&self.proxies, &peek, false).is_ok_and(|hops| match udp_exit(&hops) {
+            Some(exit) => exit.is_dialer_proxy_non_transparent(),
+            None => {
+                hops.first()
+                    .is_some_and(|hop| is_transparent_hop(hop) && is_dialer_proxy(hop))
+                    && hops.iter().filter(|hop| !is_transparent_hop(hop)).count() <= 1
+            }
+        })
+    }
+
     fn members(&self) -> Option<Vec<String>> {
         Some(self.proxies.iter().map(|p| p.name().to_string()).collect())
     }
@@ -595,7 +716,9 @@ impl Proxy for RelayGroup {
 mod tests {
     use super::*;
     use crate::{LbStrategy, LoadBalanceGroup, SelectorGroup};
-    use meow_common::{DelayHistory, MeowError, ProxyConn, ProxyHealth, ProxyPacketConn};
+    use meow_common::{
+        DelayHistory, MeowError, ProxyConn, ProxyHealth, ProxyPacketConn, RematchAction,
+    };
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -626,6 +749,11 @@ mod tests {
         dial_fail_with: Arc<parking_lot::Mutex<Option<MeowError>>>,
         /// Each `dial_udp` call records its target host here.
         udp_dials: Arc<parking_lot::Mutex<Vec<String>>>,
+        /// `target-rematch-name` — set turns the mock into a rematch
+        /// control leaf (`rematch_action` reports it). The real
+        /// `RematchAdapter` implements `ProxyAdapter` only; config wraps
+        /// it before it can sit in a member list, hence the flag here.
+        rematch: Option<String>,
     }
 
     /// Recorded dial target: `host` for domains, `dst_ip` for IP literals —
@@ -652,6 +780,7 @@ mod tests {
                 fail_with: Arc::new(parking_lot::Mutex::new(None)),
                 dial_fail_with: Arc::new(parking_lot::Mutex::new(None)),
                 udp_dials: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                rematch: None,
             })
         }
 
@@ -674,6 +803,17 @@ mod tests {
                 adapter_type: AdapterType::Direct,
                 addr_str: String::new(),
                 udp: true,
+                ..inner
+            })
+        }
+
+        /// A rematch control leaf.
+        fn rematch(name: &str) -> Arc<Self> {
+            let proxy = Self::direct();
+            let inner = Arc::try_unwrap(proxy).ok().unwrap();
+            Arc::new(Self {
+                proxy_name: name.to_string(),
+                rematch: Some(name.to_string()),
                 ..inner
             })
         }
@@ -820,6 +960,13 @@ mod tests {
 
         fn health(&self) -> &ProxyHealth {
             &self.health
+        }
+
+        fn rematch_action(&self) -> Option<RematchAction<'_>> {
+            self.rematch.as_deref().map(|rematch_name| RematchAction {
+                rematch_name: Some(rematch_name),
+                sub_rule: None,
+            })
         }
     }
 
@@ -1488,6 +1635,46 @@ mod tests {
         }
     }
 
+    // C5b (issue #969): a chained, UDP-incapable *exit* makes the relay
+    // answer the pair the match probe reads — `support_udp() == false`
+    // plus `is_dialer_proxy_non_transparent() == true` — so the scan
+    // stops on the matched rule instead of sliding to a later target.
+    // The verdict names the same exit `support_udp`'s peek resolves.
+    #[test]
+    fn relay_udp_exit_chained_udp_incapable_fails_closed() {
+        let chained: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::new("chained-exit", "10.0.0.9", 8443, 9),
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let group = RelayGroup::new("udp-chained-exit", vec![MockProxy::direct(), chained]);
+
+        assert!(
+            !group.support_udp(),
+            "the single proxy hop is the exit — a chained leaf that cannot carry UDP"
+        );
+        assert!(
+            group.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must name the same exit support_udp peeks"
+        );
+
+        // The no-exit case answers `false`: two or more proxy hops leave
+        // UDP unchainable — a limitation of the relay itself, not a
+        // chained pin a slide could bypass — so `Missing` stays the safe
+        // failure side.
+        let two_hop = RelayGroup::new(
+            "udp-two-hops",
+            vec![
+                MockProxy::new("a", "10.0.0.1", 1080, 1),
+                MockProxy::new("b", "10.0.0.2", 1081, 2),
+            ],
+        );
+        assert!(!two_hop.support_udp());
+        assert!(!two_hop.is_dialer_proxy_non_transparent());
+    }
+
     // C6: a group or nested relay member that resolves to one proxy hop
     // behaves like that leaf.
     #[tokio::test]
@@ -1570,6 +1757,291 @@ mod tests {
         // still gets B1.
         assert_eq!(b1_udp.lock().len(), 1);
         assert!(b2_udp.lock().is_empty());
+    }
+
+    // C8 (issue #971): an entry-position `dialer-proxy` reads `Direct`
+    // when its inner is transparent, but the flattened chain keeps the
+    // wrapper at hop 0 so TCP dials its configured front — so it counts
+    // as a proxy hop for UDP too. `[DPA(direct→front), exit]` is two
+    // effective hops: fail closed, and the exit's `dial_udp` never runs —
+    // before the fix the exit sent the UDP straight out, a split-path
+    // bypass of the declared front.
+    #[tokio::test]
+    async fn relay_udp_entry_dialer_proxy_counts_as_proxy_hop() {
+        let exit = MockProxy::new_udp("exit", "10.0.0.2", 1081, 2);
+        let exit_udp = Arc::clone(&exit.udp_dials);
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::direct(),
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+
+        let group = RelayGroup::new("udp-dpa-entry", vec![dpa, exit]);
+
+        assert!(!group.support_udp());
+        let err = group
+            .dial_udp(&udp_target())
+            .await
+            .err()
+            .expect("must fail closed");
+        assert!(
+            matches!(err, MeowError::UdpNotSupported),
+            "must be UdpNotSupported; got {err:?}"
+        );
+        assert!(
+            exit_udp.lock().is_empty(),
+            "the exit must not send the UDP past the front TCP traverses"
+        );
+    }
+
+    // C9 (issue #971): `[DPA(direct→front), DIRECT]` keeps the pre-fix
+    // shape — the entry DPA is the chain's one proxy hop and the exit
+    // itself, so UDP still rides the front's association. The new count
+    // must not turn this chain unchainable.
+    #[tokio::test]
+    async fn relay_udp_entry_dialer_proxy_is_the_exit_for_a_direct_tail() {
+        let front = MockProxy::new_udp("front", "10.0.9.9", 1090, 9);
+        let front_udp = Arc::clone(&front.udp_dials);
+        let registry = crate::dialer::ProxyRegistry::default();
+        let mut proxies: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+            std::collections::HashMap::new();
+        proxies.insert(front.name().into(), front);
+        registry.publish(Arc::new(proxies));
+
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::direct(),
+            crate::dialer::DialerTarget::new("front", &registry),
+        ));
+        let group = RelayGroup::new("udp-dpa-direct", vec![dpa, MockProxy::direct()]);
+
+        assert!(group.support_udp());
+        group
+            .dial_udp(&udp_target())
+            .await
+            .expect("the entry DPA is the exit; UDP rides the front's association");
+        assert_eq!(*front_udp.lock(), vec!["target.example".to_string()]);
+    }
+
+    // C10 (issue #971): a `dialer-proxy` at a NON-entry position stays
+    // ignored — inside a chain the wrapper's `connect_over` delegates to
+    // the inner adapter, so it is a no-op like TCP's. `[exit,
+    // DPA(direct→front)]` still exits at the one real proxy hop and the
+    // front is never consulted.
+    #[tokio::test]
+    async fn relay_udp_non_entry_dialer_proxy_stays_ignored() {
+        let front = MockProxy::new_udp("front", "10.0.9.9", 1090, 9);
+        let front_udp = Arc::clone(&front.udp_dials);
+        let exit = MockProxy::new_udp("exit", "10.0.0.2", 1081, 2);
+        let exit_udp = Arc::clone(&exit.udp_dials);
+        let registry = crate::dialer::ProxyRegistry::default();
+        let mut proxies: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+            std::collections::HashMap::new();
+        proxies.insert(front.name().into(), front);
+        registry.publish(Arc::new(proxies));
+
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::direct(),
+            crate::dialer::DialerTarget::new("front", &registry),
+        ));
+        let group = RelayGroup::new("udp-exit-dpa", vec![exit, dpa]);
+
+        assert!(group.support_udp());
+        group
+            .dial_udp(&udp_target())
+            .await
+            .expect("the real proxy hop is the exit");
+        assert_eq!(*exit_udp.lock(), vec!["target.example".to_string()]);
+        assert!(
+            front_udp.lock().is_empty(),
+            "a non-entry DPA's front must not be consulted"
+        );
+    }
+
+    // C11 (issue #971): the no-exit verdict on `[DPA(direct→front), ss]`
+    // is caused by the entry DPA's count — the hops behind it hold one
+    // real proxy hop, so the flow is pinned to a declared chain and
+    // reports the `Unusable` a chained leaf would, not `Missing`.
+    #[test]
+    fn relay_udp_entry_dialer_proxy_reports_unusable() {
+        let dpa = || -> Arc<dyn Proxy> {
+            Arc::new(DialerProxyAdapter::new(
+                MockProxy::direct(),
+                crate::dialer::DialerTarget::new(
+                    "never-resolved",
+                    &crate::dialer::ProxyRegistry::default(),
+                ),
+            ))
+        };
+
+        let group = RelayGroup::new(
+            "udp-dpa-ss",
+            vec![dpa(), MockProxy::new("ss", "10.0.0.9", 8443, 9)],
+        );
+        assert!(!group.support_udp());
+        assert!(
+            group.is_dialer_proxy_non_transparent(),
+            "the entry DPA pushed the count to two — the flow is pinned \
+             to the declared front chain, so the verdict is Unusable"
+        );
+
+        // When the hops behind the entry DPA already leave no exit on
+        // their own, the verdict stays `Missing`: generic multi-hop is
+        // the relay's own limitation, not a declared pin.
+        let multi = RelayGroup::new(
+            "udp-dpa-ss-ss",
+            vec![
+                dpa(),
+                MockProxy::new("ss1", "10.0.0.8", 8443, 8),
+                MockProxy::new("ss2", "10.0.0.9", 8443, 9),
+            ],
+        );
+        assert!(!multi.support_udp());
+        assert!(!multi.is_dialer_proxy_non_transparent());
+
+        // And ≥2 *bare* proxy hops keep `Missing` — the slide stays the
+        // safe failure side (the C5b precedent).
+        let bare = RelayGroup::new(
+            "udp-two-bare",
+            vec![
+                MockProxy::new("a", "10.0.0.1", 1080, 1),
+                MockProxy::new("b", "10.0.0.2", 1081, 2),
+            ],
+        );
+        assert!(!bare.support_udp());
+        assert!(!bare.is_dialer_proxy_non_transparent());
+    }
+
+    // C12 (issue #971, review gap 1): `[DPA(socks5→front), ss]` — an
+    // entry `dialer-proxy` over a NON-transparent inner. The wrapper's
+    // `adapter_type()` delegates to the inner, so it already reads
+    // non-transparent and counts via the regular `!is_transparent_hop`
+    // disjunct — the entry-position forced count adds nothing. Two real
+    // proxy hops → no exit → fail closed, exactly like bare
+    // `[socks5, ss]`. The verdict stays `Missing`, not `Unusable`: the
+    // no-exit `true` arm is scoped to a *transparent* entry DPA — the
+    // one shape whose forced count alone manufactures the no-exit —
+    // and the dialer declaration removed no UDP path here (a
+    // `DPA(socks5)` cannot carry UDP even as a standalone target), so
+    // the incapability is the relay's generic multi-hop limit, not a
+    // declared pin a slide would bypass.
+    #[tokio::test]
+    async fn relay_udp_non_transparent_entry_dpa_is_generic_multihop() {
+        let inner = MockProxy::new("ss-inner", "10.0.0.7", 8388, 7);
+        let exit = MockProxy::new_udp("ss", "10.0.0.9", 8443, 9);
+        let exit_udp = Arc::clone(&exit.udp_dials);
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            inner,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+
+        let group = RelayGroup::new("udp-ntdpa-ss", vec![dpa, exit]);
+
+        // Pin the mechanism: the flattened entry keeps the DPA wrapper
+        // and counts as a regular proxy hop — `adapter_type()` delegates
+        // to the non-transparent socks5 inner — so two counted hops
+        // leave no exit.
+        let peek = Metadata {
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        let hops = flatten_hops(&group.proxies, &peek, false).expect("flatten");
+        assert!(
+            is_dialer_proxy(&hops[0]) && !is_transparent_hop(&hops[0]),
+            "the entry DPA must read non-transparent through its inner"
+        );
+        assert!(udp_exit(&hops).is_none(), "two proxy hops → no UDP exit");
+
+        assert!(!group.support_udp());
+        let err = group
+            .dial_udp(&udp_target())
+            .await
+            .err()
+            .expect("must fail closed");
+        assert!(
+            matches!(err, MeowError::UdpNotSupported),
+            "must be UdpNotSupported; got {err:?}"
+        );
+        assert!(exit_udp.lock().is_empty(), "no hop may send the UDP");
+
+        // `false` is the intended verdict (see the C12 comment): the
+        // no-exit is generic multi-hop, not the manufactured case the
+        // `Unusable` arm exists for. The DPA's own standalone verdict is
+        // `true` via `!transparent`, but it is not the UDP pick — this
+        // chain has no pick at all.
+        assert!(!group.is_dialer_proxy_non_transparent());
+    }
+
+    // C13 (issue #971, review gap 2): `[DPA(direct→front1),
+    // DPA(socks5→front2)]` — a transparent-inner DPA at the entry *and*
+    // a non-transparent-inner DPA as the exit member. The entry counts
+    // via the #971 forced count, the exit member counts as a regular
+    // proxy hop → two counted hops → no exit → fail closed. The verdict
+    // is `Unusable`: the no-exit arm sees a transparent entry DPA with
+    // ≤1 real proxy hop behind it — without the entry wrapper
+    // `[DIRECT, DPA(socks5)]` would exit at the DPA itself, which
+    // reports `true` via `!transparent` anyway. Note the exit DPA's own
+    // verdict is never separately consulted here: `udp_exit` returns
+    // `None`, so the `Some(exit)` delegation arm never runs — the `true`
+    // comes entirely from the entry-side check and merely agrees with
+    // what the exit would have answered.
+    #[tokio::test]
+    async fn relay_udp_exit_dpa_pair_reports_unusable() {
+        let entry_dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::direct(),
+            crate::dialer::DialerTarget::new(
+                "front1-never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let exit_inner = MockProxy::new("ss", "10.0.0.9", 8443, 9);
+        let exit_udp = Arc::clone(&exit_inner.udp_dials);
+        let exit_dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            exit_inner,
+            crate::dialer::DialerTarget::new(
+                "front2-never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+
+        let group = RelayGroup::new("udp-dpa-dpa", vec![entry_dpa, exit_dpa]);
+
+        // Pin the mechanism: both wrappers survive flattening — the
+        // entry keeps its wrapper at hop 0, the exit member is pushed as
+        // the DPA itself. Entry counts via the forced count, exit
+        // member via regular non-transparency → no exit.
+        let peek = Metadata {
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        let hops = flatten_hops(&group.proxies, &peek, false).expect("flatten");
+        assert!(is_dialer_proxy(&hops[0]) && is_transparent_hop(&hops[0]));
+        assert!(is_dialer_proxy(&hops[1]) && !is_transparent_hop(&hops[1]));
+        assert!(udp_exit(&hops).is_none(), "two counted hops → no UDP exit");
+        // The exit member's own verdict is `true`, but `udp_exit` yields
+        // no exit for the `Some(exit)` arm to consult it — the `true`
+        // below comes from the entry-side no-exit check instead.
+        assert!(hops[1].is_dialer_proxy_non_transparent());
+
+        assert!(!group.support_udp());
+        let err = group
+            .dial_udp(&udp_target())
+            .await
+            .err()
+            .expect("must fail closed");
+        assert!(
+            matches!(err, MeowError::UdpNotSupported),
+            "must be UdpNotSupported; got {err:?}"
+        );
+        assert!(exit_udp.lock().is_empty(), "no hop may send the UDP");
+        assert!(
+            group.is_dialer_proxy_non_transparent(),
+            "the entry DPA's forced count manufactured the no-exit — Unusable"
+        );
     }
 
     // ─── D. Error handling — RelayHopFailed ───────────────────────────────
@@ -2049,4 +2521,105 @@ mod tests {
     // permissive (trait has a default body). The guard-rail is enforced by code
     // review: relay tests MUST use connect_over on every hop and will observe
     // wrong visit counts if connect_over is not called.
+
+    // ─── Probe truncation ─────────────────────────────────────────────────
+
+    /// Scoped WARN capture plus a process-wide fallback that keeps callsite
+    /// interest live across parallel tests — the same pair meow-tunnel's
+    /// `capture_warns`/`install_capture_fallback` provide, duplicated here
+    /// because they are `pub(crate)`-scoped to that crate.
+    fn install_capture_fallback() {
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::subscriber::Interest;
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct Fallback;
+
+        impl Subscriber for Fallback {
+            fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+                Interest::sometimes()
+            }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(Fallback);
+        });
+    }
+
+    fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        install_capture_fallback();
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let captured = sink.0.lock().unwrap();
+        (out, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// Running out of DFS pops must not read as "no rematch hop": 256
+    /// transparent members consume the budget before the rematch leaf at
+    /// position 257 is ever popped, so `None` is the budget's answer, not
+    /// the chain's — the walk warns instead of letting the dial meet a
+    /// leaf the probe pretended was absent (issue #974 review).
+    #[test]
+    fn probe_pop_budget_exhaustion_warns() {
+        let mut members: Vec<Arc<dyn Proxy>> = (0..256)
+            .map(|_| MockProxy::direct() as Arc<dyn Proxy>)
+            .collect();
+        members.push(MockProxy::rematch("late-rematch"));
+        let group = RelayGroup::new("deep-relay", members);
+        let (leaf, warns) = capture_warns(|| group.unwrap_proxy(&Metadata::default(), false));
+        assert!(leaf.is_none(), "the leaf sits past the pop budget");
+        assert!(
+            warns.contains("probe truncated"),
+            "truncation must say so loudly: {warns}"
+        );
+    }
+
+    /// Within the budget the walk still terminates quietly: a rematch leaf
+    /// two members deep surfaces with no warning.
+    #[test]
+    fn probe_within_budget_finds_rematch_quietly() {
+        let members: Vec<Arc<dyn Proxy>> =
+            vec![MockProxy::direct(), MockProxy::rematch("early-rematch")];
+        let group = RelayGroup::new("shallow-relay", members);
+        let (leaf, warns) = capture_warns(|| group.unwrap_proxy(&Metadata::default(), false));
+        assert_eq!(
+            leaf.map(|p| p.name().to_string()).as_deref(),
+            Some("early-rematch")
+        );
+        assert!(warns.is_empty(), "a terminated walk is silent: {warns}");
+    }
 }

@@ -13,7 +13,6 @@ use meow_config::proxy_provider::{load_proxy_providers, ProxyProvider};
 use meow_config::raw::{RawConfig, RawSubscription};
 use meow_config::rule_provider_refresh::RefreshSupervisor;
 use meow_dns::Resolver;
-use meow_proxy::SelectorStore;
 use meow_trie::DomainTrie;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
@@ -85,7 +84,7 @@ struct Fixture {
 
 /// Shared scaffolding: a two-node file provider `prov` and an origin
 /// serving `sub_body` as subscription `s`. The loop is NOT spawned here —
-/// each test finishes arranging global state (e.g. the SelectorStore)
+/// each test finishes arranging shared state (e.g. the selection backing)
 /// before calling [`spawn_loop`] so the first pass can't race it.
 async fn fixture(sub_body: &'static str) -> Fixture {
     let sub_addr = spawn_origin(sub_body).await;
@@ -200,6 +199,7 @@ fn spawn_loop(fx: &Fixture) -> tokio::task::JoinHandle<()> {
         fx.provider_dialer_registry.clone(),
         Arc::new(RefreshSupervisor::default()),
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default()),
+        Vec::new(),
     ))
 }
 
@@ -240,9 +240,10 @@ async fn refreshed_use_group_keeps_provider_members() {
 }
 
 /// The user's persisted `select` choice must survive a refresh commit.
-/// `rebuild_from_raw_runtime` wires `SelectorStore::global()` into the
-/// rebuilt groups; the plain resolver variant builds them with no store,
-/// resetting `selected` to the first member on every refresh.
+/// `rebuild_from_raw_runtime` attaches the tunnel's `SelectionBacking`
+/// to the rebuilt groups; a backing that was never installed resolves to
+/// `unpersisted()`, so groups would come up with no store and reset
+/// `selected` to the first member on every refresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refreshed_select_group_keeps_persisted_choice() {
     let fx = fixture(
@@ -256,17 +257,23 @@ async fn refreshed_select_group_keeps_persisted_choice() {
     )
     .await;
 
-    // Persist `sel-g → node-b` BEFORE the loop spawns — `with_store`
-    // reads the store once at group construction, so the choice must be
-    // in place before the first refresh commits.
-    // NOTE: `SelectorStore::open` binds the process-global on first call
-    // and later `open`s never rebind it — under plain `cargo test` this
-    // store leaks into sibling tests' `rebuild_from_raw_runtime` groups
-    // (harmless today: priming is keyed by group name). Nextest gives
-    // each test its own process, so CI is immune; keep it that way by
-    // not asserting `global()` identity in other tests of this file.
-    let store = SelectorStore::open(fx.dir.path().join("sel.json"));
-    store.set("sel-g", "node-b");
+    // Install the config-scoped backing the way startup does: file under
+    // the config's cache dir, opened+committed for an enabled
+    // `profile.store-selected`. Pre-write `sel-g → node-b` BEFORE the
+    // loop spawns — `with_store` reads the store once at group
+    // construction, so the choice must be on disk before the first
+    // refresh commits.
+    std::fs::write(
+        fx.dir.path().join("selector-cache.json"),
+        r#"{"sel-g": "node-b"}"#,
+    )
+    .unwrap();
+    let backing = Arc::new(meow_proxy::SelectionBacking::new(Some(
+        fx.dir.path().join("selector-cache.json"),
+    )));
+    backing.prepare_sync(true);
+    backing.commit(true);
+    fx.tunnel.set_selection_backing(backing);
     spawn_loop(&fx);
 
     let group = wait_group(&fx.tunnel, "sel-g").await;
@@ -376,6 +383,7 @@ async fn delete_during_in_flight_refresh_discards_payload() {
             applied_proxies: Vec::new(),
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         });
     spawn_loop(&fx);
 
@@ -643,6 +651,7 @@ async fn refresh_fetches_through_subscription_proxy() {
                 applied_proxies: Vec::new(),
                 applied_groups: Vec::new(),
                 applied_rules: Vec::new(),
+                extra: Default::default(),
             },
         );
     }
@@ -736,6 +745,7 @@ async fn refresh_without_backing_file_applies_in_memory_only() {
         fx.provider_dialer_registry.clone(),
         Arc::new(RefreshSupervisor::default()),
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default()),
+        Vec::new(),
     ));
 
     wait_group(&fx.tunnel, "node-1").await;
@@ -785,12 +795,18 @@ async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
         &live,
         Some(fx.dir.path()),
         &fx.provider_dialer_registry,
+        &fx.tunnel.selection_backing(),
+        &fx.tunnel.dns_outbound_cell(),
     )
     .unwrap();
     fx.tunnel
         .set_dialer_registry(fx.provider_dialer_registry.clone());
-    fx.tunnel
-        .update_routing(initial.proxies, initial.rules, initial.dialer_registry);
+    fx.tunnel.update_routing(
+        initial.proxies,
+        initial.rules,
+        initial.sub_rules,
+        initial.dialer_registry,
+    );
     // Stage a redefined provider while its live slot still holds the
     // last-good generation. The new front only exists in the fetched
     // subscription, so the acquisition must use the published route map.

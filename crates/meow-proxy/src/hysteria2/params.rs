@@ -17,7 +17,7 @@ pub(super) const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const MAX_CONCURRENT_STREAMS: u64 = 1024;
 pub(super) const DGRAM_QUEUE_LEN: usize = 1024;
 /// quic-go's ceiling (1500 − IPv6 40 − UDP 8); PMTUD finds the path's.
-pub(super) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
+pub(crate) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
 
 /// Flow-control windows in effect, bytes.
 #[derive(Debug, PartialEq, Eq)]

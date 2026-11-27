@@ -126,9 +126,56 @@ to the destination in the stream request; afterwards both directions are
 [len u16 BE][data] datagram frames (the same framing as meow's VLESS
 UDP-over-TCP), with no per-packet addresses. The server handles them via
 serverPacketConn. meow-rs's `MuxPacketConn` implements this framing;
-`only-tcp: true` routes UDP over the plain non-mux path instead. The
-`statistic`/`brutal-opts` fields are not supported yet (each gets a warn
-on parse; brutal is Linux-only upstream).
+`only-tcp: true` routes UDP over the plain non-mux path instead.
+`statistic: true` is parsed and warns that physical carrier tracking is
+unavailable — per-flow accounting lives in the existing
+`/connections`/`/traffic` APIs, there is no mux-carrier surface
+(issue #974).
+
+### 4a. TCP Brutal bandwidth negotiation (`brutal-opts`, sing-mux only)
+
+mihomo's `smux.brutal-opts: {enabled, up, down}` configures sing-mux's
+`BrutalOptions`: a per-carrier TCP Brutal rate cap negotiated with the
+server over a reserved control stream (sing-mux v0.3.12 `brutal.go`;
+apernet's tcp-brutal kernel module does the pacing). `up`/`down` are
+weak-decoded strings run through `utils.StringToBps` (int/float coerce
+to text, `50 Mbps`→bytes/s, garbage→0, never an error — meow's
+`string_to_bps` mirrors it exactly, including bare-int = Mbps and the
+wrapping u64 multiply).
+
+**Wire** — once per *new carrier session*, inside the 5 s setup timeout:
+the client opens an ordinary sing-mux stream (flags=0) to FQDN
+`_BrutalBwExchange` port 0, writes its `down` rate (`receiveBPS`) as u64
+BE, reads the usual §4 status byte, then `[ok u8]` → `u64 BE
+serverReceiveBPS` on success or `uvarint len + message` on failure
+(`remote error: <msg>`). The applied send cap is
+`min(up, serverReceiveBPS)`; the exchange stream is closed and the
+session proceeds to the pool. An exchange failure kills that carrier
+dial (a brutal client against a non-brutal server goes down, same as
+upstream); a socket-apply failure is Debug-log-only.
+
+**Socket apply** — Linux only: `TCP_CONGESTION "brutal"` then
+`TCP_BRUTAL_PARAMS`(23301) `{rate u64, cwnd_gain u32 = 20}` (16-byte
+`repr(C)` payload) on the carrier's *physical* socket — Go unwraps
+TLS/proxy wrappers down to the bottom `syscall.Conn`, which under
+`dialer-proxy` is the front hop's socket. meow achieves the same via a
+task-local `BrutalCarrier` cell in `connect_tcp`: installed around the
+session dial, it survives the front hop's `dialer_opts_scope`
+replacement and stashes `try_clone`s of every candidate socket;
+`resolve_via_hook` clears it so DNS-via-proxy sockets never land in the
+set. The negotiation **still runs on macOS/Windows** — the server caps
+its send side — while the local setsockopts stub debug-logs
+"TCP Brutal is only supported on Linux"; the parser warns once per
+enabled node on non-Linux.
+
+**Pool** — `brutal.Enabled` pins every stream to `sessions[0]`: the
+carrier pool collapses to one physical connection and the
+max/min-streams bounds are dead weight. `protocol: muxcool` +
+`brutal-opts` is a parse-time error (the frame mux has no control
+stream). Requires sing-box/mihomo 1.12+ on the server with `brutal-opts`
+enabled and the tcp-brutal kernel module (or sing-box's userspace
+fallback); a server without it fails the exchange, not the whole node
+silently.
 
 ### 5. Client session management (aligned with sing-mux client.go)
 
@@ -248,6 +295,7 @@ crates/meow-proxy/src/mux/
   yamux.rs      yamux wrapper (on the libp2p yamux crate)
   h2mux.rs      h2mux session + stream (h2 crate: CONNECT stream = bidirectional bodies)
   muxcool.rs    §6 Mux.Cool: frame codec (pure functions) + session + TCP stream + UDP PacketConn
+  brutal.rs     §4a MuxBrutal + string_to_bps (utils.StringToBps parity) + vstring codec
   packet.rs     MuxPacketConn: UDP stream (flagUDP + [len u16 BE][data] datagram frames)
   stream.rs     MuxStreamConn: ProxyConn wrapper (pin-projection of the !Unpin inner stream,
                 modeled after anytls AnytlsConn)
@@ -286,11 +334,22 @@ crates/meow-proxy/src/mux/
   bounds; all protocol differences are contained in the SessionKind arms
   and the with_mux dial closure — zero branching in the adapter layer.
 - **Pool defaults**: meow defaults to `max-connections=4, min-streams=4,
-  max-streams=4`. mihomo's `smux:` block defaults to `0/0/0`, which makes
-  sing-mux apply `minStreams = 8` upstream. A user copying a mihomo config
-  with explicit zeros gets one physical connection per stream (mihomo
-  semantics); a user relying on implicit defaults gets meow's 4/4/4 pooling
-  rather than mihomo's 0/0/0.
+  max-streams=4` (a single source — `MuxOptions::default` — feeds both the
+  runtime and the config parser's omitted-field fallbacks). mihomo's
+  `smux:` block defaults to `0/0/0`, which makes sing-mux apply
+  `minStreams = 8` upstream; a user relying on implicit defaults gets
+  meow's 4/4/4 pooling rather than mihomo's 0/0/0.
+- **Reuse predicate** (`MuxClient::offer`): an idle eligible session always
+  takes the next stream first. For a busy session, with positive
+  `max-connections` it is reused when its load is under `min-streams` or
+  once the pool already holds `max-connections` carriers; with zero
+  `max-connections` it is reused when load is under `min-streams`, else
+  under a positive `max-streams`. All three at `0` therefore still reuses
+  idle carriers but never shares a busy one — every *concurrent* stream
+  dials its own connection. Note the shipped defaults are not a hard
+  concurrency cap either: the fifth overlapping stream opens a second
+  carrier, and once four carriers exist `max-streams: 4` no longer limits
+  how many streams pack onto them (only the pool size does).
 
 ## Test Plan
 

@@ -25,7 +25,9 @@ exist yet.
 
 | Feature | Crate | What it gates |
 |---------|-------|---------------|
-| `ss` | `meow-proxy` | Shadowsocks adapter + `shadowsocks` crate dep + the `simple-obfs`/`obfs` and `v2ray-plugin` built-in SIP003 plugins |
+| `ss` | `meow-proxy` | Shadowsocks adapter + `shadowsocks` crate dep; carries no built-in SIP003 plugin transport — each is a per-plugin feature below |
+| `ss-obfs` | `meow-proxy` | Built-in `ss` plugin: simple-obfs HTTP/TLS wrap (`plugin: obfs`/`simple-obfs`, implies `ss` + `meow-transport/simple-obfs`; in `default`/`full`/`minimal`) |
+| `ss-v2ray-plugin` | `meow-proxy` | Built-in `ss` plugin: v2ray-plugin WebSocket(+TLS) transport (`plugin: v2ray-plugin`, implies `ss`; in `default`/`full`, not `minimal`) |
 | `shadow-tls` | `meow-proxy` | Built-in `ss` plugin: shadow-tls v1/v2/v3 cover-TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
 | `restls` | `meow-proxy` | Built-in `ss` plugin: restls record-level TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
 | `jls` | `meow-proxy` | Built-in `ss` plugin: jls TLS 1.3 record transport (implies `ss`; in `default`/`full`, not `minimal`) |
@@ -37,17 +39,25 @@ exist yet.
 | `load-balance` | `meow-proxy` | Load-balance group |
 | `relay` | `meow-proxy` | Relay group |
 | `public-suffix` | `meow-proxy` | Public-suffix list (`psl`, ~500 KB) for load-balance `consistent-hashing` eTLD+1 keys; in `full`, not `minimal`, which keys on the last two labels |
+| `wireguard` | `meow-proxy` | WireGuard outbound (issue #899): vendored boringtun Noise (`meow-wireguard`) + smoltcp userspace stack (`meow-wgstack`) behind a pump-thread actor; implies `meow-wireguard/wireguard-boring`; in `full`, not `minimal` |
+| `wireguard-boring` | `meow-wireguard` | Session data-path AEAD on BoringSSL `AeadCtx` (key schedule once per session, platform assembly) instead of a per-packet RustCrypto cipher — the handshake stays on RustCrypto and wire bytes are identical. Implied by `wireguard` and `listener-wireguard`; a standalone `meow-wireguard` build without it keeps the pure-RustCrypto session path |
 
-The `ss` built-in-plugin contract is narrowed to `simple-obfs`/`obfs` +
-`v2ray-plugin`; the four heavier SIP003 transports above are opt-in and
-re-bundled into `default`/`full`. All built-in plugin names (including
-`kcptun` and `ech-tls-tunnel`) stay *reserved* even when compiled out — a
-`plugin:` line naming one keeps the node bound as an unavailable
-placeholder (`meow -t`, boot and provider refresh all read it
+The `ss` built-in-plugin contract is fully per-plugin: `ss-obfs` and
+`ss-v2ray-plugin` joined the four heavier SIP003 transports as opt-in
+features re-bundled into `default`/`full` (ADR-0007 2026-11-21 addendum —
+the pair's ~19 KB of symbols tipped `minimal` past its 8 MiB aarch64-musl
+cap; `ss-obfs` was later restored to `minimal`, while `ss-v2ray-plugin`
+stays out alongside the heavier plugins). All built-in plugin names
+(including `kcptun` and `ech-tls-tunnel`) stay *reserved* even when
+compiled out — a `plugin:` line naming one keeps the node bound as an
+unavailable placeholder (`meow -t`, boot and provider refresh all read it
 identically), and every dial through it fails with "not compiled into
 this build; rebuild with `--features <name>`" instead of the node
 silently dropping — and the name can never fall through to the external
-SIP003 subprocess path.
+SIP003 subprocess path. The SIP003 binary spelling `obfs-local` is the
+one exception: it stays an external name, but a build without `ss-obfs`
+answers it with the same feature-named error rather than spawning a
+plugin binary the operator pruned.
 
 ### Transport features
 
@@ -66,6 +76,7 @@ SIP003 subprocess path.
 | `listener-socks5` | `meow-listener` | SOCKS5 inbound |
 | `listener-tproxy` | `meow-listener` | TProxy (nftables/pf); Linux/macOS only |
 | `listener-mixed` | `meow-listener` | Mixed (HTTP+SOCKS5) inbound |
+| `listener-wireguard` | `meow-listener` | WireGuard inbound responder (`listeners: - type: wireguard`): static multi-peer table on one UDP port, AnyIP smoltcp TCP termination, per-flow UDP dial; implies `meow-wireguard/wireguard-boring`; in `full`, not `minimal` |
 
 ### DNS features
 
@@ -73,12 +84,18 @@ SIP003 subprocess path.
 |---------|-------|---------------|
 | `dns-server` | `meow-dns` | `hickory-server` DNS server dep (currently unconditional) |
 
+### API features
+
+| Feature | Crate | What it gates |
+|---------|-------|---------------|
+| `api-tls` | `meow-api` | `external-controller-tls` HTTPS endpoint (issue #974): BoringSSL `SslAcceptor` + ephemeral RSA identity + handshake driver, plus axum's `http2` server (enabled only on meow-api's axum edge so `minimal` never links h2 server code). In `full`/`default`, not `minimal` — a configured endpoint there parses as dead config and startup warns it is "not compiled into this build". Unix/pipe endpoints carry no feature |
+
 ### Convenience bundles (workspace root)
 
 | Bundle | Includes |
 |--------|---------|
 | `full` (default) | all features above |
-| `minimal` | `ss`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional) |
+| `minimal` | `ss` + `ss-obfs`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional), but its HTTPS endpoint (`api-tls`) is not |
 
 **ADR-0007 §1 defines `minimal` as `tls,ws,ss,trojan,api`** — the "minimum useful set
 for a router operator." Dropping TLS would exclude SS+v2ray-plugin+TLS+ws, the

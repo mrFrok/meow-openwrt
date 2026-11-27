@@ -169,7 +169,16 @@ pub fn match_rules<'rules>(
     for rule in &rules[..scan_end] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper, probe) {
             match probe.check(adapter_name) {
-                TargetCheck::Usable => {
+                // A rematch verdict is terminal for the pass like Usable.
+                TargetCheck::Usable | TargetCheck::Rematch => {
+                    return Some(MatchResult {
+                        adapter_name,
+                        rule_type: rule.rule_type(),
+                        rule_payload: rule.payload(),
+                    });
+                }
+                TargetCheck::Unusable => {
+                    warn_unusable_target(adapter_name, rule.as_ref());
                     return Some(MatchResult {
                         adapter_name,
                         rule_type: rule.rule_type(),
@@ -189,7 +198,15 @@ pub fn match_rules<'rules>(
         let rule = &rules[trie_idx];
         let adapter_name = rule.adapter();
         match probe.check(adapter_name) {
-            TargetCheck::Usable => {
+            TargetCheck::Usable | TargetCheck::Rematch => {
+                return Some(MatchResult {
+                    adapter_name,
+                    rule_type: rule.rule_type(),
+                    rule_payload: rule.payload(),
+                });
+            }
+            TargetCheck::Unusable => {
+                warn_unusable_target(adapter_name, rule.as_ref());
                 return Some(MatchResult {
                     adapter_name,
                     rule_type: rule.rule_type(),
@@ -206,7 +223,15 @@ pub fn match_rules<'rules>(
     for rule in &rules[tail..] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper, probe) {
             match probe.check(adapter_name) {
-                TargetCheck::Usable => {
+                TargetCheck::Usable | TargetCheck::Rematch => {
+                    return Some(MatchResult {
+                        adapter_name,
+                        rule_type: rule.rule_type(),
+                        rule_payload: rule.payload(),
+                    });
+                }
+                TargetCheck::Unusable => {
+                    warn_unusable_target(adapter_name, rule.as_ref());
                     return Some(MatchResult {
                         adapter_name,
                         rule_type: rule.rule_type(),
@@ -222,16 +247,28 @@ pub fn match_rules<'rules>(
     None
 }
 
-/// Log a skipped match: the rule matched but its target is absent from the
-/// registry or unusable for this traffic (issue #513; mihomo's match loop
-/// also `continue`s a target without UDP support on UDP flows).
+/// Log a skipped match: the rule matched but its target is absent from
+/// the registry (issue #513; mihomo's `continue` in the match loop).
 /// Keep the wording in sync with the IR engine's copy in
 /// `rule_ir::warn_missing_target`.
 fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
     tracing::warn!(
-        "rule {} matched target '{adapter_name}' which is unavailable for \
-         this connection (absent from the registry, or no UDP support); \
-         skipping it",
+        "rule {} matched target '{adapter_name}' which is absent from the \
+         registry; skipping it",
+        rule.rule_type().as_str(),
+    );
+}
+
+/// Log a [`TargetCheck::Unusable`] verdict: the rule matched and the target
+/// exists, but it cannot carry this connection class — the match is still
+/// returned (the dial then fails loudly) instead of sliding to a later
+/// rule (issue #969). Keep the wording in sync with
+/// `rule_ir::warn_unusable_target`.
+fn warn_unusable_target(adapter_name: &str, rule: &dyn Rule) {
+    tracing::warn!(
+        "rule {} matched target '{adapter_name}' which cannot carry this \
+         connection class (e.g. no UDP support on a UDP flow); failing \
+         closed instead of sliding to a later rule",
         rule.rule_type().as_str(),
     );
 }
@@ -239,6 +276,12 @@ fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
 /// Async counterpart of [`maybe_enrich_with_process`]: the platform socket
 /// scan runs on the blocking pool so a large `/proc` table cannot stall the
 /// Tokio worker the match executes on (issue #515).
+///
+/// Production dispatch must NOT use this — it bypasses the flow's
+/// `FlowLookup` memo and pays a scan per call. Routing goes through
+/// `TunnelInner::resolve_proxy_flow`, whose `find-process-mode` demand
+/// gate runs the same scan once per flow (issue #974); these helpers
+/// remain for tests.
 pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;
@@ -256,6 +299,10 @@ pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Meta
 /// callers MUST use [`maybe_enrich_with_process_async`]: the platform
 /// socket scan can walk a large `/proc` tree and would stall the Tokio
 /// worker this runs on (issue #515).
+///
+/// Like its async counterpart this bypasses the flow's `FlowLookup`
+/// memo — production dispatch belongs to `TunnelInner::resolve_proxy_flow`
+/// (issue #974).
 pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;

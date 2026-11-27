@@ -7,14 +7,18 @@
 //! the client supplies in the first SOCKS5-style frame) and our adapter
 //! dials through it to a local TCP echo server.
 
+use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::protocol::Command;
 use anytls_rs::server::Server as AnytlsServer;
-use meow_common::{Metadata, Network, ProxyAdapter};
+use bytes::BufMut;
+use meow_common::{Metadata, Network, ProxyAdapter, ProxyConn};
+use meow_proxy::dialer::TcpDialer;
 use meow_proxy::{AnytlsAdapter, AnytlsTlsOptions};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -903,10 +907,10 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     // Real adapter: it dials, completes the TLS handshake, and emits the
     // auth record. We don't care whether `dial_tcp` ultimately succeeds —
     // the regression server closes right after capturing auth, so the
-    // client's post-auth SYNACK wait may error. The assertion is purely
+    // client's post-auth session setup may error. The assertion is purely
     // server-side: did the whole auth come over in one TLS record? Run the
     // dial on a detached task so the test isn't held hostage to the
-    // client's post-auth timeout.
+    // client's post-auth error handling.
     //
     // Invariant this test depends on: a *freshly constructed* adapter has
     // an empty session pool, so the first `dial_tcp` opens a brand-new
@@ -977,19 +981,19 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     dial_h.abort();
 }
 
-// ─── Regression: UoT request must precede the SYNACK wait (#535) ──────────
+// ─── Regression: UoT request rides the open's first flush (#535) ──────────
 //
 // sing-box's anytls inbound sequences a UoT stream as: read destination →
 // see the magic address → `uot.ReadRequest(conn)` blocks on the wire →
-// `RoutePacketConnectionEx` → `N.HandshakeSuccess` → SYNACK. A client that
-// returns the stream from `dial_udp` and writes the UoT request lazily with
-// the first datagram deadlocks against it: client waits SYNACK, server
-// waits request. The vendored `anytls_rs::server::Server` SYNACKs
-// unconditionally right after the destination (handler.rs), so the tests
-// above cannot pin this ordering. The fake below speaks just enough AnyTLS
-// — TLS, auth, the frame layer — to reproduce sing-box's ordering: it
-// withholds SYNACK until the UoT request has been consumed, then echoes
-// datagrams back.
+// `RoutePacketConnectionEx` → `N.HandshakeSuccess` → SYNACK. The open no
+// longer waits for SYNACK, so that ordering can no longer deadlock — but
+// the request still goes out with the first flush, a latency measure where
+// upstream sends it lazily with the first datagram (`uot.NewLazyConn`).
+// The vendored `anytls_rs::server::Server` SYNACKs unconditionally right
+// after the destination (handler.rs), so the tests above cannot pin this
+// ordering. The fake below speaks just enough AnyTLS — TLS, auth, the
+// frame layer — to reproduce sing-box's ordering: it withholds SYNACK
+// until the UoT request has been consumed, then echoes datagrams back.
 
 /// Bytes consumed by a SOCKS5-family `ATYP+ADDR+PORT` at the front of
 /// `buf`; `None` while more bytes are needed.
@@ -1114,9 +1118,24 @@ async fn run_singbox_uot_session(
                                 break;
                             };
                             let uot = is_uot_magic(&stream.buf[..n]);
+                            let port = u16::from_be_bytes([stream.buf[n - 2], stream.buf[n - 1]]);
                             stream.buf.drain(..n);
                             if uot {
                                 stream.stage = FakeUotStage::Request;
+                            } else if port == FAKE_REFUSED_PORT {
+                                // Outbound dial failed: SYNACK carries the
+                                // error message (protocol v2).
+                                write_anytls_frame(
+                                    &mut writer,
+                                    Command::SynAck,
+                                    stream_id,
+                                    b"connection refused",
+                                )
+                                .await?;
+                                stream.stage = FakeUotStage::Dead;
+                            } else if port == FAKE_SILENT_PORT {
+                                // A server that never SYNACKs (protocol v1).
+                                stream.stage = FakeUotStage::Dead;
                             } else {
                                 // Non-UoT destination: SYNACK immediately,
                                 // the vendored server's unconditional shape.
@@ -1167,6 +1186,11 @@ async fn run_singbox_uot_session(
     }
 }
 
+/// Destination port the fake refuses with an error SYNACK.
+const FAKE_REFUSED_PORT: u16 = 9;
+/// Destination port the fake never SYNACKs, like a protocol v1 server.
+const FAKE_SILENT_PORT: u16 = 7;
+
 /// Start the sing-box-ordered fake AnyTLS server; returns its bound addr.
 async fn start_singbox_uot_server(
     cert_der: rustls::pki_types::CertificateDer<'static>,
@@ -1192,11 +1216,11 @@ async fn start_singbox_uot_server(
     (addr, h)
 }
 
-/// Regression for issue #535: `dial_udp` must put the UoT request on the
-/// wire before it waits for SYNACK. Under the old lazy-request shape the
-/// server below withholds SYNACK forever (its UoT-request read never
-/// completes), the dial stalls until the outer deadline, and this test
-/// fails at the 5-second timeout — the exact deadlock sing-box produced.
+/// Issue #535 ordering, kept: `dial_udp` puts the UoT request on the wire
+/// in the open's first flush. The open no longer waits for SYNACK, so the
+/// request-gated fake below can no longer deadlock the dial — what this
+/// pins now is the wire-order interop: the request lands ahead of the
+/// first datagram, the fake SYNACKs on consuming it, then echoes.
 #[tokio::test]
 async fn anytls_udp_survives_singbox_synack_after_uot_request_ordering() {
     install_crypto_provider();
@@ -1221,7 +1245,7 @@ async fn anytls_udp_survives_singbox_synack_after_uot_request_ordering() {
         adapter.dial_udp(&udp_metadata(target)),
     )
     .await
-    .expect("dial_udp deadlocks while SYNACK is gated on the uot request")
+    .expect("dial_udp must not stall on a request-gated SYNACK")
     .expect("dial_udp must succeed against sing-box-ordered SYNACK");
 
     timeout(T, conn.write_packet(b"ping", &target))
@@ -1281,6 +1305,83 @@ async fn anytls_tcp_gets_immediate_synack_from_singbox_ordered_fake() {
     conn.flush().await.unwrap();
 }
 
+fn tcp_metadata(port: u16) -> Metadata {
+    Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from("192.0.2.2"),
+        dst_ip: Some("192.0.2.2".parse().unwrap()),
+        dst_port: port,
+        ..Default::default()
+    }
+}
+
+/// `dial_tcp` hands the stream back without waiting for SYNACK, like the
+/// reference clients (mihomo / sing-anytls `CreateProxy`), so a server that
+/// never SYNACKs (protocol v1) neither stalls the dial nor blocks the first
+/// write. Waiting cost every stream one extra round trip.
+#[tokio::test]
+async fn anytls_tcp_dial_does_not_wait_for_synack() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-no-synack",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_SILENT_PORT)))
+        .await
+        .expect("dial_tcp must not wait for a SYNACK that never comes")
+        .expect("dial_tcp must succeed");
+    timeout(T, conn.write_all(b"GET / HTTP/1.0\r\n\r\n"))
+        .await
+        .expect("tcp write must not stall")
+        .expect("tcp write must succeed");
+    conn.flush().await.unwrap();
+}
+
+/// A SYNACK carrying an error (the server's outbound dial failed) arrives
+/// after `dial_tcp` returned; it must close the stream so the caller's
+/// read ends promptly instead of hanging — mihomo surfaces it the same way,
+/// on the next read.
+#[tokio::test]
+async fn anytls_tcp_error_synack_ends_the_stream() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-refused",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_REFUSED_PORT)))
+        .await
+        .expect("dial_tcp must not stall")
+        .expect("dial_tcp returns before the error SYNACK arrives");
+    let mut buf = [0u8; 16];
+    let read = timeout(T, conn.read(&mut buf))
+        .await
+        .expect("an error SYNACK must end the stream, not leave the read hanging");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "a refused stream must not yield data: {read:?}"
+    );
+}
+
 /// Issue #570 — `connect_over` must apply the adapter's TLS layer to the
 /// relay-supplied stream, then run AnyTLS auth + session + proxy-stream on
 /// top. The upstream is plain TCP to the anytls server; the adapter's own
@@ -1336,4 +1437,323 @@ async fn anytls_connect_over_runs_tls_auth_and_stream() {
         .expect("echo must not stall")
         .expect("echo must succeed");
     assert_eq!(&buf[..], payload, "echo payload must match what we wrote");
+}
+
+// ── `dialer-proxy` injection (PR #972, Batch-2 parity) ──────────────────
+
+/// A `dialer-proxy` front stand-in: reports `is_proxy()` and counts every
+/// transport it hands out. Its `dial` is a plain TCP connect to the AnyTLS
+/// server — what a real front's resolved chain terminates in — which is
+/// enough to prove the vendored client layered TLS + auth + its session
+/// pool on the chained stream (the in-process server is real).
+struct CountingFrontDialer {
+    dials: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl TcpDialer for CountingFrontDialer {
+    async fn dial(
+        &self,
+        host: &str,
+        port: u16,
+        _internal: bool,
+    ) -> io::Result<Box<dyn meow_transport::Stream>> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        let stream = tokio::net::TcpStream::connect((host, port)).await?;
+        Ok(Box::new(stream))
+    }
+
+    fn is_proxy(&self) -> bool {
+        true
+    }
+}
+
+/// Injected chain: every session's transport comes from the front, the
+/// adapter's TLS layer handshakes on it (`TlsConnect::connect_stream`), and
+/// sessions pool exactly like direct ones — a second `dial_tcp` must not
+/// re-dial the front. `connect_over` stays the unpooled relay path and
+/// never touches the injected dialer; `reset_sessions` forces a fresh
+/// transport dial.
+#[tokio::test]
+async fn anytls_injected_dialer_chains_tcp_and_pools_sessions() {
+    install_crypto_provider();
+
+    let (echo_addr, _echo_h) = start_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-chained",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        false,
+    )
+    .expect("adapter must build")
+    .with_dialer(Arc::new(CountingFrontDialer {
+        dials: Arc::clone(&dials),
+    }));
+
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from(echo_addr.ip().to_string()),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    // First dial: one chained transport carrying TLS + auth + the stream.
+    let mut conn = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .expect("chained dial_tcp must not stall")
+        .expect("chained dial_tcp must succeed");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    let payload = b"anytls over injected chain";
+    timeout(T, conn.write_all(payload))
+        .await
+        .expect("chained write must not stall")
+        .expect("chained write must succeed");
+    conn.flush().await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    timeout(T, conn.read_exact(&mut buf))
+        .await
+        .expect("chained echo must not stall")
+        .expect("chained echo must succeed");
+    assert_eq!(&buf[..], payload);
+    drop(conn);
+
+    // Second dial reuses the pooled session — the front is not re-dialed.
+    let conn2 = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .expect("second chained dial must not stall")
+        .expect("second chained dial must succeed");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "a pooled session must not re-dial the front"
+    );
+    drop(conn2);
+
+    // `connect_over` is the unpooled relay path: it bypasses the injected
+    // dialer entirely, so the count stays put and its session can never
+    // leak into the pool.
+    let upstream = tokio::net::TcpStream::connect(server_addr)
+        .await
+        .expect("upstream connect");
+    let conn3 = timeout(T, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over must not stall")
+        .expect("connect_over must succeed");
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    drop(conn3);
+
+    // Reset flushes the generation: the next dial builds a new session on
+    // a freshly chained transport — a pre-reset session can never be
+    // handed out.
+    adapter.reset_sessions();
+    let conn4 = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .expect("post-reset dial must not stall")
+        .expect("post-reset dial must succeed");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        2,
+        "reset_sessions must force a fresh transport dial"
+    );
+    drop(conn4);
+}
+
+/// `udp: true` UoT rides the same injected session — the front only has
+/// to carry TCP for chained UDP to work.
+#[tokio::test]
+async fn anytls_injected_dialer_carries_udp_over_tcp() {
+    install_crypto_provider();
+
+    let (echo_addr, _echo_h) = start_udp_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-chained-udp",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build")
+    .with_dialer(Arc::new(CountingFrontDialer {
+        dials: Arc::clone(&dials),
+    }));
+
+    let conn = timeout(T, adapter.dial_udp(&udp_metadata(echo_addr)))
+        .await
+        .expect("chained dial_udp must not stall")
+        .expect("chained dial_udp must succeed");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "UoT must be built on a chained transport"
+    );
+
+    let payload = b"anytls udp over injected chain";
+    let sent = timeout(T, conn.write_packet(payload, &echo_addr))
+        .await
+        .expect("write_packet must not stall")
+        .expect("write_packet must succeed");
+    assert_eq!(sent, payload.len());
+    let mut buf = vec![0u8; 2048];
+    let (n, from) = timeout(T, conn.read_packet(&mut buf))
+        .await
+        .expect("read_packet must not stall")
+        .expect("read_packet must succeed");
+    assert_eq!(&buf[..n], payload);
+    assert_eq!(from, echo_addr);
+}
+
+/// A dead front must fail the dial, not silently bypass the chain to a
+/// direct connection (fail-closed; ADR-0002 Class-A divergence guard).
+struct FailingFrontDialer;
+
+#[async_trait::async_trait]
+impl TcpDialer for FailingFrontDialer {
+    async fn dial(
+        &self,
+        _host: &str,
+        _port: u16,
+        _internal: bool,
+    ) -> io::Result<Box<dyn meow_transport::Stream>> {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "front hop is down",
+        ))
+    }
+
+    fn is_proxy(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn anytls_injected_dialer_fails_closed_when_front_dial_fails() {
+    install_crypto_provider();
+
+    // The server is reachable direct — if the adapter silently bypassed
+    // the injected dialer this dial would succeed.
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-chained-dead-front",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        false,
+    )
+    .expect("adapter must build")
+    .with_dialer(Arc::new(FailingFrontDialer));
+
+    let Err(err) = timeout(T, adapter.dial_tcp(&tcp_metadata(443)))
+        .await
+        .expect("dial must not stall")
+    else {
+        panic!("a dead front must fail the dial");
+    };
+    assert!(
+        err.to_string().contains("front hop is down"),
+        "the front's error must surface, not a direct-connect result: {err}"
+    );
+}
+
+/// End-to-end WriteBytes headroom contract: feed the dialed conn slots
+/// built the way `copy_bidirectional_buf_tracked_wg` builds them (7-byte
+/// zero headroom + payload in one BytesMut), read the echo back — every
+/// byte must be the payload byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anytls_write_bytes_headroom_round_trip_exact() {
+    install_crypto_provider();
+    let (echo_addr, _echo_h) = start_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-wb",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from(echo_addr.ip().to_string()),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+    let mut conn = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .unwrap()
+        .unwrap();
+
+    const SLOT: usize = 64 * 1024;
+    const TOTAL: usize = 4 * 1024 * 1024;
+
+    // One task drives both legs on the same `&mut conn` — exactly what
+    // `copy_bidirectional_buf_tracked_wg` does (a single poller that
+    // alternates reader/writer borrows): `write_bytes()` hands out a
+    // `&mut dyn WriteBytes` view borrowed from the conn, so splitting
+    // the conn up-front would make the view unreachable. Write one
+    // relay-shaped slot, drain its echo, repeat — a pure write-then-read
+    // burst would deadlock once the server's write-side kernel buffer
+    // fills and it stops draining our writes.
+    let mut bm = bytes::BytesMut::with_capacity(SLOT);
+    let mut pending: Option<bytes::BytesMut> = None;
+    let mut sent = 0usize;
+    let mut got = 0usize;
+    let mut alien = Vec::new();
+    let mut buf = vec![0u8; SLOT];
+    while got < TOTAL {
+        if sent < TOTAL {
+            if pending.is_none() {
+                if bm.capacity() - bm.len() < SLOT && !bm.try_reclaim(SLOT) {
+                    bm.reserve(SLOT);
+                }
+                bm.put_bytes(0u8, 7);
+                let n = (TOTAL - sent).min(SLOT - 7);
+                bm.extend_from_slice(&vec![0x41u8; n]);
+                sent += n;
+                pending = Some(bm.split_to(bm.len()));
+            }
+            let wb = conn
+                .write_bytes()
+                .expect("anytls conn must expose WriteBytes");
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *wb).poll_write_bytes(cx, &mut pending)
+            })
+            .await
+            .unwrap();
+        }
+        // Drain the echo for what has been offered so far — the server
+        // returns exactly `sent` bytes, so this always terminates.
+        while got < sent {
+            let n = timeout(T, conn.read(&mut buf)).await.unwrap().unwrap();
+            assert!(n > 0, "echo closed early at {got}/{TOTAL}");
+            for (i, &b) in buf[..n].iter().enumerate() {
+                if b != 0x41 {
+                    alien.push(got + i);
+                }
+            }
+            got += n;
+        }
+    }
+    conn.flush().await.unwrap();
+
+    assert_eq!(got, TOTAL, "echoed byte count");
+    assert!(alien.is_empty(), "alien bytes at offsets {alien:?}");
 }

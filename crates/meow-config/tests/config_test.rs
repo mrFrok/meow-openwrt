@@ -1,15 +1,5 @@
 use meow_config::{load_config_from_str, ListenerSpec};
 
-/// Whether `name` parsed into a real node. meow-openwrt binds a named node
-/// that fails to parse to a dead placeholder (no address) rather than
-/// dropping it, so presence alone no longer means "accepted".
-fn parsed(config: &meow_config::Config, name: &str) -> bool {
-    config
-        .proxies
-        .get(name)
-        .is_some_and(|p| !p.addr().is_empty())
-}
-
 // Some tests use #[tokio::test] because ShadowsocksAdapter plugin startup
 // internally requires a tokio runtime (tokio::process::Command).
 
@@ -1428,6 +1418,13 @@ proxies:
     assert!(config.proxies.contains_key("trojan-double-mux"));
 }
 
+fn parsed(config: &meow_config::Config, name: &str) -> bool {
+    config
+        .proxies
+        .get(name)
+        .is_some_and(|p| !p.addr().is_empty())
+}
+
 #[tokio::test]
 async fn test_proxy_parsing_rejects_non_boolean_mux_enabled() {
     let yaml = r#"
@@ -1460,6 +1457,45 @@ proxies:
     assert!(!parsed(&config, "trojan-scalar-mux"));
 }
 
+/// `strict: true` promotes the bad-`smux:` node defect to a document
+/// error — `check_mux_shape` gates it before the ECH pre-resolution
+/// opens sockets, so the load fails on the shape check itself.
+#[tokio::test]
+async fn test_proxy_parsing_strict_rejects_bad_mux_block() {
+    for yaml in [
+        r#"
+strict: true
+proxies:
+  - name: "trojan-bad-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: "true"
+"#,
+        r#"
+strict: true
+proxies:
+  - name: "trojan-scalar-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux: true
+"#,
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .expect("strict mode must reject a malformed smux block");
+        assert!(
+            err.to_string().contains("mux"),
+            "the error must name the mux defect, got: {err}"
+        );
+    }
+}
+
 #[cfg(feature = "mux")]
 #[tokio::test]
 async fn test_proxy_parsing_trojan_mux_h2mux_accepted() {
@@ -1475,7 +1511,7 @@ proxies:
       protocol: h2mux
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(parsed(&config, "trojan-mux-h2"));
+    assert!(config.proxies.contains_key("trojan-mux-h2"));
 }
 
 #[tokio::test]
@@ -1503,7 +1539,7 @@ proxies:
     cipher: auto
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(parsed(&config, "vmess-test"));
+    assert!(config.proxies.contains_key("vmess-test"));
 }
 
 #[tokio::test]
@@ -2655,8 +2691,8 @@ listeners:
     for needle in [
         "udp: only meaningful under a `listeners:` entry",
         "udp-timeout: only meaningful under a `listeners:`/`tun:` entry",
-        "my-http].udp: only meaningful on `type: tproxy`/`shadowsocks`",
-        "my-ss].udp-timeout: only meaningful on `type: tproxy`",
+        "my-http].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`",
+        "my-ss].udp-timeout: only meaningful on `type: tproxy`/`wireguard`",
         "my-http].tproxy-sni: only meaningful on `type: tproxy`",
     ] {
         assert!(logs.contains(needle), "missing warning '{needle}': {logs}");
@@ -2927,8 +2963,8 @@ listeners:
     });
     let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
     assert!(
-        logs.contains("only meaningful on `type: tproxy`/`shadowsocks`")
-            && logs.contains("only meaningful on `type: tproxy`, ignored"),
+        logs.contains("only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`")
+            && logs.contains("only meaningful on `type: tproxy`/`wireguard`, ignored"),
         "expected both misuse warnings, got: {logs}"
     );
 
@@ -3053,6 +3089,75 @@ listeners:
         .find(|nl| nl.name == "s")
         .unwrap();
     assert_eq!(s.spec, ListenerSpec::Socks5);
+}
+
+/// mihomo spells the named SOCKS inbound `type: socks`; meow-rs accepts
+/// both spellings (any case) and resolves them to the same `Socks5` spec —
+/// `socks5` stays the canonical runtime name.
+#[tokio::test]
+async fn test_socks_listener_spelling_alias() {
+    for spelling in ["socks", "socks5", "SOCKS", "Socks5", "SoCkS"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: s
+    type: {spelling}
+    listen: 0.0.0.0:7891
+    max-connections: 42
+"#
+        );
+        let config = load_config_from_str(&yaml)
+            .await
+            .unwrap_or_else(|e| panic!("type {spelling:?} must resolve: {e}"));
+        let nl = &config.listeners.named[0];
+        assert_eq!(
+            nl.spec,
+            ListenerSpec::Socks5,
+            "type {spelling:?} must resolve to the canonical Socks5 spec"
+        );
+        assert_eq!(nl.spec.type_name(), "socks5");
+        assert_eq!(nl.name, "s");
+        assert_eq!(nl.listen, "0.0.0.0");
+        assert_eq!(nl.port, 7891);
+        assert_eq!(nl.max_connections, 42);
+    }
+
+    // Same aliasing on the `port:`-field path, explicit ephemeral `0`.
+    for spelling in ["socks", "socks5"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: s
+    type: {spelling}
+    port: 0
+"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let nl = &config.listeners.named[0];
+        assert_eq!(nl.spec, ListenerSpec::Socks5);
+        assert_eq!(nl.port, 0);
+    }
+}
+
+/// The `socks` spelling occupies the same port space as the `socks-port`
+/// shorthand — a collision still trips the duplicate-port check.
+#[tokio::test]
+async fn test_socks_alias_collides_with_socks_port() {
+    let yaml = r#"
+socks-port: 7892
+listeners:
+  - name: s
+    type: socks
+    listen: 127.0.0.1:7892
+"#;
+    let Err(err) = load_config_from_str(yaml).await else {
+        panic!("named `socks` listener on the socks-port must hard-error");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("7892") && msg.contains("already used"),
+        "expected the duplicate-port diagnostic, got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -3280,30 +3385,104 @@ geox-url:
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
 }
 
-/// meow-openwrt: `redir-port` is mihomo's REDIRECT inbound — meow's tproxy
-/// TCP path, no managed rules, bound per allow-lan / bind-address.
+/// mihomo's flat `geo-auto-update` / `geo-update-interval` alias onto the
+/// resolved geodata schedule — the same `parse_geodata` boundary the
+/// startup spawn gate consumes.
 #[tokio::test]
-async fn test_redir_port_is_mihomo_redirect() {
-    let yaml = "redir-port: 7892\nallow-lan: true\nbind-address: '*'\n";
-    let config = load_config_from_str(yaml).await.unwrap();
-    let redir = config
-        .listeners
-        .named
-        .iter()
-        .find(|nl| nl.name == "redir")
-        .expect("redir shorthand listener must exist");
+async fn test_geo_flat_keys_alias_schedule() {
+    // Flat-only: no `geodata:` block required.
+    let config = load_config_from_str("geo-auto-update: true\ngeo-update-interval: 6\n")
+        .await
+        .unwrap();
+    assert!(config.geodata.auto_update);
+    assert_eq!(config.geodata.auto_update_interval, 6);
+
+    // An explicit nested value beats the flat alias per field — including
+    // an explicit `false`.
+    let config = load_config_from_str(
+        "geo-auto-update: true\ngeo-update-interval: 1\n\
+         geodata:\n  auto-update: false\n",
+    )
+    .await
+    .unwrap();
+    assert!(!config.geodata.auto_update);
     assert_eq!(
-        redir.spec,
-        ListenerSpec::TProxy {
-            sni: true,
-            firewall: false,
-            udp: false,
-            udp_timeout: 60,
-            transparent: false,
-        }
+        config.geodata.auto_update_interval, 1,
+        "nested block without an interval must not shadow the flat one"
     );
-    assert_eq!(redir.listen, "0.0.0.0");
-    assert_eq!(redir.port, 7892);
+
+    // The flat interval validates even when auto-update is off.
+    let err = load_config_from_str("geo-update-interval: 0\n")
+        .await
+        .err()
+        .expect("geo-update-interval: 0 must be rejected");
+    assert!(
+        err.to_string().contains("geo-update-interval"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The unsupported selectors are compatibility inputs, not errors —
+/// including under `strict: true`, where they stay warn-only.
+#[tokio::test]
+async fn test_geo_selectors_warn_only_even_under_strict() {
+    for strict in ["", "strict: true\n"] {
+        let yaml =
+            format!("{strict}geodata-mode: true\ngeodata-loader: standard\ngeosite-matcher: mph\n");
+        load_config_from_str(&yaml).await.unwrap_or_else(|e| {
+            panic!("geo selectors must stay warn-only (strict={strict:?}): {e}")
+        });
+    }
+}
+
+// ─── find-process-mode (issue #974) ────────────────────────────────────
+
+/// Omitted resolves to upstream's `strict` default; every spelling —
+/// case-insensitive — parses to its mode, and serialization is the
+/// canonical lowercase.
+#[tokio::test]
+async fn test_find_process_mode_parses_and_defaults() {
+    use meow_common::ProcessLookupMode;
+
+    let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
+    assert_eq!(config.general.find_process_mode, ProcessLookupMode::Strict);
+    assert_eq!(config.raw.find_process_mode, None);
+
+    for (spelling, mode) in [
+        ("always", ProcessLookupMode::Always),
+        ("Strict", ProcessLookupMode::Strict),
+        ("OFF", ProcessLookupMode::Off),
+    ] {
+        let yaml = format!("find-process-mode: {spelling}\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(
+            config.general.find_process_mode, mode,
+            "spelling {spelling:?}"
+        );
+        assert_eq!(config.raw.find_process_mode, Some(mode));
+        // The raw document serializes the canonical lowercase.
+        let v = serde_json::to_value(&config.raw).unwrap();
+        assert_eq!(
+            v["find-process-mode"].as_str().unwrap(),
+            mode.as_str(),
+            "spelling {spelling:?} must serialize lowercase"
+        );
+    }
+}
+
+/// An unknown spelling fails at the raw boundary — even in lenient mode
+/// there is no warn-and-continue path for this key (upstream's
+/// `ParseFindProcessMode` error propagates the same way).
+#[tokio::test]
+async fn test_find_process_mode_rejects_unknown_spelling() {
+    let err = load_config_from_str("find-process-mode: sometimes\n")
+        .await
+        .err()
+        .expect("an unknown find-process-mode must fail");
+    assert!(
+        err.to_string().contains("find-process-mode"),
+        "unexpected error: {err}"
+    );
 }
 
 // ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
@@ -3472,33 +3651,1691 @@ async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
     }
 }
 
-/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
-/// AND outbound dials there) are captured and warned (never honored),
-/// not silently dropped: they must land in the `RawConfig` capture
-/// fields AND not fail the load.
+/// Upstream mihomo's `keep-alive-*` keys tune the OUTBOUND side here
+/// (`tcp-keepalive*` keeps the inbound side) — typed fields resolving
+/// into the `OutboundTcpKeepalive` snapshot, never silently dropped.
 #[tokio::test]
-async fn test_upstream_keepalive_keys_warn_but_parse() {
+async fn test_upstream_keepalive_keys_resolve_outbound() {
     let yaml = r#"
 keep-alive-idle: 15
 keep-alive-interval: 30
 disable-keep-alive: false
 mixed-port: 7890
 "#;
-    // The keys must be captured, not dropped as unknown fields — a
-    // misnamed serde field would leave `keep-alive-idle` silently
-    // ignored while this test's load assertions still pass.
+    // The keys must be captured as typed fields — a misnamed serde field
+    // would leave `keep-alive-idle` silently ignored while the load
+    // assertions below still pass.
     let raw = meow_config::parse_raw_yaml(yaml).unwrap();
-    assert!(raw.keep_alive_idle.is_some());
-    assert!(raw.keep_alive_interval.is_some());
-    assert!(raw.disable_keep_alive.is_some());
+    assert_eq!(raw.keep_alive_idle, Some(15));
+    assert_eq!(raw.keep_alive_interval, Some(30));
+    assert_eq!(raw.disable_keep_alive, Some(false));
+
+    let outbound = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(outbound.enabled);
+    assert_eq!(outbound.idle, std::time::Duration::from_secs(15));
+    assert_eq!(outbound.interval, std::time::Duration::from_secs(30));
+    assert_eq!(outbound.probes, 9);
 
     let config = load_config_from_str(yaml).await.unwrap();
-    // Ignored upstream keys never reach the resolved inbound posture.
+    // The independent inbound posture is untouched by outbound knobs.
     let ka = config.listeners.tcp_keepalive;
     assert!(ka.enabled);
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
+}
+
+/// Omitted and explicit-0 keepalive timings resolve to the 15 s upstream
+/// default; `disable-keep-alive` defaults to enabled policy.
+#[test]
+fn test_outbound_keepalive_defaults() {
+    let raw = meow_config::parse_raw_yaml("mixed-port: 7890\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+
+    let raw = meow_config::parse_raw_yaml("keep-alive-idle: 0\nkeep-alive-interval: 0\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+}
+
+/// Timing bounds hold at 0–32767 s even while disabled; a negative value
+/// fails the typed field's serde before resolution.
+#[test]
+fn test_outbound_keepalive_bounds() {
+    let err = meow_config::parse_raw_yaml("keep-alive-idle: 32768\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("32768 must fail the 32767 s ceiling");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    assert!(
+        meow_config::parse_raw_yaml("keep-alive-interval: -5\n").is_err(),
+        "a negative interval must fail the typed field's serde"
+    );
+
+    // Disabled keeps the timing bounds — a disabled-but-invalid knob is
+    // still rejected rather than committed.
+    let err = meow_config::parse_raw_yaml("disable-keep-alive: true\nkeep-alive-idle: 40000\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("an out-of-range idle must fail even when disabled");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    let raw = meow_config::parse_raw_yaml("disable-keep-alive: true\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(!ka.enabled);
+}
+
+/// meow-openwrt: `redir-port` is mihomo's REDIRECT inbound — meow's tproxy
+/// TCP path, no managed rules, bound per allow-lan / bind-address.
+#[tokio::test]
+async fn test_redir_port_is_mihomo_redirect() {
+    let yaml = "redir-port: 7892\nallow-lan: true\nbind-address: '*'\n";
+    let config = load_config_from_str(yaml).await.unwrap();
+    let redir = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "redir")
+        .expect("redir shorthand listener must exist");
+    assert_eq!(
+        redir.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: false,
+            udp: false,
+            udp_timeout: 60,
+            transparent: false,
+        }
+    );
+    assert_eq!(redir.listen, "0.0.0.0");
+    assert_eq!(redir.port, 7892);
+}
+
+/// mihomo's `type: tproxy` is real TPROXY: `listeners:` takes
+/// `transparent`, which needs `firewall: false`.
+#[tokio::test]
+async fn test_listener_transparent_tproxy() {
+    let yaml = "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    listen: 0.0.0.0\n    firewall: false\n    udp: true\n    transparent: true\n";
+    let result = load_config_from_str(yaml).await;
+    if cfg!(target_os = "linux") {
+        let config = result.unwrap();
+        let tp = &config.listeners.named[0];
+        assert!(matches!(
+            tp.spec,
+            ListenerSpec::TProxy {
+                transparent: true,
+                firewall: false,
+                udp: true,
+                ..
+            }
+        ));
+    } else {
+        assert!(result.is_err(), "transparent is Linux-only");
+    }
+    let managed =
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    transparent: true\n";
+    let err = load_config_from_str(managed)
+        .await
+        .err()
+        .expect("transparent with the managed firewall is rejected")
+        .to_string();
+    assert!(err.contains("firewall: false"), "{err}");
+}
+
+#[tokio::test]
+async fn classical_provider_preserves_regex_quantifiers() {
+    let config = load_config_from_str(
+        r#"
+strict: true
+rule-providers:
+  nodes:
+    type: inline
+    behavior: classical
+    payload:
+      - 'DOMAIN-REGEX,^api[0-9]{1,3}\.example$'
+rules:
+  - RULE-SET,nodes,REJECT
+  - MATCH,DIRECT
+"#,
+    )
+    .await
+    .unwrap();
+    let metadata = |host: &str| meow_common::Metadata {
+        host: host.into(),
+        ..Default::default()
+    };
+    let rule = &config.rules[0];
+    assert!(rule.match_metadata(&metadata("api123.example"), &meow_common::RuleMatchHelper));
+    assert!(!rule.match_metadata(&metadata("api1234.example"), &meow_common::RuleMatchHelper));
+}
+
+// ── Unknown-key warnings (issue #974) ───────────────────────────────────
+//
+// Class B per ADR-0002: keys no schema models warn by name — never an
+// error, so a verbatim mihomo config keeps loading. `TU-4` (top-level
+// `firewall`) is covered by `test_top_level_firewall_warns_and_is_ignored`
+// above: that key is typed on `RawConfig` and keeps its bespoke warn.
+mod unknown_key_warns {
+    use meow_config::{load_config_from_str, parse_raw_yaml, rebuild_from_raw};
+    use std::sync::{Arc, Mutex};
+
+    /// WARN-sink + scoped-subscriber harness: the config build runs inside
+    /// `with_default` on a current-thread runtime so the thread-local
+    /// dispatch is in effect when warns fire (same pattern as the listener
+    /// misuse tests above).
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        (out, logs)
+    }
+
+    fn load_and_capture_warns(yaml: &str) -> (meow_config::Config, String) {
+        capture_warns(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(load_config_from_str(yaml))
+                .unwrap()
+        })
+    }
+
+    /// TU-1/TU-2/TU-3: unsupported keys name the feature and cite the
+    /// tracking issue where one exists; a bare typo aggregates under
+    /// "unknown keys".
+    #[test]
+    fn unknown_top_level_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+brutal-delay: 1
+tcp-idl-timeout: 5
+"#,
+        );
+        assert!(
+            logs.contains("unsupported key in top-level config: brutal-delay"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: tcp-idl-timeout"),
+            "got: {logs}"
+        );
+    }
+
+    /// Issue #974: both new top-level keys are typed now — they must
+    /// produce no unknown/unsupported warning at all.
+    #[test]
+    fn global_client_fingerprint_and_global_ua_do_not_warn_as_unknown() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+global-client-fingerprint: chrome
+global-ua: my-client/1.0
+"#,
+        );
+        assert!(
+            !logs.contains("global-client-fingerprint") && !logs.contains("global-ua"),
+            "neither supported key may warn: {logs}"
+        );
+    }
+
+    /// An unsupported `global-client-fingerprint` name warns once per
+    /// rebuild pass (Class B) and still loads — nodes inheriting it would
+    /// otherwise send a silently unshaped hello. `rebuild_from_raw` runs
+    /// exactly one pass (startup's two-pass DNS build legitimately warns
+    /// twice).
+    #[test]
+    fn unsupported_global_client_fingerprint_warns_once() {
+        let raw = meow_config::parse_raw_yaml("global-client-fingerprint: bogus-fp\n").unwrap();
+        let (_result, logs) = capture_warns(|| rebuild_from_raw(&raw).unwrap());
+        let hits = logs
+            .matches("global-client-fingerprint=\"bogus-fp\" is not a supported uTLS profile")
+            .count();
+        assert_eq!(hits, 1, "one warn per rebuild pass, got: {logs}");
+    }
+
+    /// `global-ua` with header-injection bytes is a Class A rejection —
+    /// the build fails rather than emit a second request line. NUL and
+    /// other control bytes cannot be spelled inside a YAML scalar, so
+    /// they drive the rebuild's validation gate directly. Edge-position
+    /// bytes (`"evil\r\n"`) are the smuggling case: trimming first would
+    /// strip them before the check, so the validator must inspect the
+    /// untrimmed string.
+    #[test]
+    fn global_ua_rejects_crlf_and_control_bytes() {
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\u{1f}b",
+            "a\u{7f}b",
+            "a\u{0b}b",
+            "\r\n",
+            "evil\r\n",
+            "\r\nevil",
+            "evil\u{0b}",
+        ] {
+            let raw = meow_config::raw::RawConfig {
+                global_ua: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let err = rebuild_from_raw(&raw)
+                .err()
+                .unwrap_or_else(|| panic!("global-ua {bad:?} must fail the rebuild"));
+            assert!(
+                err.to_string().contains("global-ua"),
+                "the error must name the key, got: {err}"
+            );
+        }
+        // The same gate fires through the YAML/document path.
+        let raw = meow_config::parse_raw_yaml("global-ua: \"a\\x0ab\"\n").unwrap();
+        assert!(
+            rebuild_from_raw(&raw).is_err(),
+            "a CRLF-injected global-ua must fail at admission"
+        );
+    }
+
+    /// Misplaced keys name the surface that honors them — `firewall` under
+    /// `dns:` is not a typed field there, so the extra-capture classify
+    /// fires (the top-level `firewall` key is typed and warned by its own
+    /// bespoke check instead).
+    #[test]
+    fn misplaced_keys_name_their_surface() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  firewall: true
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [DIRECT]
+    tfo: true
+"#,
+        );
+        assert!(
+            logs.contains("misplaced key in dns: firewall (belongs on a listeners:"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("misplaced key in proxy-group 'g': tfo"),
+            "got: {logs}"
+        );
+        assert!(logs.contains("proxies: entry"), "got: {logs}");
+    }
+
+    /// TP-1/TP-2: per-node keys outside the ss inventory warn — registered
+    /// unsupported keys with their reason, open-ended `brutal-*` too.
+    #[test]
+    fn unknown_ss_node_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: s
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    udp-over-tcp-version: 3
+    brutal-opts: {}
+"#,
+        );
+        assert!(
+            logs.contains("unsupported key in proxy 's': udp-over-tcp-version"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unsupported key in proxy 's': brutal-opts"),
+            "got: {logs}"
+        );
+    }
+
+    /// TP-3: a misspelling of a real key gets the spelling hint.
+    #[test]
+    fn trojan_near_miss_hint() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: t
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    skip-cert-verfiy: true
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in proxy 't': skip-cert-verfiy (not recognized; mihomo uses 'skip-cert-verify')"
+            ),
+            "got: {logs}"
+        );
+    }
+
+    /// TP-4: `smux`/`mux` are both accepted — neither warns.
+    #[test]
+    fn mux_smux_aliases_do_not_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: a
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    smux:
+      enabled: true
+  - name: b
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    mux:
+      enabled: true
+"#,
+        );
+        assert!(
+            !logs.contains("unknown keys in proxy 'a': smux"),
+            "smux alias must not warn: {logs}"
+        );
+        assert!(
+            !logs.contains("unknown keys in proxy 'b': mux"),
+            "mux alias must not warn: {logs}"
+        );
+        assert!(!logs.contains("unknown keys"), "got: {logs}");
+    }
+
+    /// TPG-1/TPG-2: group-level keys outside the group schema — a near-miss
+    /// spelling plus a plain unknown.
+    #[test]
+    fn proxy_group_unknown_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxy-groups:
+  - name: auto
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    proxies: [DIRECT]
+    test-timeout: 5
+  - name: relay-g
+    type: select
+    proxies: [DIRECT]
+    max-alive: 3
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in proxy-group 'auto': test-timeout (not recognized; mihomo uses 'timeout' (not modeled here))"
+            ),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in proxy-group 'relay-g': max-alive"),
+            "got: {logs}"
+        );
+    }
+
+    /// TL-1: a key no listener schema models warns on `type: mixed`.
+    #[test]
+    fn listener_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+listeners:
+  - name: mixed-l
+    type: mixed
+    listen: 127.0.0.1:0
+    unknown-listener-opt: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in listener 'mixed-l': unknown-listener-opt"),
+            "got: {logs}"
+        );
+    }
+
+    /// TL-2: WG peer extras keep their bespoke per-peer warn.
+    #[test]
+    fn wg_peer_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+listeners:
+  - name: wg-in
+    type: wireguard
+    listen: 127.0.0.1:0
+    private-key: "eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU="
+    peers:
+      - public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+        allowed-ips: [10.0.0.2/32]
+        persistant-keepalive: 25
+"#,
+        );
+        assert!(
+            logs.contains("persistant-keepalive")
+                && logs.contains("not a known wireguard peer field"),
+            "got: {logs}"
+        );
+    }
+
+    /// TD-1/TT-1/TS-1/TG-1/TGX-1: one unknown key per section.
+    #[test]
+    fn section_unknown_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  bogus-dns-key: 1
+tun:
+  bogus-tun-key: 1
+sniffer:
+  bogus-sniffer-key: 1
+geodata:
+  bogus-geodata-key: 1
+geox-url:
+  bogus-geox-key: 1
+"#,
+        );
+        for want in [
+            "unknown keys in dns: bogus-dns-key",
+            "unknown keys in tun: bogus-tun-key",
+            "unknown keys in sniffer: bogus-sniffer-key",
+            "unknown keys in geodata: bogus-geodata-key",
+            "unknown keys in geox-url: bogus-geox-key",
+        ] {
+            assert!(logs.contains(want), "missing '{want}' in: {logs}");
+        }
+    }
+
+    /// The flat `geo-*` selectors are typed compat inputs: they warn on
+    /// their effective value with the winning key's path — never under
+    /// the generic unknown-key line.
+    #[test]
+    fn flat_geo_selectors_warn_by_effective_path() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+geodata-mode: true
+geodata-loader: standard
+geosite-matcher: mph
+"#,
+        );
+        for want in [
+            "geodata-mode: `true` selects mihomo's geoip.dat backend",
+            "geodata-loader: value \"standard\" selects a DAT loader",
+            "geosite-matcher: value \"mph\" selects a geosite matcher",
+        ] {
+            assert!(logs.contains(want), "missing '{want}' in: {logs}");
+        }
+        for key in [
+            "geo-auto-update",
+            "geo-update-interval",
+            "geodata-mode",
+            "geodata-loader",
+            "geosite-matcher",
+        ] {
+            assert!(
+                !logs.contains(&format!("unknown keys in top-level config: {key}"))
+                    && !logs.contains(&format!("unsupported key in top-level config: {key}")),
+                "{key} is a recognized typed field — it must not warn as unknown: {logs}"
+            );
+        }
+    }
+
+    /// An explicit nested selector wins the merge, so the nested path is
+    /// the one the warning names — and `geodata-mode: false` (the
+    /// MMDB-compatible value) does not warn at all.
+    #[test]
+    fn geo_selector_warns_follow_the_winning_spelling() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+geodata-mode: false
+geodata-loader: standard
+geosite-matcher: hybrid
+geodata:
+  geodata-mode: true
+  geosite-matcher: succinct
+"#,
+        );
+        // Nested true wins over flat false → the nested path warns.
+        assert!(
+            logs.contains("geodata.geodata-mode: `true` selects mihomo's geoip.dat backend"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("geodata-mode: `false`"),
+            "flat false never warns: {logs}"
+        );
+        // Flat loader has no nested rival → the flat path warns.
+        assert!(
+            logs.contains("geodata-loader: value \"standard\" selects a DAT loader"),
+            "got: {logs}"
+        );
+        // Nested matcher wins over flat.
+        assert!(
+            logs.contains("geodata.geosite-matcher: value \"succinct\" selects a geosite matcher"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("geosite-matcher: value \"hybrid\""),
+            "the shadowed flat value must not warn: {logs}"
+        );
+    }
+
+    /// A legacy non-boolean nested `geodata-mode` and the nested-only
+    /// `geoip-matcher` warn without failing — the selectors never become
+    /// errors even under `strict: true`.
+    #[test]
+    fn geo_legacy_selector_values_warn_not_fail() {
+        let (config, logs) = load_and_capture_warns(
+            r#"
+strict: true
+geodata:
+  geodata-mode: memconservative
+  geoip-matcher: mph
+"#,
+        );
+        assert!(
+            logs.contains("geodata.geodata-mode: unsupported value"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("geodata.geoip-matcher: field is not supported"),
+            "got: {logs}"
+        );
+        drop(config);
+    }
+
+    /// `nameserver-policy` keys are domain patterns, not config keys —
+    /// they must never warn.
+    #[test]
+    fn nameserver_policy_patterns_do_not_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  enable: true
+  nameserver-policy:
+    "+.example.com": 1.1.1.1
+    "geosite:cn": [8.8.8.8]
+"#,
+        );
+        assert!(
+            !logs.contains("unknown keys in dns"),
+            "policy patterns warned: {logs}"
+        );
+    }
+
+    /// TR-1: provider-definition keys outside the schema warn with the
+    /// provider named; the provider need not load for the def-level warn.
+    #[test]
+    fn proxy_provider_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxy-providers:
+  p:
+    type: file
+    path: /nonexistent/nodes.yaml
+    bogus-provider-key: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in proxy-provider 'p': bogus-provider-key"),
+            "got: {logs}"
+        );
+    }
+
+    /// TR-2 + TV-3: a loaded `file:` provider — override keys other than
+    /// `dialer-proxy` warn (pre-existing bespoke warn), and provider
+    /// payload nodes warn with provider context. `path:` providers resolve
+    /// inside the provider cache dir, so this goes through `build_config`
+    /// with a tempdir rather than the `None`-cache `load_config_from_str`.
+    #[test]
+    fn provider_override_and_node_unknown_keys_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - name: n\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-256-gcm\n    password: pw\n    bogus-node-key: 1\n",
+        )
+        .unwrap();
+        let yaml = "proxy-providers:\n  p:\n    type: file\n    path: nodes.yaml\n    override:\n      dialer-proxy: DIRECT\n      bogus-override-key: 1\n";
+        let (_config, logs) = capture_warns(|| {
+            let raw = parse_raw_yaml(yaml).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(meow_config::build_config(raw, Some(dir.path())))
+                .unwrap()
+        });
+        assert!(
+            logs.contains("proxy-provider override key 'bogus-override-key' is not supported"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("'dialer-proxy' is not supported"),
+            "dialer-proxy must stay honored: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in proxy 'n' (from provider 'p'): bogus-node-key"),
+            "got: {logs}"
+        );
+    }
+
+    /// TV-2: a rebuild (the `PUT`/`PATCH /configs` path) re-emits — warns
+    /// are not one-shot startup noise.
+    #[test]
+    fn unknown_keys_reemit_on_rebuild() {
+        let raw = parse_raw_yaml("rebuild-bogus-key: 1\n").unwrap();
+        let (_out, logs) = capture_warns(|| {
+            rebuild_from_raw(&raw).unwrap();
+            rebuild_from_raw(&raw).unwrap();
+        });
+        assert_eq!(
+            logs.matches("unknown keys in top-level config: rebuild-bogus-key")
+                .count(),
+            2,
+            "each rebuild pass must re-emit: {logs}"
+        );
+    }
+
+    /// TC-1: unrecognized keys aggregate sorted into one line per context.
+    #[test]
+    fn unknown_keys_aggregate_sorted_into_one_line() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+zebra-key: 1
+alpha-key: 2
+mid-key: 3
+beta-key: 4
+kappa: 5
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in top-level config: alpha-key, beta-key, kappa, mid-key, zebra-key"
+            ),
+            "got: {logs}"
+        );
+    }
+
+    /// TC-2: the same unknown key on three nodes warns three times, each
+    /// carrying its node's name.
+    #[test]
+    fn same_unknown_key_warns_per_proxy() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: a
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    bogus-key: 1
+  - name: b
+    type: ss
+    server: 1.2.3.5
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    bogus-key: 1
+  - name: c
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    bogus-key: 1
+"#,
+        );
+        for name in ["a", "b", "c"] {
+            assert!(
+                logs.contains(&format!("unknown keys in proxy '{name}': bogus-key")),
+                "missing proxy '{name}' warn in: {logs}"
+            );
+        }
+    }
+
+    /// `strict: true` promotes *defects* to errors — unknown keys are not
+    /// defects; the warns stay warns and the config still loads.
+    #[test]
+    fn strict_mode_keeps_unknown_keys_warn_only() {
+        let (config, logs) = load_and_capture_warns(
+            r#"
+strict: true
+strict-bogus-key: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: strict-bogus-key"),
+            "got: {logs}"
+        );
+        drop(config);
+    }
+
+    /// TI-1: serialized `RawConfig::default()` exposes exactly the typed
+    /// fields (the `extra` flatten contributes nothing when empty). The
+    /// exact list, not a count — a `skip_serializing_if`-gated addition
+    /// would evade a bare `len()` check, as would one name for another.
+    /// (Still not airtight: a field that never serializes leaves no mark.)
+    #[test]
+    fn raw_config_field_inventory_is_pinned() {
+        let v = serde_json::to_value(meow_config::raw::RawConfig::default()).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected = [
+            "allow-lan",
+            "authentication",
+            "bind-address",
+            "connection-notes",
+            "disable-keep-alive",
+            "dns",
+            "external-controller",
+            "external-controller-cors",
+            "external-controller-pipe",
+            "external-controller-tls",
+            "external-controller-unix",
+            "external-ui",
+            "external-ui-name",
+            "external-ui-url",
+            "find-process-mode",
+            "firewall",
+            "geo-auto-update",
+            "geo-update-interval",
+            "geodata",
+            "geodata-loader",
+            "geodata-mode",
+            "geosite-matcher",
+            "geox-url",
+            "global-client-fingerprint",
+            "global-ua",
+            "hosts",
+            "interface-name",
+            "ipv6",
+            "keep-alive-idle",
+            "keep-alive-interval",
+            "listeners",
+            "log-level",
+            "logbook",
+            "max-connections",
+            "mixed-port",
+            "mode",
+            // Typed `ntp:`/`profile:` sections (issue #974) — deliberate.
+            "ntp",
+            "port",
+            "profile",
+            "proxies",
+            "proxy-groups",
+            "proxy-providers",
+            "redir-port",
+            "routing-mark",
+            "rule-providers",
+            "rules",
+            "secret",
+            "skip-auth-prefixes",
+            "sniffer",
+            "socks-port",
+            "strict",
+            "sub-rules",
+            "subscriptions",
+            "tcp-concurrent",
+            "tcp-connect-timeout",
+            "tcp-idle-timeout",
+            "tcp-keepalive",
+            "tcp-keepalive-idle",
+            "tcp-keepalive-interval",
+            "tcp-keepalive-probes",
+            "tls",
+            "tproxy-port",
+            "tproxy-sni",
+            "traffic-ledger",
+            "tun",
+            "udp",
+            "udp-timeout",
+            "unified-delay",
+        ];
+        assert_eq!(
+            keys, expected,
+            "RawConfig serialized fields changed — confirm a new typed field \
+             is deliberate; unknown keys must keep flowing into `extra`"
+        );
+    }
+
+    /// Unknown keys never block a load — a config carrying several of them
+    /// still builds its proxies.
+    #[test]
+    fn config_with_unknown_keys_still_loads() {
+        let (config, _logs) = load_and_capture_warns(
+            r#"
+bogus-key: 1
+proxies:
+  - name: s
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    another-bogus: 2
+"#,
+        );
+        assert!(
+            config.proxies.contains_key("s"),
+            "node must load despite the unknown key"
+        );
+    }
+
+    /// Review F1 regression: an unknown key whose *value* nests a map with
+    /// non-string scalar keys must still load — serde's flatten buffer
+    /// hands typed keys (`123` as `u64`) to the extra map, which used to
+    /// fail the whole parse. The nested keys stringify for the
+    /// warn + save round-trip; the outer key warns as before.
+    #[test]
+    fn unknown_key_with_nonstring_nested_keys_loads() {
+        let (config, logs) = load_and_capture_warns(
+            "mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x, 1.5: y}\nrules: [MATCH,DIRECT]\n",
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: x-tpl"),
+            "got: {logs}"
+        );
+        assert_eq!(
+            config.raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "1.5": "y", "true": "x"}),
+            "nested scalar keys must stringify, not fail the parse"
+        );
+    }
+
+    /// Same F1 regression through the production ingest path —
+    /// `parse_raw_yaml`'s `yaml_tree` deserializer types nested keys the
+    /// same way, so the boundary must hold there too. A null key keeps
+    /// erroring (the `String` map key rejected it before).
+    #[test]
+    fn parse_raw_yaml_unknown_key_nonstring_nested_keys() {
+        let raw = meow_config::parse_raw_yaml("mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x}\n")
+            .expect("non-string scalar keys inside an unknown key must load");
+        assert_eq!(
+            raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "true": "x"})
+        );
+
+        let err = meow_config::parse_raw_yaml("x-tpl: {~: v}\n")
+            .expect_err("a null mapping key must still fail");
+        assert!(err.to_string().contains("null"), "got: {err}");
+    }
+}
+
+/// `resolve_profile` — `profile.store-fake-ip` outranks
+/// `dns.store-fake-ip`, which outranks the `false` default; plus
+/// upstream's `store-selected: true` default and the typed-shape
+/// contract (`profile:` must be a mapping, flags booleans when
+/// non-null) — issue #974.
+#[test]
+fn test_resolve_profile_matrix() {
+    // Omitted everything → upstream defaults.
+    let raw = meow_config::parse_raw_yaml("mode: rule\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected);
+    assert!(!p.store_fake_ip);
+
+    // Explicit profile values win over dns and defaults.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  store-fake-ip: true\ndns:\n  store-fake-ip: false\n",
+    )
+    .unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(!p.store_selected);
+    assert!(p.store_fake_ip, "profile.store-fake-ip outranks dns'");
+
+    // The alias carries over when profile omits the key — including an
+    // explicit `store-fake-ip: false` in dns (false is a value, not a
+    // fallthrough).
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: true\ndns:\n  store-fake-ip: true\n",
+    )
+    .unwrap();
+    assert!(meow_config::resolve_profile(&raw).store_fake_ip);
+    let raw = meow_config::parse_raw_yaml("dns:\n  store-fake-ip: false\n").unwrap();
+    assert!(!meow_config::resolve_profile(&raw).store_fake_ip);
+
+    // `null` falls through to the next source; a `null` profile section
+    // resolves like an absent one.
+    let raw =
+        meow_config::parse_raw_yaml("profile:\n  store-fake-ip: ~\ndns:\n  store-fake-ip: true\n")
+            .unwrap();
+    assert!(
+        meow_config::resolve_profile(&raw).store_fake_ip,
+        "null falls through to the dns spelling"
+    );
+    let raw = meow_config::parse_raw_yaml("profile: ~\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected && !p.store_fake_ip);
+
+    // Typed shape: non-bool flags and a non-mapping section are hard
+    // failures, not warn-and-ignore.
+    for doc in [
+        "profile: {store-selected: 5}\n",
+        "profile: {store-fake-ip: yes-but-no}\n",
+        "profile: 3\n",
+    ] {
+        assert!(
+            meow_config::parse_raw_yaml(doc).is_err(),
+            "must fail raw parse: {doc:?}"
+        );
+    }
+
+    // Unmodeled children survive into `extra` for the scoped warning —
+    // `selected`/`tracing` must NOT be silently accepted as config.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  selected: {G: X}\n  tracing: true\n",
+    )
+    .unwrap();
+    let profile = raw.profile.as_ref().unwrap();
+    assert!(profile.extra.contains_key("selected"));
+    assert!(profile.extra.contains_key("tracing"));
+}
+
+/// `resolve_ntp` — upstream defaults, the disabled-section range
+/// checks, server-shape rules, and `write-to-system` compatibility
+/// (issue #974).
+mod ntp_resolution {
+
+    fn resolve(yaml: &str) -> Result<meow_config::NtpConfig, anyhow::Error> {
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        meow_config::resolve_ntp(&raw)
+    }
+
+    #[test]
+    fn defaults_apply_when_absent_or_partial() {
+        let c = resolve("{}").unwrap();
+        assert!(!c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+        assert_eq!(c.dialer_proxy, None);
+
+        let c = resolve("ntp:\n  enable: true\n").unwrap();
+        assert!(c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+    }
+
+    #[test]
+    fn explicit_values_and_direct_spelling() {
+        let c = resolve(
+            "ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n",
+        )
+        .unwrap();
+        assert_eq!(c.server, "pool.ntp.org");
+        assert_eq!(c.port, 1123);
+        assert_eq!(c.interval_minutes, 60);
+        // `dialer-proxy: DIRECT` normalizes to the absent spelling — both
+        // resolve to the direct dial path, so the two spellings must
+        // compare equal or reconcile would restart an unchanged worker.
+        assert_eq!(c.dialer_proxy, None);
+        assert_eq!(
+            c,
+            resolve("ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_matches_names_verbatim() {
+        // No trimming: `' DIRECT '` is not the DIRECT built-in — enabled,
+        // it must fail the named-target gate like any undeclared name.
+        let raw = meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ' DIRECT '\n")
+            .unwrap();
+        let c = meow_config::resolve_ntp(&raw).unwrap();
+        assert_eq!(c.dialer_proxy.as_deref(), Some(" DIRECT "));
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("a whitespace-padded name must not resolve to DIRECT");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    fn server_shape_accepts_hosts_and_literals_rejects_compound() {
+        for good in ["1.2.3.4", "time.apple.com", "[2001:db8::1]", "2001:db8::1"] {
+            let y = format!("ntp:\n  server: '{good}'\n");
+            let c = resolve(&y).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(c.server, good.trim_matches(|x| x == '[' || x == ']'));
+        }
+        for bad in [
+            "",
+            "bad host",
+            "host:123",
+            "udp://host",
+            "host/path",
+            "user@host",
+            "ntp://pool.ntp.org:123",
+            "ho\tst",
+        ] {
+            let y = format!("ntp:\n  server: '{bad}'\n");
+            assert!(resolve(&y).is_err(), "{bad} must fail");
+        }
+    }
+
+    #[test]
+    fn ranges_checked_even_when_disabled() {
+        assert!(resolve("ntp:\n  enable: false\n  port: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525601\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525600\n").is_ok());
+        assert!(resolve("ntp:\n  interval: 1\n").is_ok());
+    }
+
+    #[test]
+    fn write_to_system_resolves_but_stays_out_of_the_config() {
+        // The raw field parses; the resolved config has no such knob.
+        let c = resolve("ntp:\n  enable: true\n  write-to-system: true\n").unwrap();
+        assert!(c.enable);
+    }
+
+    /// An enabled `dialer-proxy` must name a transport: the
+    /// REJECT/REJECT-DROP/PASS/PASS-RULE built-ins sit in the proxy map
+    /// but are match-engine signals, so admission denies them by name.
+    /// DIRECT/COMPATIBLE dial direct and GLOBAL is a group — all valid.
+    #[test]
+    fn dialer_proxy_rejects_non_transport_builtins() {
+        for name in ["REJECT", "REJECT-DROP", "PASS", "PASS-RULE"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            let e = meow_config::rebuild_from_raw(&raw)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail admission"));
+            assert!(
+                e.to_string().contains("non-transport built-in"),
+                "{name}: unexpected error: {e}"
+            );
+        }
+        for name in ["DIRECT", "COMPATIBLE", "GLOBAL"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            meow_config::rebuild_from_raw(&raw)
+                .unwrap_or_else(|e| panic!("{name} must pass admission: {e}"));
+        }
+        // A disabled section's dialer-proxy never reaches the gate.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: false\n  dialer-proxy: REJECT\n").unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a disabled ntp section must not gate its dialer name");
+        // An undeclared name still fails the map check.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ghost\n").unwrap();
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("ghost must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// `check_ntp_dialer_target_declared` — the forced verbatim-commit
+    /// fallback must prove the name can enter the built map: a declared
+    /// node/group whose `type:` the build dispatch cannot construct is
+    /// dropped by the lenient build, so name-only presence is not enough
+    /// (Codex review: same-name unbuildable node bypass).
+    #[test]
+    fn declared_dialer_target_requires_a_buildable_type() {
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
+        };
+        // A declared node with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n    server: s\n    port: 1\n").is_ok()
+        );
+        // A declared group with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT]\n").is_ok()
+        );
+        // A same-name node with an unknown `type:` would be dropped by
+        // the lenient build — the raw declaration must not count.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: not-a-protocol\n    server: s\n    port: 1\n",
+        )
+        .expect_err("an unbuildable same-name node must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // A node with no `type:` at all is dropped for the same reason.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    server: s\n    port: 1\n"
+        )
+        .is_err());
+        // A known `type:` with missing required fields fails the real
+        // parse the check runs — the lenient build drops the node
+        // (socks5 is not placeholder-eligible), so the name never lands.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n"
+        )
+        .is_err());
+        // Same hole on the group lane: an unknown group `type:` fails.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: not-a-group\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A group whose only member is undeliverable drops too.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [ghost]\n"
+        )
+        .is_err());
+        // A relay below its two-member floor drops.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: relay\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A group whose only member source is an UNBUILDABLE provider
+        // drops too — `materialize_proxy_providers` warn-drops a def the
+        // constructor refuses, so declared `use:` membership cannot count
+        // it (Codex review: provider-only target floor).
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: http\n"
+        )
+        .is_err());
+        // Same for a `file` provider when no cache dir exists to contain
+        // its path — the constructor refuses it in that posture.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+        )
+        .is_err());
+        // And for an unknown provider `type:`.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: carrier-pigeon\n"
+        )
+        .is_err());
+
+        // A buildable provider DOES land its `use:` slot — the same gate
+        // the build applies, run against a real cache dir.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check_dir = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok(),
+            "a contained file provider must satisfy the provider-only target"
+        );
+        // The same def with an escaping path is dropped by containment —
+        // the group no longer lands even though `use:` still names it.
+        assert!(check_dir(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: ../outside.yaml\n"
+        )
+        .is_err());
+        // `include-all-providers` wires the same buildable set.
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    include-all-providers: true\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok()
+        );
+        // A member that names a later group resolves once that group
+        // lands — the fixpoint mirrors the build's multi-pass settle.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g1\nproxy-groups:\n  - name: g1\n    type: select\n    proxies: [g2]\n  - name: g2\n    type: select\n    proxies: [DIRECT]\n"
+        )
+        .is_ok());
+        // But a group that only lands *late in the build's final pass*
+        // must not rescue an EARLIER group's dependency on it: the real
+        // settle never revisits, so `a` drops while `b` still lands
+        // (Codex review: the plain fixpoint revisited `a` and admitted
+        // it, letting a forced PUT commit a `dialer-proxy` the next boot
+        // fails to find). `c` is unbuildable, so `b`'s [DIRECT, c] keeps
+        // only DIRECT.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: a\nproxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .expect_err("a depends on a group that only lands after it in the final pass");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // The built map agrees: `b` lands, `a` and `c` do not.
+        let raw = meow_config::parse_raw_yaml(
+            "proxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .unwrap();
+        let rebuilt = meow_config::rebuild_from_raw(&raw).unwrap();
+        assert!(rebuilt.proxies.contains_key("b"), "b must land");
+        assert!(!rebuilt.proxies.contains_key("a"), "a must drop");
+        assert!(!rebuilt.proxies.contains_key("c"), "c must drop");
+        // A compiled-out spelling keeps an unavailable placeholder in
+        // the built map, but the placeholder carries no transport — it
+        // cannot serve as the NTP dialer target.
+        let tt = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n",
+        );
+        assert_eq!(tt.is_ok(), cfg!(feature = "trusttunnel"));
+        // DIRECT remains the always-valid spelling.
+        assert!(check("ntp:\n  enable: true\n  dialer-proxy: DIRECT\n").is_ok());
+    }
+
+    /// The built-map side of the same gate: `proxies.contains_key` alone
+    /// cannot tell an `UnavailableAdapter` placeholder — bound by the
+    /// lenient build for a node it cannot construct — from a live leaf,
+    /// yet every dial on it fails (Codex review). A group naming the
+    /// placeholder beside a usable member stays valid: groups route
+    /// around dead members the same way they route around down nodes.
+    #[test]
+    fn ntp_dialer_target_rejects_placeholder_leaves_not_groups() {
+        let node = "proxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n";
+
+        // `front` parses to a dead placeholder when trusttunnel is
+        // compiled out of this build; with the feature it is a live leaf.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: front\n{node}"
+        ))
+        .unwrap();
+        let result = meow_config::rebuild_from_raw(&raw);
+        if cfg!(feature = "trusttunnel") {
+            result.expect("a live leaf target must pass the gate");
+        } else {
+            let e = result.err().expect("a placeholder leaf must fail the gate");
+            assert!(
+                e.to_string().contains("no such top-level"),
+                "unexpected error: {e}"
+            );
+        }
+
+        // The same placeholder as a group MEMBER never disqualifies the
+        // group — `placeholder_names` holds leaf bindings only, and the
+        // group dials its live sibling.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: g\n{node}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT, front]\n"
+        ))
+        .unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a group with a usable member must pass the gate");
+    }
+
+    /// `use:` names are inert when `include-all`/`include-all-providers`
+    /// supplies the provider slots — the real parser never iterates them
+    /// in that posture, so an unknown name cannot fail even `strict`
+    /// (Codex review: the fallback validator rejected them). The forced
+    /// declared-side check must mirror that precedence.
+    #[test]
+    fn declared_group_use_ignored_when_include_all_supplies_slots() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        let providers = "proxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n";
+
+        for flag in ["include-all", "include-all-providers"] {
+            assert!(
+                check(&format!(
+                    "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    {flag}: true\n    use: [ghost]\n{providers}"
+                ))
+                .is_ok(),
+                "{flag} must make the unknown `use:` name inert under strict"
+            );
+        }
+        // Without include-all the same unknown name still fails strict.
+        assert!(check(&format!(
+            "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [ghost]\n{providers}"
+        ))
+        .is_err());
+    }
+
+    /// The forced declared-side check runs each named block's real
+    /// constructor for a verdict only — an `ss` node's external SIP003
+    /// plugin must never spawn a local subprocess for it (Codex review).
+    /// A plugin binary that does not exist makes the spawn observable:
+    /// reaching `Plugin::start` fails the parse and warn-drops the node,
+    /// where suppressing it yields the constructor's verdict modulo
+    /// process existence — the same answer `-t` gives.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn declared_dialer_target_never_spawns_external_plugins() {
+        let raw = meow_config::parse_raw_yaml(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: ss\n    server: s\n    port: 1\n    cipher: aes-128-gcm\n    password: p\n    plugin: meow-no-such-sip003-plugin\n",
+        )
+        .unwrap();
+        let ntp = meow_config::resolve_ntp(&raw).unwrap();
+        meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
+            .expect("the verdict-only parse must not spawn the plugin binary");
+    }
+
+    /// Local shape/range gates precede the first candidate network work
+    /// (issue #974): `ech-opts.enable` with no `config:` and no query
+    /// source is a deterministic strict defect that never dials, yet an
+    /// out-of-range `ntp.interval` must still be the reported failure —
+    /// ECH pre-resolution may not open a socket before it.
+    #[tokio::test]
+    async fn build_config_local_gates_precede_ech_preresolve() {
+        let raw = meow_config::parse_raw_yaml(
+            "strict: true\nntp:\n  interval: 0\nproxies:\n  - name: p\n    type: direct\n    ech-opts:\n      enable: true\n",
+        )
+        .unwrap();
+        let e = meow_config::build_config(raw, None)
+            .await
+            .err()
+            .expect("interval 0 must fail");
+        assert!(
+            e.to_string().contains("ntp.interval"),
+            "the ntp range defect must surface before the strict ECH defect: {e}"
+        );
+    }
+}
+
+// ─── issue #974: extended external-controller surface ──────────────────
+
+mod api_listener_config {
+    use super::*;
+
+    #[tokio::test]
+    async fn extended_controller_keys_parse_and_stay_strings() {
+        let yaml = r#"
+external-controller: "127.0.0.1:9090"
+external-controller-tls: "127.0.0.1:9443"
+external-controller-unix: "meow.sock"
+external-controller-pipe: '\\.\pipe\meow'
+"#;
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert_eq!(
+            config.api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            config.api.external_controller_unix.as_deref(),
+            Some("meow.sock")
+        );
+        assert_eq!(
+            config.api.external_controller_pipe.as_deref(),
+            Some("\\\\.\\pipe\\meow")
+        );
+        assert!(config.api.external_controller.is_some());
+    }
+
+    #[tokio::test]
+    async fn extended_controller_keys_weak_decode_scalars() {
+        // mihomo's Go decoder coerces scalars into string fields — `5`
+        // becomes `"5"` and never errors at parse (it fails at bind).
+        for key in [
+            "external-controller-tls",
+            "external-controller-unix",
+            "external-controller-pipe",
+        ] {
+            let yaml = format!("{key}: 5\n");
+            let config = load_config_from_str(&yaml)
+                .await
+                .unwrap_or_else(|e| panic!("{key}: 5 must parse: {e}"));
+            let got = match key {
+                "external-controller-tls" => &config.api.external_controller_tls,
+                "external-controller-unix" => &config.api.external_controller_unix,
+                _ => &config.api.external_controller_pipe,
+            };
+            assert_eq!(got.as_deref(), Some("5"), "{key}");
+        }
+        // YAML 1.2's core schema resolves only `true`/`false` as booleans:
+        // a legacy `yes` spelling reaches the weak decoder as a plain
+        // string and passes through verbatim — unquoted or quoted makes
+        // no difference (issue #974).
+        for spelling in [
+            "external-controller-tls: yes\n",
+            "external-controller-tls: 'yes'\n",
+        ] {
+            let config = load_config_from_str(spelling).await.unwrap();
+            assert_eq!(
+                config.api.external_controller_tls.as_deref(),
+                Some("yes"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_controller_keys_reject_containers() {
+        for key in [
+            "external-controller-tls",
+            "external-controller-unix",
+            "external-controller-pipe",
+        ] {
+            assert!(
+                load_config_from_str(&format!("{key}: [a, b]\n"))
+                    .await
+                    .is_err(),
+                "{key} sequence must be a hard error"
+            );
+            assert!(
+                load_config_from_str(&format!("{key}:\n  nested: true\n"))
+                    .await
+                    .is_err(),
+                "{key} mapping must be a hard error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_one_sided_pair_is_shape_only_at_build() {
+        // Upstream `-t` accepts a one-sided pair — every identity
+        // failure defers to endpoint bind, so the values are kept and
+        // bind_tls fails just that endpoint at startup (issue #974).
+        for yaml in [
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  private-key: x\n",
+        ] {
+            let config = load_config_from_str(yaml)
+                .await
+                .expect("one-sided tls pair must build (shape only)");
+            assert!(config.api.external_controller_tls.is_some());
+        }
+        let cert_only = load_config_from_str(
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cert_only.api.tls_certificate.as_deref(), Some("x"));
+        assert_eq!(cert_only.api.tls_private_key, None);
+    }
+
+    #[tokio::test]
+    async fn extended_endpoints_alone_count_as_servable() {
+        // Startup must not treat `external-controller` as the only real
+        // endpoint — TLS-only (every platform) and unix-only (unix
+        // platforms) configs keep the API up (issue #974).
+        let config = load_config_from_str("external-controller-tls: '127.0.0.1:9443'\n")
+            .await
+            .unwrap();
+        assert!(config.api.has_servable_endpoint());
+        #[cfg(unix)]
+        {
+            let config = load_config_from_str("external-controller-unix: 'meow.sock'\n")
+                .await
+                .unwrap();
+            assert!(config.api.has_servable_endpoint());
+        }
+        // The pipe endpoint serves nowhere but Windows — on Darwin/Linux
+        // a pipe-only config is not servable, on Windows it is.
+        let config = load_config_from_str("external-controller-pipe: '\\\\.\\pipe\\meow'\n")
+            .await
+            .unwrap();
+        assert_eq!(config.api.has_servable_endpoint(), cfg!(windows));
+        // And nothing at all → nothing servable.
+        let config = load_config_from_str("").await.unwrap();
+        assert!(!config.api.has_servable_endpoint());
+    }
+
+    #[tokio::test]
+    async fn tls_pem_file_paths_do_not_read_at_build() {
+        // `-t` parity at build: file-path PEMs resolve at endpoint bind —
+        // a nonexistent path must not be read here.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: /nonexistent/cert.pem\n  private-key: /nonexistent/key.pem\n";
+        let config = load_config_from_str(yaml)
+            .await
+            .expect("file-path pair must not be read at build");
+        assert_eq!(
+            config.api.tls_certificate.as_deref(),
+            Some("/nonexistent/cert.pem")
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_keys_without_listener_warn_but_parse() {
+        // `tls:` cert/key without `external-controller-tls` are inert:
+        // parse keeps them and startup just never binds TLS.
+        let yaml = "tls:\n  certificate: x\n  private-key: y\n";
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert_eq!(config.api.tls_certificate.as_deref(), Some("x"));
+        assert!(config.api.external_controller_tls.is_none());
+    }
+
+    #[tokio::test]
+    async fn tls_ignored_members_parse() {
+        let yaml = "tls:\n  ech-key: abc\n  client-auth-type: require-and-verify\n  client-auth-certificates: x\n  custom-certifactes: y\n";
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        let tls = raw.tls.unwrap();
+        assert!(tls.ech_key.is_some());
+        assert!(tls.client_auth_type.is_some());
+        assert!(tls.client_auth_certificates.is_some());
+        assert!(tls.custom_certifactes.is_some());
+    }
+
+    #[tokio::test]
+    async fn tls_non_map_is_hard_error() {
+        for yaml in ["tls: []\n", "tls: 5\n"] {
+            assert!(
+                meow_config::parse_raw_yaml(yaml).is_err(),
+                "{yaml} must fail: tls is map-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn top_level_certificate_private_key_are_not_tls() {
+        // Never TLS aliases — they parse as unknown/misplaced top-level
+        // keys and must not feed the TLS identity.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ncertificate: x\nprivate-key: y\n";
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert!(config.api.tls_certificate.is_none());
+        assert!(config.api.tls_private_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_absent_and_present_resolve_identically() {
+        // Under a configured secret the map's presence does not select
+        // middleware — absent, `{}` and `null`-only maps all resolve to
+        // the configured path's `["*"]`/`true` defaults; upstream's
+        // permissive AllowAll fires only on `secret: ""` (issue #974).
+        for yaml in [
+            "mode: rule\n",
+            "external-controller-cors: {}\n",
+            "external-controller-cors:\n  allow-origins: null\n",
+        ] {
+            let config = load_config_from_str(yaml).await.unwrap();
+            assert_eq!(config.api.cors.allow_origins, vec!["*"], "{yaml}");
+            assert!(config.api.cors.allow_private_network, "{yaml}");
+        }
+
+        // Partial maps merge by key.
+        let config = load_config_from_str(
+            "external-controller-cors:\n  allow-origins: ['https://a.example']\n  allow-private-network: false\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.api.cors.allow_origins, vec!["https://a.example"]);
+        assert!(!config.api.cors.allow_private_network);
+
+        // Explicit empty list stays empty — the allow-all edge upstream.
+        let config = load_config_from_str("external-controller-cors:\n  allow-origins: []\n")
+            .await
+            .unwrap();
+        assert!(config.api.cors.allow_origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cors_scalar_items_weak_decode() {
+        let config = load_config_from_str(
+            "external-controller-cors:\n  allow-origins: [5, true, 'https://a.example']\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config.api.cors.allow_origins,
+            vec!["5", "true", "https://a.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_legacy_bool_spellings() {
+        let config =
+            load_config_from_str("external-controller-cors:\n  allow-private-network: yes\n")
+                .await
+                .unwrap();
+        assert!(config.api.cors.allow_private_network);
+        let config =
+            load_config_from_str("external-controller-cors:\n  allow-private-network: no\n")
+                .await
+                .unwrap();
+        assert!(!config.api.cors.allow_private_network);
+    }
+
+    #[tokio::test]
+    async fn cors_shape_errors_are_hard() {
+        for yaml in [
+            "external-controller-cors: []\n",
+            "external-controller-cors: 5\n",
+            "external-controller-cors:\n  allow-origins: '*'\n",
+            "external-controller-cors:\n  allow-private-network: 1\n",
+            "external-controller-cors:\n  allow-private-network: 'true'\n",
+        ] {
+            assert!(
+                meow_config::parse_raw_yaml(yaml).is_err(),
+                "{yaml} must be a hard parse error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_bad_inline_pem_is_shape_only_at_build() {
+        // Inline PEM material is *content*, not shape — upstream accepts
+        // a bogus pair at `-t` and fails the endpoint at bind (issue
+        // #974), so build keeps the values untouched and never parses
+        // the PEM.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: '-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----'\n  private-key: '-----BEGIN PRIVATE KEY-----\\nbogus\\n-----END PRIVATE KEY-----'\n";
+        let config = load_config_from_str(yaml)
+            .await
+            .expect("bogus inline PEM must build (shape only)");
+        assert_eq!(
+            config.api.tls_certificate.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----")
+        );
+    }
 }
 
 /// OpenWrt front-ends (clashwrt, OpenClash, nikki) keep provider caches on
@@ -3580,62 +5417,4 @@ rules:
             .unwrap_or_else(|| panic!("{bad} must be refused"));
         assert!(err.to_string().contains("escapes"), "{bad}: {err}");
     }
-}
-
-/// mihomo's `type: tproxy` is real TPROXY: `listeners:` takes
-/// `transparent`, which needs `firewall: false`.
-#[tokio::test]
-async fn test_listener_transparent_tproxy() {
-    let yaml = "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    listen: 0.0.0.0\n    firewall: false\n    udp: true\n    transparent: true\n";
-    let result = load_config_from_str(yaml).await;
-    if cfg!(target_os = "linux") {
-        let config = result.unwrap();
-        let tp = &config.listeners.named[0];
-        assert!(matches!(
-            tp.spec,
-            ListenerSpec::TProxy {
-                transparent: true,
-                firewall: false,
-                udp: true,
-                ..
-            }
-        ));
-    } else {
-        assert!(result.is_err(), "transparent is Linux-only");
-    }
-    let managed =
-        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    transparent: true\n";
-    let err = load_config_from_str(managed)
-        .await
-        .err()
-        .expect("transparent with the managed firewall is rejected")
-        .to_string();
-    assert!(err.contains("firewall: false"), "{err}");
-}
-
-#[tokio::test]
-async fn classical_provider_preserves_regex_quantifiers() {
-    let config = load_config_from_str(
-        r#"
-strict: true
-rule-providers:
-  nodes:
-    type: inline
-    behavior: classical
-    payload:
-      - 'DOMAIN-REGEX,^api[0-9]{1,3}\.example$'
-rules:
-  - RULE-SET,nodes,REJECT
-  - MATCH,DIRECT
-"#,
-    )
-    .await
-    .unwrap();
-    let metadata = |host: &str| meow_common::Metadata {
-        host: host.into(),
-        ..Default::default()
-    };
-    let rule = &config.rules[0];
-    assert!(rule.match_metadata(&metadata("api123.example"), &meow_common::RuleMatchHelper));
-    assert!(!rule.match_metadata(&metadata("api1234.example"), &meow_common::RuleMatchHelper));
 }

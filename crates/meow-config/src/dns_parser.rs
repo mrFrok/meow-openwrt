@@ -59,7 +59,10 @@ pub async fn parse_dns(
             );
             let resolver = Arc::new(resolver);
             return Ok(DnsConfig {
-                resolver_slot: meow_dns::new_resolver_slot(Arc::clone(&resolver)),
+                // Disabled is published on the generation itself: a
+                // `type: dns` leaf serves SERVFAIL on it rather than
+                // dialling this stub's fallback upstream (issue #974).
+                resolver_slot: meow_dns::new_resolver_slot_state(Arc::clone(&resolver), false),
                 resolver,
                 listen_addr: None,
                 enabled: false,
@@ -369,7 +372,11 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
+        // `profile.store-fake-ip` > `dns.store-fake-ip` > false — resolved
+        // once for both family pools so a spelling flip can't leave v4/v6
+        // disagreeing about persistence (issue #974).
+        let persist = crate::resolve_profile(raw).store_fake_ip;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict, persist).await?;
         if let Some(range) = &dns.fake_ip_range6 {
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
@@ -382,7 +389,7 @@ pub async fn parse_dns(
             }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
-            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict).await?;
+            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict, persist).await?;
         }
     } else {
         // Dead-key observability for the fake-IP ranges: a user who pairs
@@ -425,6 +432,9 @@ async fn install_fakeip(
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
     strict: bool,
+    // The profile-resolved persistence flag — `profile.store-fake-ip`
+    // already folded over `dns.store-fake-ip` by the caller (issue #974).
+    persist: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -434,12 +444,13 @@ async fn install_fakeip(
         .parse()
         .map_err(|e| anyhow::anyhow!("dns.fake-ip-range '{range_str}' is not a valid CIDR: {e}"))?;
 
-    let persist = dns.store_fake_ip.unwrap_or(false);
-
     // The file this generation would bind to, when persisting. Computed
     // before the reuse check so the check can compare store identity, not
-    // just store kind.
-    let wanted_store_path = persist.then(|| {
+    // just store kind. A `-t` validation run takes the memory path like
+    // `persist: false` — `FileStore::open_async` would both touch the
+    // cache dir and spawn a debounce flush task, two side effects an
+    // offline candidate must not run (issue #974).
+    let wanted_store_path = (persist && !crate::is_offline_validate()).then(|| {
         // `cache_dir` is `None` for a `--config-string` run — the launch
         // CWD is not the daemon's to write into, so persist under the
         // resolved home (same base geodata defaults use) instead of
@@ -2318,6 +2329,62 @@ mod tests {
         assert!(new_pool.look_back(ip).is_none());
     }
 
+    /// `profile.store-fake-ip: true` under `-t` must not open the
+    /// `FileStore` — its `open_async` touches the cache dir and spawns a
+    /// debounce flush task, both forbidden on a validation run
+    /// (issue #974). The flag is a one-way process-global, so the
+    /// assertion runs in a child process (same pattern as
+    /// `MEOW_OFFLINE_VALIDATE_CHILD`).
+    #[test]
+    fn offline_validate_store_fake_ip_stays_memory() {
+        const CHILD: &str = "MEOW_OFFLINE_FAKEIP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            crate::set_offline_validate(true);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let raw: RawConfig = serde_saphyr::from_str(
+                    "profile:\n  store-fake-ip: true\ndns:\n  enable: true\n  \
+                     enhanced-mode: fake-ip\n  nameserver:\n    - 1.1.1.1\n",
+                )
+                .unwrap();
+                let cfg = parse_dns(
+                    &raw,
+                    None,
+                    Some(dir.path()),
+                    &HashMap::new(),
+                    None,
+                    &HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let pool = cfg
+                    .resolver
+                    .fakeip_pool_over("198.18.0.0/16".parse().unwrap())
+                    .expect("fake-ip mode installs the v4 pool");
+                assert!(
+                    !pool.is_persistent(),
+                    "an offline validate must not bind a FileStore"
+                );
+                assert!(
+                    !dir.path().join("fakeip-v4.json").exists(),
+                    "no store file may be created under -t"
+                );
+            });
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "dns_parser::tests::offline_validate_store_fake_ip_stays_memory",
+                "--exact",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn the -t arm child");
+        assert!(status.success(), "child offline arm failed: {status:?}");
+    }
+
     /// `store-fake-ip: true` across a reload: the persistent pool is
     /// carried over too — reuse keeps ONE `FileStore` (and its flush task)
     /// on the backing file instead of running a second writer over it.
@@ -3196,6 +3263,7 @@ mod tests {
                     proxy: None,
                     header: None,
                     payload: Some(payload.clone()),
+                    extra: Default::default(),
                 },
             );
         }
@@ -3617,6 +3685,7 @@ mod tests {
             geoip_code: None,
             ipcidr: Some(vec!["240.0.0.0/4".to_string()]),
             domain: None,
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
@@ -3635,6 +3704,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["+.google.cn".to_string()]),
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         assert!(ff.domain_gated("www.google.cn"));
@@ -3653,6 +3723,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["*.fb.test".to_string()]),
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         assert!(
@@ -3677,6 +3748,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["a..b".to_string(), "fine.example".to_string()]),
+            extra: Default::default(),
         };
         let cap = WarnCapture::start();
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
@@ -3709,6 +3781,7 @@ mod tests {
                 geoip_code: None,
                 ipcidr: None,
                 domain: Some(vec![dead.to_string()]),
+                extra: Default::default(),
             };
             let cap = WarnCapture::start();
             build_fallback_filter(Some(&raw), None, false)
@@ -4557,17 +4630,17 @@ dns:
         );
     }
 
-    /// The relay-based `DialerProxyAdapter` fallback (hysteria2 cannot take
-    /// an injected dialer) is not a `WrappedProxy` — the validator must see
-    /// its declared chain through `has_configured_dialer`, or a front group
-    /// parked on REJECT would let the tag pass.
-    #[cfg(feature = "hysteria2")]
+    /// The relay-based `DialerProxyAdapter` fallback (a `type: direct`
+    /// node cannot take an injected dialer — it is a raw egress) is not
+    /// a `WrappedProxy` — the validator must see its declared chain
+    /// through `has_configured_dialer`, or a front group parked on REJECT
+    /// would let the tag pass.
     #[tokio::test]
     async fn node_policy_rejects_dpa_chain_when_front_selects_reject() {
         let raw: RawConfig = serde_saphyr::from_str(
             r#"
 proxies:
-  - {name: Node, type: hysteria2, server: 192.0.2.1, port: 443, password: example, dialer-proxy: G}
+  - {name: Node, type: direct, dialer-proxy: G}
   - {name: Front, type: ss, server: front.invalid, port: 443, cipher: aes-128-gcm, password: example}
 proxy-groups:
   - {name: G, type: select, proxies: [REJECT, Front]}

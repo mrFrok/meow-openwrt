@@ -8,7 +8,52 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-26
+
 ### Added
+
+- `global-client-fingerprint` and `global-ua` — mihomo's two top-level
+  globals (issue #974). `global-client-fingerprint` is the default uTLS
+  ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting
+  `client-fingerprint`: the node value wins, an omitted or empty value
+  inherits the global, and an explicit `none` opts out — under
+  VLESS+REALITY the literal `none` passes through to the
+  warn-and-Chrome fallback, matching upstream — and an unsupported name
+  warns once per rebuild and degrades to the TLS backend's defaults. The
+  value is config-threaded, not a process global: it is baked into the
+  adapters at parse, so a `PUT /configs` change rebuilds inheriting
+  nodes, and a changed global fails provider identity so provider feeds
+  re-parse too. `global-ua` overrides the `User-Agent` internal HTTP
+  fetches (providers, subscriptions, geodata, external-ui) and latency
+  probes send — `clash.meta/<version>` by default, `""` clears, and a
+  request-supplied `User-Agent` still wins. Values carrying CR/LF/NUL or
+  other control bytes are rejected at admission; a rejected `PUT`/`PATCH`
+  candidate never mutates the live override. `PATCH /configs` applies
+  `global-ua` immediately and `GET /configs` reports both keys.
+
+- **WireGuard outbound** (`type: wireguard`) — userspace WireGuard via a vendored
+  patch of `boringtun 0.7.1` (ring replaced by workspace RustCrypto crates) over
+  smoltcp; full mihomo config surface except `dns` (Phase-1: ignored) and
+  `amnezia-wg-option` (Phase-1: rejected); `dialer-proxy` supported — the
+  endpoint's UDP transport rides the front's UDP association (UDP-capable
+  fronts only; a TCP-only front fails the bind at dial time, never a silent
+  direct egress); standard WG servers, Cloudflare WARP `reserved` field,
+  persistent-keepalive, `remote-dns-resolve`, routing-loop prevention under
+  `tun.auto-route`. Behind the `wireguard` feature; included in `full`,
+  excluded from `minimal`. (#899)
+
+- **WireGuard inbound** (`listeners: - type: wireguard`) — meow as a static
+  multi-peer WireGuard *server*: authenticated responder handshakes via the
+  same vendored boringtun, per-peer `receiver_idx >> 8` demux, endpoint
+  roaming on ACL-admitted inner packets, `allowed-ips` inner-source ACLs
+  (v4/v6), optional `preshared-key` and WARP-style `reserved` bytes. Inner
+  TCP terminates in a lazy smoltcp AnyIP listen pool and routes through
+  `route_inbound_tcp` (`metadata.type = "wireguard"`, SNI/`Host` sniffing);
+  inner UDP routes per-flow through `dial_udp` keyed on
+  `(peer, inner src, inner dst)` with `udp-timeout` eviction and `mtu - 64`
+  reply caps. `udp`, `udp-timeout` and `max-connections` follow the TUN
+  inbound's semantics. Behind the `listener-wireguard` feature; included
+  in `full`, excluded from `minimal`.
 
 - `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
   all domain depths in both blacklist and whitelist modes.
@@ -160,8 +205,79 @@ the canonical, in-repo source a release is cut from.
   dials and forwards them upstream first. TCP flows on the same
   listeners keep the existing TLS/HTTP sniff; non-TUN inbounds carry
   no sniffed UDP.
+- **`dialer-proxy` on `hysteria2` and `trusttunnel` (`quic: true`)
+  nodes** — the QUIC endpoint's whole transport rides the front hop's
+  UDP association, the WireGuard `with_dialer` contract (issue #899
+  follow-up); TrustTunnel `quic: false` keeps its existing TCP path. A
+  hysteria2 node's `ports`/`hop-interval` hopping is ignored with a
+  warning beside a chain — a bound front association has no second port
+  to hop to. `direct` and `ss` with an external SIP003 plugin still
+  cannot take an injected dialer (relay-based wrapper fallback).
+
+- **`dialer-proxy` on `anytls` nodes** — the vendored client accepts a
+  per-instance transport dialer, so the session's TCP transport rides the
+  injected front hop while TLS, auth, and stream framing stay on the
+  client's own `TlsConnect` path (identical SNI/ALPN/verify profile to
+  direct dials). Chained sessions pool, reuse, and reset exactly like
+  direct ones; `udp: true` UoT rides the same chained session, and a
+  front that cannot dial fails closed rather than falling back to a
+  direct connection. `connect_over` relay sessions remain unpooled.
+
+- **Unknown config keys warn at load** — every config section that used
+  to drop keys its schema doesn't model (the top level, `dns:`, `tun:`,
+  `sniffer:`, `geodata:`/`geox-url:`, `logbook:`, `traffic-ledger:`,
+  `listeners:`, `proxy-groups:`, provider definitions and
+  `subscriptions:`, plus per-`type` `proxies:` node inventories) now
+  emits a sorted warn per rebuild: unrecognized keys aggregate with
+  spelling hints, mihomo keys this build doesn't implement name the
+  feature, and misplaced keys name the surface that honors them.
+  Warn-only — a verbatim mihomo config keeps loading, `strict: true`
+  does not promote them, and unknown keys round-trip through the config
+  save path. (ADR-0002 Class B, issue #974)
 
 ### Changed
+
+- Large classical rule-providers index consecutive exact and suffix domain rules
+  for routing and DNS policy lookups. Mixed rules keep their original order.
+
+- **WireGuard received packets are now serviced in the same pump pass
+  that polls them**, removing a half-poll scheduling gap that left an
+  inbound packet waiting for the next timer wakeup — this was the ~12.7 ms
+  floor under every chained-WireGuard RTT. A pass that did work reschedules
+  at once instead of the idle 10 ms sleep, smoltcp's TCP ACK delay drops
+  from 10 ms to 1 ms, UDP socket queues grow 64→256 packets, the wire
+  drain budget grows 64→256, and macOS `sendmsg_x`/`recvmsg_x` calls are
+  chunked at 100 (XNU clips larger counts). On a LAN rig the chained
+  WireGuard UDP echo RTT went from a 12.7 ms p50 to 0.35 ms and new-TCP
+  churn from ~24 to ~850 connections/s.
+
+- **Chained Hysteria2/TrustTunnel-H3 datagrams drop instead of stalling
+  the whole QUIC engine when the front hop is congested.** The
+  `ProxyPacketConn → SocketIo` bridge used `PollSender::poll_reserve`, so
+  one full mpsc queue suspended the connection driver's entire poll —
+  every stream on the association stalled behind a single slow front
+  hop. `poll_send` now uses `try_send` (quic-go's semantics: QUIC's own
+  loss recovery absorbs a dropped datagram, a stalled driver cannot be
+  recovered), with a `dropped_tx` counter for observability. The
+  outbound queue stays shallow at 512 (a deeper tail-drop FIFO would
+  delay the loss signal and inflate quiche's RTT/BDP estimate) while
+  the inbound queue grows 256→4096, UDP receive buffers grow to 7 MiB,
+  the front hop gets a 1280 MTU hint, and the receive batch grows
+  32→128. `quiche` and `shadowsocks` are now compiled at `opt-level=3`.
+
+- **BoringTLS client connections resume sessions from a per-`SSL_CTX`
+  ticket store.** Each connector keeps a 64-entry FIFO of
+  `SslSession`s keyed by SNI, offers the newest via `SSL_set_session`
+  only within the same context, and drops an SNI's whole queue when a
+  handshake that offered a ticket fails (peer restart or ticket-key
+  rotation makes stale tickets actively harmful). A node configured
+  with `cert-pin` or `verify-name` never offers a cached ticket — a
+  resumed handshake carries no Certificate for the override check to
+  inspect. Verified live: `session_reused=true` on the
+  `boring TLS handshake complete` debug line against sing-box. A
+  `vless connect breakdown` debug line now reports per-phase connect
+  timings (`tcp_ms`/`tls_ms`/`vless_ms`) for VLESS dials, plus first
+  payload-write/first-server-data markers on Vision streams.
 
 - **gRPC and XHTTP (stream-one) tunnels share one HTTP/2 connection per
   proxy**, as mihomo and Xray clients do, instead of a TCP + TLS/REALITY
@@ -205,6 +321,32 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- On Unix, saved configurations, backups, downloaded proxy-provider caches,
+  and subscription usage files use owner-only permissions. Saves preserve
+  stricter owner permissions and replace each file atomically. (#978)
+
+- **AnyTLS streams no longer wait for SYNACK.** A new stream used to wait up
+  to 30 s for the server's SYNACK before the caller could send its first
+  byte, adding a round trip to every connection and stalling every stream to
+  a protocol v1 server (which never sends SYNACK). The stream is now returned
+  right after the destination address, as in anytls-go, sing-anytls and
+  mihomo. An error SYNACK still ends the stream, and the 3 s session watchdog
+  still closes a session whose peer never answers.
+- **WireGuard bridge latency.** Flush ready outgoing datagrams without a fixed
+  delay and continue batching datagrams that are already queued.
+- **DoH speaks HTTP/2.** DoH over TLS offered only the `http/1.1` ALPN, so
+  a server that answers only over HTTP/2 failed every query with
+  `doh: EOF inside response headers` (Yandex DNS, 77.88.8.8, accepts
+  `http/1.1` and then closes each request unanswered). The client now offers
+  `h2` and `http/1.1`, as mihomo does, and speaks whichever the server picks.
+  On h2 an upstream keeps one shared connection and runs concurrent queries
+  as streams on it; servers that pick HTTP/1.1 keep the keep-alive pool.
+  HTTP/2 is behind the new app feature `dns-doh-h2` (meow-dns `doh-h2`), in
+  `full` and out of `minimal`, where it would be the first user of the `h2`
+  crate (ADR-0007); a `minimal` build keeps HTTP/1.1-only DoH.
+- **Concurrent DNS-over-HTTPS startup.** Cold queries share the first TLS
+  handshake and open HTTP/2 streams as soon as the connection is ready.
+  HTTP/1.1 queries dial in parallel once the server selects that protocol.
 - **`ech-opts` on a VLESS REALITY node.** A node with both was refused with
   `reality-opts cannot be combined with ech-opts` once the ECH config was
   known, whether inline or fetched from DNS. `ech-opts` is now ignored with a
@@ -217,10 +359,10 @@ the canonical, in-repo source a release is cut from.
   field as the target — matching upstream comma protection.
 - `dns.proxy-server-nameserver-policy` now also rejects a proxy tagged while
   it carries a `dialer-proxy:` chain through the relay-based fallback
-  wrapper (hysteria2 and anytls nodes cannot take an injected dialer): the
-  declared dependency is read through a `ProxyAdapter` query instead of a
-  concrete-type downcast, so a front group parked on REJECT can no longer
-  make the chain invisible.
+  wrapper (anytls and `direct` nodes — and `ss` with an external SIP003
+  plugin — cannot take an injected dialer): the declared dependency is
+  read through a `ProxyAdapter` query instead of a concrete-type downcast,
+  so a front group parked on REJECT can no longer make the chain invisible.
 - hysteria2 `max-stream-receive-window` values configured above
   `max-connection-receive-window` are clamped to the connection ceiling —
   a stream can never outrun connection credit — keeping the advertised
@@ -296,6 +438,8 @@ the canonical, in-repo source a release is cut from.
 - Internal HTTP fetch errors omit full request/redirect URLs and response
   body snippets from provider diagnostics, preserving the HTTP status and
   failure category without copying subscription credentials into logs.
+- **Provider download memory.** Buffer each response body once and limit
+  each rule-provider prefetch worker to four concurrent downloads.
 
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
   driver queue reported `Closed`, so the tunnel tore the association
@@ -332,6 +476,11 @@ the canonical, in-repo source a release is cut from.
 - API: request bodies decode as JSON whatever their `Content-Type`, as
   mihomo does — dashboards that PUT a selection as `text/plain` or untyped
   no longer get 415.
+- **Controller browser access.** Without a secret, use an IP address or
+  `localhost` and access the REST API and WebSocket endpoints from the
+  controller's origin. With a secret, cross-origin dashboard preflights
+  explicitly allow the `Authorization` header when requested.
+
 - **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
   termination signals even while an upstream write is pending** (extends
   #893): `write_packet` races the idle timeout, outbound-session flush and
@@ -404,6 +553,10 @@ the canonical, in-repo source a release is cut from.
   warning vs strict refusal), not what the entry matches.
   `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
   a normalized host is not decidable by label inspection.
+- **Controller secret changes require a restart.** `PUT /configs` rejects
+  adding, changing, or removing the YAML secret, even with `?force=true`.
+  Reloads that preserve the YAML secret work with a startup override.
+
 - **UDP to a loopback destination works under TUN global route scope.**
   With `tun.auto-route: true` (or `global`) meow binds its own sockets to
   the physical interface against routing loops, and decided that for UDP
@@ -416,6 +569,61 @@ the canonical, in-repo source a release is cut from.
   Windows (Linux bound loopback TCP too), everything else — LAN,
   link-local and multicast included — keeps it. IPv4-mapped destinations
   get an IPv4 socket; native IPv6 keeps its scope id.
+- Update the workspace's locked `rustix` dependency to `1.1.6` to address
+  [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html) (#973).
+- **A UDP flow matched to a `dialer-proxy`-chained target whose inner is
+  non-transparent now fails loudly at the named rule** instead of sliding
+  to a later rule that may resolve to `DIRECT` (issue #969): the chain
+  the operator pinned cannot be silently replaced, and the dial refuses
+  with `UdpNotSupported`. A chain over a transparent inner
+  (`type: direct`) is unchanged — UDP routes through the front hop's
+  association — and a plain `udp: false` node keeps mihomo's `continue`
+  semantics, the scan sliding to the next rule as before.
+- fix(tunnel): UDP flows to an injected `dialer-proxy` node whose inner
+  cannot carry UDP (e.g. `type: http`, or `type: ss`/`type: socks5` via a
+  UDP-incapable front) now fail closed at the matched rule instead of
+  silently sliding to `DIRECT` — the injected-path counterpart of the
+  #969 fix above, since an injected leaf carries no `DialerProxyAdapter`
+  to report the configured chain; a new `ChainedProxy` registry marker
+  reports it instead (#969). The same verdict now reaches the scan
+  through a *group* target too: every group type forwards
+  `is_dialer_proxy_non_transparent` to the member its `support_udp`
+  picks (the selector's selection, the url-test/fallback pick, the
+  relay's UDP exit hop, the load-balance live member set), so a matched
+  rule targeting a group whose pick is a chained UDP-incapable member
+  stops the same way instead of rerouting the flow past the pinned
+  chain. Provider-sourced nodes whose `dialer-proxy` was injected are
+  marked `ChainedProxy` exactly like static `proxies:` entries, closing
+  the last spot a chained leaf could answer `false` (#969).
+
+- **`vless` `flow: xtls-rprx-vision` UDP no longer sends a bare
+  `Cmd::Udp` request** — strict servers (sing-box ≥1.12's vendored
+  sing-vmess `vless.Service`) validate `request.Flow == account.Flow` on
+  every command, so the empty-addon datagram request was rejected with
+  `flow mismatch` and UDP timed out while TCP worked. Vision UDP now
+  rides a per-association Mux.Cool session — a `CommandMux` request
+  carrying the `xtls-rprx-vision` addon with the datagrams as a
+  `network=0x02` substream — the shape xray, mihomo and sing-box
+  clients use. A domain `UdpTarget::Name` warns once and falls back to
+  the bare request; without the `mux` feature a vision node reports
+  `support_udp() = false`. Non-vision UDP is unchanged.
+
+- **WireGuard UDP flows now recover after session expiry without waiting
+  for TCP traffic.** `encapsulate`'s no-session arm deduped on
+  `is_in_progress()`, so for the whole post-expiry retry generation —
+  up to a `REKEY_ATTEMPT_TIME` window — a fresh datagram could only
+  queue behind the in-flight `InitSent` and was silently dropped when
+  the generation gave up; only smoltcp's retransmitted TCP SYNs stayed
+  queue-resident long enough to flush on completion. Matching the
+  kernel's `wg_packet_send_queued_handshake_initiation`, an in-flight
+  initiation whose birthdate is older than `REKEY_TIMEOUT` is now
+  re-armed by packet pressure — the same forced-resend call
+  `update_timers` makes on a rekey timeout, throttled at the same 5 s
+  floor.
+
+- **OpenWrt controller credentials.** The service reads its secret from a
+  root-only runtime file, and the LuCI API helper sends the bearer header
+  through standard input. Managed UCI and YAML files use mode `0600`.
 
 ## [0.29.0] - 2026-11-05
 

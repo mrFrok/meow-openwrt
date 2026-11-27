@@ -24,7 +24,7 @@ mod udp_io;
 #[cfg(hy2_quiche)]
 pub(crate) type QuicConn = quiche::Connection<bufpool::PoolFactory>;
 
-pub use client::ReconnectableClient;
+pub use client::{ReconnectableClient, DEFAULT_QUIC_CONNECTIONS, MAX_QUIC_CONNECTIONS};
 pub use config::{Config, ObfsConfig, ReceiveWindows};
 pub use error::{Error, Result};
 pub(crate) use obfs::gecko_packet_sizes;

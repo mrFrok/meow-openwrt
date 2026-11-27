@@ -16,6 +16,18 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
+/// Serialization for every test that commits `/configs`: a commit
+/// re-asserts the process-wide knobs (interface name, UA, tcp-concurrent,
+/// find-process-mode, outbound keepalive), so a sibling commit between a
+/// test's request and its observation is the only way the globals go
+/// stale. Holding this lane for a test's whole body keeps the committed
+/// posture stable to observe — no retry windows.
+static PROCESS_GLOBALS_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn process_globals_lane() -> tokio::sync::MutexGuard<'static, ()> {
+    PROCESS_GLOBALS_LANE.lock().await
+}
+
 fn test_log_tx() -> broadcast::Sender<meow_api::log_stream::LogMessage> {
     broadcast::channel(16).0
 }
@@ -59,10 +71,14 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
     let tunnel = Tunnel::new(resolver);
 
     // Build proxies/rules from raw and apply
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     Arc::new(AppState {
         tunnel,
@@ -72,6 +88,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -80,6 +97,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -112,6 +130,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -120,6 +139,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -138,10 +158,14 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -155,6 +179,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -163,6 +188,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -212,7 +238,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7894,
             listen: "127.0.0.1".into(),
             max_connections: 256,
-            proxy: None,
+            route_override: None,
+            routing_mark: None,
         },
         NamedListener {
             name: "mixed".into(),
@@ -220,7 +247,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7890,
             listen: "127.0.0.1".into(),
             max_connections: 256,
-            proxy: None,
+            route_override: None,
+            routing_mark: None,
         },
     ];
 
@@ -287,10 +315,14 @@ async fn external_ui_serves_static_directory() {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
     let state = Arc::new(AppState {
         tunnel,
         secret: None,
@@ -299,6 +331,7 @@ async fn external_ui_serves_static_directory() {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -307,6 +340,7 @@ async fn external_ui_serves_static_directory() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
     let app = create_router(state);
 
@@ -440,6 +474,7 @@ async fn get_json(state: &Arc<AppState>, path: &str) -> (StatusCode, serde_json:
 /// (`{dir}` in `config` expands to that directory), then wait for every
 /// provider's detached first load to publish its nodes.
 async fn state_with_file_providers(config: &str, providers: &[(&str, &str)]) -> Arc<AppState> {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let dir = std::path::Path::new(state.config_path.as_deref().unwrap())
@@ -853,6 +888,7 @@ async fn get_configs_returns_default_ipv6_false_when_omitted() {
 
 #[tokio::test]
 async fn patch_configs_change_mode() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -884,6 +920,7 @@ async fn patch_configs_change_mode() {
 
 #[tokio::test]
 async fn patch_configs_invalid_mode() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(state);
     let resp = app
@@ -898,6 +935,1783 @@ async fn patch_configs_invalid_mode() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Issue #974: `PATCH /configs` with `interface-name` updates the live
+/// global dialer binding (mihomo's top-level option), GET reports it,
+/// and `""` clears back to unset.
+///
+/// `global_interface_name` is process-wide state that *every* config
+/// commit re-asserts — parallel tests' TUN/PUT swaps can reset it to
+/// their raw's `None` between this test's PATCH and its reads. So the
+/// assertions run under `CONFIG_MUTATION` (the same lane the writers
+/// serialize on): once held, the observed global is stable.
+#[tokio::test]
+async fn patch_configs_interface_name_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_iface = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["interface-name"].as_str().unwrap().to_string()
+        }
+    };
+
+    // Unset reports the mihomo-compatible empty string. (Only this test
+    // ever *sets* a name — every other writer commits `None` — so the
+    // unset observation needs no lane.)
+    assert_eq!(get_iface(&state).await, "");
+
+    // Setting it updates the live global, the raw config, and GET. A
+    // concurrent test's swap may win the lane after our PATCH's commit
+    // and reset the global to `None` — re-PATCH and retry until the
+    // lane sees our value (bounded: writers are finite).
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"interface-name":"eth9"}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.raw_config.read().interface_name.as_deref(),
+            Some("eth9")
+        );
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_interface_name().as_deref() == Some("eth9") {
+            assert_eq!(get_iface(&state).await, "eth9");
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global name");
+    }
+
+    // `""` clears the live global again — the raw keeps the user's
+    // `""` (normalized away on the next load, like mihomo). Every
+    // other writer also commits `None`, so the cleared state is
+    // race-free to observe.
+    let resp = patch(r#"{"interface-name":""}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    assert!(meow_common::global_interface_name().is_none());
+    assert_eq!(get_iface(&state).await, "");
+}
+
+/// Issue #974: `PATCH /configs` with `global-ua` installs the process-wide
+/// UA override the internal fetchers and probes send, GET echoes it, `""`
+/// clears back to `clash.meta/<version>`, and a value carrying header bytes
+/// is rejected without mutating the live override or the committed raw.
+/// `global-client-fingerprint` is exposed on GET but not PATCHable —
+/// adapters bake it at parse, so it only changes through `PUT /configs`.
+///
+/// `GLOBAL_UA` is process-wide state every config commit re-asserts —
+/// like `global_interface_name` above, the set-side assertions retry under
+/// `CONFIG_MUTATION` against racing writers.
+#[tokio::test]
+async fn patch_configs_global_ua_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_ua = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            (
+                json["global-ua"].as_str().unwrap().to_string(),
+                json["global-client-fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        }
+    };
+
+    // Unset: the mihomo-compatible empty string, both keys exposed. A
+    // racing writer may have left a UA installed, so clear it ourselves
+    // first and read under the lane — a commit between the clear and the
+    // read would swap the live global mid-assertion.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":""}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().is_none() {
+            assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept re-installing a global UA");
+    }
+
+    // Set → the live global, the raw, and GET all carry it (retry loop:
+    // a parallel writer's commit can reset the shared global).
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":"mihomo/v1.18.0"}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().as_deref() == Some("mihomo/v1.18.0") {
+            assert_eq!(get_ua(&state).await, ("mihomo/v1.18.0".into(), "".into()));
+            assert_eq!(
+                state.raw_config.read().global_ua.as_deref(),
+                Some("mihomo/v1.18.0")
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+
+    // Header bytes are refused — `state.raw_config` is this test's own
+    // cell, so the unmutated check is race-free. The live UA must stay
+    // EXACTLY what it was — not merely "not the bad value" — so the
+    // snapshot/compare pair runs under the lane on both sides of the
+    // request, and retries when a sibling commit legitimately moved it.
+    let mut attempts = 0;
+    loop {
+        let before = {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            meow_common::global_ua()
+        };
+        let resp = patch("{\"global-ua\":\"bad\\r\\nua\"}").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua() == before {
+            assert_eq!(
+                state.raw_config.read().global_ua.as_deref(),
+                Some("mihomo/v1.18.0"),
+                "a rejected PATCH must not reach the committed raw"
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "a rejected PATCH kept mutating the live global UA"
+        );
+    }
+
+    // `""` clears the live override — same retry shape as the set side:
+    // a racing PUT commits `Some(..)`, so the cleared state is only safe
+    // to observe while the lane is held.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":""}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().is_none() {
+            assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept re-installing a global UA");
+    }
+}
+
+/// `tcp-concurrent` is a live process-global like `global-ua`: PATCH
+/// flips it without a rebuild, GET reports the live boolean, the
+/// committed raw keeps the last PATCH, a replacement PUT applies its own
+/// value at the swap (omission resets to the meow-rs default `true`),
+/// and a rejected PATCH leaves the running value alone.
+///
+/// The process-global is shared with every config commit — the
+/// assertions run under `CONFIG_MUTATION` like `global_ua`'s.
+#[tokio::test]
+async fn patch_configs_tcp_concurrent_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    // The process-global must return to `true` even if this test panics —
+    // a leaked `false` silently sequentializes every sibling's dials.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::dial::set_tcp_concurrent(true);
+        }
+    }
+    let _reset = Reset;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_concurrent = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["tcp-concurrent"].as_bool().expect("tcp-concurrent")
+        }
+    };
+    // A racing PUT may have committed either value — PATCH the one this
+    // test needs and observe under the lane, retrying when a sibling
+    // commit legitimately flipped it back.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"tcp-concurrent":false}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+            assert_eq!(
+                state.raw_config.read().tcp_concurrent,
+                Some(false),
+                "the PATCH must persist into committed raw"
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+
+    // Absent/null PATCHes mean no change — the running `false` survives.
+    for body in [r#"{"log-level":"info"}"#, r#"{"tcp-concurrent":null}"#] {
+        let resp = patch(body).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    // Observe `false` unconditionally under the lane — a sibling commit
+    // that flipped it is retried like the flips above, not skipped over.
+    let mut attempts = 0;
+    loop {
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+            break;
+        }
+        drop(_lane);
+        let resp = patch(r#"{"tcp-concurrent":false}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+
+    // A wrong-type PATCH is refused before any mutation — the live value
+    // and the committed raw must not move.
+    {
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        let before = meow_common::dial::tcp_concurrent();
+        let resp = patch(r#"{"tcp-concurrent":"yes","mode":"direct"}"#).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(meow_common::dial::tcp_concurrent(), before);
+        assert_eq!(
+            state.raw_config.read().tcp_concurrent,
+            Some(false),
+            "a rejected PATCH must not reach the committed raw"
+        );
+        assert_ne!(
+            state.tunnel.mode().to_string(),
+            "direct",
+            "the bundled mode change must be rolled back with the rejection"
+        );
+    }
+
+    // `true` flips it back; GET reports the live policy again.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"tcp-concurrent":true}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::dial::tcp_concurrent() {
+            assert!(get_concurrent(&state).await);
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+
+    // A replacement PUT installs its own value at the accepted swap.
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut attempts = 0;
+    loop {
+        let resp = put("mode: rule\ntcp-concurrent: false\nrules:\n  - MATCH,DIRECT\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+            assert_eq!(state.raw_config.read().tcp_concurrent, Some(false));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+    // Omission resets to the meow-rs default `true` (upstream's default
+    // is `false` — the divergence is deliberate).
+    let mut attempts = 0;
+    loop {
+        let resp = put("mode: rule\nrules:\n  - MATCH,DIRECT\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::dial::tcp_concurrent() {
+            assert!(get_concurrent(&state).await);
+            assert_eq!(state.raw_config.read().tcp_concurrent, None);
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+}
+
+/// `find-process-mode` rides the same live-policy lane as
+/// `tcp-concurrent`, but per-tunnel: PATCH flips it without a rebuild,
+/// GET reports the live mode, the committed raw keeps the last PATCH, a
+/// replacement PUT applies its own value at the swap (omission resets to
+/// upstream's default `strict`), and a bad spelling is refused before
+/// any bundled mutation lands (issue #974).
+#[tokio::test]
+async fn patch_configs_find_process_mode_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_mode = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["find-process-mode"]
+                .as_str()
+                .expect("find-process-mode")
+                .to_string()
+        }
+    };
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Default is upstream's `strict`.
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict
+    );
+    assert_eq!(get_mode(&state).await, "strict");
+
+    let resp = patch(r#"{"find-process-mode":"always"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(get_mode(&state).await, "always");
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always),
+        "the PATCH must persist into committed raw"
+    );
+
+    // Absent/null PATCHes mean no change — `always` survives both.
+    for body in [r#"{"log-level":"info"}"#, r#"{"find-process-mode":null}"#] {
+        let resp = patch(body).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+
+    // An unknown spelling fails JSON extraction before anything applies:
+    // the bundled `mode` mutation must not land either.
+    let resp = patch(r#"{"find-process-mode":"sometimes","mode":"direct"}"#).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always)
+    );
+    assert_ne!(
+        state.tunnel.mode().to_string(),
+        "direct",
+        "the bundled mode change must be rolled back with the rejection"
+    );
+
+    // Case-insensitive like the YAML key.
+    let resp = patch(r#"{"find-process-mode":"OFF"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Off
+    );
+    assert_eq!(get_mode(&state).await, "off");
+
+    // A replacement PUT applies its value at the accepted swap; an
+    // omitted key resets to upstream's `strict` and clears the raw.
+    let resp = put("mode: rule\nfind-process-mode: always\nrules:\n  - MATCH,DIRECT\n").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always)
+    );
+
+    let resp = put("mode: rule\nrules:\n  - MATCH,DIRECT\n").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict
+    );
+    assert_eq!(get_mode(&state).await, "strict");
+    assert_eq!(state.raw_config.read().find_process_mode, None);
+}
+
+/// Issue #974: `PUT /configs` commits `global-ua` and
+/// `global-client-fingerprint` from the new document — the UA installs
+/// process-wide, the fingerprint lands in the committed raw GET reports.
+/// A document whose `global-ua` carries header bytes is refused and
+/// never mutates the live override.
+#[tokio::test]
+async fn put_configs_commits_global_ua_and_client_fingerprint() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state_default();
+    // This test leaves `Some("mihomo/v1.18.0")` installed on the happy
+    // path — reset it on every exit so later tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_global_ua(None);
+        }
+    }
+    let _reset = Reset;
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A document with header-injection bytes in `global-ua` fails at
+    // candidate validation — and the live override must stay EXACTLY what
+    // it was, not merely "not the bad value": snapshot/compare under the
+    // lane on both sides, retrying when a sibling commit legitimately
+    // moved it between the two reads.
+    let mut attempts = 0;
+    loop {
+        let before = {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            meow_common::global_ua()
+        };
+        let resp = put("global-ua: \"bad\\r\\nua\"\n").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua() == before {
+            assert!(state.raw_config.read().global_ua.is_none());
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "a rejected PUT kept mutating the live global UA"
+        );
+    }
+
+    // The happy path: both keys commit together — and the VLESS REALITY
+    // node declares no `client-fingerprint` of its own, so its adapter can
+    // only satisfy the REALITY uTLS gate by inheriting the global the PUT
+    // committed (issue #974 review).
+    let mut attempts = 0;
+    loop {
+        let resp = put(
+            "global-ua: mihomo/v1.18.0\nglobal-client-fingerprint: chrome\n\
+             proxies:\n  - {name: rl, type: vless, server: rl.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, reality-opts: {public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo}}\n",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.raw_config.read().global_client_fingerprint.as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(
+            state.raw_config.read().global_ua.as_deref(),
+            Some("mihomo/v1.18.0")
+        );
+        let rl = state
+            .tunnel
+            .proxy("rl")
+            .expect("the VLESS node registers in the tunnel");
+        assert_eq!(
+            rl.client_fingerprint(),
+            Some("chrome"),
+            "without the committed global the REALITY gate would have dropped it"
+        );
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().as_deref() == Some("mihomo/v1.18.0") {
+            // GET inside the lane: the live UA it reports can't be reset
+            // by a racing commit while it's held.
+            let json = body_json(
+                create_router(Arc::clone(&state))
+                    .oneshot(
+                        Request::get("/configs")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(json["global-ua"], "mihomo/v1.18.0");
+            assert_eq!(json["global-client-fingerprint"], "chrome");
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+
+    // Ordered cleanup under the lane: a racing reader between here and
+    // the `Reset` guard's drop never observes this test's stale value.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_global_ua(None);
+}
+
+/// `?force` degrades the `global-ua` admission gate to warn + rewrite:
+/// an invalid value must never persist, because the verbatim-commit arm
+/// (strict and lenient rebuilds both fail) lands `raw_config` untouched
+/// and every later warm mutation re-validates the field through its
+/// rebuild — a persisted injection string would 400 them all and
+/// hard-error the next boot. The gate rewrites it to the live override.
+#[tokio::test]
+async fn put_configs_force_invalid_global_ua_commits_live_value() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    // This test installs a live UA — reset it on every exit so later
+    // tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_global_ua(None);
+        }
+    }
+    let _reset = Reset;
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // The committed `global-ua`, checked under the mutation lane: never
+    // the injected value, always boot-valid. Returns whether it is the
+    // live override this test installed (a racing writer's commit can
+    // swap the process-global the gate copies — equally valid, but not
+    // ours, so the caller retries).
+    let check_committed_ua = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        async move {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            let committed = state.raw_config.read().global_ua.clone();
+            assert!(
+                meow_config::validate_global_ua(committed.as_deref()).is_ok(),
+                "a forced commit must persist a boot-valid global-ua, got {committed:?}"
+            );
+            committed.as_deref() == Some("mihomo/v1.18.0")
+        }
+    };
+
+    let mut attempts = 0;
+    loop {
+        // The live override the gate should copy on the forced PUTs.
+        let resp = put("/configs", "global-ua: mihomo/v1.18.0\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Arm 1 — the verbatim-commit early return: duplicate group names
+        // are rejected unconditionally, so the rebuild fails under strict
+        // AND lenient and `raw_config` is persisted as written.
+        let resp = put(
+            "/configs?force=true",
+            concat!(
+                "global-ua: \"bad\\r\\nua\"\n",
+                "proxy-groups:\n",
+                "  - {name: dup, type: select, proxies: [DIRECT]}\n",
+                "  - {name: dup, type: select, proxies: [REJECT]}\n",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            let raw = state.raw_config.read();
+            assert!(
+                raw.proxy_groups.as_deref().is_some_and(|groups| groups
+                    .iter()
+                    .filter(|g| g.name == "dup")
+                    .count()
+                    == 2),
+                "the unbuildable document must commit verbatim"
+            );
+        }
+        assert!(
+            state.tunnel.proxy("dup").is_none(),
+            "nothing built — the previous route table is kept"
+        );
+        if !check_committed_ua(&state).await {
+            attempts += 1;
+            assert!(attempts < 20, "writers kept resetting the global UA");
+            continue;
+        }
+
+        // Arm 2 — a buildable document: the gate normalizes `global-ua`
+        // before the rebuild ever sees it.
+        let resp = put(
+            "/configs?force=true",
+            "global-ua: \"bad\\r\\nua\"\nmode: rule\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        if check_committed_ua(&state).await {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+
+    // The poison check: a warm-path mutation on the committed document
+    // re-validates `global-ua` through its rebuild — it must succeed.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rules")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"rules":["MATCH,DIRECT"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a forced commit must not poison later warm-path mutations"
+    );
+
+    // Ordered cleanup under the lane, same as the PUT test above.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_global_ua(None);
+}
+
+/// Issue #974: `PUT /configs` commits the `keep-alive-*`, `profile`, and
+/// `ntp` top-level knobs; `GET /configs` reports the resolved values —
+/// `ntp.write-to-system` always `false` — and `PATCH` applies only the
+/// keep-alive keys while leaving the PUT-only sections untouched.
+#[tokio::test]
+async fn put_configs_roundtrips_top_level_knobs() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    // The PUT installs a non-default keepalive posture on the process
+    // global — restore it on every exit so later tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+        }
+    }
+    let _reset = Reset;
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get = || {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+
+    // GET reports keep-alive from the live process global. The lane
+    // `process_globals_lane` keeps every config-committing sibling out
+    // for this test's whole body, so the PUT's committed posture is
+    // stable to observe — the mutation-lane assert below can never see
+    // it reset mid-flight (no retry window).
+    let resp = put(
+        "mode: rule\n\
+         keep-alive-idle: 45\n\
+         keep-alive-interval: 5\n\
+         disable-keep-alive: true\n\
+         profile:\n  store-selected: false\n  store-fake-ip: true\n\
+         ntp:\n  enable: true\n  server: ntp.test\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n  write-to-system: true\n\
+         rules:\n  - MATCH,DIRECT\n",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    {
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        let live = meow_common::outbound_tcp_keepalive();
+        assert!(!live.enabled);
+        assert_eq!(live.idle.as_secs(), 45);
+        assert_eq!(live.interval.as_secs(), 5);
+        let json = get().await;
+        assert_eq!(json["keep-alive-idle"], 45);
+        assert_eq!(json["keep-alive-interval"], 5);
+        assert_eq!(json["disable-keep-alive"], true);
+        assert_eq!(json["store-selected"], false);
+        assert_eq!(json["store-fake-ip"], true);
+    }
+    let json = get().await;
+    assert_eq!(
+        json["ntp"],
+        serde_json::json!({
+            "enable": true,
+            "server": "ntp.test",
+            "port": 1123,
+            "interval": 60,
+            "write-to-system": false,
+        }),
+        "GET reports the resolved ntp section: DIRECT normalizes to the \
+         omitted spelling and write-to-system is never claimed"
+    );
+    assert_eq!(
+        state
+            .raw_config
+            .read()
+            .ntp
+            .as_ref()
+            .and_then(|n| n.write_to_system),
+        Some(true),
+        "the raw spelling persists verbatim; only the resolved view drops it"
+    );
+
+    // PATCH: keep-alive keys apply (merged over the committed document);
+    // `ntp`/`profile` body keys are not PATCH fields — unknown keys are
+    // ignored and must leave both the document and GET report alone.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "keep-alive-idle": 30,
+                        "ntp": { "enable": false },
+                        "profile": { "store-selected": true },
+                        "store-selected": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let json = get().await;
+    assert_eq!(json["ntp"]["enable"], true, "PATCH must not touch ntp:");
+    assert_eq!(
+        json["store-selected"], false,
+        "PATCH must not touch profile"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.ntp.is_some() && raw.profile.is_some(),
+            "PATCH must not merge PUT-only sections into the document"
+        );
+    }
+
+    // Ordered cleanup under the lane: a racing reader between here and
+    // the `Reset` guard's drop never observes this test's stale posture.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+}
+
+/// Issue #974: the forced verbatim-commit fallback — strict AND lenient
+/// rebuilds both fail — must not claim a changed effective profile, ntp,
+/// or outbound-keepalive posture: each diff alone rejects the PUT, and a
+/// knob-free document still commits verbatim.
+#[tokio::test]
+async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    // The reconcile spy proves a rejected PUT never feeds the candidate's
+    // resolved ntp config to the supervisor.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<meow_config::NtpConfig>::new()));
+    let mut state = test_state(test_raw_config());
+    Arc::get_mut(&mut state).unwrap().ntp_reconcile = Some({
+        let seen = Arc::clone(&seen);
+        Arc::new(move |cfg| seen.lock().unwrap().push(cfg)) as meow_api::routes::NtpReconcile
+    });
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the unbuildable
+    // document the verbatim fallback would otherwise commit as written.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // Each effective-knob diff rejects before the fallback commits. The
+    // `tun:` enable flip is the same refusal: the verbatim commit keeps
+    // the previous routing and resolver, so a transition it cannot back
+    // with a built candidate must not fire (issue #974). Effective
+    // `find-process-mode` is the same live tunnel policy — a diff the
+    // fallback cannot rebuild is refused, an equal value is not.
+    for (label, knob) in [
+        ("profile", "profile:\n  store-selected: false\n"),
+        ("ntp", "ntp:\n  enable: true\n  server: ntp.test\n"),
+        ("keepalive", "keep-alive-idle: 60\n"),
+        ("tun", "tun:\n  enable: true\n"),
+        ("find-process-mode", "find-process-mode: always\n"),
+    ] {
+        let before = seen.lock().unwrap().len();
+        let resp = put(
+            "/configs?force=true",
+            &format!("mode: rule\n{knob}{UNBUILDABLE}"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{label} diff must be rejected under the verbatim fallback"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before,
+            "{label}: a rejected PUT must not reach the ntp supervisor"
+        );
+        // The committed document keeps its original knob-free sections.
+        {
+            let raw = state.raw_config.read();
+            assert!(
+                raw.ntp.is_none()
+                    && raw.profile.is_none()
+                    && raw.keep_alive_idle.is_none()
+                    && raw.tun.is_none()
+                    && raw.find_process_mode.is_none(),
+                "{label}: a rejected PUT must not touch the committed document"
+            );
+        }
+    }
+
+    // The knob-free unbuildable document still commits verbatim — the
+    // fallback's force leniency itself is unchanged.
+    let resp = put("/configs?force=true", &format!("mode: rule\n{UNBUILDABLE}")).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxy_groups.as_deref().is_some_and(|groups| groups
+                .iter()
+                .filter(|g| g.name == "dup")
+                .count()
+                == 2),
+            "the unbuildable document must commit verbatim"
+        );
+    }
+    // ...and the verbatim commit's ntp section still reaches the
+    // supervisor (resolved disabled — a no-op for it).
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the committed document's ntp section must reconcile"
+    );
+}
+
+/// Issue #974 review: the forced verbatim-commit fallback keeps the
+/// previous route table, but the committed document's `dns:` verdict must
+/// still publish — a verbatim `dns.enable: false` installs the disabled
+/// generation, so a `type: dns` leaf's answers flip to SERVFAIL even
+/// though the route table (and the leaf adapter itself) was kept. Before
+/// the fix the lane committed with `PendingPublish::default()`, so the
+/// old enabled generation kept answering and a later same-inputs PUT
+/// short-circuited on `dns_inputs_equal` without reconciling.
+#[tokio::test]
+async fn put_configs_force_verbatim_publishes_dns_disable() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RData, RecordType};
+    use meow_common::Metadata;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Committed: DNS enabled with a hosts answer and a `type: dns` leaf
+    // reached by DST-PORT,53. Rebuild through the runtime lane so the
+    // leaf binds the tunnel's outbound cell — the production publish —
+    // then install the enabled generation the way
+    // `install_resolver_everywhere` does.
+    let raw = meow_config::parse_raw_yaml(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: true\n\
+         \x20 nameserver: [127.0.0.1:9]\n\
+         proxies:\n\
+         \x20 - {name: dns-out, type: dns}\n\
+         rules:\n\
+         \x20 - DST-PORT,53,dns-out\n",
+    )
+    .unwrap();
+    let state = test_state(raw);
+    let mut hosts = DomainTrie::new();
+    hosts.insert(
+        "example.com",
+        HostEntry::Addresses(vec!["10.0.0.1".parse().unwrap()]),
+    );
+    state.tunnel.set_resolver(
+        Arc::new(Resolver::new(
+            vec!["127.0.0.1:9".parse().unwrap()],
+            vec![],
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        )),
+        true,
+    );
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw_runtime(
+        &state.raw_config.read().clone(),
+        Some(&state.tunnel.resolver_slot()),
+        &HashMap::new(),
+        None,
+        &state.provider_dialer_registry,
+        &state.tunnel.selection_backing(),
+        &state.tunnel.dns_outbound_cell(),
+    )
+    .unwrap();
+    state.tunnel.update_proxies(proxies, Default::default());
+    state.tunnel.update_rules_with_sub_rules(rules, sub_rules);
+    *state.tunnel.dns_outbound_cell().write() = Some(state.tunnel.resolver_slot());
+
+    async fn leaf_exchange(state: &Arc<AppState>, id: u16) -> Message {
+        let metadata = Metadata {
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let ResolvedTarget { adapter, .. } =
+            state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+        assert_eq!(adapter.name(), "dns-out");
+        let mut conn = adapter.dial_tcp(&metadata).await.unwrap();
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = query.to_vec().unwrap();
+        conn.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        conn.write_all(&wire).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        conn.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        conn.read_exact(&mut body).await.unwrap();
+        Message::from_vec(&body).unwrap()
+    }
+
+    let before = leaf_exchange(&state, 1).await;
+    assert_eq!(before.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        before.answers[0].data,
+        RData::A("10.0.0.1".parse().unwrap()),
+        "the enabled generation must answer the hosts hit"
+    );
+
+    // Duplicate group names fail strict AND lenient — the verbatim lane
+    // commits the document as written. Its `dns.enable: false` must still
+    // install into the resolver slot the kept leaf reads.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(format!(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: false\n\
+         {UNBUILDABLE}"
+    ));
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = leaf_exchange(&state, 2).await;
+    assert_eq!(
+        after.metadata.response_code,
+        ResponseCode::ServFail,
+        "a verbatim `dns.enable: false` commit must publish the disabled \
+         generation to the dns-outbound cell"
+    );
+}
+
+/// Issue #974 review: the forced verbatim-commit fallback compares
+/// effective `ntp:` values only — a candidate that keeps the committed
+/// `ntp:` block verbatim but deletes the named `dialer-proxy` target
+/// shows no ntp diff, and without the raw-level declared-name check it
+/// would commit a reference the next startup's built-map check
+/// hard-fails. A target the candidate still declares commits as before.
+#[tokio::test]
+async fn put_configs_force_fallback_rejects_dangling_ntp_target() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    // Committed: ntp enabled through `front`, `front` itself declared.
+    let state = test_state(
+        meow_config::parse_raw_yaml(
+            "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+             proxies:\n  - {name: front, type: direct}\nrules:\n  - MATCH,front\n",
+        )
+        .unwrap(),
+    );
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the unbuildable
+    // document the verbatim fallback would otherwise commit as written.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // `front` deleted, `ntp:` kept verbatim — the dangling reference must
+    // be refused rather than persisted for the next boot to trip over.
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a dangling ntp.dialer-proxy must not commit through the verbatim fallback"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|proxies| proxies
+                .iter()
+                .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some("front"))),
+            "the rejected document must not replace the committed one"
+        );
+    }
+
+    // A non-transport built-in is refused on the same lane — committed
+    // below with the same `dialer-proxy` so the ntp diff gate stays
+    // silent and only the declared-name check can catch it.
+    {
+        let mut raw = state.raw_config.write();
+        raw.ntp = Some(meow_config::raw::RawNtp {
+            enable: Some(true),
+            dialer_proxy: Some("REJECT".into()),
+            ..Default::default()
+        });
+    }
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: REJECT\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-transport built-in must not dial ntp through the verbatim fallback"
+    );
+    assert_eq!(
+        state.raw_config.read().ntp.as_ref().unwrap().enable,
+        Some(true),
+        "the rejected document must not persist"
+    );
+
+    // `front` still declared in the candidate → the verbatim commit keeps
+    // working (the enabled ntp block resolves through the raw names).
+    {
+        let mut raw = state.raw_config.write();
+        raw.ntp = Some(meow_config::raw::RawNtp {
+            enable: Some(true),
+            dialer_proxy: Some("front".into()),
+            ..Default::default()
+        });
+    }
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+         proxies:\n  - {{name: front, type: direct}}\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a declared target keeps the verbatim commit"
+    );
+}
+
+/// Issue #974 review: the forced verbatim-commit fallback must not commit
+/// a `sub-rules:` section that fails its structural checks — the section
+/// has no lenient arm, so a defect committed verbatim would hard-fail the
+/// next boot and every warm mutation until then. Declared rule-provider
+/// names stand in as empty sets (availability is environment, not shape);
+/// a well-formed section still commits as written.
+#[tokio::test]
+async fn put_configs_force_fallback_gates_sub_rules_shape() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A malformed condition inside a block body is shape — the verbatim
+    // commit must refuse it, and the committed document must not move.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - SUB-RULE,(MATCH,x),inner\n  inner:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        state.raw_config.read().sub_rules.is_none(),
+        "the rejected document must not replace the committed one"
+    );
+
+    // A top-level `rules:` reference to an undefined block hits the same
+    // gate — both builds already fail on it, and the fallback must too.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,ghost\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Structurally sound `sub-rules:` — a conditional reference carrying
+    // the MEOW fourth-field fallback included — still commits verbatim.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(DOMAIN,x.test),blk,DIRECT\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(state
+        .raw_config
+        .read()
+        .sub_rules
+        .as_ref()
+        .is_some_and(|m| m.contains_key("blk")));
+
+    // A conditional reference gated on REMATCH-NAME is sound too — the
+    // verbatim gate parses it through the build's block-aware path
+    // (issue #974), not the plain rule parser that knows no `SUB-RULE`.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(REMATCH-NAME,stage),blk\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a sound REMATCH-NAME conditional must commit verbatim"
+    );
+
+    // A malformed REMATCH-NAME inside the same conditional — an empty
+    // alternative the build would hard-fail on — still hits the gate.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(REMATCH-NAME,),blk\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Issue #974: `/rules/append` dry-parses a candidate line against the
+/// committed `sub-rules:` — conditional references (any leaf type but
+/// MATCH/SUB-RULE), the MEOW four-field fallback, and plain names all
+/// resolve; a broken `sub-rules:` section reports its own error rather
+/// than a phantom undefined block.
+#[tokio::test]
+async fn append_sub_rule_lines_dry_parse() {
+    // Every accepted append commits a raw candidate, and the commit
+    // re-asserts the process-wide knobs — the lane keeps a sibling
+    // config test's commit-and-assert window intact.
+    let _globals_lane = process_globals_lane().await;
+    let mut raw = test_raw_config();
+    raw.sub_rules = Some(std::collections::HashMap::from([(
+        "blk".to_string(),
+        vec!["DOMAIN,inside.test,DIRECT".to_string()],
+    )]));
+    raw.rules = Some(vec!["SUB-RULE,blk".into(), "MATCH,DIRECT".into()]);
+    let state = test_state(raw);
+    let post = |rule: &'static str| {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            app.oneshot(
+                Request::post("/rules/append")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "rule": rule }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Plain, conditional, and four-field references resolve against `blk`;
+    // a cond leaf is any rule type except MATCH/SUB-RULE — the widened
+    // upstream exclusion set (issue #974 review).
+    for rule in [
+        "SUB-RULE,(DOMAIN,ok.test),blk",
+        "SUB-RULE,(DOMAIN,ok.test),blk,DIRECT",
+        "SUB-RULE,((PROCESS-NAME,curl)&(DST-PORT,443)),blk",
+    ] {
+        assert_eq!(post(rule).await.status(), StatusCode::NO_CONTENT, "{rule}");
+    }
+    // The committed list carries the appended references; `/rules`
+    // reports them in mihomo spelling with the cond text as payload.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let rules = json["rules"].as_array().unwrap();
+    for payload in ["blk", "(DOMAIN,ok.test),blk", "(DOMAIN,ok.test),blk,DIRECT"] {
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "SubRules" && r["payload"] == payload),
+            "a SubRules entry with payload {payload} must be reported"
+        );
+    }
+
+    // MATCH/SUB-RULE leaves stay excluded, an undefined block name and a
+    // malformed head fail — each with its own parse error.
+    for rule in [
+        "SUB-RULE,(MATCH,x),blk",
+        "SUB-RULE,(SUB-RULE,blk),blk",
+        "SUB-RULE,ghost",
+        "SUB-RULE,(DOMAIN,x",
+    ] {
+        assert_eq!(post(rule).await.status(), StatusCode::BAD_REQUEST, "{rule}");
+    }
+    // The rejections left nothing behind: the rule count is unchanged.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["rules"].as_array().unwrap().len(), 5);
+}
+
+/// Issue #974: the local shape/range gates precede the first candidate
+/// network work — `ech-opts.enable` with no `config:` and no query
+/// source is a deterministic strict defect that never dials, yet an
+/// out-of-range `ntp.interval` must still be the reported failure.
+#[tokio::test]
+async fn put_configs_local_gates_precede_ech_preresolve() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let app = create_router(Arc::clone(&state));
+    let document =
+        "strict: true\nntp:\n  interval: 0\nproxies:\n  - name: p\n    type: direct\n    ech-opts:\n      enable: true\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(document);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("ntp.interval"),
+        "the ntp range defect must surface before the strict ECH defect: {msg}"
+    );
+}
+
+/// A malformed `smux:`/`mux:` block on a static leaf is a node-level
+/// defect, so the `check_mux_shape` admission gate mirrors the parse's
+/// strictness: `strict` rejects the PUT before the ECH preresolve opens
+/// sockets, while `?force=true` degrades it like every other strict
+/// defect class — the lenient rebuild warn-drops the node and the
+/// document commits.
+#[tokio::test]
+async fn put_configs_strict_bad_mux_gate_force_drops_node() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let yaml = "strict: true\nmode: rule\n\
+        proxies:\n  - {name: badmux, type: vless, server: vless.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, smux: true}\n\
+        rules: ['MATCH,DIRECT']\n";
+
+    let status = put_config_yaml(&state, yaml, false).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a strict smux shape defect must reject the candidate"
+    );
+    assert!(
+        state.tunnel.proxy("badmux").is_none(),
+        "the route map must be untouched"
+    );
+    assert!(
+        state.raw_config.read().strict.is_none(),
+        "the live raw config must be untouched"
+    );
+
+    // `?force=true` retries the same candidate leniently: the malformed
+    // node is warn-dropped and the document commits.
+    let status = put_config_yaml(&state, yaml, true).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "force retains the lenient escape"
+    );
+    // meow-openwrt: the lenient rebuild binds the malformed node to a dead
+    // placeholder (72a5c188) so nothing can fall back past the name.
+    assert!(
+        state.tunnel.proxy("badmux").is_some(),
+        "the lenient rebuild keeps the node as a dead placeholder"
+    );
+}
+
+/// Issue #974: under `force`, a `dns:` section that fails its rebuild
+/// keeps the previous resolver — but a candidate whose EFFECTIVE
+/// store-fake-ip flag (profile > dns > false) differs from the committed
+/// document's must not claim a posture the kept pool never implements.
+/// A flag-unchanged candidate still degrades to 204 as before.
+#[tokio::test]
+async fn put_configs_force_broken_dns_gates_store_fake_ip() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // `fake-ip-range` fails inside `reconcile_dns_config` — after the
+    // routing rebuild succeeded — landing in the force keep-resolver arm.
+    const BROKEN_DNS: &str =
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: not-a-cidr\n";
+
+    // A changed effective flag (committed has none → false) rejects.
+    let resp = put(
+        "/configs?force=true",
+        &format!(
+            "mode: rule\nprofile:\n  store-fake-ip: true\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a store-fake-ip change must not commit through the kept resolver"
+    );
+    assert!(
+        state.raw_config.read().profile.is_none(),
+        "the rejected document must not persist"
+    );
+
+    // A `tun:` transition is refused on the same footing — with the
+    // resolver kept, the device would respawn on fake-IP geometry the
+    // kept generation does not implement.
+    let resp = put(
+        "/configs?force=true",
+        &format!("mode: rule\ntun:\n  enable: true\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a tun transition must not commit through the kept resolver"
+    );
+    assert!(
+        state.raw_config.read().tun.is_none(),
+        "the rejected document must not persist"
+    );
+
+    // Flag unchanged (both sides resolve false) keeps the force degrade.
+    let resp = put(
+        "/configs?force=true",
+        &format!("mode: rule\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "unchanged effective flag commits through the keep-resolver arm"
+    );
+}
+
+/// Issue #974: at the API boundary every non-transport built-in
+/// (`REJECT`/`REJECT-DROP`/`PASS`/`PASS-RULE`) is rejected as an
+/// `ntp.dialer-proxy` target — they sit in the proxy map but cannot
+/// carry the exchange — while `DIRECT` stays a valid dialer.
+#[tokio::test]
+async fn put_configs_rejects_ntp_dialer_proxy_builtin_policies() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |document: String| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    for name in ["REJECT", "REJECT-DROP", "PASS", "PASS-RULE"] {
+        let resp = put(format!(
+            "ntp:\n  enable: true\n  dialer-proxy: {name}\nrules:\n  - MATCH,DIRECT\n"
+        ))
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{name}: a non-transport built-in must not dial ntp"
+        );
+        assert!(
+            state.raw_config.read().ntp.is_none(),
+            "{name}: a rejected candidate must not touch the committed document"
+        );
+    }
+    let resp =
+        put("ntp:\n  enable: true\n  dialer-proxy: DIRECT\nrules:\n  - MATCH,DIRECT\n".to_string())
+            .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "DIRECT remains a valid ntp dialer"
+    );
+}
+
+/// Codex review: the NTP reconcile must run only after the commit has
+/// installed the keepalive posture — the supervisor's worker dials
+/// through it, so the hook must observe the committed values rather than
+/// the pre-commit ones, on a fresh commit AND on a TUN-failure rollback
+/// that restores the previous document.
+#[tokio::test]
+async fn put_configs_installs_keepalive_before_ntp_reconcile() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    // This test commits a keepalive posture — reset the process global
+    // on every exit path.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+        }
+    }
+    let _reset = Reset;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<
+        meow_common::OutboundTcpKeepalive,
+    >::new()));
+    let mut state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    Arc::get_mut(&mut state).unwrap().ntp_reconcile = Some({
+        let observed = Arc::clone(&observed);
+        Arc::new(move |_| {
+            observed
+                .lock()
+                .unwrap()
+                .push(meow_common::outbound_tcp_keepalive());
+        }) as meow_api::routes::NtpReconcile
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let yaml = "mode: rule\nkeep-alive-idle: 33\nkeep-alive-interval: 7\n\
+                ntp:\n  enable: true\n  dialer-proxy: DIRECT\nrules:\n  - MATCH,DIRECT\n";
+    assert_eq!(put(yaml).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let seen = observed.lock().unwrap().clone();
+    let ka = seen
+        .last()
+        .expect("the commit must have reconciled ntp once");
+    assert_eq!(
+        (ka.idle.as_secs(), ka.interval.as_secs()),
+        (33, 7),
+        "the reconcile hook must already observe the committed keepalive"
+    );
+    drop(seen);
 }
 
 #[tokio::test]
@@ -1156,6 +2970,7 @@ async fn rules_round_trip_keeps_disabled_switch() {
 
 #[tokio::test]
 async fn replace_rules() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1196,6 +3011,7 @@ async fn replace_rules() {
 
 #[tokio::test]
 async fn update_rule_at_index() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1239,6 +3055,7 @@ async fn update_rule_out_of_range() {
 
 #[tokio::test]
 async fn delete_rule() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1278,6 +3095,7 @@ async fn delete_rule_out_of_range() {
 
 #[tokio::test]
 async fn reorder_rules() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1339,6 +3157,7 @@ async fn get_proxy_groups_empty() {
 
 #[tokio::test]
 async fn create_proxy_group_selector() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1498,6 +3317,7 @@ async fn get_proxy_groups_expands_provider_backed_runtime_members() {
 
 #[tokio::test]
 async fn update_proxy_group() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G1".into(),
@@ -1549,6 +3369,7 @@ async fn update_proxy_group_not_found() {
 
 #[tokio::test]
 async fn delete_proxy_group() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "ToDelete".into(),
@@ -1676,6 +3497,7 @@ async fn get_subscriptions_with_data() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state(raw);
     let app = create_router(state);
@@ -1712,6 +3534,7 @@ async fn get_subscriptions_reports_counts() {
         applied_proxies: vec!["S1".into()],
         applied_groups: vec!["G".into()],
         applied_rules: vec!["MATCH,G".into()],
+        extra: Default::default(),
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
@@ -1769,6 +3592,7 @@ async fn delete_subscription_not_found() {
 /// groups, and rules it never declared must survive.
 #[tokio::test]
 async fn delete_subscription_clears_data() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.subscriptions = Some(vec![RawSubscription {
         name: "delsub".into(),
@@ -1779,6 +3603,7 @@ async fn delete_subscription_clears_data() {
         applied_proxies: vec!["S1".into()],
         applied_groups: vec!["G".into()],
         applied_rules: vec!["MATCH,G".into()],
+        extra: Default::default(),
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
@@ -1846,6 +3671,7 @@ async fn delete_subscription_clears_data() {
 /// inside the `CONFIG_MUTATION` lane before committing (issue #543).
 #[tokio::test]
 async fn refresh_subscription_deleted_mid_fetch_returns_404() {
+    let _globals_lane = process_globals_lane().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1895,6 +3721,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));
@@ -1952,6 +3779,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
 /// that hop, and the stored value is exposed by `GET` (issue #625).
 #[tokio::test]
 async fn add_subscription_proxy_resolution() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::{
         AdapterType, DelayHistory, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth,
         ProxyPacketConn,
@@ -2146,6 +3974,7 @@ async fn add_subscription_proxy_resolution() {
 /// removes only the tracked contribution.
 #[tokio::test]
 async fn add_subscription_merges_with_local_config() {
+    let _globals_lane = process_globals_lane().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -2407,6 +4236,7 @@ async fn save_config_refuses_without_backing_file() {
 /// raw config drops the entry (issue #717).
 #[tokio::test]
 async fn delete_subscription_without_backing_file_skips_persist() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.subscriptions = Some(vec![RawSubscription {
         name: "delsub".into(),
@@ -2417,6 +4247,7 @@ async fn delete_subscription_without_backing_file_skips_persist() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state_ephemeral(raw);
     let app = create_router(Arc::clone(&state));
@@ -2484,6 +4315,7 @@ async fn spawn_sub_origin(body: &'static str) -> std::net::SocketAddr {
 /// explicit in the API contract (issue #717).
 #[tokio::test]
 async fn add_subscription_without_backing_file_reports_not_persisted() {
+    let _globals_lane = process_globals_lane().await;
     let addr =
         spawn_sub_origin("proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n")
             .await;
@@ -2516,6 +4348,7 @@ async fn add_subscription_without_backing_file_reports_not_persisted() {
 /// `"persisted": false` contract on this endpoint too (issue #717).
 #[tokio::test]
 async fn refresh_subscription_without_backing_file_reports_not_persisted() {
+    let _globals_lane = process_globals_lane().await;
     let addr =
         spawn_sub_origin("proxies:\n  - {name: node-2, type: http, server: 127.0.0.1, port: 9}\n")
             .await;
@@ -2530,6 +4363,7 @@ async fn refresh_subscription_without_backing_file_reports_not_persisted() {
         applied_proxies: vec![],
         applied_groups: vec![],
         applied_rules: vec![],
+        extra: Default::default(),
     }]);
     let state = test_state_ephemeral(raw);
     let app = create_router(Arc::clone(&state));
@@ -2794,6 +4628,154 @@ async fn select_proxy_roundtrip() {
 }
 
 // ── Bearer auth middleware ───────────────────────────────────────
+
+#[tokio::test]
+async fn controller_without_secret_restricts_browser_access() {
+    use axum::http::header;
+
+    let app = create_router(test_state_with_secret(""));
+    let cases = [
+        ("/ui", "localhost:9090", None, None, StatusCode::OK),
+        ("/version", "127.0.0.1:9090", None, None, StatusCode::OK),
+        (
+            "/version",
+            "[::1]:9090",
+            Some("http://[::1]:9090"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "localhost:80",
+            Some("http://localhost"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "127.0.0.1:9090",
+            Some("http://127.0.0.1:9091"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("https://localhost:9090"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("null"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            None,
+            Some("cross-site"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "controller.example:9090",
+            None,
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (path, host, origin, fetch_site, status) in cases {
+        let mut req = Request::get(path).header(header::HOST, host);
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        if let Some(fetch_site) = fetch_site {
+            req = req.header("sec-fetch-site", fetch_site);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{host} from {origin:?}");
+        assert!(!response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/rules")
+                .header(header::HOST, "127.0.0.1:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(axum::body::Body::from(r#"{"rules":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn controller_with_secret_allows_authenticated_cross_origin_dashboards() {
+    use axum::http::{header, Method};
+
+    let app = create_router(test_state_with_secret("test-token"));
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type",
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    // Absent map under a configured secret resolves `["*"]`/`true` — the
+    // configured-path shape: method echo, canonicalized header echo and
+    // max-age 300 (issue #974).
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "Authorization, Content-Type"
+    );
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+        "GET"
+    );
+    assert_eq!(preflight.headers()[header::ACCESS_CONTROL_MAX_AGE], "300");
+
+    let response = app
+        .oneshot(
+            Request::get("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
 
 #[tokio::test]
 async fn auth_middleware_table() {
@@ -3277,6 +5259,7 @@ mod delay_support {
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -3285,6 +5268,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
@@ -3336,6 +5320,7 @@ mod delay_support {
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -3344,6 +5329,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 }
@@ -4465,9 +6451,12 @@ async fn get_connection_by_id_returns_notes_live_and_after_close() {
     let state = test_state_default();
     let rule =
         meow_rules::parse_rule("MATCH,DIRECT", &meow_rules::ParserContext::default()).unwrap();
-    state
-        .tunnel
-        .update_routing(HashMap::new(), vec![rule], Default::default());
+    state.tunnel.update_routing(
+        HashMap::new(),
+        vec![rule],
+        HashMap::new(),
+        Default::default(),
+    );
     state.tunnel.set_connection_notes(true);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4698,10 +6687,14 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -4715,6 +6708,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -4723,6 +6717,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -4863,10 +6858,14 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
     std::mem::forget(dir);
@@ -4878,6 +6877,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
         rule_provider_refresh: Default::default(),
         proxy_provider_refresh: Default::default(),
@@ -4886,6 +6886,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
 
     let resp = create_router(state)
@@ -5058,6 +7059,44 @@ async fn get_connections_entry_has_camel_case_shape() {
     );
 }
 
+/// `ConnType::WireGuard` serialises as `"wireguard"` in `/connections`
+/// `metadata.type` — errata U4 pins the lowercase spelling even though
+/// the other conn types keep their CamelCase variant names.
+#[tokio::test]
+async fn get_connections_wireguard_metadata_type() {
+    use meow_common::{ConnType, Metadata, Network};
+    let state = test_state_default();
+
+    let meta = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::WireGuard,
+        host: "10.0.0.2".into(),
+        dst_port: 443,
+        ..Default::default()
+    };
+    state.tunnel.statistics().track_connection(
+        meta,
+        smol_str::SmolStr::new_static("MATCH"),
+        smol_str::SmolStr::default(),
+        smallvec![Arc::from("DIRECT")],
+    );
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::get("/connections")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let conn = &json["connections"].as_array().unwrap()[0];
+    assert_eq!(conn["metadata"]["type"], "wireguard");
+    assert_eq!(conn["metadata"]["network"], "tcp");
+}
+
 /// `metadata.dscp` is always a number in `/connections`, as mihomo panels
 /// read it: `0` for a flow whose inbound saw no DSCP (every listener but
 /// TProxy), the value otherwise.
@@ -5136,6 +7175,7 @@ async fn rule_provider_format_uses_mihomo_names() {
         proxy: None,
         header: None,
         payload: None,
+        extra: Default::default(),
     };
     let cases = [
         ("yaml", file(&yaml, Some("yaml")), "YamlRule"),
@@ -5308,6 +7348,7 @@ async fn delete_all_connections_terminates_both_stream_directions() {
 
 #[tokio::test]
 async fn cold_reload_terminates_live_stream_without_drain_delay() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
         ..Default::default()
@@ -5358,6 +7399,7 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
 /// using the old IP-CIDR rule, even though the active policy is now REJECT.
 #[tokio::test]
 async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use hickory_proto::{
         op::Message,
@@ -5385,10 +7427,14 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             false,
             false,
         )));
-        let meow_config::RebuildResult { proxies, rules, .. } =
-            meow_config::rebuild_from_raw(&raw).unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
         tunnel.update_proxies(proxies, Default::default());
-        tunnel.update_rules(rules);
+        tunnel.update_rules_with_sub_rules(rules, sub_rules);
         Arc::get_mut(&mut state).unwrap().tunnel = tunnel;
 
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5500,6 +7546,7 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
 /// host-resolver hook all kept the startup generation forever.
 #[tokio::test]
 async fn put_configs_swaps_running_dns_resolver() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -5589,6 +7636,58 @@ async fn put_configs_swaps_running_dns_resolver() {
     );
 }
 
+#[tokio::test]
+async fn put_configs_requires_restart_to_change_the_controller_secret() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+
+    let state = test_state_with_secret("startup-override");
+    state.raw_config.write().secret = Some("original-yaml-value".into());
+    let app = create_router(Arc::clone(&state));
+
+    for (uri, candidate, status) in [
+        (
+            "/configs?force=true",
+            "mode: global\nsecret: new-yaml-value\n",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/configs", "mode: global\n", StatusCode::BAD_REQUEST),
+        (
+            "/configs",
+            "mode: direct\nsecret: original-yaml-value\n",
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(candidate);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(uri)
+                    .header("authorization", "Bearer startup-override")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(
+                body_json(response).await["message"],
+                "changing the controller secret requires a restart"
+            );
+            assert_eq!(state.raw_config.read().mode.as_deref(), Some("rule"));
+        }
+        assert_eq!(
+            state.raw_config.read().secret.as_deref(),
+            Some("original-yaml-value")
+        );
+    }
+    assert_eq!(state.raw_config.read().mode.as_deref(), Some("direct"));
+}
+
 /// A `PUT /configs` parse failure surfaces the tree error through the 400
 /// body: `{"message": "config parse error: line N column M: port: invalid
 /// u16"}`. The `line`/`column` prefix plus the dotted field path are the
@@ -5597,6 +7696,7 @@ async fn put_configs_swaps_running_dns_resolver() {
 /// location/path plumbing shows up at the HTTP boundary.
 #[tokio::test]
 async fn put_configs_parse_error_reports_line_column_and_path() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let payload = base64::engine::general_purpose::STANDARD
@@ -5641,6 +7741,7 @@ async fn put_configs_parse_error_reports_line_column_and_path() {
 /// routing" branch (204 with the old map retained).
 #[tokio::test]
 async fn put_configs_duplicate_group_names_rejected() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -5724,6 +7825,7 @@ async fn put_configs_duplicate_group_names_rejected() {
 /// contribution).
 #[tokio::test]
 async fn put_configs_carries_subscription_tracking_forward() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     let mut node = std::collections::HashMap::new();
@@ -5748,6 +7850,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
             applied_proxies: vec!["node-1".into()],
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         },
         RawSubscription {
             name: "t".into(),
@@ -5758,6 +7861,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
             applied_proxies: vec!["t-node".into()],
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         },
     ]);
     let state = test_state(raw);
@@ -5813,6 +7917,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
 /// previous routing" branch (204 with the old map retained).
 #[tokio::test]
 async fn put_configs_group_cycle_rejected() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -5888,12 +7993,37 @@ async fn put_configs_group_cycle_rejected() {
     );
 }
 
+/// A port bindable over BOTH UDP and TCP — what `DnsServer::bind` needs.
+/// Windows can exclude a port per protocol (Hyper-V/WINNAT), so either
+/// protocol's allocator can walk into the other's exclusion band;
+/// alternate which one picks the :0 port so both allocators sample
+/// independent counter positions.
+fn dual_proto_port() -> u16 {
+    for attempt in 0..16u32 {
+        if attempt % 2 == 0 {
+            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
+                return candidate;
+            }
+        } else {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                return candidate;
+            }
+        }
+    }
+    panic!("no port bindable over both UDP and TCP after 16 alternating attempts");
+}
+
 /// Issue #514 review: a `dns.listen` change whose new socket FAILS to bind
 /// must keep the old listener alive — the config is already committed, and
 /// dropping the only working DNS server would silently break resolution
 /// until the next dns-changing PUT.
 #[tokio::test]
 async fn put_configs_dns_rebind_failure_keeps_old_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -5913,35 +8043,7 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
         )
     };
 
-    // The DNS bind needs UDP *and* TCP on the same port, and Windows can
-    // exclude a port per protocol (Hyper-V/WINNAT) — either protocol's
-    // allocator can walk into the other's exclusion band. Alternate which
-    // protocol picks the :0 port so both allocators sample independent
-    // counter positions (the same mechanism DnsServer::bind() uses).
-    let mut port_a = None;
-    'probe: for attempt in 0..16u32 {
-        if attempt % 2 == 0 {
-            // Even: TCP picks, UDP verifies.
-            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let candidate = sock.local_addr().unwrap().port();
-            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
-                drop(sock);
-                port_a = Some(candidate);
-                break 'probe;
-            }
-        } else {
-            // Odd: UDP picks, TCP verifies.
-            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let candidate = sock.local_addr().unwrap().port();
-            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-                drop(sock);
-                port_a = Some(candidate);
-                break 'probe;
-            }
-        }
-    }
-    let port_a =
-        port_a.expect("no port bindable over both UDP and TCP after 16 alternating attempts");
+    let port_a = dual_proto_port();
     let yaml_a = format!(
         "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
     );
@@ -5978,12 +8080,88 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
     drop(blocker);
 }
 
+/// A `dns.listen` disable → re-enable cycle on the SAME address must
+/// rebind cleanly: a retired listener's task aborts asynchronously and an
+/// in-flight reply can hold the socket briefly past its death, so the
+/// next plan must wait for actual socket release — task joined AND weak
+/// ref dead — before binding, or the re-enable dies on EADDRINUSE
+/// (Codex review).
+#[tokio::test]
+async fn put_configs_dns_disable_reenable_same_addr_rebinds() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let port = dual_proto_port();
+    let yaml_on = format!(
+        "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
+    );
+    assert_eq!(
+        put(&yaml_on).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        state
+            .dns_server
+            .read()
+            .as_ref()
+            .is_some_and(|h| h.listen.port() == port && !h.task.is_finished()),
+        "first PUT must leave a live listener on port {port}"
+    );
+
+    // Disable: the listener retires — its socket release is proven, not
+    // synchronous.
+    let yaml_off = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
+    assert_eq!(
+        put(yaml_off).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        state.dns_server.read().is_none(),
+        "disable must retire the listener handle"
+    );
+
+    // Re-enable on the same address: the bind must succeed over the
+    // just-released socket — not race the retired one into EADDRINUSE.
+    assert_eq!(
+        put(&yaml_on).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let guard = state.dns_server.read();
+    let h = guard
+        .as_ref()
+        .expect("the re-enabled listener must be bound");
+    assert_eq!(h.listen.port(), port);
+    assert!(
+        !h.task.is_finished(),
+        "the re-enabled listener must actually serve"
+    );
+    drop(guard);
+}
+
 /// Issue #514 review: `nameserver-policy` `rule-set:` keys must resolve
 /// against the CANDIDATE's `rule-providers:` — a PUT that adds a provider
 /// and references it in the same payload is valid (startup accepts it), so
 /// it must not 400 against the startup-frozen provider registry.
 #[tokio::test]
 async fn put_configs_rule_set_policy_uses_candidate_providers() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -6095,6 +8273,7 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
 /// a changed rule must still swap the resolver generation.
 #[tokio::test]
 async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -6154,6 +8333,7 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
 /// in that feed operator's hands. Credentials never reach a response.
 #[tokio::test]
 async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecting() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let directory = tempfile::tempdir_in(
@@ -6287,6 +8467,7 @@ async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution()
 /// nothing) while the matchers referenced a detached generation (#543).
 #[tokio::test]
 async fn put_configs_publishes_rule_provider_registry_changes() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -6417,6 +8598,7 @@ async fn put_configs_publishes_rule_provider_registry_changes() {
 /// fetch hits the wire.
 #[tokio::test]
 async fn put_configs_fetches_rule_provider_payload_once() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -6503,6 +8685,15 @@ async fn put_configs_fetches_rule_provider_payload_once() {
 /// so post-state alone can't distinguish a no-op from a working
 /// restart under a privileged listener-tun build).
 fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
+    let (handle, flag) = fake_tun_handle_owned(meow_tunnel::TunOwner::TopLevel);
+    (handle, flag)
+}
+
+/// [`fake_tun_handle`] with an explicit [`TunOwner`] — named-owner
+/// variants pin the top-level reconcile off the slot (spec §3).
+fn fake_tun_handle_owned(
+    owner: meow_tunnel::TunOwner,
+) -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
     struct Flag(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Flag {
         fn drop(&mut self) {
@@ -6518,6 +8709,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
                 std::future::pending::<()>().await;
             }
         }),
+        owner,
         core_done: None,
         udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -6539,6 +8731,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_param_change_reconciles_running_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -6601,6 +8794,7 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
 /// treats as unchanged.
 #[tokio::test]
 async fn put_configs_tun_unchanged_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -6656,6 +8850,7 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -6707,6 +8902,7 @@ async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
 /// listener before the spawn-side parse fails (issue #543 review).
 #[tokio::test]
 async fn put_configs_invalid_tun_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -6767,6 +8963,7 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
 /// handle proves the gate ran before the reconcile.
 #[tokio::test]
 async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -6832,6 +9029,7 @@ async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_sniffer_respelling_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -6919,6 +9117,7 @@ async fn put_configs_sniffer_respelling_does_not_reconcile() {
 /// worthy diff (review #887).
 #[tokio::test]
 async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -6979,6 +9178,7 @@ async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
 /// `load_config` would hard-error on boot (issue #564 review).
 #[tokio::test]
 async fn put_configs_invalid_listeners_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -7021,6 +9221,270 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
     );
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips` are hard admission errors even
+/// under `?force=true`: a malformed CIDR or a `listeners:`-nested key is
+/// a 400 that commits nothing, since persisting a broken access policy
+/// would leave the next boot's guarded listeners enforcing the wrong
+/// (or no) ACL. A valid PUT commits the raw fields for the next boot
+/// without hot-applying anything.
+#[tokio::test]
+async fn put_configs_lan_acl_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (yaml, force) in [
+        ("lan-allowed-ips: [10.0.0.1]\n", ""), // bare IP, not a CIDR
+        ("lan-allowed-ips: [10.0.0.1]\n", "?force=true"),
+        ("lan-disallowed-ips: bogus\n", "?force=true"),
+        (
+            concat!(
+                "lan-allowed-ips: [10.0.0.0/8]\n",
+                "listeners:\n",
+                "  - name: lan\n",
+                "    type: http\n",
+                "    port: 8081\n",
+                "    lan-disallowed-ips: [10.9.0.0/16]\n", // misplaced
+            ),
+            "?force=true",
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/configs{force}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{yaml} (force={force}) must be rejected"
+        );
+        assert!(
+            state.raw_config.read().lan_allowed_ips.is_none(),
+            "the rejected ACL must not have been committed"
+        );
+    }
+
+    // A valid ACL commits verbatim — for the next boot only; nothing
+    // about the running listeners changes.
+    let yaml = "lan-allowed-ips: [10.0.0.0/8, fd00::/8]\nlan-disallowed-ips: [10.9.0.0/16]\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..])
+        );
+        assert_eq!(
+            raw.lan_disallowed_ips.as_deref(),
+            Some(&["10.9.0.0/16".to_string()][..])
+        );
+    }
+
+    // PATCH is not an ACL surface (the ACL is a startup snapshot): the
+    // keys are simply not modeled by the patch schema, so this is a
+    // no-op that leaves the committed document alone.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"lan-allowed-ips": ["1.2.3.0/24"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..]),
+            "PATCH must not touch the committed ACL"
+        );
+    }
+}
+
+/// mihomo spells the named SOCKS inbound `type: socks` — a full PUT must
+/// admit it through the same `resolve_named_listeners` gate, store the
+/// spelling verbatim, and not rebind anything (listeners stay a startup
+/// snapshot). A malformed entry still 400s before commit.
+#[tokio::test]
+async fn put_configs_socks_listener_alias_admitted() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "listeners:\n",
+        "  - name: s\n",
+        "    type: socks\n",
+        "    listen: 127.0.0.1:17891\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        let listeners = raw.listeners.as_deref().unwrap_or(&[]);
+        assert_eq!(listeners.len(), 1, "the alias must commit verbatim");
+        assert_eq!(listeners[0].listener_type, "socks");
+    }
+    assert!(
+        state.listeners.is_empty(),
+        "admission must not rebind the running listeners"
+    );
+
+    // A malformed entry still 400s before commit.
+    let yaml = yaml.replace("type: socks", "type: socks4");
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown listener type")),
+        "the 400 must name the bad listener type, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().listeners.as_deref().unwrap_or(&[])[0].listener_type == "socks",
+        "the rejected PUT must not have overwritten the committed section"
+    );
+}
+
+/// Same admission contract for the geo schedule: an invalid effective
+/// interval (`geo-update-interval: 0`, or a nested `auto-update-interval`
+/// `0` with no valid nested override) must be rejected before commit —
+/// the running auto-update loop is a startup snapshot, so a committed
+/// `0` would only fail the NEXT boot's `build_config`. Even `?force=true`
+/// cannot push it through.
+#[tokio::test]
+async fn put_configs_geo_interval_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (yaml, force) in [
+        ("geo-update-interval: 0\n", ""),
+        ("geo-update-interval: 0\n", "?force=true"),
+        (
+            "geo-update-interval: 6\ngeodata:\n  auto-update-interval: 0\n",
+            "",
+        ),
+    ] {
+        let yaml = format!("mode: rule\n{yaml}rules:\n  - MATCH,DIRECT\n");
+        let payload = base64::engine::general_purpose::STANDARD.encode(&yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/configs{force}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{yaml} (force={force:?}) must be rejected"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("update-interval")),
+            "the 400 must name the interval key, got: {body}"
+        );
+    }
+
+    // A valid flat schedule validates and commits — stored for the next
+    // restart without replacing the running schedule (the auto-update
+    // loop is a startup snapshot, so nothing here observes a reschedule).
+    let yaml = concat!(
+        "mode: rule\n",
+        "geo-auto-update: true\n",
+        "geo-update-interval: 6\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let raw = state.raw_config.read();
+    assert_eq!(raw.geo_auto_update, Some(true));
+    assert_eq!(raw.geo_update_interval, Some(6));
+}
+
 /// Same admission contract for `tcp-keepalive*`: values `build_config`
 /// would hard-error on at boot (0 / >127 probes / over-ceiling seconds)
 /// must be rejected before commit — the rebuild never sees general
@@ -7028,6 +9492,7 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
 /// `load_config` refuses.
 #[tokio::test]
 async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -7078,6 +9543,7 @@ async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
 /// gate a PUT could persist a config the next `load_config` refuses.
 #[tokio::test]
 async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -7115,6 +9581,7 @@ async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
 /// tunnel (`set_tcp_idle_timeout`), where `0` disables it.
 #[tokio::test]
 async fn put_configs_tcp_idle_timeout_hot_applies() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -7155,6 +9622,7 @@ async fn put_configs_tcp_idle_timeout_hot_applies() {
 /// persisting the invalid value would 400 every later unrelated PATCH.
 #[tokio::test]
 async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     state
@@ -7243,6 +9711,7 @@ async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
 /// unconditionally, so it fails the lenient retry too).
 #[tokio::test]
 async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     state
@@ -7296,6 +9765,7 @@ async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
 /// `parse_tun_config` at spawn regardless of privileges.
 #[tokio::test]
 async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -7344,6 +9814,7 @@ async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_max_connections_change_reconciles_tun() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -7396,6 +9867,7 @@ async fn put_configs_max_connections_change_reconciles_tun() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_enable_on_attempts_spawn() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -7441,6 +9913,7 @@ async fn put_configs_tun_enable_on_attempts_spawn() {
 /// device.
 #[tokio::test]
 async fn put_configs_tun_enable_off_stops_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -7482,6 +9955,7 @@ async fn put_configs_tun_enable_off_stops_listener() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_param_change_without_handle_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -7530,6 +10004,7 @@ async fn put_configs_tun_param_change_without_handle_rolls_back() {
 /// handle stands in for a listener that must not be stopped.
 #[tokio::test]
 async fn put_configs_tun_disabled_param_change_no_restart() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: false\nmtu: 1500").unwrap());
@@ -7576,6 +10051,7 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_fake_ip_change_restarts_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -7629,6 +10105,29 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
         "stop_tun must have reaped the listener slot, not just the flag"
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
+
+    // Restore a dns-free config so the process-global host-resolver hook
+    // installed above does not leak into other tests in this binary.
+    let restore =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    let restore_resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": restore}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restore_resp.status(),
+        StatusCode::NO_CONTENT,
+        "restore PUT must succeed so the host-resolver hook is cleared"
+    );
 }
 
 /// `PATCH /configs` with `body`, as a GUI's TUN switch sends it.
@@ -7666,6 +10165,7 @@ async fn get_configs_json(state: &Arc<AppState>) -> serde_json::Value {
 /// Deterministic under both feature sets — `stop_tun` needs no device.
 #[tokio::test]
 async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -7713,6 +10213,7 @@ async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     assert_eq!(
         get_configs_json(&state).await["tun"],
@@ -7720,9 +10221,17 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
         "no tun: section still reports the switch"
     );
 
+    // The socket policy starts at the default (enabled) posture.
+    assert!(meow_common::outbound_tcp_keepalive().enabled);
     let resp = patch_configs(
         &state,
-        serde_json::json!({"mode": "direct", "tun": {"enable": true, "mtu": 1400}}),
+        serde_json::json!({
+            "mode": "direct",
+            "tun": {"enable": true, "mtu": 1400},
+            "tcp-concurrent": false,
+            "find-process-mode": "off",
+            "disable-keep-alive": true,
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -7738,6 +10247,37 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
     let tun = state.raw_config.read().tun.clone().unwrap();
     assert!(!tun.enable, "a failed start must roll `enable` back");
     assert_eq!(tun.mtu, Some(1400));
+    // Riding the same swap, the live globals it commits before the
+    // fallible reconcile must be restored too — not just `tun.enable`
+    // (issue #974 review).
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.tcp_concurrent, None,
+            "the riding tcp-concurrent must not commit"
+        );
+        assert_eq!(
+            raw.find_process_mode, None,
+            "the riding find-process-mode must not commit"
+        );
+    }
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict,
+        "the live find-process-mode must be restored"
+    );
+    // The riding `disable-keep-alive` must not reach the socket policy
+    // either — the keepalive resolves from `final_doc`, which is the
+    // pre-patch document on a failed TUN reconcile (issue #974 review).
+    assert!(
+        meow_common::outbound_tcp_keepalive().enabled,
+        "a failed TUN patch must leave the socket keepalive posture alone"
+    );
+    assert_eq!(
+        state.raw_config.read().disable_keep_alive,
+        None,
+        "the committed document must not carry the rolled-back key"
+    );
     let configs = get_configs_json(&state).await;
     assert_eq!(configs["tun"]["enable"], false);
     assert_eq!(
@@ -7753,6 +10293,7 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn patch_configs_tun_param_change_restarts_running_listener() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -7773,10 +10314,46 @@ async fn patch_configs_tun_param_change_restarts_running_listener() {
     assert_eq!(tun.mtu, Some(9000));
 }
 
+/// The `keep-alive-*` PATCH fields deserialize as raw `Value` so a number
+/// that is not an unsigned u64 reaches the semantic gate as a 400 — not a
+/// 422 JSON extraction failure (Codex review).
+#[tokio::test]
+async fn patch_configs_rejects_malformed_keepalive_values() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    for (key, value) in [
+        ("keep-alive-idle", serde_json::json!(-1)),
+        ("keep-alive-interval", serde_json::json!(-5)),
+        ("keep-alive-idle", serde_json::json!(1.5)),
+        ("keep-alive-interval", serde_json::json!("30")),
+        // serde_json stores a past-u64 integer as f64 — still not a u64.
+        ("keep-alive-idle", serde_json::json!(1e30)),
+        ("keep-alive-interval", serde_json::json!(true)),
+    ] {
+        let resp = patch_configs(&state, serde_json::json!({key: value})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{key}={value} must be a semantic 400, not a 422 extraction failure"
+        );
+    }
+    // A well-formed value still commits — and `null` stays "absent".
+    let resp = patch_configs(&state, serde_json::json!({"keep-alive-idle": 30})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(meow_common::outbound_tcp_keepalive().idle.as_secs(), 30);
+    let resp = patch_configs(&state, serde_json::json!({"keep-alive-idle": null})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(meow_common::outbound_tcp_keepalive().idle.as_secs(), 30);
+    // Ordered cleanup under the lane, as the other keepalive tests do.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+}
+
 /// Keys are merged over the committed section: a key the patch omits, or
 /// sends as `null`, keeps its value.
 #[tokio::test]
 async fn patch_configs_tun_merges_over_committed_section() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(
         serde_saphyr::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
@@ -7839,6 +10416,7 @@ async fn get_configs_tun_inet4_address_reports_the_string_form() {
 /// spelling the client sent while `GET /configs` still reports a string.
 #[tokio::test]
 async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: false").unwrap());
     let state = test_state(raw);
@@ -7875,6 +10453,7 @@ async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
 /// string, like a config file load would.
 #[tokio::test]
 async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -7912,6 +10491,7 @@ async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
 /// committed string (invalid CIDR or not) is echoed verbatim as a string.
 #[tokio::test]
 async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let put = |inet4: &str| {
         let yaml = format!(
@@ -7958,6 +10538,7 @@ async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
 /// not stored and not rejected.
 #[tokio::test]
 async fn patch_configs_tun_ignores_unknown_keys() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
 
     let resp = patch_configs(
@@ -7990,6 +10571,7 @@ async fn patch_configs_tun_ignores_unknown_keys() {
 /// both feature sets: no `enable` transition, no respawn.
 #[tokio::test]
 async fn patch_configs_tun_stack_commits_and_echoes() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -8041,6 +10623,7 @@ async fn patch_configs_tun_stack_commits_and_echoes() {
 /// alone.
 #[tokio::test]
 async fn patch_configs_without_tun_leaves_tun_untouched() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -8063,6 +10646,7 @@ async fn patch_configs_without_tun_leaves_tun_untouched() {
 /// committed section and the rest of the body stay as they were.
 #[tokio::test]
 async fn patch_configs_tun_rejects_invalid_section() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -8096,6 +10680,7 @@ async fn patch_configs_tun_rejects_invalid_section() {
 /// `apply_raw_to_tunnel` (issue #533 review).
 #[tokio::test]
 async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     let state = test_state(test_raw_config());
@@ -8165,6 +10750,7 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
 /// ever load synchronously during materialize (`is_file_vehicle`).
 #[tokio::test]
 async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     let state = test_state(test_raw_config());
@@ -8216,6 +10802,7 @@ async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
 /// every read filters on this test's subject.
 #[tokio::test]
 async fn logbook_lists_filters_and_clears_entries() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::logbook;
 
     let state = test_state_default();
@@ -8305,6 +10892,7 @@ async fn logbook_lists_filters_and_clears_entries() {
 /// it is installed, so every read narrows to this test's host.
 #[tokio::test]
 async fn traffic_ledger_groups_drills_and_clears() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::traffic_ledger;
 
     let state = test_state_default();
@@ -8522,6 +11110,11 @@ async fn state_with_providers(
         .iter()
         .map(|(name, yaml)| ((*name).to_string(), serde_saphyr::from_str(yaml).unwrap()))
         .collect();
+    let state = test_state_default();
+    // Share the tunnel's dns-outbound cell like production provider
+    // loading — `type: dns` leaves in these providers bind the same
+    // live-resolver slot the tunnel republishes (issue #974).
+    let dns_cell = state.tunnel.dns_outbound_cell();
     let loaded = meow_config::proxy_provider::load_proxy_providers_within(
         &raw,
         Some(dir),
@@ -8529,11 +11122,12 @@ async fn state_with_providers(
         false,
         &Default::default(),
         None,
+        None,
+        Some(&dns_cell),
         &mut meow_config::DroppedProviders::default(),
     )
     .await
     .unwrap();
-    let state = test_state_default();
     for (name, provider) in loaded {
         state.proxy_providers.insert(name, provider);
     }
@@ -8618,6 +11212,7 @@ async fn proxy_providers_report_subscription_userinfo() {
 /// clears it.
 #[tokio::test]
 async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches() {
+    let _globals_lane = process_globals_lane().await;
     let origin = UserinfoOrigin::spawn(OriginReply {
         status: 200,
         userinfo: Some("upload=1; download=2; total=1000"),
@@ -8762,6 +11357,7 @@ fn backing_dir(state: &Arc<AppState>) -> std::path::PathBuf {
 /// node is warn-skipped and the provider commits empty.
 #[tokio::test]
 async fn put_configs_strict_rejects_malformed_file_provider_payload() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -8816,6 +11412,7 @@ async fn put_configs_strict_rejects_malformed_file_provider_payload() {
 /// the node is warn-skipped and the provider registers empty.
 #[tokio::test]
 async fn put_configs_lenient_commits_malformed_file_provider() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -8836,6 +11433,7 @@ async fn put_configs_lenient_commits_malformed_file_provider() {
 /// so `use:` groups have members the moment the PUT returns.
 #[tokio::test]
 async fn put_configs_commits_valid_file_provider_payload() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -8864,6 +11462,7 @@ async fn put_configs_commits_valid_file_provider_payload() {
 /// empty and the detached acquisition retries it — no 400.
 #[tokio::test]
 async fn put_configs_strict_remote_payload_defect_commits_empty() {
+    let _globals_lane = process_globals_lane().await;
     let origin = UserinfoOrigin::spawn(OriginReply {
         status: 200,
         userinfo: None,
@@ -8919,6 +11518,7 @@ async fn rule_provider_refresh_failure_is_readable_and_preserves_last_good() {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         },
     )]);
     let state = test_state_default();
@@ -9212,6 +11812,7 @@ async fn configs_sniffing_uses_resolved_sniffer() {
 
 #[tokio::test]
 async fn response_rules_reload_order_provider_generation_and_rejection() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
@@ -9316,4 +11917,1097 @@ dns:
         put("rules: ['MATCH,DIRECT']\n").await.unwrap().status(),
         StatusCode::NO_CONTENT
     );
+}
+
+/// Issue #974 (TV-2): a `PUT /configs` rebuild re-emits unknown-key
+/// warnings — they are not one-shot startup noise. The rebuild runs inside
+/// the request handler on this test's runtime, so a scoped subscriber sees
+/// the warns.
+#[test]
+fn put_configs_warns_on_unknown_keys() {
+    use base64::Engine as _;
+
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let status = tracing::subscriber::with_default(subscriber, || {
+        let state = test_state_default();
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode("api-bogus-key: 1\nrules:\n  - MATCH,DIRECT\n");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let _globals_lane = process_globals_lane().await;
+                create_router(Arc::clone(&state))
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri("/configs")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({"payload": payload}).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            })
+    });
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("unknown keys in top-level config: api-bogus-key"),
+        "PUT rebuild must re-emit the unknown-key warn: {logs}"
+    );
+}
+
+// ─── Named `type: tun` listeners (spec §3) ─────────────────────────────
+
+/// PUT a base64 YAML payload into `/configs`; `query` carries `?force`
+/// & friends.
+async fn put_configs_payload(
+    state: &Arc<AppState>,
+    yaml: &str,
+    query: &str,
+) -> axum::response::Response {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/configs{query}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Store a stand-in *named* `type: tun` device in the slot — the owner
+/// the startup path publishes (`spec §3`); the pending task is what
+/// owner-aware paths must not reap.
+async fn install_named_tun(
+    state: &Arc<AppState>,
+    name: &str,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    let (handle, stopped) = fake_tun_handle_owned(meow_tunnel::TunOwner::Named(name.to_string()));
+    state.tunnel.set_tun_handle(handle).await;
+    stopped
+}
+
+/// A `tun.enable` candidate must never pass admission while a named
+/// `type: tun` device holds the slot — and the named device stays up.
+#[tokio::test]
+async fn put_configs_tun_enable_while_named_tun_owns_slot_rejected() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // The request even *removes* the listeners section — the slot stays
+    // owned until a restart, so the enable still rejects.
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("edge-tun"),
+            "the error must name the owning listener, query {query}"
+        );
+    }
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert!(state.tunnel.has_tun());
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// Same contract when the enable arrives inside a doc that *declares* a
+/// named TUN: refused before binding/mutation/persist, `force` included
+/// (the listeners-gate bail alone would be force-degradable).
+#[tokio::test]
+async fn put_configs_tun_enable_with_named_tun_entry_rejected() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("tun.enable"),
+            "the error must explain the one-effective-TUN rule, query {query}"
+        );
+    }
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// PATCHing `tun.enable` on is refused while a named device owns the
+/// slot or the committed document still stages a named entry — a PATCH
+/// cannot drop `listeners:`.
+#[tokio::test]
+async fn patch_configs_tun_enable_while_named_tun_rejected() {
+    let _globals_lane = process_globals_lane().await;
+    // (a) slot owned by a live named device
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!stopped.load(Ordering::SeqCst));
+
+    // (b) no live device, but the committed document stages a named TUN
+    let mut raw = test_raw_config();
+    raw.listeners = Some(vec![
+        serde_saphyr::from_str("name: n-tun\ntype: tun").unwrap()
+    ]);
+    let state = test_state(raw);
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// The allowed shape: a PUT that disables the running top-level TUN and
+/// stages a named `type: tun` entry — the former may stop, the named
+/// device starts only at next boot.
+#[tokio::test]
+async fn put_configs_tun_disable_plus_named_tun_staged_ok() {
+    let _globals_lane = process_globals_lane().await;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let resp = put_configs_payload(
+        &state,
+        "tun:\n  enable: false\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the running top-level device may stop"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "the staged named TUN must not start — next boot only"
+    );
+    let committed = state.raw_config.read().clone();
+    assert!(
+        committed
+            .listeners
+            .as_deref()
+            .unwrap()
+            .iter()
+            .any(|l| l.listener_type == "tun"),
+        "the named entry persists for next boot"
+    );
+}
+
+/// `GET /configs` `tun-enable` reports the top-level section's device
+/// only — a live named device does not read as `tun.enable`.
+#[tokio::test]
+async fn get_configs_tun_enable_ignores_named_tun() {
+    let state = test_state(test_raw_config());
+    install_named_tun(&state, "edge-tun").await;
+    let json = get_configs_json(&state).await;
+    assert_eq!(json["tun-enable"], serde_json::json!(false));
+    assert_eq!(json["tun"]["enable"], serde_json::json!(false));
+}
+
+/// A resolver rebuild that would move the fake-IP pool while a named
+/// `type: tun` device runs is refused wholesale; an unrelated resolver
+/// change keeps the device alive.
+#[tokio::test]
+async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
+    let _globals_lane = process_globals_lane().await;
+    let mut raw = test_raw_config();
+    raw.dns = Some(
+        serde_saphyr::from_str(
+            "enable: true\nenhanced-mode: fake-ip\nfake-ip-range: 198.18.0.0/16\nnameserver: [1.1.1.1]",
+        )
+        .unwrap(),
+    );
+    let state = test_state(raw);
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // Give the tunnel a resolver generation carrying the committed
+    // fake-IP pool (the startup would have built it the same way).
+    {
+        let committed = state.raw_config.read().clone();
+        let dns = meow_config::parse_dns_from_raw(
+            &committed,
+            None,
+            &Default::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dns builds");
+        state
+            .tunnel
+            .set_resolver(Arc::clone(&dns.resolver), dns.enabled);
+    }
+    let pool_before = state.tunnel.resolver().fake_ip_v4_net();
+    assert!(pool_before.is_some(), "the pin needs a live pool");
+
+    // Moving `fake-ip-range` → refused, device untouched.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 28.0.0.0/8\n  nameserver: [1.1.1.1]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert_eq!(
+        state.tunnel.resolver().fake_ip_v4_net(),
+        pool_before,
+        "the rejected pool must never publish"
+    );
+
+    // An unrelated resolver change (nameserver swap, same pool) → the
+    // device is not pinned against it.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/16\n  nameserver: [9.9.9.9]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.tunnel.resolver().fake_ip_v4_net(), pool_before);
+    assert!(!stopped.load(Ordering::SeqCst));
+}
+
+/// `GET /listeners` reports a `type: tun` entry's name and type without
+/// port/listen — it owns no socket.
+#[tokio::test]
+async fn get_listeners_named_tun_reports_no_socket() {
+    use meow_config::{ListenerSpec, NamedListener};
+    let mut state = test_state(test_raw_config());
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .listeners
+        .push(NamedListener {
+            name: "edge-tun".into(),
+            spec: ListenerSpec::Tun(meow_config::TunConfig::default()),
+            port: 0,
+            listen: String::new(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        });
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_json(resp).await;
+    assert_eq!(items[0]["name"], serde_json::json!("edge-tun"));
+    assert_eq!(items[0]["type"], serde_json::json!("tun"));
+    assert!(
+        items[0].get("port").is_none() && items[0].get("listen").is_none(),
+        "a TUN owns no socket endpoint: {items}"
+    );
+}
+
+/// A PUT that drops a still-running listener's forced proxy must be
+/// refused even though the candidate also removes the listener — the
+/// running inbound keeps its `proxy:` reference across the route swap
+/// and would strand on the missing name. `?force` cannot push past it.
+#[tokio::test]
+async fn put_configs_refuses_dropping_running_listener_dependency() {
+    use base64::Engine as _;
+    use meow_config::{ListenerSpec, NamedListener};
+
+    let raw: RawConfig = meow_config::parse_raw_yaml(concat!(
+        "listeners:\n",
+        "  - name: edge\n",
+        "    type: mixed\n",
+        "    port: 0\n",
+        "    proxy: sel\n",
+        "proxy-groups:\n",
+        "  - name: sel\n",
+        "    type: select\n",
+        "    proxies: [DIRECT]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    ))
+    .unwrap();
+    let mut state = test_state(raw);
+    Arc::get_mut(&mut state).unwrap().listeners = vec![NamedListener {
+        name: "edge".into(),
+        spec: ListenerSpec::Mixed,
+        port: 0,
+        listen: "127.0.0.1".into(),
+        max_connections: 256,
+        route_override: meow_common::InboundRouteOverride::new(Some("sel"), None),
+        routing_mark: None,
+    }];
+
+    // The candidate removes the listener AND its forced group — the
+    // running inbound still holds `proxy: sel`.
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    for uri in ["/configs", "/configs?force=true"] {
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{uri} must refuse to strand the running listener's forced proxy"
+        );
+    }
+    // Nothing committed: the group and the listener stay in the document.
+    let committed = state.raw_config.read();
+    assert!(
+        committed
+            .proxy_groups
+            .as_deref()
+            .is_some_and(|g| g.iter().any(|g| g.name == "sel")),
+        "the refused PUT must not persist"
+    );
+    drop(committed);
+    assert!(state.tunnel.route_snapshot().proxies.contains_key("sel"));
+}
+
+/// A `listeners[].proxy` naming nothing the document declares — or a
+/// `proxy-providers:` key — is a document-shape defect: provider members
+/// are not registry keys, so the name can never resolve. `?force` cannot
+/// persist it the way it persists a declared name that merely failed to
+/// build (environment degradation).
+#[tokio::test]
+async fn put_configs_refuses_undeclared_listener_proxy_under_force() {
+    use base64::Engine as _;
+
+    for (decl, needle) in [("ghost", "no declared proxy"), ("feed", "proxy-provider")] {
+        let raw: RawConfig = meow_config::parse_raw_yaml("rules:\n  - MATCH,DIRECT\n").unwrap();
+        let state = test_state(raw);
+        let yaml = format!(
+            "proxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: edge\n    type: mixed\n    port: 0\n    proxy: {decl}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        for uri in ["/configs", "/configs?force=true"] {
+            let resp = create_router(Arc::clone(&state))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"payload": payload}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} with proxy: {decl} must be refused"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["message"].as_str().is_some_and(|m| m.contains(needle)),
+                "{uri} with proxy: {decl} must explain the refusal: {body}"
+            );
+        }
+        assert!(
+            state.raw_config.read().listeners.is_none(),
+            "the refused PUT must not persist ({decl})"
+        );
+    }
+}
+
+// ─── `type: rematch` / `REMATCH-NAME` API surface (issue #974) ─────────
+
+fn rematch_state() -> Arc<AppState> {
+    let raw: RawConfig = meow_config::parse_raw_yaml(
+        "proxies:\n\
+         \x20 - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: blk}\n\
+         rules:\n\
+         \x20 - DOMAIN-SUFFIX,example.test,inspect\n\
+         \x20 - REMATCH-NAME,stage1/alternative,REJECT\n\
+         \x20 - MATCH,DIRECT\n",
+    )
+    .unwrap();
+    test_state(raw)
+}
+
+/// `/proxies` reports the control leaf like any node — `type: Rematch`,
+/// `udp: true` (the capability gate never preempts a transition), the
+/// ordinary alive/history fields — and never the action fields, which
+/// are routing directives, not transport facts.
+#[tokio::test]
+async fn rematch_node_shows_on_proxies() {
+    let state = rematch_state();
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let node = &json["proxies"]["inspect"];
+    assert_eq!(node["type"], "Rematch");
+    assert_eq!(node["udp"], true, "capability display matches mihomo");
+    assert_eq!(node["name"], "inspect");
+    assert!(
+        node.get("target-rematch-name").is_none() && node.get("target-sub-rule").is_none(),
+        "action fields are not transport fields: {node}"
+    );
+    // No built-in `REMATCH` node appeared — rematch is a node type, not
+    // a reserved registry name.
+    assert!(json["proxies"].get("REMATCH").is_none());
+
+    let (status, one) = get_json(&state, "/proxies/inspect").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["type"], "Rematch");
+}
+
+/// `/rules` reports the API spelling `RematchName` with the raw payload
+/// preserved.
+#[tokio::test]
+async fn rematch_name_rule_shows_on_rules() {
+    let state = rematch_state();
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    let rules = json["rules"].as_array().unwrap();
+    let rematch = rules
+        .iter()
+        .find(|r| r["type"] == "RematchName")
+        .expect("the REMATCH-NAME rule must be listed");
+    assert_eq!(rematch["payload"], "stage1/alternative");
+    assert_eq!(rematch["proxy"], "REJECT");
+}
+
+/// A delay probe of the control leaf fails through ordinary transport
+/// failure — no socket opens, no rule scan runs, no routing side
+/// effects. mihomo reports it as a generic delay-test error (503).
+#[tokio::test]
+async fn rematch_leaf_delay_fails_as_transport_error() {
+    let state = rematch_state();
+    let (status, _) = get_json(
+        &state,
+        "/proxies/inspect/delay?url=http://cp.cloudflare.com&timeout=2000",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the leaf's control-outbound dial error maps to mihomo's delay-test 503"
+    );
+}
+
+/// A structurally unsafe rematch document must never commit verbatim:
+/// under `?force`, an environmentally unbuildable candidate retains the
+/// old live routing — but only after the verbatim store is gated. Both
+/// shapes below (malformed node, malformed predicate) are *shape*, so
+/// the fallback refuses them and the committed document does not move
+/// (issue #974).
+#[tokio::test]
+async fn put_configs_force_gates_malformed_rematch() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A rematch node with neither target field.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A `dialer-proxy` on a rematch node — same class of shape defect.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x, dialer-proxy: front}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The reverse edge fails the same gate: a transport node chaining
+    // through a rematch leaf is the build's hard `dialer-proxy` error —
+    // a rematch cannot carry a transport hop (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: front, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: front}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A malformed REMATCH-NAME predicate (empty alternative) — no
+    // `sub-rules:` section needed for the gate to see it.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             rules:\n  - REMATCH-NAME,a//b,REJECT\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A relay's static `proxies:` member naming a rematch leaf — the
+    // build's relay-membership hard error: a rematch can never carry a
+    // transport hop (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, inspect]}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The `include-all-proxies` expansion is a static membership too —
+    // it would absorb the declared leaf.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, include-all-proxies: true}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The same predicate nested inside a `sub-rules:` block — the gate
+    // reaches predicate leaves through the block map too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             rules:\n  - SUB-RULE,(DOMAIN-SUFFIX,x.test),blk\n  - MATCH,DIRECT\n\
+             sub-rules:\n  blk:\n    - REMATCH-NAME,,REJECT\n    - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        state.raw_config.read().rules.as_deref()
+            == Some(&[
+                "DOMAIN,example.com,DIRECT".to_string(),
+                "MATCH,REJECT".to_string()
+            ]),
+        "the rejected documents must not replace the committed rules"
+    );
+
+    // Structurally sound rematch content still commits verbatim.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+             rules:\n  - REMATCH-NAME,stage1,REJECT\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "sound rematch shape commits even when the live build cannot"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|p| p
+                .iter()
+                .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("rematch"))),
+            "the committed document keeps the rematch node"
+        );
+    }
+
+    // …but the live route table is untouched — the verbatim commit
+    // must not report the rematch graph as installed.
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["proxies"].get("inspect").is_none(),
+        "live routing still runs the retained generation: {json}"
+    );
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["type"] != "RematchName"),
+        "live rules are still the retained generation's: {json}"
+    );
+
+    // A *group* member is a dynamic pick — not gated: the build leaves
+    // its rematch selection to the probe, so the verbatim gate does too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, sel]}}\n\
+             \x20 - {{name: sel, type: select, proxies: [inspect]}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a group member's dynamic rematch pick is not a static-membership defect"
+    );
+
+    // The gate judges the edges that will actually bind, like the
+    // build: a shadowed duplicate's raw `dialer-proxy` never becomes an
+    // edge — the last declaration wins — so the candidate commits
+    // rather than tripping the rematch-edge check (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: inspect}}\n\
+             \x20 - {{name: node, type: direct}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed duplicate's dialer-proxy is no edge the build binds"
+    );
+
+    // Same for a leaf shadowing a built-in: the build drops the entry,
+    // so its `dialer-proxy` never becomes an edge either.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: DIRECT, type: direct, dialer-proxy: inspect}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a built-in-shadowed node's dialer-proxy is no edge the build binds"
+    );
+
+    // The name side is last-wins too: a rematch declaration shadowed by
+    // a same-named transport never becomes the leaf a member binds —
+    // the build's map holds `x` as direct, so the candidate commits
+    // rather than tripping the relay-membership check (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, x]}}\n\
+             proxies:\n\
+             \x20 - {{name: x, type: rematch, target-rematch-name: s}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed rematch declaration is not the leaf the relay member binds"
+    );
+
+    // Same shadow on the dialer edge: `dialer-proxy: x` binds the
+    // shadowing transport, not the dropped rematch declaration.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: x, type: rematch, target-rematch-name: s}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed rematch declaration is not the edge's target either"
+    );
+
+    // And a built-in shadow: `name: DIRECT` never binds — the built-in
+    // stays, so relay member DIRECT is legal whatever the entry's type.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, REJECT]}}\n\
+             proxies:\n  - {{name: DIRECT, type: rematch, target-rematch-name: s}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a built-in-shadowed rematch declaration binds no member either"
+    );
+}
+
+/// The same verbatim-commit obligation for `type: dns` (issue #974
+/// review): the force path never ran the build's structural gate, so
+/// shape defects the next boot would hard-fail — a nameless dns node, a
+/// transport chaining a dialer hop through a dns leaf, a relay member
+/// or `include-all-proxies` naming one — are refused rather than
+/// committed. The name set is the CONSERVATIVE `declared_dns_names`
+/// view: any raw dns declaration marks the name, since a later shadow
+/// may warn-drop and leave the dns binding standing.
+#[tokio::test]
+async fn put_configs_force_gates_malformed_dns_nodes() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A dns node without a `name` is the one structural defect the type
+    // has — everything else it tolerates by contract.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The reverse edge is the build's hard error: a transport node
+    // chaining through a dns leaf — the leaf answers in-process, it
+    // never dials a hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: dns-out, type: dns}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: dns-out}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The conservative half of the name set: the same edge is still
+    // refused when a LATER same-named transport shadows the dns decl —
+    // lenient parse can warn-drop the shadow and leave the dns binding
+    // effective, so the verbatim lane cannot trust last-wins.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: x, type: dns}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A relay's static `proxies:` member naming a dns leaf — the leaf
+    // can never carry a transport hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, dns-out]}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // `include-all-proxies` would absorb the declared leaf — a static
+    // membership too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, include-all-proxies: true}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A built-in shadow never binds the leaf: `name: DIRECT` typed dns
+    // stays the built-in, so relay member DIRECT is legal.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, REJECT]}}\n\
+             proxies:\n  - {{name: DIRECT, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Sound dns content still commits verbatim — including the leaf's
+    // own `dialer-proxy`, which binds no edge and is ignored by contract
+    // (the committed document keeps the node).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: dns-out, type: dns, dialer-proxy: front}}\n\
+             rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a well-formed dns node commits even when the live build cannot"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|p| p
+                .iter()
+                .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("dns"))),
+            "the committed document keeps the dns node"
+        );
+    }
+}
+
+/// A plain `PUT /configs` (no `force`) rebuilds rematch content live:
+/// the node is dialed by the route engine and the rule is listed in
+/// the new generation.
+#[tokio::test]
+async fn put_configs_reloads_rematch_live() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let resp = put_configs_payload(
+        &state,
+        "mode: rule\n\
+         proxies:\n  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: blk}\n\
+         rules:\n  - DOMAIN-SUFFIX,example.test,inspect\n  - REMATCH-NAME,stage1,REJECT\n  - MATCH,DIRECT\n\
+         sub-rules:\n  blk:\n    - REMATCH-NAME,stage1,REJECT\n    - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, json) = get_json(&state, "/proxies/inspect").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["type"], "Rematch");
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["type"] == "RematchName" && r["payload"] == "stage1"),
+        "the rebuilt generation installs the predicate: {json}"
+    );
+}
+
+/// Issue #974 review: a `type: dns` leaf surfaces on `/proxies/{name}`
+/// like any route-table entry — `type: "Dns"`, `udp: true` (the leaf
+/// serves framed UDP exchanges in-process), and no endpoint address:
+/// `addr()` is `""` and the JSON shape carries no server field a client
+/// could misread as dialable.
+#[tokio::test]
+async fn get_proxy_reports_dns_leaf_shape() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let resp = put_configs_payload(
+        &state,
+        "mode: rule\n\
+         proxies:\n  - {name: dns-out, type: dns}\n\
+         rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, json) = get_json(&state, "/proxies/dns-out").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "dns-out");
+    assert_eq!(json["type"], "Dns");
+    assert_eq!(json["udp"], true);
+    assert!(
+        json.get("server").is_none() && json.get("address").is_none(),
+        "a dns leaf advertises no endpoint: {json}"
+    );
+}
+
+/// A group delay round probes a rematch member like any other — it is
+/// scheduled, fails through the ordinary transport-error path, is left
+/// out of the result map, and records the failed probe. mihomo has no
+/// rematch-type exclusion in its health check; the leaf's own control
+/// error is what stops the dial — no socket, rule scan, or DNS lookup
+/// runs for it.
+#[tokio::test]
+async fn rematch_member_group_delay_reports_failed_probe() {
+    let ok = TestAdapter::new("ok", DialBehavior::InstantOk).into_proxy();
+    let rematch: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+        meow_proxy::RematchAdapter::new("inspect", Some("stage1"), None),
+    )));
+    let group = fallback_group("G", vec![Arc::clone(&rematch), Arc::clone(&ok)]);
+    let state = state_with_proxies(vec![
+        ("inspect", Arc::clone(&rematch)),
+        ("ok", Arc::clone(&ok)),
+        ("G", group),
+    ]);
+    let app = create_router(state);
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=1000", url_q())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    assert_eq!(
+        body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["ok"],
+        "the rematch member's probe fails and is left out: {body}"
+    );
+    let history = rematch.delay_history();
+    assert_eq!(history.len(), 1, "the failed probe is still recorded");
+    assert_eq!(history[0].delay, 0, "recorded as down");
 }

@@ -20,7 +20,7 @@ Release profile: `lto = fat, strip = true, codegen-units = 1, panic = abort, opt
 Feature set measured:
 - **default**: `cargo build --release` (`full` bundle: ss, trojan, vless, dns-server, all listeners)
 - **minimal**: `--no-default-features --features minimal`
-  (`ss + trojan + dns-server + listener-mixed`)
+  (`ss + ss-obfs + trojan + dns-server + listener-mixed`)
 
 ## Size budgets (ADR-0007 §2)
 
@@ -304,3 +304,125 @@ before→after package-set diff): **removed** `sysinfo v0.32.1`,
 `sysinfo v0.32.1` (now `system` component only). `Cargo.lock` is
 byte-identical — `rayon` remains locked via `criterion` (dev-dep) and
 `meow-dns`'s sysinfo dev-dep, and the lock records no target-cfg edges.
+
+## `ss-obfs`/`ss-v2ray-plugin` leave `minimal` — cap restored (2026-11-21)
+
+Measured 2026-11-21 on macOS/Apple Silicon with cargo-zigbuild + zig, the
+`--no-default-features --features minimal` aarch64-musl leg, `stat`
+bytes of the stripped binary (`lto = fat, strip = true, codegen-units = 1,
+panic = abort, opt-level = "z"`):
+
+| Build | Size | vs 8 MiB cap (8,388,608 B) |
+|-------|------|---------------------------|
+| before (`c3045b43`, `ss` still bundling both plugins) | 8,399,176 B (~8.01 MiB) | **+10,568 B over — hard gate fails** |
+| after (plugins behind `ss-obfs`/`ss-v2ray-plugin`) | 8,290,952 B (~7.91 MiB) | **−97,656 B headroom** |
+
+Delta: **−108,224 B (~−105.7 KiB)**. The two named modules contribute
+~18.7 KB of `meow_proxy` symbols (`simple_obfs` 13,356 B + `v2ray_plugin`
+5,340 B); the rest is dead-stripped machinery that only their dial paths
+instantiated — `meow_transport::simple_obfs::{client,server}` codecs, the
+`first_flight` HTTP-obfs redial shim, `plugin_util` opts helpers, and the
+WS/TLS monomorphizations LTO can now drop. `plugin:`/`plugin-opts:`
+parsing, the external SIP003 subprocess path (`PluginKind::External` +
+`"failed to start ss plugin"`), and the feature-named "not compiled into
+this build" error strings remain in the stripped binary (verified via
+`strings`). `Cargo.lock` is unchanged — `meow-transport/simple-obfs`
+stays in the graph for `snell` and `listener-shadowsocks`, which carry
+their own feature edges.
+
+Feature semantics unchanged for `default`/`full`: both features are
+re-bundled, so release binaries keep `plugin: obfs`/`simple-obfs`/
+`v2ray-plugin` working; `minimal` answers those nodes with the dead
+placeholder + feature-named dial error. `obfs-local` follows `ss-obfs`:
+compiled in it keeps spawning the SIP003 binary; compiled out it reports
+"rebuild with `--features ss-obfs`" before `Plugin::start` can run.
+
+## C-dep unwind-table suppression + zstd `default-features = false` (2026-11-21)
+
+Measured 2026-11-21 on macOS/Apple Silicon with cargo-zigbuild + zig
+0.17.1, `--no-default-features --features minimal`, same release
+profile, A/B against a same-tree baseline build (`exp-u0`/`exp-x0`).
+Baseline stripped sizes: aarch64-musl **8,290,952 B**, x86_64-musl
+**10,054,968 B**.
+
+Two changes landed:
+
+1. `zstd = { version = "0.14", default-features = false }` in the
+   workspace Cargo.toml — drops `legacy` (v0.1–v0.7 frame decoders that
+   `ZSTD_decompress` dispatches into, keeping them LTO-live), `arrays`
+   and `zdict_builder`. meow uses only `zstd::encode_all` and
+   `zstd::stream::Decoder` on current-version frames; `cargo fetch`
+   leaves `Cargo.lock` byte-identical.
+2. `.cargo/config.toml` `[env]` — target-qualified
+   `CFLAGS_<triple>` = `-fno-unwind-tables -fno-asynchronous-unwind-tables`,
+   `CXXFLAGS_<triple>` = same + ` -fno-exceptions`, for the two musl
+   triples. Both C frontends consume them: the cc crate reads the vars
+   directly, cmake-rs merges them into its `-DCMAKE_C_FLAGS`/`-DCMAKE_CXX_FLAGS`
+   configure args (verified in boring-sys's generated `flags.make` —
+   our flags sit *inside* the same `-D` value after `--target=…`, so the
+   cross-compile flags are preserved; an appended standalone `-D` would
+   have overridden them). `[env]` does not override an operator-set
+   variable, and the scoping is by compiled-for triple, not by
+   host/target role: the qualified names reach *every* musl
+   compilation — a native musl→musl build eats the same flags, its
+   build-script outputs included — while compilations for any other
+   triple (gnu/darwin target objects and host-side build-script tool
+   compilations, which resolve `CFLAGS_<host-triple>`) never read them.
+
+   Packager opt-out: exporting the same `CFLAGS_<triple>`/
+   `CXXFLAGS_<triple>` names — to the desired flags, or empty to
+   suppress them — replaces the repo defaults, because `[env]` never
+   clobbers a variable already set. A generic `CFLAGS`/`CXXFLAGS`
+   cannot remove them: cc accumulates flag vars in the order bare →
+   `HOST_`/`TARGET_`-prefixed → underscore-qualified →
+   hyphenated-qualified so the qualified value lands last, and cmake-rs
+   merges `cc::Build::get_compiler()`'s arg list — the same accumulated
+   flags — into `CMAKE_*_FLAGS`. Rebuild in a fresh
+   `CARGO_TARGET_DIR`: the boring-sys and blake3 warm object caches do
+   not sense flag changes.
+
+Per-dep consumption evidence (exp-u1, `zig ar` member scans):
+`libzstd.a` 36 members, `libblake3_neon.a`, `libmimalloc` object,
+`libssl.a` 38 members and `libcrypto.a` 76 members — all with **zero**
+`.eh_frame`; ring/boringssl hand-written `.S` objects keep 192+72 B of
+assembler CFI each (cosmetic, unavoidable).
+
+| Build | Target | Stripped | Δ vs baseline | .eh_frame | .eh_frame_hdr | .gcc_except_table |
+|-------|--------|----------|---------------|-----------|---------------|-------------------|
+| baseline | aarch64-musl | 8,290,952 B | — | 1,010,868 | 300,948 | 21,392 |
+| env flags | aarch64-musl | 8,127,680 B | **−163,272 B** | 893,304 | 275,724 | 8,964 |
+| baseline | x86_64-musl | 10,054,968 B | — | 1,093,724 | 167,716 | 19,972 |
+| env flags | x86_64-musl | 9,884,656 B | **−170,312 B** | 967,140 | 141,988 | 8,476 |
+| landed (flags + zstd) | aarch64-musl | **8,002,048 B** | **−288,904 B** | 893,280 | 275,716 | 8,964 |
+
+The zstd delta inside the landed build is −125,632 B (its earlier
+isolated A/B measured −130,752 B); both trims compose cleanly — the
+aarch64 minimal binary now sits **386,560 B under the 8 MiB hard cap**.
+
+Residual attribution (a deliberate non-result, recorded so nobody
+re-chases it): ~1.1 MiB of unwind data remains, all *outside* C-dep
+control — prebuilt std-family rlib objects ship `.eh_frame` (a libcore
+member object alone carries 21,784 B; locally compiled workspace rlibs
+emit none, so `RUSTFLAGS=-Cforce-unwind-tables=no` was verified a
+no-op), and zig compiles its bundled musl with unwind tables (174/400
+sampled cache objects carry it). Reaching those needs `-Zbuild-std` on
+nightly or upstream zig flags. Post-link `llvm-objcopy --remove-section`
+of all three sections shrank the file only 232 B — the payload bytes
+live inside `PT_LOAD` segments and cannot be reclaimed without
+relinking.
+
+## `ss-obfs` restored to `minimal` (2026-11-22)
+
+Measured 2026-11-22 on macOS/Apple Silicon with cargo-zigbuild + zig
+0.17.1, `--no-default-features --features minimal`, same release
+profile — the aarch64-musl leg the ADR-0007 hard gate runs:
+
+| Build | Size | vs 8 MiB cap (8,388,608 B) |
+|-------|------|---------------------------|
+| previous head (`minimal` without plugins, 2026-11-21 landed state) | 8,002,048 B (~7.63 MiB) | −386,560 B headroom |
+| this branch (`minimal` + `ss-obfs`) | **8,213,192 B (~7.83 MiB)** | **−175,416 B headroom** |
+
+`plugin: obfs`/`simple-obfs`/`obfs-local` nodes validate again under
+`minimal`; `plugin: v2ray-plugin` still answers with the
+`--features ss-v2ray-plugin` dead-placeholder contract. `default`/`full`
+feature sets unchanged.

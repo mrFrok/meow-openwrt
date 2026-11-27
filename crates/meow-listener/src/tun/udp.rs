@@ -232,6 +232,7 @@ pub(super) async fn run_udp(
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    route_override: Option<meow_common::InboundRouteOverride>,
 ) {
     // One owner for the loop's cancellable async work: flows, DNS queries
     // and the lwIP reply pump. Blocking nftset hooks are handled separately.
@@ -478,6 +479,7 @@ pub(super) async fn run_udp(
                 in_name: in_name.clone(),
                 last_activity,
                 sniffer: sniffer.clone(),
+                route_override: route_override.clone(),
             },
         ));
         let task_id = task.id();
@@ -511,6 +513,9 @@ struct FlowSpec {
     /// The configured sniffer; its QUIC ports name a flow from the
     /// client's Initials before it is routed.
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    /// A named `type: tun` entry's `proxy`/`rule` override — stamped on
+    /// the metadata before routing (upstream's `Additions` shape).
+    route_override: Option<meow_common::InboundRouteOverride>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
@@ -595,6 +600,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name,
         last_activity,
         sniffer,
+        route_override,
     } = spec;
     // Capture the generation before any await, including sniffing and DNS.
     // A refresh must cancel establishment, not just a connected relay.
@@ -609,6 +615,11 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name: in_name.into(),
         ..Default::default()
     };
+    // A named entry's `proxy`/`rule` override stamps before sniffing and
+    // routing, as on every socket listener (upstream's `Additions`).
+    if let Some(ov) = &route_override {
+        ov.apply(&mut metadata);
+    }
 
     // QUIC sniff: hold the first datagrams until their Initials yield the
     // server name, at most `sniffer.timeout` and a few packets; they are
@@ -668,6 +679,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
+    let mut probe_target = None;
     tokio::select! {
         biased;
         () = flush.flushed() => {
@@ -678,26 +690,26 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         }
         () = async {
             inner.pre_resolve(&mut metadata).await;
-            inner.resolve_udp_dst(&mut metadata).await;
+            probe_target = inner.resolve_udp_dst(&mut metadata).await;
         } => {}
     }
-    let Some(dst_ip) = metadata.dst_ip else {
-        drop_held(&held);
-        return Err(format!(
-            "dst_ip not resolved for {}",
-            metadata.remote_address()
-        ));
-    };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
-
     // Non-hijacked client traffic follows the same policy on every port.
+    // A `resolve_udp_dst` probe already produced the committed decision —
+    // use it so the direct-nameserver verdict and the route agree
+    // (issue #974).
+    let resolve = async {
+        match probe_target {
+            Some(target) => Some(target),
+            None => inner.resolve_proxy_flow(&mut metadata).await,
+        }
+    };
     let target = tokio::select! {
         biased;
         () = flush.flushed() => {
             drop_held(&held);
             return Ok(());
         }
-        target = inner.resolve_proxy(&metadata) => target,
+        target = resolve => target,
     };
     let Some(ResolvedTarget {
         adapter: proxy,
@@ -711,6 +723,24 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             "no matching rule for {}",
             metadata.remote_address()
         ));
+    };
+    // A `type: dns` leaf never contacts the destination — its conn only
+    // echoes this addr back as the reply source, so mandatory
+    // pre-resolution must not gate it (a fake-IP dst rewritten to an
+    // unresolvable host would die before routing) and the flow's ORIGINAL
+    // dst is what gets stamped (issue #974 review). Transports keep
+    // requiring `dst_ip` — they actually dial it.
+    let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+        metadata.dns_udp_dst(Some(dst))
+    } else {
+        let Some(dst_ip) = metadata.dst_ip else {
+            drop_held(&held);
+            return Err(format!(
+                "dst_ip not resolved for {}",
+                metadata.remote_address()
+            ));
+        };
+        SocketAddr::new(dst_ip, metadata.dst_port)
     };
     info!(
         "UDP {} --> {} match {} using {}",
@@ -1030,6 +1060,7 @@ mod tests {
                 net(),
                 Arc::clone(&gauge),
                 None,
+                None,
             ));
             (tx, task)
         };
@@ -1113,6 +1144,7 @@ mod tests {
             net,
             Arc::clone(&gauge),
             None,
+            None,
         ));
 
         let pkt = |src: SocketAddr| (b"x".to_vec(), src, SocketAddr::from(([8, 8, 8, 8], 1234)));
@@ -1167,6 +1199,7 @@ mod tests {
                     in_name: "tun".to_string(),
                     last_activity: std::sync::Arc::new(meow_common::atomic::AtomicU::new(0)),
                     sniffer: None,
+                    route_override: None,
                 },
             )
             .await;
@@ -1368,6 +1401,7 @@ mod cleanup_tests {
             in_name: "tun".into(),
             last_activity: Arc::new(AtomicU::new(0)),
             sniffer: None,
+            route_override: None,
         };
         (tunnel, spec, tx, probe)
     }
@@ -1442,6 +1476,7 @@ mod cleanup_tests {
             },
             Arc::clone(&gauge),
             None,
+            None,
         ));
         tx.send((vec![1], spec.key.0, spec.key.1)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), probe.reading.notified())
@@ -1490,6 +1525,7 @@ mod cleanup_tests {
                 nat: None,
             },
             Arc::new(AtomicUsize::new(0)),
+            None,
             None,
         ));
         // Standard recursive TXT question for example.com, with no local answer.
@@ -1605,7 +1641,7 @@ mod cleanup_tests {
         let resolver = dns.resolver;
         let fake = resolver.lookup_ipv4("pending.example").await.unwrap();
         let (tunnel, mut spec, _tx, probe) = fixture();
-        tunnel.set_resolver(resolver);
+        tunnel.set_resolver(resolver, true);
         spec.key.1.set_ip(fake);
         let worker_tunnel = tunnel.clone();
         let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });
@@ -1644,6 +1680,7 @@ mod cleanup_tests {
                 nat: None,
             },
             Arc::clone(&gauge),
+            None,
             None,
         ));
         incoming_tx

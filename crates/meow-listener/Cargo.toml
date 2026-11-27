@@ -44,6 +44,36 @@ listener-shadowsocks = [
     "dep:meow-transport",
     "meow-transport/simple-obfs",
 ]
+# WireGuard inbound (`listeners: - type: wireguard`): meow is the WG
+# responder on one UDP port serving a static peer table; inner TCP flows
+# are terminated by a smoltcp userspace stack, inner UDP by a per-flow
+# dial_udp path — semantically a TUN inbound carried over WireGuard.
+# Opt-in (the app's `full` bundle carries it, `minimal` does not). The
+# `meow-dns` edge is for the snooping-table `prefill_host` the TCP tail
+# shares with the TUN inbound; `smoltcp` is a direct dep because the
+# actor holds Interface/SocketSet/TcpSocket itself rather than going
+# through meow-wgstack.
+listener-wireguard = [
+    "dep:meow-wireguard",
+    "meow-wireguard/wireguard-boring",
+    "dep:meow-wgstack",
+    "dep:smoltcp",
+    "dep:ipnet",
+    "dep:bytes",
+    "dep:meow-dns",
+    "dep:rand",
+]
+# AnyTLS server inbound (`listeners: - type: anytls`) — BoringSSL TLS
+# termination (never the vendored crate's rustls `server` fixture),
+# multi-user auth, v1/v2 sessions routed through the tunnel (TCP +
+# UoT v2). Opt-in; `full` carries it, `minimal` does not.
+listener-anytls = [
+    "dep:meow-anytls",
+    "dep:tokio-boring",
+    "dep:boring",
+    "dep:meow-config",
+    "dep:bytes",
+]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -63,10 +93,33 @@ lwip = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 meow-dns = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
+# listener-wireguard: vendored boringtun noise (responder side) + the
+# smoltcp/tokio plumbing shared with the WG outbound pump. The actor
+# itself holds smoltcp types, so smoltcp is a direct optional dep.
+meow-wireguard = { workspace = true, optional = true }
+meow-wgstack = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+# listener-wireguard: the smoltcp interface's ISN/ephemeral-port seed.
+rand = { workspace = true, optional = true }
 # listener-shadowsocks
 shadowsocks = { workspace = true, optional = true }
+# listener-tun/listener-anytls: QUIC Initial decryption for the QUIC
+# sniffer / the AnyTLS inbound's TLS acceptor (the same BoringSSL every
+# TLS path links).
+boring = { workspace = true, optional = true }
+# listener-anytls: BoringSSL's tokio accept driver.
+tokio-boring = { workspace = true, optional = true }
+# listener-anytls: the vendored AnyTLS session/padding/UoT codec (its
+# `server` feature stays off — that fixture is rustls-based).
+meow-anytls = { workspace = true, optional = true }
+# listener-anytls: `resolve_home_contained` for `certificate`/
+# `private-key` path resolution (same contract the API TLS endpoint
+# keeps).
+meow-config = { workspace = true, optional = true }
 meow-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
+anyhow = { workspace = true }
 
 [dev-dependencies]
 meow-config = { workspace = true }
@@ -79,6 +132,11 @@ shadowsocks = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
+# wireguard_listener.rs: the outbound adapter is the in-process WG
+# client driving the listener over loopback UDP.
+meow-proxy = { workspace = true, features = ["wireguard"] }
+x25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 # listener-tun: the Wintun adapter's addresses are assigned through IP
 # Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
@@ -108,6 +166,10 @@ netlink-sys = { version = "0.8", optional = true }
 [[test]]
 name = "ss_listener_integration"
 required-features = ["listener-shadowsocks"]
+
+[[test]]
+name = "wireguard_listener"
+required-features = ["listener-wireguard"]
 
 [lints]
 workspace = true

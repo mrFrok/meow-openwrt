@@ -18,6 +18,7 @@ pub mod ech_dns;
 pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
+mod private_file;
 pub mod proxy_parser;
 pub mod proxy_provider;
 pub mod proxy_provider_refresh;
@@ -26,11 +27,26 @@ pub mod rule_parser;
 pub mod rule_provider;
 pub mod rule_provider_refresh;
 mod safe_path;
+pub use safe_path::resolve_home_contained;
 pub mod sub_rules_parser;
 pub mod subscription;
 pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
+
+/// Serializes tests that write `meow_common::set_global_ua` — a
+/// process-global the internal-HTTP/health emitters read per request, so
+/// a parallel test's setter would race a wire check. Callers must restore
+/// the cleared state before returning. `#[doc(hidden)]`: reached from the
+/// `global_ua_internal_http_test` integration binary, which `#[cfg(test)]`
+/// helpers cannot serve — not public API.
+#[doc(hidden)]
+pub fn global_ua_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub(crate) mod validation;
 mod yaml_tree;
 
 pub use dropped_providers::DroppedProviders;
@@ -89,7 +105,22 @@ pub struct Config {
     /// update, so provider nodes — which persist across rebuilds — always
     /// resolve the *current* name map.
     pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// Live-resolver indirection every `type: dns` leaf this build
+    /// produced binds (issue #974): static `proxies:` entries parse
+    /// against it directly, and `ProxyProvider`s carry it so nodes their
+    /// payloads declare — parsed before DNS exists, refreshed long after
+    /// — resolve the same slot. Install it on the tunnel
+    /// (`Tunnel::set_dns_outbound_cell`) so `install_resolver_everywhere`
+    /// republishes the tunnel's `ResolverSlot` into it; until then it
+    /// stays empty and bound leaves SERVFAIL rather than guess an
+    /// upstream.
+    pub provider_dns_cell: meow_dns::DnsOutboundCell,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks `listeners[].rule` selects by name —
+    /// published into the route table in the same snapshot as `rules` so
+    /// a listener's named scan never observes a block and a route that
+    /// disagree.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
     /// Providers the load left out leniently. The embedder records them once
     /// it runs this config ([`DroppedProviders::record`]).
@@ -98,6 +129,15 @@ pub struct Config {
     /// Hand it to `Tunnel::update_routing` so the route table retains it —
     /// chained adapters resolve through it weakly (issue #533).
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// The config-scoped `profile.store-selected` persistence owner —
+    /// install it on the `Tunnel` (`set_selection_backing`) so every
+    /// runtime rebuild lane shares this build's store and epoch
+    /// (issue #974).
+    pub selection: std::sync::Arc<meow_proxy::SelectionBacking>,
+    /// The resolved `ntp:` service configuration — the supervisor
+    /// reconciles workers against it; `PUT` diffs a new resolution on
+    /// this (issue #974).
+    pub ntp: NtpConfig,
     pub listeners: ListenerConfig,
     pub tun: TunConfig,
     pub api: ApiConfig,
@@ -128,6 +168,16 @@ pub struct GeneralConfig {
     /// directions for this long is torn down. `None` disables the bound
     /// (`tcp-idle-timeout: 0`).
     pub tcp_idle_timeout: Option<std::time::Duration>,
+    /// `tcp-concurrent` — the resolved live dial policy; the process-wide
+    /// value dialers consult lives in `meow_common::dial` (installed at
+    /// the startup/PATCH/PUT commit points). Deliberate divergence from
+    /// upstream: mihomo defaults `false`, meow-rs keeps its historical
+    /// race unless the operator opts out.
+    pub tcp_concurrent: bool,
+    /// `find-process-mode` — the resolved live lookup policy installed on
+    /// the tunnel's `meow_common::ProcessLookupPolicy` at startup/PATCH/
+    /// PUT-commit (issue #974). Defaults to `strict`.
+    pub find_process_mode: meow_common::ProcessLookupMode,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -142,6 +192,16 @@ pub struct GeneralConfig {
 /// answers IPv4-only — set `ipv6: true` for dual-stack resolution.
 pub fn effective_ipv6(raw_ipv6: Option<bool>) -> bool {
     raw_ipv6.unwrap_or(false)
+}
+
+/// The effective `tcp-concurrent` of a config whose key is unset — one
+/// helper so startup install, `GeneralConfig`, `GET /configs` and PUT
+/// commit can never disagree. Defaults to **`true`**: omission preserves
+/// meow-rs's existing candidate race (a deliberate divergence — upstream
+/// mihomo defaults `false`); only an explicit `false` requests strictly
+/// sequential dialing.
+pub fn effective_tcp_concurrent(raw_tcp_concurrent: Option<bool>) -> bool {
+    raw_tcp_concurrent.unwrap_or(true)
 }
 
 pub struct DnsConfig {
@@ -203,6 +263,117 @@ pub enum ListenerSpec {
     /// target address, and hands the decrypted flow to the tunnel. Mirrors
     /// upstream mihomo's `type: shadowsocks` listener.
     Shadowsocks(SsListenerConfig),
+    /// WireGuard server-side inbound (`type: wireguard`): meow is the WG
+    /// responder on one UDP port serving a static peer table; inner
+    /// TCP/UDP flows are routed by the tunnel — semantically a TUN inbound
+    /// carried over WireGuard. The variant always parses (no config-side
+    /// feature gate); servability is gated at runtime by the
+    /// `listener-wireguard` build feature — the same pattern as
+    /// `type: shadowsocks` vs. `listener-shadowsocks`.
+    WireGuard(WgListenerConfig),
+    /// Named TUN device inbound (`type: tun`): the entry's flat options
+    /// resolve to the same [`TunConfig`] the top-level `tun:` section
+    /// produces (its own defaults profile — the entry's presence is the
+    /// enabled state, MTU 9000, UDP timeout 300 s, auto-route off). It
+    /// owns no socket port (`NamedListener.port`/`listen` are inert).
+    /// Servability is gated by the `listener-tun` build feature and at
+    /// most one effective TUN may exist: one named entry, or the
+    /// top-level section — never both (spec §3).
+    Tun(TunConfig),
+    /// AnyTLS server inbound (`type: anytls`, mihomo-compatible): a
+    /// BoringSSL TLS termination (or an explicitly opted-in plaintext
+    /// mode) carrying authenticated AnyTLS v1/v2 sessions; every SYN'd
+    /// logical stream is routed through the tunnel as a normal inbound
+    /// flow, UoT v2 as UDP. Always parses; servability is gated by the
+    /// `listener-anytls` build feature.
+    Anytls(AnytlsListenerConfig),
+}
+
+/// Per-listener config for the `anytls` inbound (`ListenerSpec::Anytls`).
+///
+/// Built by `build_anytls_listener_spec`, the single semantic entry
+/// point shared by startup, `-t` and `PUT /configs` — no file I/O
+/// happens here; `certificate`/`private_key` stay as-written (PEM
+/// literal or path) for the app's bind-time resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AnytlsListenerConfig {
+    /// SHA-256-keyed user table in declaration order. EMPTY is a legal
+    /// shape — "authenticate nothing", the upstream reject-all state
+    /// (warned once at build); the listener still serves TLS.
+    pub users: Vec<AnytlsUser>,
+    /// `certificate` — PEM literal or path, `None` only in the
+    /// `allow-insecure` plaintext mode.
+    pub certificate: Option<String>,
+    /// `private-key` — same dual form; `private_key` name because the
+    /// raw field is shared with `type: wireguard`.
+    pub private_key: Option<String>,
+    /// Explicit plaintext opt-in (`allow-insecure: true`); `false` means
+    /// the certificate pair above is mandatory.
+    pub allow_insecure: bool,
+    /// Raw `padding-scheme` bytes as written — already validated by the
+    /// shared `meow_common::anytls_padding` contract, whose MD5 the
+    /// protocol layer computes itself.
+    pub padding_scheme: Option<String>,
+    /// Every normalized bind target in declaration order — `listen` may
+    /// carry a comma-separated list; the listener binds them atomically.
+    /// Always non-empty after a successful build.
+    pub addresses: Vec<ListenerBind>,
+}
+
+/// One normalized `(ip, port)` bind target inside a multi-address
+/// `type: anytls` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerBind {
+    pub listen: String,
+    pub port: u16,
+}
+
+/// One `users:` entry: the username verbatim plus its wire credential —
+/// `SHA256(password)`, the key the auth preface looks up (upstream
+/// `userMap` semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnytlsUser {
+    pub name: String,
+    #[serde(with = "digest_serde")]
+    pub password_sha256: [u8; 32],
+}
+
+/// `[u8; 32]` serde as a lowercase hex string — keeps `PUT /configs`
+/// round-trips and API diagnostics readable without ever carrying the
+/// plaintext password.
+mod digest_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(digest: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() != 64 {
+            return Err(serde::de::Error::custom(
+                "sha256 digest must be 64 hex chars",
+            ));
+        }
+        let mut out = [0u8; 32];
+        // Slice BYTES, not `&str` — a 64-byte non-ASCII string would
+        // panic splitting a multi-byte char boundary.
+        let (pairs, _rest) = s.as_bytes().as_chunks::<2>();
+        for (b, pair) in out.iter_mut().zip(pairs) {
+            let hi = (pair[0] as char).to_digit(16);
+            let lo = (pair[1] as char).to_digit(16);
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return Err(serde::de::Error::custom("sha256 digest must be hex"));
+            };
+            *b = (hi * 16 + lo) as u8;
+        }
+        Ok(out)
+    }
 }
 
 /// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
@@ -222,6 +393,102 @@ pub struct SsListenerConfig {
 
 fn default_ss_udp() -> bool {
     true
+}
+
+/// Per-listener config for the `wireguard` inbound (`ListenerSpec::WireGuard`).
+///
+/// Validated at config-build time by `build_wg_listener_spec`: `private_key`
+/// is the listener's static private key (base64 → exactly 32 bytes in the
+/// YAML, stored decoded) and `peers` is the static peer table (never empty,
+/// at most `2^24 - 1` entries — the `index << 8` demux namespace).
+/// `port`/`listen`/`max_connections` live on [`NamedListener`], the same
+/// split as [`SsListenerConfig`].
+///
+/// [`Debug`] is hand-rolled: the struct carries key material that must
+/// never land in a log line (the `WireGuardConfig` outbound precedent).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgListenerConfig {
+    /// Listener static private key, 32 bytes. Never logged.
+    pub private_key: [u8; 32],
+    /// Static peer table — at least one entry after validation.
+    pub peers: Vec<WgPeerConfig>,
+    /// Outer (wire) MTU; `inner_mtu = mtu - 64` stays ≥ 576. Default 1420.
+    #[serde(default = "default_wg_mtu")]
+    pub mtu: u16,
+    /// `false` silently drops inner UDP datagrams. Default `true`.
+    #[serde(default = "default_wg_udp")]
+    pub udp: bool,
+    /// Inner UDP flow idle timeout (default 60s; `0` is rejected at build
+    /// time, matching the `tproxy`/`tun` `udp-timeout` contract).
+    #[serde(default = "default_wg_udp_timeout")]
+    pub udp_timeout: std::time::Duration,
+}
+
+/// One static peer of a `type: wireguard` listener.
+///
+/// `public_key` doubles as the handshake demux key and must be unique
+/// inside the listener's peer table; `allowed_ips` is the inbound
+/// inner-source-IP ACL (spoofing guard) and is never empty — an explicit
+/// `0.0.0.0/0` + `::/0` is required for full openness, deliberately
+/// unlike the outbound's empty-means-open default.
+///
+/// [`Debug`] is hand-rolled to redact `preshared_key`; `public_key` is
+/// *not* redacted — a public key is safe to log and needed for diagnosis.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgPeerConfig {
+    /// Peer static public key, 32 bytes.
+    pub public_key: [u8; 32],
+    /// Optional pre-shared symmetric key (Noise `psk` mixing). Never logged.
+    pub preshared_key: Option<[u8; 32]>,
+    /// Inbound inner-source-IP ACL for this peer — non-empty.
+    pub allowed_ips: Vec<ipnet::IpNet>,
+    /// Log/diagnostic label only (`peer-<index>` when unnamed) — never
+    /// enters `Metadata`.
+    pub name: SmolStr,
+    /// WARP-style 3-byte `reserved` field stamped onto wire datagrams
+    /// headed to this peer; inbound reserved bytes are cleared regardless.
+    pub reserved: Option<[u8; 3]>,
+}
+
+impl std::fmt::Debug for WgListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgListenerConfig")
+            .field("private_key", &"[REDACTED]")
+            .field("peers", &self.peers)
+            .field("mtu", &self.mtu)
+            .field("udp", &self.udp)
+            .field("udp_timeout", &self.udp_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WgPeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgPeerConfig")
+            .field("public_key", &self.public_key)
+            .field("preshared_key", &self.preshared_key.map(|_| "[REDACTED]"))
+            .field("allowed_ips", &self.allowed_ips)
+            .field("name", &self.name)
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+/// `WgListenerConfig::mtu` serde default — the usual WG baseline, same as
+/// the outbound adapter's.
+fn default_wg_mtu() -> u16 {
+    1420
+}
+
+/// `WgListenerConfig::udp` serde default: the inner-UDP path is on.
+fn default_wg_udp() -> bool {
+    true
+}
+
+/// `WgListenerConfig::udp_timeout` serde default — matches the `tproxy`
+/// `udp-timeout` and `tun.udp-timeout` default (60s).
+fn default_wg_udp_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(default_udp_timeout_secs())
 }
 
 /// `ListenerSpec::TProxy::firewall` serde default: managed firewall rules
@@ -265,6 +532,9 @@ impl ListenerSpec {
             Self::Socks5 => "socks5",
             Self::TProxy { .. } => "tproxy",
             Self::Shadowsocks(_) => "shadowsocks",
+            Self::WireGuard(_) => "wireguard",
+            Self::Tun(_) => "tun",
+            Self::Anytls(_) => "anytls",
         }
     }
 }
@@ -288,16 +558,24 @@ pub struct NamedListener {
     /// `max-connections` field, falling back to the global `max-connections`.
     #[serde(default)]
     pub max_connections: usize,
-    /// mihomo `proxy:`: this listener's connections skip the rules and go to
-    /// the named proxy or group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
+    /// `listeners[].proxy`/`listeners[].rule` — the named-listener route
+    /// override stamped onto every flow's `Metadata` (upstream's
+    /// `BaseOption` Additions). `None` on the port shorthands and on
+    /// entries that declare neither key.
+    #[serde(default)]
+    pub route_override: Option<meow_common::InboundRouteOverride>,
+    /// `listeners[].routing-mark` — `SO_MARK` on the listener socket at
+    /// bind; Linux only (warned and ignored elsewhere).
+    #[serde(default)]
+    pub routing_mark: Option<u32>,
 }
 
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
 /// layer, which maps it onto `meow_listener::TunListenerConfig` when the
-/// `listener-tun` feature is compiled in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `listener-tun` feature is compiled in. A named `listeners:`
+/// `type: tun` entry resolves to the same type ([`ListenerSpec::Tun`])
+/// — under its own defaults profile, never sharing the top-level ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunConfig {
     pub enable: bool,
     /// `auto-redirect` (Linux): `None` when off.
@@ -338,7 +616,7 @@ pub struct TunConfig {
 /// unset) keeps the userspace lwIP stack. Under `system` UDP is handled
 /// in the pump (UDP fragments and ICMP still go to lwIP; fragmented TCP
 /// is dropped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TunStack {
     #[default]
     Lwip,
@@ -346,7 +624,7 @@ pub enum TunStack {
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunRouteMode {
     /// `auto-route: fake-ip`: route only the fake-IP range into the
     /// device. Loop-free by construction; IP-literal traffic is not
@@ -435,6 +713,26 @@ fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Validate the raw `global-ua` value (issue #974): `None`/empty resolves
+/// to the default UA. A value with CR/LF/NUL/control bytes is a Class A
+/// rejection — the emitters format it into a raw request head, so an
+/// unchecked newline is header injection. The byte check runs on the
+/// UNTRIMMED string: `str::trim` strips `\r`/`\n`/`\x0b`/`\x0c` at the
+/// edges, which would smuggle `"evil\r\n"` past the check while callers
+/// keep the untrimmed value. Only `' '`/`'\t'` — HTTP OWS — are trimmed
+/// for the returned value; a bare `"\r\n"` is an error, not `None`.
+pub fn validate_global_ua(raw_ua: Option<&str>) -> Result<Option<&str>, anyhow::Error> {
+    let Some(raw) = raw_ua else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        meow_common::is_valid_http_header_value(raw),
+        "global-ua contains bytes that are not legal in an HTTP header \
+         value (newline/NUL/control characters are rejected)"
+    );
+    Ok(Some(raw.trim_matches([' ', '\t'])).filter(|s| !s.is_empty()))
+}
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
 /// `tun.auto-redirect` (mihomo's key; Linux, meow-openwrt): TCP is captured
@@ -442,7 +740,7 @@ fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
 /// policy-routed into the device, for the host's own traffic and the LAN
 /// it forwards alike. `route-address(-set)` narrows capture to those
 /// destinations, `route-exclude-address(-set)` exempts some.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AutoRedirectConfig {
     /// `route-address-dns` (meow): also capture the addresses DNS answers
     /// give for domains the rules send anywhere but DIRECT.
@@ -632,23 +930,23 @@ pub fn parse_tun_config(
         ));
     }
 
-    let inet4_address = match first_cidr("inet4-address", "IPv4", r.inet4_address.as_ref())? {
+    let inet4_address = match first_cidr("tun.inet4-address", "IPv4", r.inet4_address.as_ref())? {
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
         None => default_tun_inet4_address(fake_ip_range),
     };
 
-    // Absent: on. An empty list turns it off. Any usable entry hijacks
-    // every UDP :53 flow.
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack.
     let mut dns_hijack = r.dns_hijack.is_none();
     for entry in r.dns_hijack.as_deref().unwrap_or(&[]) {
-        let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-        match port {
-            Some(53) => dns_hijack = true,
-            _ => warn!(
-                "tun.dns-hijack: entry '{entry}' is not a :53 target; meow-rs only hijacks \
-                 UDP port 53 — entry ignored"
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "tun.dns-hijack: entry '{entry}' is not a wildcard UDP :53 target \
+                 {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
             ),
         }
     }
@@ -692,7 +990,7 @@ pub fn parse_tun_config(
     // IPv6 routes to send into the device — elsewhere an address on the
     // device would capture nothing, so it is normalised out for the same
     // restart-diff reason as `outbound-interface` above.
-    let inet6_address = parse_inet6_address(r.inet6_address.as_ref())?;
+    let inet6_address = parse_inet6_address("tun.inet6-address", r.inet6_address.as_ref())?;
     if inet6_address.is_some() && !global {
         warn!(
             "tun.inet6-address: only used when auto-route captures all traffic \
@@ -749,7 +1047,214 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
     }
 }
 
-/// The CIDR string of a `tun.inet{4,6}-address`: a string or mihomo's list
+/// `listeners[]` `type: tun` defaults — the named profile, deliberately
+/// distinct from the top-level section's (upstream `NewTun`/`sing_tun`
+/// supplies these): the entry's presence is the enabled state, MTU 9000,
+/// UDP idle timeout 300 s, `auto-route` OFF. On this path an explicit
+/// `0` for `mtu`/`udp-timeout` also means "default" (upstream fills the
+/// zero with the fallback).
+const NAMED_TUN_MTU: u16 = 9000;
+const NAMED_TUN_UDP_TIMEOUT_SECS: u64 = 300;
+
+/// Parse and validate a `listeners:` `type: tun` entry — the flat
+/// `TunOption` shape, never a nested `tun:` map. Shares the top-level
+/// parser's normalization (same address forms, fake-IP-derived default
+/// address, global-only IPv6, MTU floor, duration ceiling) but applies
+/// the named defaults profile (`NAMED_TUN_MTU`,
+/// `NAMED_TUN_UDP_TIMEOUT_SECS`, auto-route off, enabled by presence).
+/// `global_max_connections`/`fake_ip_range` are the same inherited
+/// inputs `parse_tun_config` takes.
+///
+/// Unlike the top-level parser this errors on unknown `stack` spellings —
+/// upstream `-t` rejects an invalid flat `stack` (it only tolerates one
+/// under the ignored nested `tun:` map).
+pub fn parse_named_tun_config(
+    raw_l: &raw::RawListener,
+    global_max_connections: usize,
+    fake_ip_range: Option<&str>,
+) -> Result<TunConfig, anyhow::Error> {
+    let name = &raw_l.name;
+    // Warn on the upstream keys meow does not implement (Class B per
+    // ADR-0002) — `auto-detect-interface` gets its specific reason: it
+    // never controlled the outbound-interface binding meow installs for
+    // loop protection under global route scope.
+    if raw_l.auto_detect_interface.is_some() {
+        warn!(
+            "listeners[{name}].auto-detect-interface: meow's loop-protection \
+             outbound-interface binding is not governed by this flag — ignored"
+        );
+    }
+    for (key, val) in [
+        ("dns-mode", &raw_l.dns_mode),
+        ("strict-route", &raw_l.strict_route),
+        ("auto-redirect", &raw_l.auto_redirect),
+        ("endpoint-independent-nat", &raw_l.endpoint_independent_nat),
+        ("mtu-v6", &raw_l.mtu_v6),
+        ("route-address", &raw_l.route_address),
+        ("route-exclude-address", &raw_l.route_exclude_address),
+        ("include-uid", &raw_l.include_uid),
+        ("exclude-uid", &raw_l.exclude_uid),
+        ("gso", &raw_l.gso),
+        ("file-descriptor", &raw_l.file_descriptor),
+    ] {
+        if val.is_some() {
+            warn!(
+                "listeners[{name}].{key}: field is not supported in meow-rs and will \
+                 be ignored; remove it to suppress this warning"
+            );
+        }
+    }
+
+    // Explicit `0` = the named default on this path (upstream fills a
+    // zero with the fallback); below the IPv6 floor is a hard error.
+    let mtu = raw_l.mtu.unwrap_or(0);
+    let mtu = if mtu == 0 { NAMED_TUN_MTU } else { mtu };
+    if mtu < TUN_MIN_MTU {
+        return Err(anyhow::anyhow!(
+            "listeners[{name}].mtu: {mtu} is below the minimum {TUN_MIN_MTU} \
+             required by the userspace stack"
+        ));
+    }
+
+    let udp_timeout = std::time::Duration::from_secs(match raw_l.udp_timeout {
+        // `0` = the 300 s named default here (the tproxy/wireguard
+        // surfaces keep their `0`-is-an-error contract).
+        Some(0) | None => NAMED_TUN_UDP_TIMEOUT_SECS,
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => {
+            return Err(anyhow::anyhow!(
+                "listeners[{name}].udp-timeout: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ));
+        }
+        Some(secs) => secs,
+    });
+
+    let err_key = format!("listeners[{name}].auto-route");
+    let (auto_route, route_mode) =
+        parse_auto_route_value(raw_l.auto_route.as_ref(), false, &err_key)?;
+    let global = auto_route && route_mode == TunRouteMode::Global;
+
+    let outbound_interface = raw_l.outbound_interface.clone().filter(|s| !s.is_empty());
+    if outbound_interface.is_some() && !global {
+        warn!(
+            "listeners[{name}].outbound-interface: only used when auto-route \
+             captures all traffic ('auto-route: true' or 'global'); ignored"
+        );
+    }
+    let outbound_interface = outbound_interface.filter(|_| global);
+
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack — a `tcp:` target (the pump has no
+    // TCP/53 diversion), a specific address, or any other shape warns and
+    // is ignored rather than broadening what the device diverts.
+    let mut dns_hijack = raw_l.dns_hijack.is_none();
+    for entry in raw_l.dns_hijack.as_deref().unwrap_or(&[]) {
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "listeners[{name}].dns-hijack: entry '{entry}' is not a wildcard \
+                 UDP :53 target {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — \
+                 entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
+            ),
+        }
+    }
+
+    let key4 = format!("listeners[{name}].inet4-address");
+    let inet4_address = match first_cidr(&key4, "IPv4", raw_l.inet4_address.as_ref())? {
+        Some(s) => s
+            .parse::<ipnet::Ipv4Net>()
+            .map_err(|e| anyhow::anyhow!("{key4}: invalid CIDR '{s}': {e}"))?,
+        // Deliberate meow behaviour: the fake-IP-range-derived /30, the
+        // same default the top-level section uses.
+        None => default_tun_inet4_address(fake_ip_range),
+    };
+    // IPv6 is honoured only in global route scope, same as the top-level
+    // section — elsewhere it is normalised out so nothing capture-less
+    // sits on the device.
+    let key6 = format!("listeners[{name}].inet6-address");
+    let inet6_address = parse_inet6_address(&key6, raw_l.inet6_address.as_ref())?;
+    if inet6_address.is_some() && !global {
+        warn!(
+            "listeners[{name}].inet6-address: only used when auto-route \
+             captures all traffic ('auto-route: true' or 'global'); ignored \
+             (the device stays IPv4-only)"
+        );
+    }
+    let inet6_address = inet6_address.filter(|_| global);
+
+    Ok(TunConfig {
+        enable: true,
+        device: raw_l.device.clone().filter(|s| !s.is_empty()),
+        mtu,
+        inet4_address,
+        inet6_address,
+        auto_route,
+        route_mode,
+        outbound_interface,
+        dns_hijack,
+        udp_timeout,
+        max_connections: raw_l.max_connections.unwrap_or(global_max_connections),
+        stack: parse_named_tun_stack(name, raw_l.stack.as_ref())?,
+        auto_redirect: None,
+    })
+}
+
+/// `listeners[].stack` for `type: tun` — like `parse_tun_stack` but
+/// strict: `system`/`mixed` select the kernel TCP path, `mips`/`gvisor`
+/// fold to lwIP with a warning (upstream names; meow has no such stack),
+/// `lwip`/empty select lwIP, and every other value is a hard error —
+/// upstream `-t` rejects an invalid flat `stack`.
+fn parse_named_tun_stack(
+    name: &str,
+    raw: Option<&serde_json::Value>,
+) -> Result<TunStack, anyhow::Error> {
+    let Some(value) = raw else {
+        return Ok(TunStack::Lwip);
+    };
+    match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("system") => Ok(TunStack::System),
+        Some("mixed") => {
+            warn!(
+                "listeners[{name}].stack: mixed is system here — kernel TCP, \
+                 and UDP parsed in the pump rather than by a userspace stack"
+            );
+            Ok(TunStack::System)
+        }
+        Some("gvisor") => {
+            warn!(
+                "listeners[{name}].stack: gvisor is not available; using the \
+                 userspace (lwip) stack"
+            );
+            Ok(TunStack::Lwip)
+        }
+        Some("mips") => {
+            warn!(
+                "listeners[{name}].stack: mips (mihomo's own stack) is not \
+                 available; using the userspace (lwip) stack"
+            );
+            Ok(TunStack::Lwip)
+        }
+        Some("lwip" | "") => Ok(TunStack::Lwip),
+        _ => Err(anyhow::anyhow!(
+            "listeners[{name}].stack: unknown value {value} (expected \
+             system, mixed, gvisor, mips, or lwip)"
+        )),
+    }
+}
+
+/// The `dns-hijack` targets meow admits — the wildcard UDP/53 spellings
+/// only. `tcp:`-schemed targets name a TCP diversion meow does not
+/// implement; a specific host address or another port is outside the
+/// hijack's "every UDP :53 flow" contract.
+const DNS_HIJACK_FORMS: &str = "(0.0.0.0:53, any:53, *:53, [::]:53)";
+
+/// Whether `entry` is one of [`DNS_HIJACK_FORMS`]' exact spellings.
+fn dns_hijack_entry(entry: &str) -> bool {
+    matches!(entry, "0.0.0.0:53" | "any:53" | "*:53" | "[::]:53")
+}
+
+/// The CIDR string of an `inet{4,6}-address`: a string or mihomo's list
 /// form (`[]netip.Prefix`), of which the first entry is used — with a
 /// warning when there are more — since the device takes a single address.
 /// `''` and `[]` are "unset". A `Value::Null` is an error, not unset:
@@ -757,7 +1262,9 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
 /// so only a non-finite float (`.nan`, `.inf`, `1e999`) — which
 /// `serde_json::Value` maps to `Null` — reaches it, and those were a hard
 /// error when `inet4-address` was `Option<String>` (the spelling reached
-/// the CIDR parse as text).
+/// the CIDR parse as text). `key` is the fully qualified key name
+/// (`tun.inet4-address`, `listeners[name].inet4-address`, …) used in
+/// diagnostics.
 fn first_cidr<'a>(
     key: &str,
     family: &str,
@@ -767,7 +1274,7 @@ fn first_cidr<'a>(
         None => return Ok(None),
         Some(serde_json::Value::Null) => {
             return Err(anyhow::anyhow!(
-                "tun.{key}: expected a CIDR string or a list of them, got a \
+                "{key}: expected a CIDR string or a list of them, got a \
                  non-finite number (e.g. .nan, .inf)"
             ));
         }
@@ -775,7 +1282,7 @@ fn first_cidr<'a>(
         Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {
                 warn!(
-                    "tun.{key}: {} entries given; meow-rs assigns one {family} \
+                    "{key}: {} entries given; meow-rs assigns one {family} \
                      address to the device — only the first is used",
                     entries.len()
                 );
@@ -785,14 +1292,14 @@ fn first_cidr<'a>(
                 Some(serde_json::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
-                        "tun.{key}: expected a CIDR string, got {other:?}"
+                        "{key}: expected a CIDR string, got {other:?}"
                     ));
                 }
             }
         }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "tun.{key}: expected a CIDR string or a list of them, got {other:?}"
+                "{key}: expected a CIDR string or a list of them, got {other:?}"
             ));
         }
     };
@@ -800,33 +1307,42 @@ fn first_cidr<'a>(
 }
 
 fn parse_inet6_address(
+    key: &str,
     raw: Option<&serde_json::Value>,
 ) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
-    let Some(cidr) = first_cidr("inet6-address", "IPv6", raw)? else {
+    let Some(cidr) = first_cidr(key, "IPv6", raw)? else {
         return Ok(None);
     };
     cidr.parse::<ipnet::Ipv6Net>()
         .map(Some)
-        .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
+        .map_err(|e| anyhow::anyhow!("{key}: invalid CIDR '{cidr}': {e}"))
 }
 
 /// `auto-route` (#375): mihomo boolean, or a mode string selecting what
-/// gets routed. `true` (and unset) captures all traffic where that is
-/// supported ([`TunRouteMode::default`]); `fake-ip` opts into the narrower
-/// loop-free scope, and `global` names the full one explicitly. Shared by
-/// [`parse_tun_config`] and [`global_route_outbound_interface`] so the two
-/// can never disagree on what selects global scope.
-fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
+/// gets routed. `true` captures all traffic where that is supported
+/// ([`TunRouteMode::default`]); `fake-ip` opts into the narrower
+/// loop-free scope, and `global` names the full one explicitly.
+/// `default_on` is the surface's absent-value policy: `true` for the
+/// top-level `tun:` section, `false` for a named `type: tun` entry.
+/// Shared by [`parse_tun_config`], [`parse_named_tun_config`],
+/// [`global_route_outbound_interface`] and
+/// [`named_tun_global_route_interface`] so the four can never disagree on
+/// what selects global scope.
+fn parse_auto_route_value(
+    value: Option<&raw::RawAutoRoute>,
+    default_on: bool,
+    err_key: &str,
+) -> Result<(bool, TunRouteMode), anyhow::Error> {
     let defaults = TunConfig::default();
-    Ok(match r.auto_route.as_ref() {
-        None => (defaults.auto_route, defaults.route_mode),
+    Ok(match value {
+        None => (default_on, defaults.route_mode),
         Some(raw::RawAutoRoute::Enabled(on)) => (*on, defaults.route_mode),
         Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
             "fake-ip" => (true, TunRouteMode::FakeIp),
             "global" => (true, TunRouteMode::Global),
             other => {
                 return Err(anyhow::anyhow!(
-                    "tun.auto-route: unknown value '{other}' (expected true, false, \
+                    "{err_key}: unknown value '{other}' (expected true, false, \
                      fake-ip, or global)"
                 ));
             }
@@ -834,9 +1350,42 @@ fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Err
     })
 }
 
+fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
+    parse_auto_route_value(
+        r.auto_route.as_ref(),
+        TunConfig::default().auto_route,
+        "tun.auto-route",
+    )
+}
+
 /// `tun.outbound-interface` with the empty string normalised to "unset".
 fn raw_outbound_interface(r: &raw::RawTun) -> Option<String> {
     r.outbound_interface.clone().filter(|s| !s.is_empty())
+}
+
+/// Whether a `listeners:` `type: tun` entry selects global route scope,
+/// and if so its configured `outbound-interface` (`Some(None)` =
+/// auto-detect). `None` when the entry is absent, its `auto-route` is
+/// unset/`false`/fake-IP, or it fails [`parse_named_tun_config`]'s
+/// mode check.
+///
+/// Side-effect free, like [`global_route_outbound_interface`]: the binary
+/// calls it on the raw document *before* [`build_config`] so a named
+/// global-route TUN gets the same pre-first-dial outbound-interface
+/// binding the top-level section does (issue #695 — the sole TUN must
+/// be selected before the first bootstrap dial).
+pub fn named_tun_global_route_interface(raw: &raw::RawConfig) -> Option<Option<String>> {
+    let l = raw
+        .listeners
+        .as_deref()?
+        .iter()
+        .find(|l| l.listener_type.eq_ignore_ascii_case("tun"))?;
+    match parse_auto_route_value(l.auto_route.as_ref(), false, "") {
+        Ok((true, TunRouteMode::Global)) => {
+            Some(l.outbound_interface.clone().filter(|s| !s.is_empty()))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `raw` selects an enabled TUN in global route scope, and if so
@@ -871,12 +1420,78 @@ pub struct ListenerConfig {
     /// [`meow_common::TcpKeepaliveConfig`]). Engine-wide: per-listener
     /// overrides are deliberately not offered.
     pub tcp_keepalive: meow_common::TcpKeepaliveConfig,
+    /// `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP
+    /// ACL the mixed/HTTP/SOCKS accept loops check the remote IP against
+    /// (upstream's `ipfilter` gate). A startup snapshot, deliberately
+    /// not hot-applied by `PATCH`/`PUT` — same lifecycle as the
+    /// listener auth store it guards alongside.
+    pub lan_acl: std::sync::Arc<meow_common::LanAcl>,
     /// All active listeners (shorthand + named), deduplicated and validated.
     pub named: Vec<NamedListener>,
 }
 
+/// The `external-controller-cors:` section resolved for serving (issue
+/// #974) — a startup snapshot like the listener addresses: `PUT /configs`
+/// commits the raw section but the live policy stays frozen until restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiCorsConfig {
+    /// Resolved `allow-origins`: default `["*"]`; an explicit `[]` and a
+    /// `*` entry both mean allow-all (weird-but-real, probe-verified).
+    pub allow_origins: Vec<String>,
+    /// Resolved `allow-private-network`: default `true`.
+    pub allow_private_network: bool,
+}
+
+impl Default for ApiCorsConfig {
+    /// Upstream's `cors.New` defaults — the same resolution an absent
+    /// `external-controller-cors:` map gets under a configured secret.
+    fn default() -> Self {
+        Self {
+            allow_origins: vec!["*".to_string()],
+            allow_private_network: true,
+        }
+    }
+}
+
+impl ApiCorsConfig {
+    /// Resolve the raw section. Under a configured secret, absent and
+    /// present maps resolve identically on the `["*"]`/`true` defaults —
+    /// upstream gates its permissive `AllowAll` middleware on an explicit
+    /// `secret: ""`, not on the map's presence (issue #974).
+    pub fn from_raw(raw: Option<&raw::RawCors>) -> Self {
+        match raw {
+            None => Self::default(),
+            Some(cors) => Self {
+                allow_origins: cors
+                    .allow_origins
+                    .clone()
+                    .unwrap_or_else(|| vec!["*".to_string()]),
+                allow_private_network: cors.allow_private_network.unwrap_or(true),
+            },
+        }
+    }
+}
+
 pub struct ApiConfig {
     pub external_controller: Option<SocketAddr>,
+    /// `external-controller-tls` — the HTTPS controller's listen address,
+    /// still a string: `-t` validates shape only, and the endpoint may be
+    /// a hostname resolved at bind time (issue #974).
+    pub external_controller_tls: Option<String>,
+    /// `external-controller-unix` — the Unix-domain socket path (relative
+    /// resolves under the meow home at bind time).
+    pub external_controller_unix: Option<String>,
+    /// `external-controller-pipe` — the Windows named-pipe name; parsed
+    /// on every platform, served only on Windows.
+    pub external_controller_pipe: Option<String>,
+    /// `tls.certificate` — inline PEM or path; used only with
+    /// `external_controller_tls`. `None` (both absent) means the listener
+    /// generates an ephemeral self-signed identity at bind, like mihomo.
+    pub tls_certificate: Option<String>,
+    /// `tls.private-key` — the `tls_certificate` pair.
+    pub tls_private_key: Option<String>,
+    /// `external-controller-cors` resolved for serving.
+    pub cors: ApiCorsConfig,
     pub secret: Option<String>,
     /// Resolved directory of static files for a third-party web UI, served at
     /// `/ui` in place of the built-in panel. `None` keeps the built-in panel.
@@ -885,6 +1500,20 @@ pub struct ApiConfig {
     /// Download URL recorded from `external-ui-url`; auto-download is not
     /// performed, but it is surfaced in a warning when the directory is absent.
     pub external_ui_url: Option<String>,
+}
+
+impl ApiConfig {
+    /// Whether any controller endpoint is configured that this platform
+    /// can serve — a Unix socket needs `cfg(unix)`, the named pipe needs
+    /// Windows (issue #974). The `external-controller-tls` check reports
+    /// *configured*, not *compiled*: meow-app's `api-tls` feature owns
+    /// that gate and warns at startup when the binary lacks it.
+    pub fn has_servable_endpoint(&self) -> bool {
+        self.external_controller.is_some()
+            || self.external_controller_tls.is_some()
+            || (cfg!(unix) && self.external_controller_unix.is_some())
+            || (cfg!(windows) && self.external_controller_pipe.is_some())
+    }
 }
 
 /// When set, config loading validates structure only and performs no remote
@@ -1179,12 +1808,19 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    meow_common::yaml::run_on_parse_stack(content, |doc| {
-        let root: yaml_tree::SpannedNode =
-            serde_saphyr::from_str_with_options(doc, yaml_options())?;
-        yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
-    })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
+    let raw = meow_common::yaml::run_on_parse_stack(
+        content,
+        |doc| -> Result<raw::RawConfig, anyhow::Error> {
+            let root: yaml_tree::SpannedNode =
+                serde_saphyr::from_str_with_options(doc, yaml_options())?;
+            yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))??;
+    // Alias-conflict warnings are scoped to the document admission — this
+    // parse — not to the rebuild passes it later fans out to (issue #974).
+    validation::warn_store_fake_ip_alias(&raw);
+    Ok(raw)
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —
@@ -1201,7 +1837,9 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Save a RawConfig back to disk with atomic write (.tmp → rename) and .bak backup.
+/// Save a RawConfig atomically and keep a best-effort .bak copy of the
+/// previous regular file. On Unix, new files use owner-only permissions
+/// and preserve any stricter owner permissions on existing files.
 ///
 /// Unique scratch names keep concurrent saves from tearing, but file
 /// *order* is only guaranteed when callers serialize under the
@@ -1214,30 +1852,7 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
-    // Scratch files orphaned by a crash between create and rename
-    // accumulate forever otherwise — sweep stale ones on each save
-    // (issue #621).
-    meow_common::fs_util::sweep_scratch_siblings(
-        Path::new(path),
-        meow_common::fs_util::SCRATCH_STALE_AGE,
-    );
-    let tmp_path = unique_scratch_path(Path::new(path));
-    let bak_path = format!("{path}.bak");
-    // Unique scratch names would accumulate on repeated failures — sweep
-    // the scratch on each fallible step so a chronic error (ENOSPC, a
-    // denied rename) can't fill the config dir.
-    if let Err(e) = std::fs::write(&tmp_path, &yaml) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    if std::path::Path::new(path).exists() {
-        // Keep one backup
-        let _ = std::fs::rename(path, &bak_path);
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
+    private_file::save_config(Path::new(path), &yaml)?;
     info!("Config saved to {}", path);
     Ok(())
 }
@@ -1247,32 +1862,7 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
-    // Same crash-leftover sweep as the sync variant (issue #621), off the
-    // async worker since it walks the config dir.
-    {
-        let dir_target = PathBuf::from(path);
-        spawn_blocking_with_current_dispatcher(move || {
-            meow_common::fs_util::sweep_scratch_siblings(
-                &dir_target,
-                meow_common::fs_util::SCRATCH_STALE_AGE,
-            );
-        })
-        .await
-        .ok();
-    }
-    let tmp_path = unique_scratch_path(Path::new(path));
-    let bak_path = format!("{path}.bak");
-    if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
-    }
-    if tokio::fs::metadata(path).await.is_ok() {
-        let _ = tokio::fs::rename(path, &bak_path).await;
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
-    }
+    private_file::save_config_async(Path::new(path), yaml).await?;
     info!("Config saved to {}", path);
     Ok(())
 }
@@ -1291,6 +1881,61 @@ mod save_scratch_tests {
             .map(|e| e.file_name())
             .filter(|n| n.to_string_lossy().ends_with(".tmp"))
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_config_and_backup_with_private_modes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let backup = dir.path().join("config.yaml.bak");
+        let raw = raw::RawConfig::default();
+
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        for file in [&path, &backup] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "mode: rule\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_save_preserves_stricter_owner_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let backup = dir.path().join("config.yaml.bak");
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(&backup, "mode: global\n").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+
+        save_raw_config_async(path.to_str().unwrap(), &raw::RawConfig::default())
+            .await
+            .unwrap();
+        for file in [&path, &backup] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "mode: rule\n");
     }
 
     #[test]
@@ -1395,15 +2040,12 @@ mod save_scratch_tests {
         let dir = tempfile::tempdir().unwrap();
         let raw: raw::RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
 
-        // Rename step fails: `as-dir.bak` is a non-empty directory, so the
-        // backup rotate fails silently and `as-dir` stays put — the final
-        // rename then hits EISDIR and must sweep its scratch.
+        // The final rename cannot replace a directory with a file and
+        // must remove its scratch.
         let bad = dir.path().join("as-dir");
         std::fs::create_dir(&bad).unwrap();
-        std::fs::create_dir(dir.path().join("as-dir.bak")).unwrap();
-        std::fs::write(dir.path().join("as-dir.bak").join("x"), "").unwrap();
-        let bad = bad.to_string_lossy().into_owned();
-        assert!(save_raw_config(&bad, &raw).is_err());
+        assert!(save_raw_config(bad.to_str().unwrap(), &raw).is_err());
+        assert!(bad.is_dir());
         assert!(
             leftovers(dir.path()).is_empty(),
             "rename failure must sweep its scratch: {:?}",
@@ -1451,6 +2093,10 @@ mod save_scratch_tests {
 pub struct RebuildResult {
     pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks this build parsed — passed through to
+    /// `Tunnel::update_routing`/`reload_routing` so a listener's `rule:`
+    /// override publishes in the same route snapshot as `rules`.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
     /// The rule-provider set parsed for this generation — shared by the
     /// rules, any DNS `rule-set:` policy matchers, and (once the caller
@@ -1503,6 +2149,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &meow_dns::new_dns_outbound_cell(),
         None,
         false,
     )
@@ -1558,17 +2205,32 @@ pub fn rebuild_from_raw_with_resolver(
     cache_dir: Option<&Path>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
+    // The running config's selection-persistence owner — pass
+    // `Tunnel::selection_backing()` for committed-state republishes so
+    // rebuilt groups keep the user's persisted pick (issue #974);
+    // SelectionBacking::unpersisted() otherwise.
+    selection: &meow_proxy::SelectionBacking,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
+    // This lane hands in a live resolver slot but no long-lived dns
+    // outbound cell — bind the slot so `type: dns` leaves built here
+    // answer the same generation instead of sitting unbound (issue
+    // #974; the geodata lane's proxies are never committed anyway).
+    let dns_cell = meow_dns::new_dns_outbound_cell();
+    *dns_cell.write() = resolver.cloned();
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        None,
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &dns_cell,
         shared_rule_providers,
         false,
     )
@@ -1594,26 +2256,33 @@ pub fn rebuild_from_raw_runtime(
     // or their `dialer-proxy` chains never resolve (issue #489). Pass
     // `Config::provider_dialer_registry`.
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The running config's selection-persistence owner — the same
+    // SelectionBacking startup built, so a rebuilt group keeps the user's
+    // persisted pick and the PUT commit's epoch bump fences these groups'
+    // writers correctly (issue #974). Pass
+    // SelectionBacking::unpersisted() for embedders without a backing file.
+    selection: &meow_proxy::SelectionBacking,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // pass `Tunnel::dns_outbound_cell()` so leaves the candidate builds
+    // resolve the same slot the running generation's leaves do.
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<RebuildResult, anyhow::Error> {
-    let store = meow_proxy::SelectorStore::global();
-    if store.is_none() {
-        // First-`open`-wins binds the global at startup; embedders that
-        // never call `SelectorStore::open` (e.g. `load_config_from_str`)
-        // get the unpersisted behavior — selections reset on rebuild.
-        debug!(
-            "rebuild_from_raw_runtime: no global SelectorStore; group selections will not persist"
-        );
-    }
+    // This lane always runs on a blocking thread (spawn_blocking in the
+    // API/subscription callers), so the lazy store open is safe inline.
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        store.as_ref(),
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         provider_dialer_registry,
+        provider_dns_cell,
         None,
         true,
     )
@@ -1631,6 +2300,8 @@ pub fn rebuild_from_raw_with_cache_dir(
     cache_dir: Option<&Path>,
     resolver: Option<&meow_dns::ResolverSlot>,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let dns_cell = meow_dns::new_dns_outbound_cell();
+    *dns_cell.write() = resolver.cloned();
     rebuild_from_raw_impl(
         raw,
         cache_dir,
@@ -1641,6 +2312,7 @@ pub fn rebuild_from_raw_with_cache_dir(
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &dns_cell,
         None,
         false,
     )
@@ -1692,7 +2364,7 @@ pub async fn parse_dns_from_raw(
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
     dns_parser::validate_node_policy_sources(raw)?;
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(raw)?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
         prefetched_payloads.map_or(&empty, Arc::as_ref);
@@ -1738,7 +2410,7 @@ pub async fn parse_dns_from_raw(
     Ok(dns)
 }
 
-/// Prefix of the sentinel dialer target [`apply_dialer_proxies`] binds to a
+/// Prefix of the sentinel dialer target [`collect_dialer_edges`] binds to a
 /// node whose `dialer-proxy` value is malformed in lenient mode. It is never
 /// registered in the proxy map, so the node's dials fail loudly ("not in the
 /// proxy registry", naming the node via the suffix) instead of silently
@@ -1746,47 +2418,49 @@ pub async fn parse_dns_from_raw(
 /// dialer name that resolves to nothing.
 const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 
-/// Apply per-outbound `dialer-proxy` in place (issue #210).
+/// The `dialer-proxy` edges of one `proxies:` list, collected before any
+/// leaf is built.
 ///
-/// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
-/// re-parsed from the raw config with a [`meow_proxy::dialer::NamedProxyDialer`]
-/// injected, so the adapter dials its server through `<name>` transparently
-/// (mihomo `proxyDialer` model).
+/// [`insert_parsed_leaves`] injects each edge into the *single* parse of the
+/// block that declared it — the same shape provider nodes already use —
+/// instead of building every node bare and re-parsing the chained ones
+/// afterwards (issue #513 rework: one construction per block, so an `ss`
+/// node on an external SIP003 plugin spawns its subprocess exactly once).
+struct DialerEdges {
+    /// `(proxy name, dialer name)` per effective declaration, in collection
+    /// order — the same list the old post-build pass returned, feeding the
+    /// post-build checks and [`seed_chain_owners`].
+    declared: Vec<(SmolStr, SmolStr)>,
+    /// `raw_proxies` index of each edge's *effective* block (the last block
+    /// of a duplicated name) → its dialer name, so
+    /// [`insert_parsed_leaves`]'s forward pass can tell which block carries
+    /// the chain. A superseded duplicate must not get it: the registry
+    /// insert is last-wins, and injecting the edge into a block that is
+    /// about to be overwritten would both waste a construction (a second
+    /// plugin subprocess for `ss` + external SIP003) and resurrect the
+    /// earlier definition the file superseded.
+    by_index: HashMap<usize, SmolStr>,
+}
+
+/// Collect proxy -> dialer edges from the raw `proxies:` list, before any
+/// leaf is built.
 ///
-/// `<name>` is bound *late*: the injected dialer keeps the name plus a
-/// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up on
-/// every dial, which is what mihomo does (`component/proxydialer/byname.go`).
-/// Capturing the front `Arc` here instead freezes whatever the registry holds
-/// at build time — and since this pass runs *before* groups are built, so that
-/// grouped members inherit the chain (issue #513), a group-valued dialer does
-/// not exist yet at that point.
+/// Iterate in reverse and keep only the first sighting (the *last* block in
+/// the file) per name: the registry-building loop uses `insert`, so for
+/// duplicate `name:` entries the last block is the effective definition.
+/// Collecting edges from superseded duplicates would apply a chain the
+/// effective block never declared.
 ///
-/// Adapter types that do not establish their underlying connection through the
-/// pluggable dialer — `anytls`, `hysteria2` (QUIC), and `ss` with an external
-/// SIP003 plugin — reject the injected dialer at parse time. Those fall back to
-/// wrapping the existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay
-/// chain), which works where `connect_over` is implemented (direct, reject,
-/// http, socks5, snell, vless, vmess, trojan, anytls, and ss without an
-/// external plugin) and fails loudly at dial time otherwise (`hysteria2`,
-/// `ss` + external SIP003). The fallback never degrades to a direct dial, so
-/// a configured chain cannot be silently bypassed.
-///
-/// UDP: Shadowsocks plain relay and SOCKS5 UDP ASSOCIATE now chain — the
-/// front proxy opens a UDP association to the inner node's datagram
-/// endpoint and the protocol framing rides it (mihomo
-/// `proxyDialer.ListenPacket` parity), failing closed when the front
-/// cannot carry UDP. Datagram transports that still cannot chain refuse
-/// rather than leak the real source path; mux-based UDP rides the dialer
-/// over TCP and is unaffected.
-///
-/// A self-referencing dialer, a reference to a name the config does not
-/// declare, or a dialer cycle is a hard config error — silently falling back to
-/// a direct dial would let traffic egress from the real source path past a
-/// chain the user configured for policy/security reasons (Class A, ADR-0002).
-/// A cycle has to be caught here in particular: late binding would turn it into
-/// unbounded recursion on the first dial. Cycles *through group membership* are
-/// checked separately by [`reject_group_membership_cycles`], which runs after
-/// the group build where the real membership is known.
+/// A self-referencing dialer is a hard config error in either mode — the
+/// old post-build pass never warn-skipped it, and silently keeping the node
+/// unchained would dial past the chain the user configured for
+/// policy/security reasons (Class A, ADR-0002). A dialer cycle is a hard
+/// error for the same reason: late binding would turn it into unbounded
+/// recursion on the first dial. The cycle peel here runs on the *declared*
+/// name graph — every member of a pure leaf chain must itself declare an
+/// edge — so it needs no built adapters. Cycles *through group membership*
+/// are checked separately by [`reject_group_membership_cycles`], which runs
+/// after the group build where the real membership is known.
 ///
 /// A malformed (non-string, non-null) `dialer-proxy` value rejects the whole
 /// config under strict; lenient mode instead binds the node to a
@@ -1794,37 +2468,14 @@ const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 /// loudly naming the node — the same "node loads, dial fails" shape mihomo
 /// gives a dialer name that resolves to nothing — rather than silently
 /// egressing direct.
-///
-/// `placeholder_names` carries the leaf names [`insert_parsed_leaves`] bound
-/// as unavailable placeholders: those entries skip the relay-based wrapper
-/// below, since `DialerProxyAdapter::support_udp()` is always `false` and
-/// would hide the placeholder's `true` guard that keeps a UDP rule from
-/// sliding to DIRECT — the node is dead either way, so the chain adds
-/// nothing for TCP.
-///
-/// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
-/// dialer targets once groups have been built (a *declared* group that failed
-/// to build satisfies `dialable` but never enters the registry) and run
-/// [`reject_group_membership_cycles`] against the finished registry.
-fn apply_dialer_proxies(
-    proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
+fn collect_dialer_edges(
     raw_proxies: &[HashMap<String, serde_json::Value>],
-    raw_groups: &[raw::RawProxyGroup],
-    registry: &meow_proxy::dialer::ProxyRegistry,
-    ipv6: bool,
     strict: bool,
-    placeholder_names: &std::collections::HashSet<SmolStr>,
-) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
-    // Collect proxy -> dialer edges from the raw config.
-    //
-    // Iterate in reverse and keep only the first sighting (the *last* block in
-    // the file) per name: the registry-building loop uses `insert`, so for
-    // duplicate `name:` entries the last block is the effective definition.
-    // Collecting edges from superseded duplicates would apply a chain the
-    // effective block never declared.
-    let mut edges: Vec<(SmolStr, SmolStr)> = Vec::new();
+) -> Result<DialerEdges, anyhow::Error> {
+    let mut declared: Vec<(SmolStr, SmolStr)> = Vec::new();
+    let mut by_index: HashMap<usize, SmolStr> = HashMap::new();
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for raw_proxy in raw_proxies.iter().rev() {
+    for (index, raw_proxy) in raw_proxies.iter().enumerate().rev() {
         let Some(name) = raw_proxy.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -1838,12 +2489,27 @@ fn apply_dialer_proxies(
         if BUILTIN_ADAPTER_NAMES.contains(&name) {
             continue;
         }
+        // `type: rematch` owns no dialer — `check_rematch_node` already
+        // rejected a non-blank `dialer-proxy`, so a leftover blank value
+        // is unset, not malformed. Binding the sentinel here would wrap
+        // the control leaf in `DialerProxyAdapter` and hide its rematch
+        // action (issue #974). `type: dns` is the same shape: an
+        // in-process resolver leaf owns no transport to chain, and
+        // mihomo reads no `dialer-proxy` off it — skip the edge entirely
+        // (`parse_dns_node` emits the ignored-key warning instead).
+        if matches!(
+            raw_proxy.get("type").and_then(|v| v.as_str()),
+            Some("rematch") | Some("dns")
+        ) {
+            continue;
+        }
         let dialer: SmolStr = match raw_proxy.get("dialer-proxy") {
             None => continue,
             Some(v) => match v.as_str() {
                 // Trimmed like the provider-node path so
                 // `dialer-proxy: " front "` resolves `front` identically
-                // on statics instead of missing the `dialable` check below.
+                // on statics instead of missing the `dialable` check in
+                // [`apply_dialer_proxies_validate`].
                 Some(s) if !s.trim().is_empty() => SmolStr::from(s.trim()),
                 // `""` and `~` unset the chain in mihomo — not malformed.
                 Some("") => continue,
@@ -1866,33 +2532,23 @@ fn apply_dialer_proxies(
         if dialer.as_str() == name {
             anyhow::bail!("proxy '{name}': dialer-proxy points to itself");
         }
-        edges.push((SmolStr::from(name), dialer));
+        declared.push((SmolStr::from(name), dialer.clone()));
+        by_index.insert(index, dialer);
     }
-    if edges.is_empty() {
-        return Ok(edges);
-    }
-
-    // Names a dialer may reference. Leaf proxies are in the registry already;
-    // groups are built after this pass, so only their *declared* names count
-    // here, plus `GLOBAL`, which is auto-created when the config omits it.
-    let dialable: std::collections::HashSet<&str> = proxies
-        .keys()
-        .map(SmolStr::as_str)
-        .chain(raw_groups.iter().map(|group| group.name.as_str()))
-        .chain(std::iter::once("GLOBAL"))
-        .collect();
-    for (name, dialer) in &edges {
-        if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
-            anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
-        }
+    if declared.is_empty() {
+        return Ok(DialerEdges { declared, by_index });
     }
 
     // Peel every edge whose dialer declares no dialer of its own. What survives
     // is on a cycle or feeds one, and late binding would recurse forever on it.
-    let mut live: std::collections::HashSet<&SmolStr> = edges.iter().map(|(n, _)| n).collect();
+    // The check only needs the declared name graph — a dialer naming a group
+    // or a leaf that never declares an edge has no outgoing edge and peels
+    // away — so it runs here, ahead of the leaf build, exactly as it did in
+    // the old post-collection pass.
+    let mut live: std::collections::HashSet<&SmolStr> = declared.iter().map(|(n, _)| n).collect();
     loop {
         let before = live.len();
-        for (name, dialer) in &edges {
+        for (name, dialer) in &declared {
             if live.contains(name) && !live.contains(dialer) {
                 live.remove(name);
             }
@@ -1902,7 +2558,7 @@ fn apply_dialer_proxies(
         }
     }
     if !live.is_empty() {
-        let cycle: Vec<String> = edges
+        let cycle: Vec<String> = declared
             .iter()
             .filter(|(name, _)| live.contains(name))
             .map(|(name, dialer)| format!("{name} -> {dialer}"))
@@ -1910,88 +2566,130 @@ fn apply_dialer_proxies(
         anyhow::bail!("dialer-proxy cycle detected: {}", cycle.join(", "));
     }
 
-    // Apply the edges. Order no longer matters — the front hop is resolved at
-    // dial time — so nested chains need no deepest-first deferral pass.
-    for (name, dialer) in &edges {
-        let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
-        // `rev()` matters: the registry-building loop above uses `insert`, so
-        // for a config with duplicate `name:` entries the *last* block wins. A
-        // forward `find` here would resurrect the *first* block and silently
-        // swap the running definition out from under the user.
-        let Some(raw) = raw_proxies
-            .iter()
-            .rev()
-            .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-        else {
-            // Unreachable in practice — edges are only collected from blocks in
-            // this same list — but refuse instead of silently dialing direct if
-            // the invariant ever breaks.
-            anyhow::bail!(
-                "proxy '{name}': dialer-proxy '{dialer}' not applied; no raw \
-                 config block found for this name"
-            );
+    Ok(DialerEdges { declared, by_index })
+}
+
+/// The `dialer-proxy` edges `collect_dialer_edges` will actually bind
+/// at build — the verbatim/validation view of the same graph, so a
+/// shadowed duplicate's, a built-in-shadowing entry's or a rematch
+/// node's raw `dialer-proxy` key is not judged as an edge it never
+/// becomes (issue #974 review). Lenient collection: a malformed value
+/// resolves to the sentinel target instead of erroring, matching the
+/// lenient boot it would commit under.
+pub fn declared_dialer_edges(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
+    collect_dialer_edges(raw_proxies, false).map(|edges| edges.declared)
+}
+
+/// The names whose final `proxies:` binding is a rematch leaf — the
+/// verbatim/validation view of the map `insert_parsed_leaves` produces:
+/// last-wins like its `proxies.insert` (a later same-name declaration
+/// replaces the earlier type), and an entry named after a built-in
+/// never binds at all (issue #974 review).
+pub fn declared_rematch_names(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> std::collections::HashSet<SmolStr> {
+    let mut rematch = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in raw_proxies.iter().rev() {
+        let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+            continue;
         };
-        // Re-parse the raw block with the by-name dialer injected (mihomo
-        // model), so the adapter's own dial + handshake runs on the tunneled
-        // stream.
-        let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
-            meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(name.clone()),
-        );
-        match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
-            Ok(rebuilt) => {
-                proxies.insert(name.clone(), rebuilt);
-            }
-            Err(e) if strict => {
-                // Under `strict` the dial-time failure the relay wrapper
-                // defers to is not acceptable — surface it at load.
-                return Err(anyhow::anyhow!(
-                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                     (strict mode): {e}"
-                ));
-            }
-            Err(e) => {
-                // The adapter type cannot carry an injected dialer (anytls,
-                // hysteria2, SS-with-external-SIP003-plugin) or the block is
-                // otherwise unparseable. Fall back to the relay-based
-                // `DialerProxyAdapter`, which preserves the pre-dialer
-                // behaviour: it works for the protocols that implement
-                // `connect_over` (direct/reject/http/socks5/snell/vless/
-                // vmess/trojan/anytls/ss-without-external-plugin) and fails
-                // loudly at dial time for the rest (hysteria2, ss + external
-                // SIP003) — never silently dialing direct and leaking past
-                // the chain.
-                //
-                // A node already bound as an unavailable placeholder keeps it
-                // instead of the wrapper: `DialerProxyAdapter::support_udp()`
-                // is always `false`, so wrapping would hide the placeholder's
-                // `true` guard that fails UDP loudly — a UDP rule could then
-                // slide to DIRECT. The chain adds nothing for TCP either way,
-                // since every dial through the dead node already fails.
-                if let Some(inner) = proxies.get(name).cloned() {
-                    if placeholder_names.contains(name) {
-                        debug!(
-                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
-                             the node is an unavailable placeholder ({e})"
-                        );
-                    } else {
-                        warn!(
-                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                             ({e}); falling back to the relay-based wrapper"
-                        );
-                        let wrapped: Arc<dyn Proxy> =
-                            Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
-                        proxies.insert(name.clone(), wrapped);
-                    }
-                } else {
-                    warn!(
-                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
-                         ({e}); the outbound itself failed to parse"
-                    );
-                }
-            }
+        if !seen.insert(name) || BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            rematch.insert(SmolStr::from(name));
         }
     }
-    Ok(edges)
+    rematch
+}
+
+/// The names a `proxies:` document could leave bound to a `type: dns`
+/// leaf — the CONSERVATIVE view the verbatim lanes need (issue #974
+/// review). A dns leaf answers queries in-process and never dials, so a
+/// `dialer-proxy` front or relay hop that names one must be refused
+/// exactly like a rematch target.
+///
+/// Unlike [`declared_rematch_names`]'s straight last-wins view this
+/// cannot trust the last raw declaration: `insert_parsed_leaves` only
+/// replaces a binding on a *successful* bind — a later same-named node
+/// that lenient parsing warn-drops leaves an earlier dns binding
+/// standing, and a verbatim lane (whose build failed by definition)
+/// cannot prove a later decl binds. So ANY named dns declaration marks
+/// the name unless it is built-in-shadowed — the built-in always wins,
+/// the entry never binds.
+pub fn declared_dns_names(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> std::collections::HashSet<SmolStr> {
+    let mut dns = std::collections::HashSet::new();
+    for node in raw_proxies {
+        let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("dns") {
+            dns.insert(SmolStr::from(name));
+        }
+    }
+    dns
+}
+
+/// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
+/// that every leaf has been built — the check half of the old
+/// `apply_dialer_proxies` pass. The chains themselves are already applied:
+/// [`insert_parsed_leaves`] injected each edge into the single construction
+/// it feeds, so nothing is parsed or replaced here.
+///
+/// Names a dialer may reference: leaf proxies are in the registry already;
+/// groups are built after this pass, so only their *declared* names count
+/// here, plus `GLOBAL`, which is auto-created when the config omits it. A
+/// reference to a name the config does not declare is a hard config error —
+/// silently falling back to a direct dial would let traffic egress from the
+/// real source path past a chain the user configured for policy/security
+/// reasons (Class A, ADR-0002). The caller re-validates every target again
+/// against the finished registry once groups exist (a *declared* group that
+/// failed to build satisfies `dialable` but never enters the registry) and
+/// runs [`reject_group_membership_cycles`] on the same edges.
+fn apply_dialer_proxies_validate(
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    dialer_edges: &[(SmolStr, SmolStr)],
+    raw_groups: &[raw::RawProxyGroup],
+) -> Result<(), anyhow::Error> {
+    if dialer_edges.is_empty() {
+        return Ok(());
+    }
+    let dialable: std::collections::HashSet<&str> = proxies
+        .keys()
+        .map(SmolStr::as_str)
+        .chain(raw_groups.iter().map(|group| group.name.as_str()))
+        .chain(std::iter::once("GLOBAL"))
+        .collect();
+    for (name, dialer) in dialer_edges {
+        if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
+            anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
+        }
+        // A statically resolvable rematch or dns leaf can never carry
+        // the hop — a rematch's only action is a routing re-entry, and a
+        // dns leaf answers in-process; neither dials (issue #974). Group
+        // fronts resolve their pick at dial time, where the leaf's own
+        // dial fails closed instead.
+        if proxies.get(dialer.as_str()).is_some_and(|p| {
+            matches!(
+                p.adapter_type(),
+                meow_common::AdapterType::Rematch | meow_common::AdapterType::Dns
+            )
+        }) {
+            anyhow::bail!(
+                "proxy '{name}': dialer-proxy '{dialer}' is a control/resolver \
+                 leaf — it cannot carry a dialer front"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject cycles in the declared group-membership graph (issue #562).
@@ -2279,6 +2977,158 @@ pub(crate) fn unavailable_placeholder(
     )))
 }
 
+/// What one `proxies:` block resolved to in [`insert_parsed_leaves`]: the
+/// value to bind under the block's key, plus whether it is an unavailable
+/// placeholder (which fills only a vacant slot) rather than a live adapter.
+/// `None` means the block was skipped after its own warn.
+type ParsedLeaf = Option<(Arc<dyn Proxy>, bool)>;
+
+/// Parse the `dialer-proxy`-edged half of one `proxies:` block for
+/// [`insert_parsed_leaves`] — a single construction attempt per parse path,
+/// the same shape provider nodes already use.
+///
+/// First tries [`proxy_parser::parse_proxy_with_dialer`] with a late-bound
+/// [`meow_proxy::dialer::NamedProxyDialer`] injected (mihomo `proxyDialer`
+/// model): the adapter's own dial + handshake runs on the tunnelled stream.
+/// `<name>` is bound *late* — the injected dialer keeps the name plus a
+/// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up
+/// on every dial — so a dialer may name a group or a node declared later in
+/// the file, and nested chains need no ordering pass. A successful
+/// injection is wrapped in [`proxy_parser::ChainedProxy`]: the marker is
+/// what reports the configured chain to the UDP probe
+/// (`is_dialer_proxy_non_transparent`, issue #969), since an injected leaf
+/// carries no `DialerProxyAdapter` to answer for it.
+///
+/// Adapter types that do not establish their underlying connection through
+/// the pluggable dialer — `direct` (resolver-threaded dials stay on the real
+/// path) and `ss` with an external SIP003
+/// plugin — reject the injected dialer at parse time. Those are re-parsed
+/// *directly* — via [`proxy_parser::parse_static_proxy`] so the
+/// `dns.direct-nameserver` slot wiring matches the unedged path — and
+/// wrapped with a [`meow_proxy::DialerProxyAdapter`] (relay chain), which
+/// works where `connect_over` is implemented and fails loudly at dial time
+/// otherwise. The fallback never degrades to a direct dial, so a configured
+/// chain cannot be silently bypassed.
+///
+/// When both parses fail, lenient mode keeps the old pass's verdicts by
+/// looking up what the name already resolves to: a bound unavailable
+/// placeholder stays unwrapped (a `DialerProxyAdapter` over a dead inner
+/// is non-transparent, so its `support_udp()` is `false` and would hide
+/// the placeholder's `true` guard that keeps a UDP rule from sliding to
+/// DIRECT); a live earlier binding still takes the wrapper; an empty slot
+/// gets the unavailable placeholder when the block is placeholder-eligible,
+/// else a warn-drop.
+///
+/// Return contract mirrors the unedged match arm:
+/// `Ok(Some((proxy, placeholder_bound)))` binds through the shared tail;
+/// `Ok(None)` skips the block (a warn was already emitted); `Err` bails.
+#[allow(clippy::too_many_arguments)]
+fn parse_dialered_leaf(
+    raw_proxy: &HashMap<String, serde_json::Value>,
+    dialer: &SmolStr,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
+    resolver: Option<&meow_dns::ResolverSlot>,
+    ipv6: bool,
+    strict: bool,
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    global_client_fingerprint: Option<&str>,
+    dns_cell: &meow_dns::DnsOutboundCell,
+) -> Result<ParsedLeaf, anyhow::Error> {
+    // Edged blocks always carry `name:` — `collect_dialer_edges` only emits
+    // an edge for a block whose name parses.
+    let name = raw_proxy
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed>");
+    let key = SmolStr::from(name);
+    let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
+    let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+        Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(key.clone()));
+    match proxy_parser::parse_proxy_with_dialer_and_fp(
+        raw_proxy,
+        &proxy_dialer,
+        ipv6,
+        global_client_fingerprint,
+        Some(dns_cell),
+    ) {
+        // The `ChainedProxy` marker pins the #969 fail-closed verdict on
+        // injected entries: unlike the relay-based wrapper below, an
+        // injected leaf carries no `DialerProxyAdapter` to report the
+        // configured chain, so the UDP probe would otherwise read it as a
+        // plain `udp: false` node and slide a matched flow to a later rule.
+        Ok(built) => Ok(Some((
+            Arc::new(proxy_parser::ChainedProxy::new(built)) as Arc<dyn Proxy>,
+            false,
+        ))),
+        Err(chain_err) if strict => {
+            // Under `strict` the dial-time failure the relay wrapper defers
+            // to is not acceptable — surface it at load, exactly as the old
+            // post-build pass did.
+            Err(anyhow::anyhow!(
+                "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                 (strict mode): {chain_err}"
+            ))
+        }
+        Err(chain_err) => match proxy_parser::parse_static_proxy(
+            raw_proxy,
+            ipv6,
+            resolver,
+            global_client_fingerprint,
+            Some(dns_cell),
+        ) {
+            Ok(inner) => {
+                warn!(
+                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                     ({chain_err}); falling back to the relay-based wrapper"
+                );
+                let wrapped: Arc<dyn Proxy> =
+                    Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
+                Ok(Some((wrapped, false)))
+            }
+            Err(parse_err) => {
+                if let Some(existing) = proxies.get(&key) {
+                    if placeholder_names.contains(&key) {
+                        debug!(
+                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
+                             the node is an unavailable placeholder \
+                             ({chain_err}); the block itself also failed to parse \
+                             ({parse_err})"
+                        );
+                        Ok(None)
+                    } else {
+                        warn!(
+                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                             ({chain_err}); the block itself also failed to parse \
+                             ({parse_err}); falling back to the relay-based \
+                             wrapper over the earlier same-name binding"
+                        );
+                        let wrapped: Arc<dyn Proxy> = Arc::new(
+                            meow_proxy::DialerProxyAdapter::new(Arc::clone(existing), target),
+                        );
+                        Ok(Some((wrapped, false)))
+                    }
+                } else if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                    warn!(
+                        "proxies: '{name}' failed to parse ({parse_err}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                    );
+                    Ok(Some((
+                        unavailable_placeholder(name, &parse_err, declared),
+                        true,
+                    )))
+                } else {
+                    warn!(
+                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
+                         ({parse_err}); the outbound itself failed to parse"
+                    );
+                    Ok(None)
+                }
+            }
+        },
+    }
+}
+
 /// Parse every `proxies:` leaf entry into `proxies`, keyed by its YAML `name:`
 /// (`proxy.name()` only as fallback — `DirectAdapter::name()` is hardcoded to
 /// "DIRECT" and would overwrite the built-in, hiding a user-named direct proxy
@@ -2287,8 +3137,20 @@ pub(crate) fn unavailable_placeholder(
 /// `include-all-proxies` and membership cycles. Factored out of
 /// `build_proxy_layer` so the key derivation lives in exactly one place.
 ///
-/// Returns the names this pass bound as unavailable placeholders, for
-/// [`apply_dialer_proxies`] to leave unwrapped.
+/// `dialer_edges` maps each block index [`collect_dialer_edges`] assigned a
+/// `dialer-proxy` edge to the dialer name; those blocks go through
+/// [`parse_dialered_leaf`]'s single chained parse (plus direct re-parse
+/// fallback) instead of the bare [`proxy_parser::parse_static_proxy`], so an
+/// edged block is constructed at most once per parse path — never built
+/// bare and then rebuilt for the chain. `registry` is the late-binding
+/// handle the injected [`meow_proxy::dialer::NamedProxyDialer`]s keep; the
+/// caller must publish the finished map into it or every injected dial
+/// fails "not in the proxy registry".
+///
+/// Returns the names this pass bound as unavailable placeholders — edged
+/// blocks consult it mid-loop to keep an already-bound placeholder
+/// unwrapped, and tests reuse it for assertions.
+#[allow(clippy::too_many_arguments)]
 fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
@@ -2296,11 +3158,37 @@ fn insert_parsed_leaves(
     resolver: Option<&meow_dns::ResolverSlot>,
     ipv6: bool,
     strict: bool,
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    dialer_edges: &HashMap<usize, SmolStr>,
+    global_client_fingerprint: Option<&str>,
+    dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
     let mut placeholder_names = std::collections::HashSet::new();
-    for raw_proxy in raw_proxies {
-        let (proxy, placeholder_bound) =
-            match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
+    for (index, raw_proxy) in raw_proxies.iter().enumerate() {
+        let (proxy, placeholder_bound) = if let Some(dialer) = dialer_edges.get(&index) {
+            match parse_dialered_leaf(
+                raw_proxy,
+                dialer,
+                proxies,
+                &placeholder_names,
+                resolver,
+                ipv6,
+                strict,
+                registry,
+                global_client_fingerprint,
+                dns_cell,
+            )? {
+                Some(bound) => bound,
+                None => continue,
+            }
+        } else {
+            match proxy_parser::parse_static_proxy(
+                raw_proxy,
+                ipv6,
+                resolver,
+                global_client_fingerprint,
+                Some(dns_cell),
+            ) {
                 Ok(proxy) => (proxy, false),
                 Err(e) if strict => {
                     let name = raw_proxy
@@ -2338,7 +3226,8 @@ fn insert_parsed_leaves(
                         continue;
                     }
                 }
-            };
+            }
+        };
         // Prefer the YAML `name:` as the registry key. `proxy.name()`
         // is fine for SS/Trojan/VLESS (their parsers thread the name
         // into the adapter) but `DirectAdapter::name()` is hardcoded
@@ -2387,8 +3276,9 @@ fn insert_parsed_leaves(
                 warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
             }
             // A *live* duplicate still wins over an earlier placeholder —
-            // the normal insert replaces it, so unmark the name first or
-            // `apply_dialer_proxies` would skip wrapping a working node.
+            // the normal insert replaces it, so unmark the name first or a
+            // later same-named edged block would mistake it for a bound
+            // placeholder and leave it unwrapped.
             placeholder_names.remove(&key);
             proxies.insert(key, proxy);
         }
@@ -2405,7 +3295,11 @@ fn insert_parsed_leaves(
 ///   into the rebuilt groups. A *changed* definition rebuilds the provider:
 ///   reusing the old object would keep fetching the old `url`/`path` with the
 ///   old filters forever while the committed config claims otherwise
-///   (issue #533 review).
+///   (issue #533 review). A rebuild whose *only* change is
+///   `global-client-fingerprint` — the adapters bake the profile at parse,
+///   so the object cannot be reused — adopts the predecessor's last
+///   committed payload into the fresh provider instead of serving an empty
+///   slot until the detached post-commit fetch lands (issue #974 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`]. A `file:`
 ///   provider's payload is operator-authored local content, so it is read
 ///   and parsed right here — local I/O only, and the ECH DNS preresolve
@@ -2440,27 +3334,47 @@ fn materialize_proxy_providers(
     // newly declared providers must share it, or their `dialer-proxy`
     // nodes can never resolve (issue #489).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974):
+    // shared into every provider this call constructs so a node parsed
+    // from a payload — before DNS exists, or on a refresh long after —
+    // resolves the same slot the commit populates.
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
     dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let Some(raw_map) = raw.proxy_providers.as_ref() else {
         return Ok(HashMap::new());
     };
     let ipv6 = effective_ipv6(raw.ipv6);
+    let global_fp = raw.global_client_fingerprint.as_deref();
     let mut out = HashMap::with_capacity(raw_map.len());
     for (name, def) in raw_map {
+        let mut inherited: Option<String> = None;
         if let Some(provider) = live.get(name) {
-            if provider.matches_def(def, ipv6) {
+            if provider.matches_def(def, ipv6, global_fp) {
                 out.insert(name.clone(), Arc::clone(provider));
                 continue;
             }
+            // A rebuild that fails `matches_def` on the fingerprint leg
+            // alone inherits the predecessor's last committed payload —
+            // re-parsed under the new `global-client-fingerprint` — so
+            // `use:` groups and provider-backed selectors never see the
+            // empty slot a `--config-string` run (no on-disk cache) would
+            // otherwise serve until the detached post-commit fetch lands
+            // (issue #974 review). `None` when nothing was ever committed:
+            // the provider starts empty and retries, same as today.
+            if provider.matches_def_modulo_fingerprint(def, ipv6) {
+                inherited = provider.retained_payload();
+            }
         }
-        match ProxyProvider::new(
+        match ProxyProvider::new_with_client_fingerprint(
             name,
             def,
             cache_dir,
             ipv6,
             strict,
             provider_dialer_registry.clone(),
+            global_fp,
+            Some(Arc::clone(provider_dns_cell)),
         ) {
             Ok(provider) => {
                 // A new `file:` provider's payload is local content —
@@ -2476,6 +3390,17 @@ fn materialize_proxy_providers(
                 // providers never load on this path.
                 if provider.is_file_vehicle() {
                     provider.initial_load_blocking(strict)?;
+                } else if let Some(content) = inherited {
+                    // Remote bytes degrade rather than reject — the same
+                    // payload parsed under the old fingerprint, so a
+                    // re-parse the new one rejects (e.g. a REALITY node
+                    // left without a profile) is a feed defect, not a
+                    // config defect: the commit's detached fetch retries.
+                    if let Err(e) = provider.adopt_transferred_payload(content) {
+                        warn!(provider = %name, error = %e,
+                            "inherited proxy-provider payload failed to re-parse under \
+                             the new client fingerprint; starting empty until a fetch succeeds");
+                    }
                 }
                 out.insert(name.clone(), Arc::new(provider));
             }
@@ -2492,6 +3417,15 @@ fn materialize_proxy_providers(
     }
     Ok(out)
 }
+
+/// The registry map one `build_proxy_layer` produces plus the names it
+/// bound to unavailable placeholders — [`check_ntp_dialer_target`] needs
+/// the set: `contains_key` alone cannot tell a placeholder (every dial
+/// fails) from a live leaf.
+type BuiltProxyLayer = (
+    HashMap<SmolStr, Arc<dyn Proxy>>,
+    std::collections::HashSet<SmolStr>,
+);
 
 /// Build the complete proxy layer for one config: built-ins, `proxies:` leaf
 /// adapters, `dialer-proxy` chains, proxy groups and the auto-created GLOBAL
@@ -2511,10 +3445,14 @@ fn build_proxy_layer(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection static `type: dns` leaves bind
+    // (issue #974) — the same handle the provider set carries, so both
+    // node origins resolve one slot.
+    dns_cell: &meow_dns::DnsOutboundCell,
     strict: bool,
-) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
+) -> Result<BuiltProxyLayer, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
@@ -2586,13 +3524,55 @@ fn build_proxy_layer(
         ))),
     );
 
+    // Collect `dialer-proxy` edges (issue #210) *before* any leaf is built:
+    // the raw-name, self-reference, malformed-value and declared-cycle checks
+    // all run on the declared name graph, so they need no adapters. The
+    // collected edges then steer [`insert_parsed_leaves`]'s single chained
+    // parse — the same shape provider nodes already use — instead of the old
+    // build-bare-then-re-parse pass, whose double construction could spawn an
+    // `ss` node's external SIP003 subprocess twice.
+    let raw_proxies = raw.proxies.as_deref().unwrap_or(&[]);
+    // A malformed `type: rematch` action fails the whole load in either
+    // mode — warn-dropping it would silently remove the flow's first
+    // routing decision (issue #974). Run the structural gate before the
+    // leaf pass so `-t`, boot, PUT and provider-less rebuilds agree.
+    // `type: dns` gets the same treatment: a nameless node parses away to
+    // nothing under leniency, so a `PUT /configs?force=true` retry could
+    // otherwise commit a document the verbatim gate — and the next
+    // boot — would reject (issue #974 review).
+    for raw_proxy in raw_proxies {
+        match raw_proxy.get("type").and_then(|v| v.as_str()) {
+            Some("rematch") => {
+                if let Err(e) = proxy_parser::check_rematch_node(raw_proxy) {
+                    anyhow::bail!("proxies: {e}");
+                }
+            }
+            Some("dns") => {
+                if let Err(e) = proxy_parser::check_dns_node(raw_proxy) {
+                    anyhow::bail!("proxies: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
+    let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;
+
+    // `global-client-fingerprint` (issue #974) is normalized once per
+    // build and baked into each adapter that inherits it — config-threaded,
+    // not a runtime global, so a `PUT /configs` flip rebuilds cleanly.
+    let global_fp =
+        proxy_parser::normalize_client_fingerprint(raw.global_client_fingerprint.as_deref());
     let placeholder_names = insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
-        raw.proxies.as_deref().unwrap_or(&[]),
+        raw_proxies,
         resolver,
         ipv6,
         strict,
+        registry,
+        &dialer_edges.by_index,
+        global_fp.as_deref(),
+        dns_cell,
     )?;
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
@@ -2636,23 +3616,17 @@ fn build_proxy_layer(
 
     reject_declared_group_cycles(raw_groups)?;
 
-    // Apply per-outbound `dialer-proxy` chains (issue #210) *before* groups are
-    // built: groups clone their members eagerly, so a chain applied afterwards
-    // would only cover direct rule references and a grouped node would silently
-    // bypass it (issue #513). The front hop is resolved by name at dial time,
-    // which is what lets a dialer name a group that does not exist yet here.
-    let dialer_edges = apply_dialer_proxies(
-        &mut proxies,
-        raw.proxies.as_deref().unwrap_or(&[]),
-        raw_groups,
-        registry,
-        ipv6,
-        strict,
-        &placeholder_names,
-    )?;
+    // Validate the `dialer-proxy` targets now that every leaf is built: the
+    // static contract accepts leaf names, *declared* group names and
+    // `GLOBAL`, and the post-build recheck below narrows that to what
+    // actually landed. The chains themselves are already applied by the
+    // leaf pass — groups built afterwards clone the finished (chained or
+    // wrapped) members eagerly, which is what keeps a grouped node from
+    // bypassing its chain (issue #513).
+    apply_dialer_proxies_validate(&proxies, &dialer_edges.declared, raw_groups)?;
 
     // Mihomo expands `include-all-proxies` from the top-level `proxies:`
-    // entries only. Capture those adapters after dialer wrapping but before
+    // entries only. Capture those adapters after dialer chaining but before
     // any groups enter the registry, and keep mihomo's name-sorted order.
     let mut include_all_proxies: Vec<(SmolStr, Arc<dyn Proxy>)> = static_proxy_names
         .iter()
@@ -2667,6 +3641,52 @@ fn build_proxy_layer(
         .into_iter()
         .map(|(_, proxy)| proxy)
         .collect();
+
+    // A statically known `type: rematch` or `type: dns` hop can never
+    // carry a relay chain — rematch's only action is a routing re-entry
+    // and a dns leaf answers in-process; neither dials a transport hop
+    // (issue #974: "Rematch is not a meow relay transport hop; reject
+    // statically known uses"). Both static memberships a relay can have
+    // — a declared `proxies:` name resolving to the leaf, and the
+    // `include-all-proxies` expansion — are checked here so the verdict
+    // is a hard error in both build modes, ahead of the lenient group
+    // passes that would warn-drop it. `parse_relay_group` repeats the
+    // member-vec check for its own callers. A *group* member's dynamic
+    // rematch pick is the probe's business instead:
+    // `RelayGroup::unwrap_proxy` surfaces it and the cycle guard closes
+    // the loop.
+    let is_non_transport_leaf =
+        |p: &Arc<dyn Proxy>| p.rematch_action().is_some() || p.adapter_type() == AdapterType::Dns;
+    for group in raw_groups {
+        if group.group_type != "relay" {
+            continue;
+        }
+        for member in group.proxies.as_deref().unwrap_or(&[]) {
+            if proxies
+                .get(member.as_str())
+                .is_some_and(&is_non_transport_leaf)
+            {
+                anyhow::bail!(
+                    "relay group '{}': member '{member}' is a control/resolver \
+                     leaf — it cannot be a relay transport hop",
+                    group.name
+                );
+            }
+        }
+        if group.include_all_proxies.unwrap_or(false) {
+            if let Some(hop) = include_all_proxies
+                .iter()
+                .find(|p| is_non_transport_leaf(p))
+            {
+                anyhow::bail!(
+                    "relay group '{}': include-all-proxies supplies control/resolver \
+                     leaf '{}' — it cannot be a relay transport hop",
+                    group.name,
+                    hop.name()
+                );
+            }
+        }
+    }
 
     // Strict mode: a `use:` name that resolves to nothing is a permanent
     // miss — providers are all loaded before groups, so check upfront rather
@@ -2720,7 +3740,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -2762,7 +3782,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     details.push(format!("'{}': {e}", raw_group.name));
                 }
@@ -2793,7 +3813,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -2819,7 +3839,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     Ok(group) => {
                         let name = SmolStr::from(group.name());
@@ -2873,8 +3893,11 @@ fn build_proxy_layer(
             .collect();
         // meow-openwrt: mihomo's order (`proxyList`) — DIRECT, REJECT, the
         // config's proxies, then its groups, each in declaration order — so
-        // an unchosen GLOBAL defaults to DIRECT as it does there. Members
-        // outside that list (provider leaves) follow, sorted.
+        // an unchosen GLOBAL defaults to DIRECT as it does there (upstream
+        // #974 instead moves the primary outbound first). Members outside
+        // that list (provider leaves) follow, sorted. DIRECT at index 0
+        // keeps the #974 safety property: an ordinary flow never defaults
+        // to a rematch or dns leaf.
         all_proxy_names.sort();
         let declared = ["DIRECT", "REJECT"]
             .into_iter()
@@ -2915,7 +3938,7 @@ fn build_proxy_layer(
             &proxies,
             &[],
             providers,
-            selector_store,
+            selection,
         ) {
             Ok(group) => {
                 proxies.insert(SmolStr::new_static("GLOBAL"), group);
@@ -2934,7 +3957,7 @@ fn build_proxy_layer(
     // first dial report it late. Lenient-mode malformed-value sentinels are
     // exempt: they are deliberately unresolvable so the node's dials fail
     // loudly at dial time rather than here at load.
-    for (name, dialer) in &dialer_edges {
+    for (name, dialer) in &dialer_edges.declared {
         if !proxies.contains_key(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!(
                 "proxy '{name}': dialer-proxy '{dialer}' is declared but did \
@@ -2947,16 +3970,16 @@ fn build_proxy_layer(
     // failed GLOBAL that the auto-create just backstopped — are only decidable
     // now that the registry is finished.
     reject_group_membership_cycles(
-        &dialer_edges,
+        &dialer_edges.declared,
         raw_groups,
         &proxies,
         &static_proxy_names,
         global_auto_created,
     )?;
 
-    seed_chain_owners(&dialer_edges, &proxies);
+    seed_chain_owners(&dialer_edges.declared, &proxies);
 
-    Ok(proxies)
+    Ok((proxies, placeholder_names))
 }
 
 /// Tell each automatic group used as a `dialer-proxy` which outbounds dial
@@ -3003,13 +4026,28 @@ struct PrefetchProxies {
 fn prefetch_proxy_map(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
+    // The cell provider-sourced nodes' `dialer-proxy` targets resolve
+    // against — the same handle the providers were loaded with. The
+    // layer's own `registry` covers static `proxies:` chains only, so
+    // without publishing here a provider node's front hop resolves to
+    // nothing during the prefetch window (issue #974 review).
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The same dns-outbound cell the real build binds — prefetch dns
+    // leaves behave identically to the runtime map's (issue #974).
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
-    // No `proxies:` entries means nothing to tunnel through — named `proxy:`
-    // lookups and the default proxy all come back empty either way. Such a
-    // config's provider `proxy:` names (a group, or GLOBAL) simply defer to
-    // the load pass, which resolves them against the pass-1 registry.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // No `proxies:` and no `proxy-groups:` means nothing to tunnel
+    // through — named `proxy:` lookups and the default proxy all come
+    // back empty either way, and provider `proxy:` names defer to the
+    // load pass, which resolves them against the pass-1 registry. Groups
+    // alone still justify the layer: a provider-fed group can be a
+    // `geodata.proxy`/provider `proxy:` target, and one selecting a
+    // provider's rematch leaf must fail the fetch loudly instead of
+    // leaking it direct (issue #974).
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return Ok(None);
     }
     let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -3017,15 +4055,20 @@ fn prefetch_proxy_map(
     // cycle) hard-fails the real build with the same error; surface it
     // now instead of letting default-proxy provider/geodata fetches
     // egress direct on a config that intends chained egress.
-    let map = build_proxy_layer(
+    let (map, _) = build_proxy_layer(
         raw,
         None,
         providers,
-        selector_store,
+        selection,
         &registry,
+        provider_dns_cell,
         raw.strict.unwrap_or(false),
     )?;
     registry.publish(Arc::new(map.clone()));
+    // The same snapshot into the provider-node cell: their front hops
+    // resolve against it until the first routing install publishes the
+    // live map over it.
+    provider_dialer_registry.publish(Arc::new(map.clone()));
     Ok(Some(PrefetchProxies {
         map,
         _registry: registry,
@@ -3034,20 +4077,30 @@ fn prefetch_proxy_map(
 
 /// Build the prefetch proxy layer on a blocking thread — adapter and group
 /// construction can spawn plugin subprocesses and read TLS material, so it
-/// must not run inline on the async executor. `selector_store` is threaded
+/// must not run inline on the async executor. `selection` is threaded
 /// in so a `select` group's persisted choice resolves to the same member
 /// the runtime build would pick. A rejected layer or a failed build task
 /// surfaces as `Err` — the same failure pass 1 of the real build reports.
 async fn prefetch_proxy_layer_async(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
-    let selector_store = selector_store.cloned();
+    let selection = selection.cloned();
+    let provider_dialer_registry = provider_dialer_registry.clone();
+    let provider_dns_cell = Arc::clone(provider_dns_cell);
     spawn_blocking_with_current_dispatcher(move || {
-        prefetch_proxy_map(&raw, &providers, selector_store.as_ref())
+        prefetch_proxy_map(
+            &raw,
+            &providers,
+            selection.as_ref(),
+            &provider_dialer_registry,
+            &provider_dns_cell,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
@@ -3064,7 +4117,7 @@ fn rebuild_from_raw_impl(
     cache_dir: Option<&Path>,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<Arc<rule_provider::PrefetchedPayloads>>,
     // `dialer-proxy` front hops are resolved by name against this registry on
@@ -3079,6 +4132,12 @@ fn rebuild_from_raw_impl(
     // validation, tests) may pass a throwaway: providers built on it never
     // dial in those contexts (issue #489).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // same lifetime contract as `provider_dialer_registry`: committing
+    // lanes pass `Tunnel::dns_outbound_cell()` so leaves parsed here and
+    // by providers resolve the running slot; a throwaway leaves them
+    // unbound (SERVFAIL, never a guessed upstream).
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
     // An already-loaded provider set to bind into this build (startup's
     // two-pass build shares the set it loaded for DNS so rules, DNS
     // `rule-set:` matchers, and `Config.rule_providers` all reference one
@@ -3090,7 +4149,26 @@ fn rebuild_from_raw_impl(
     // and validation/test rebuilds must not reach the network.
     fetch_geodata: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
+    // `global-ua` gate first: an invalid UA is a Class A rejection for
+    // every candidate — validate only; the live process-global is
+    // installed at the commit point (issue #974). The validated value is
+    // also the UA this build's own HTTP emits send: `GLOBAL_UA` still
+    // holds the committed value on this lane, so the rule-provider
+    // prefetch below is handed the candidate's UA explicitly instead of
+    // reading the static (issue #974 review). `None` resolves to the
+    // default UA, the same effective value the static would give.
+    let candidate_ua =
+        validate_global_ua(raw.global_ua.as_deref())?.unwrap_or(meow_common::DEFAULT_USER_AGENT);
+    // `ntp:` shape/ranges resolve before any candidate network work —
+    // disabled included: `-t` and PUT reject an out-of-range endpoint
+    // regardless of `enable` (issue #974). The named-target reference is
+    // checked against the built map below.
+    let ntp_resolved = resolve_ntp(raw)?;
     dns_parser::validate_node_policy_sources(raw)?;
+    // Warn-only unknown-key reporting (issue #974): classify-and-warn every
+    // key the typed schema dropped. Runs on every rebuild pass — startup's
+    // `-t`/load passes and `PUT`/`PATCH /configs` rebuilds all re-emit.
+    validation::validate_and_warn(raw);
     // Top-level `strict: true` (issue #533): warn-skipped defects in
     // *operator-authored* content become hard errors — proxies,
     // proxy-groups and rules are covered inside
@@ -3139,16 +4217,23 @@ fn rebuild_from_raw_impl(
         cache_dir,
         strict,
         provider_dialer_registry,
+        provider_dns_cell,
         &mut dropped,
     )?;
-    let proxies = build_proxy_layer(
+    let (proxies, placeholder_names) = build_proxy_layer(
         raw,
         resolver,
         &candidate_providers,
-        selector_store,
+        selection,
         registry,
+        provider_dns_cell,
         strict,
     )?;
+    // An enabled `ntp.dialer-proxy` must name a BUILT target — checked
+    // here so every publication lane (startup, `-t`, PUT, warm republish)
+    // enforces it the same way, and removing a target together with its
+    // reference in one document stays legal (issue #974).
+    check_ntp_dialer_target(&ntp_resolved, &proxies, &placeholder_names)?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound during
     // the layer build resolve their front hop by name against it, and only
@@ -3165,14 +4250,34 @@ fn rebuild_from_raw_impl(
     // payload is remote content and the dialer name may point at a group
     // built above — so warn about references that will never resolve and let
     // the by-name lookup surface a loud dial error at runtime.
+    // A name that DOES resolve but lands on a `type: rematch`/`type: dns`
+    // leaf is the opposite verdict — the same statically resolvable
+    // control/resolver leaf `apply_dialer_proxies_validate` rejects on a
+    // static edge; provider fronts bind late, so judge them here, against
+    // the finished map, before they can commit (issue #974 review).
     for provider in candidate_providers.values() {
         for dialer in provider.declared_dialer_names() {
-            if !proxies.contains_key(dialer.as_str()) {
-                warn!(
-                    provider = %provider.name,
-                    "provider node declares dialer-proxy '{dialer}', which is \
-                     not a built proxy or group — chained dials will fail"
-                );
+            match proxies.get(dialer.as_str()) {
+                Some(target)
+                    if matches!(
+                        target.adapter_type(),
+                        AdapterType::Rematch | AdapterType::Dns
+                    ) =>
+                {
+                    anyhow::bail!(
+                        "proxy-provider '{}': dialer-proxy '{dialer}' is a \
+                         control/resolver leaf — it cannot carry a dialer front",
+                        provider.name
+                    );
+                }
+                None => {
+                    warn!(
+                        provider = %provider.name,
+                        "provider node declares dialer-proxy '{dialer}', which is \
+                         not a built proxy or group — chained dials will fail"
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -3214,6 +4319,7 @@ fn rebuild_from_raw_impl(
                 cache_dir,
                 download_proxy.as_ref(),
                 &proxy_lookup,
+                Some(candidate_ua),
             ),
             _ => rule_provider::PrefetchedPayloads::default(),
         }),
@@ -3223,7 +4329,7 @@ fn rebuild_from_raw_impl(
     let ctx = match shared_ctx {
         Some(c) => c,
         None => {
-            let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+            let geo = geodata::parse_geodata(raw)?;
             if fetch_geodata {
                 ensure_geodata_blocking(
                     raw,
@@ -3274,20 +4380,52 @@ fn rebuild_from_raw_impl(
         strict,
     )?;
 
-    // Validate: any `SUB-RULE,<name>` in top-level rules must reference a
-    // defined block. `parse_rules_full` warns on unknown blocks; promote
-    // undefined-block to a hard error here (Class A per ADR-0002).
+    // Validate: any `SUB-RULE` reference in top-level rules must point at a
+    // defined block — plain, conditional or fallback form alike (issue
+    // #974). `parse_rules_full` warns on unknown blocks; promote
+    // undefined-block to a hard error here (Class A per ADR-0002). Only a
+    // well-formed reference head counts: a malformed one fails at the
+    // parse stage, so skipping it here leaves exactly one error channel.
     if let Some(raw_rules) = raw.rules.as_deref() {
         for line in raw_rules {
-            if let Some(name) = sub_rules_parser::parse_sub_rule_reference(line) {
-                if !sub_rules.contains_key(&name) {
+            if let Ok(Some(reference)) = sub_rules_parser::parse_sub_rule_reference(line) {
+                if !sub_rules.contains_key(&reference.name) {
                     return Err(anyhow::anyhow!(
-                        "rules: SUB-RULE,{name} references undefined sub-rule block"
+                        "rules: SUB-RULE,{} references undefined sub-rule block",
+                        reference.name
                     ));
                 }
             }
         }
     }
+
+    // A rematch node's `target-sub-rule` names a block by reference only —
+    // like `SUB-RULE` references, a miss falls back to the main rule list
+    // at match time, so warn once here rather than failing (issue #974).
+    if let Some(raw_proxies) = raw.proxies.as_deref() {
+        for node in raw_proxies {
+            if node.get("type").and_then(|v| v.as_str()) != Some("rematch") {
+                continue;
+            }
+            let Some(block) = node.get("target-sub-rule").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !block.is_empty() && !sub_rules.contains_key(block) {
+                warn!(
+                    "rematch '{}': target-sub-rule '{block}' is not a declared \
+                     sub-rules block — flows selecting it fall back to the main rules",
+                    node.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unnamed>")
+                );
+            }
+        }
+    }
+
+    // `listeners[].proxy` forced targets resolve against this same map —
+    // validating here makes `-t`, startup and every rebuild-driven
+    // mutation reject the same dangling name identically.
+    validate_listener_proxy_targets(raw, &proxies, &candidate_providers)?;
 
     // The provider set is returned, not swapped: the committing caller
     // publishes it into the live registry only after every fallible check
@@ -3296,20 +4434,13 @@ fn rebuild_from_raw_impl(
     Ok(RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry: registry.clone(),
         rule_providers,
         proxy_providers: candidate_providers,
         dropped_providers: dropped,
         prefetched_payloads: payloads,
     })
-}
-
-async fn open_selector_store_async(
-    path: PathBuf,
-) -> Result<Arc<meow_proxy::SelectorStore>, anyhow::Error> {
-    spawn_blocking_with_current_dispatcher(move || meow_proxy::SelectorStore::open(path))
-        .await
-        .map_err(|e| anyhow::anyhow!("selector store open task failed: {e}"))
 }
 
 async fn build_parser_context_with_geo_async(
@@ -3342,6 +4473,15 @@ async fn prefetch_rule_provider_payloads_async(
     let raw_providers = raw_providers.clone();
     let raw_proxies: Vec<HashMap<String, serde_json::Value>> =
         raw.proxies.clone().unwrap_or_default();
+    // The startup `global-ua` (`build_config` already validated it, and
+    // installs it before this prefetch runs) — threaded explicitly so the
+    // downloads never depend on when the static was installed (issue #974
+    // review).
+    let user_agent = validate_global_ua(raw.global_ua.as_deref())
+        .ok()
+        .flatten()
+        .unwrap_or(meow_common::DEFAULT_USER_AGENT)
+        .to_string();
     spawn_blocking_with_current_dispatcher(move || {
         let default_proxy = prefetch
             .as_ref()
@@ -3352,6 +4492,7 @@ async fn prefetch_rule_provider_payloads_async(
             cache_dir.as_deref(),
             default_proxy.as_ref(),
             &lookup,
+            Some(&user_agent),
         )
     })
     .await
@@ -3371,7 +4512,7 @@ async fn rebuild_from_raw_impl_async(
     cache_dir: Option<PathBuf>,
     resolver: Option<meow_dns::ResolverSlot>,
     providers: HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<Arc<meow_proxy::SelectorStore>>,
+    selection: Option<meow_proxy::SelectorWriter>,
     ctx: meow_rules::ParserContext,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
     // Caller's registry cell — shared across a multi-pass build so pass-1
@@ -3381,6 +4522,9 @@ async fn rebuild_from_raw_impl_async(
     // The live provider-dialer cell newly declared providers share
     // (issue #489) — see `rebuild_from_raw_impl`.
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // see `rebuild_from_raw_impl`.
+    provider_dns_cell: meow_dns::DnsOutboundCell,
     // Startup's pass-2 shares the provider set already loaded for DNS so
     // rules, `rule-set:` matchers, and `Config.rule_providers` reference one
     // object per provider (issue #533 review). `None` = load fresh.
@@ -3392,11 +4536,12 @@ async fn rebuild_from_raw_impl_async(
             cache_dir.as_deref(),
             resolver.as_ref(),
             &providers,
-            selector_store.as_ref(),
+            selection.as_ref(),
             Some(&ctx),
             Some(provider_payloads),
             &registry,
             &provider_dialer_registry,
+            &provider_dns_cell,
             shared_providers,
             false,
         )
@@ -3935,9 +5080,13 @@ fn configured_mode(raw: &raw::RawConfig) -> TunnelMode {
 /// field resolves later against the published `provider_dialer_registry`
 /// at fetch time (issue #625) — not through this prefetch layer.
 fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> bool {
-    // No `proxies:` entries → the layer can never exist; skip the
-    // spawn_blocking hop to a deterministic `Ok(None)`.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // Neither `proxies:` nor `proxy-groups:` → the layer can never
+    // exist; skip the spawn_blocking hop to a deterministic `Ok(None)`.
+    // Groups without `proxies:` still count — a provider-fed group can
+    // resolve the `geodata.proxy`/provider `proxy:` names below.
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return false;
     }
     let has_fetchable_provider = raw
@@ -3962,8 +5111,11 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// `map` — the shared pre-registry proxy layer with `dialer-proxy` chains
 /// applied at startup, the candidate's freshly built proxies on a rebuild
 /// (needed in regions where the CDN is blocked; issue #533). When no map
-/// exists — a config without `proxies:` — fetches go direct, since a
-/// rejected layer aborts the build before this runs. Download failures are
+/// exists — a config without `proxies:` or `proxy-groups:` — the
+/// resolution runs against an empty map: named outbounds can only warn
+/// and fall back, while `geodata.proxy`/`MATCH` builtins still gate the
+/// download (a rejected layer aborts the build before this runs).
+/// Download failures are
 /// logged as warnings — the subsequent parser-context build hard-errors on
 /// a missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
 /// a clear diagnostic.
@@ -3984,9 +5136,18 @@ async fn ensure_geodata(
         return;
     }
 
-    let egress = map.map_or(GeodataEgress::Direct, |m| {
-        resolve_geodata_egress(raw, geo, configured_mode(raw), m, chained_providers)
-    });
+    // No layer means no `proxies:`/`proxy-groups:` at all, so a named
+    // outbound can never resolve — but a `geodata.proxy`/`MATCH` builtin
+    // (`REJECT`, `REJECT-DROP`, `DIRECT`) still must, since it needs no
+    // map entry to classify (issue #974 review).
+    let empty = HashMap::new();
+    let egress = resolve_geodata_egress(
+        raw,
+        geo,
+        configured_mode(raw),
+        map.unwrap_or(&empty),
+        chained_providers,
+    );
 
     for (url, dest) in downloads {
         info!("geodata: downloading {} to {}", url, dest.display());
@@ -4015,20 +5176,26 @@ fn ensure_geodata_blocking(
     {
         return;
     }
+    // Carry the scoped dispatcher onto the download thread so its warns
+    // reach the caller's subscriber (same propagation
+    // `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let joined = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(ensure_geodata(
-                    raw,
-                    geo,
-                    scan_lines,
-                    Some(map),
-                    chained_providers,
-                ));
-                Ok::<(), std::io::Error>(())
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(ensure_geodata(
+                        raw,
+                        geo,
+                        scan_lines,
+                        Some(map),
+                        chained_providers,
+                    ));
+                    Ok::<(), std::io::Error>(())
+                })
             })
             .join()
     });
@@ -4049,7 +5216,7 @@ fn build_parser_context_from_raw(
     raw: &raw::RawConfig,
     provider_payloads: &rule_provider::PrefetchedPayloads,
 ) -> Result<meow_rules::ParserContext, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(raw)?;
     build_parser_context_with_geo(raw, &geo, provider_payloads)
 }
 
@@ -4185,24 +5352,128 @@ fn load_mmdb_mmap(
 /// per-country ranges for codes no rule cares about.
 fn geoip_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
-    // `\bGEOIP` matches both `GEOIP,CN` and `SRC-GEOIP,CN` because the `-`
-    // before `GEOIP` is a non-word boundary.
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOIP\s*,\s*([A-Za-z0-9]+)").expect("compile GEOIP scan regex")
+        // `SRC-GEOIP` keys the same country index; the `^` anchor keeps
+        // `GEOIP` in the type field — scan texts are type-first strings,
+        // so a payload mention (`DOMAIN-KEYWORD,GEOIP,x`) is data, not a
+        // declaration (issue #974).
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?GEOIP\s*,\s*([A-Za-z0-9]+)")
+            .expect("compile GEOIP scan regex")
     })
+}
+
+/// One raw rule line classified for geo discovery (issue #974): the text
+/// segments the plain `GEOIP,`/`GEOSITE,`/`IP-ASN,` regexes may scan,
+/// plus the parsed SUB-RULE condition trees — the only position cond
+/// leaves can legally live. Free-form pattern fields never become scan
+/// text: a `GEOIP,x` inside a regex or glob — or inside a logic-group
+/// leg of those types — is process/domain text, never a declaration.
+/// Malformed lines contribute nothing (the parse stage owns the error).
+#[derive(Default)]
+struct GeoLineScan<'a> {
+    texts: Vec<&'a str>,
+    conds: Vec<meow_rules::sub_rule_cond::CondExpr>,
+}
+
+fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
+    let mut scan = GeoLineScan::default();
+    let trimmed = line.trim();
+    // The same input bound the rule parser enforces — a line it would
+    // reject contributes nothing, and the bound keeps the classifier's
+    // per-level work honest before the parse stage owns the error.
+    if !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && trimmed.len() <= meow_rules::parser::MAX_RULE_LINE_LEN
+    {
+        collect_geo_segments(trimmed, &mut scan, 0);
+    }
+    scan
+}
+
+/// Classify one rule-position text — a top-level line or a logic leg —
+/// into scan segments, recursing through logic groups so a leg's own
+/// type governs how its text is treated (issue #974 review: a
+/// `PROCESS-*` leg's `GEOIP,x` text must not trigger a geo load).
+/// `depth` mirrors the parser's `MAX_LOGIC_DEPTH` budget — this scan
+/// runs *before* the parse stage, so an over-deep line must stop the
+/// descent here rather than overflow the stack first.
+fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>, depth: usize) {
+    use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
+    let ty = text.split(',').next().map_or("", str::trim);
+    let ty = meow_common::RuleType::from_mihomo_name(ty)
+        .map_or_else(|| ty.to_ascii_uppercase(), |t| t.as_str().to_string());
+    match ty.as_str() {
+        // The pattern field is unbounded expression text: a `GEOIP,x`
+        // inside a regex or glob is process-name/domain text, never a
+        // geo declaration. DOMAIN-REGEX joins the class: its
+        // comma-protected payload could carry `GEOIP,x` too.
+        "PROCESS-NAME"
+        | "PROCESS-PATH"
+        | "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX"
+        | "PROCESS-NAME-WILDCARD"
+        | "PROCESS-PATH-WILDCARD"
+        | "DOMAIN-REGEX" => {}
+        "SUB-RULE" => {
+            if let Some(cond) = parse_sub_rule_reference(text)
+                .ok()
+                .flatten()
+                .and_then(|r| r.cond)
+                .and_then(|c| parse_cond(&c).ok())
+            {
+                scan.conds.push(cond);
+            }
+        }
+        "AND" | "OR" | "NOT" => {
+            // A group the parser would reject for depth can never exist
+            // as a rule — stop scanning this branch rather than recursing
+            // one stack frame per level (the parse stage owns the error).
+            if depth >= meow_rules::parser::MAX_LOGIC_DEPTH {
+                return;
+            }
+            // Decompose `(leg),(leg),<target>` and classify each leg on
+            // its own type; a malformed shape falls back to the raw
+            // text (conservative — the parse stage fails it anyway).
+            let decomposed = text
+                .split_once(',')
+                .map(|(_, rest)| rest.trim_start())
+                .filter(|rest| rest.starts_with('('))
+                .and_then(|rest| {
+                    let end = meow_rules::parser::matching_paren(rest)?;
+                    meow_rules::parser::split_logic_groups(&rest[1..end]).ok()
+                });
+            match decomposed {
+                Some(legs) => {
+                    for leg in legs {
+                        collect_geo_segments(leg.trim(), scan, depth + 1);
+                    }
+                }
+                None => scan.texts.push(text),
+            }
+        }
+        _ => scan.texts.push(text),
+    }
 }
 
 fn collect_geoip_countries(lines: &[String]) -> std::collections::HashSet<String> {
     let re = geoip_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_uppercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_uppercase());
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                // `GEOIP` covers the `,src` param form; `SRC-GEOIP` is
+                // its dedicated name — both key the country index.
+                if matches!(leaf.ty.as_str(), "GEOIP" | "SRC-GEOIP") {
+                    out.insert(leaf.payload.to_ascii_uppercase());
+                }
+            }
         }
     }
     out
@@ -4218,7 +5489,7 @@ fn geosite_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
+        regex::Regex::new(r"(?i)^\s*GEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
             .expect("compile GEOSITE scan regex")
     })
 }
@@ -4227,12 +5498,25 @@ fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<Str
     let re = geosite_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_lowercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_lowercase());
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                if leaf.ty == "GEOSITE" {
+                    // Same `category@attr` split the GeoSite leaf build
+                    // performs — only the category keys the loader.
+                    if let Some(cat) = leaf.payload.split('@').next() {
+                        let cat = cat.trim();
+                        if !cat.is_empty() {
+                            out.insert(cat.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
         }
     }
     out
@@ -4276,7 +5560,8 @@ fn asn_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(?:SRC-)?IP-ASN\s*,\s*(\d+)").expect("compile IP-ASN scan regex")
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?IP-ASN\s*,\s*(\d+)")
+            .expect("compile IP-ASN scan regex")
     })
 }
 
@@ -4284,13 +5569,21 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
     let re = asn_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                if let Ok(asn) = cap[1].parse::<u32>() {
+                    out.insert(asn);
+                }
+            }
         }
-        for cap in re.captures_iter(line) {
-            if let Ok(asn) = cap[1].parse::<u32>() {
-                out.insert(asn);
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                if matches!(leaf.ty.as_str(), "IP-ASN" | "SRC-IP-ASN") {
+                    if let Ok(asn) = leaf.payload.trim().parse::<u32>() {
+                        out.insert(asn);
+                    }
+                }
             }
         }
     }
@@ -4298,26 +5591,43 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
 }
 
 /// True iff `line` references the GeoIP Country database anywhere — as a
-/// top-level `GEOIP,`/`SRC-GEOIP,` rule or nested inside a logic rule
-/// (`AND`/`OR`/`NOT`). Comment lines never match. Uses the same regex as
+/// top-level `GEOIP,`/`SRC-GEOIP,` rule, nested inside a logic rule
+/// (`AND`/`OR`/`NOT`), or as a SUB-RULE condition leaf (issue #974).
+/// Comment lines never match. Uses the same classifier as
 /// [`collect_geoip_countries`] so the trigger and the allowlist agree.
 fn line_references_geoip(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geoip_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| geoip_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "GEOIP" | "SRC-GEOIP"))
+        })
 }
 
-/// True iff `line` references the geosite database anywhere (top-level or
-/// nested inside a logic rule). Comment lines never match.
+/// True iff `line` references the geosite database anywhere (top-level,
+/// nested inside a logic rule, or a SUB-RULE condition leaf). Comment
+/// lines never match.
 fn line_references_geosite(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geosite_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| geosite_scan_regex().is_match(t))
+        || scan
+            .conds
+            .iter()
+            .any(|c| c.leaves().iter().any(|l| l.ty == "GEOSITE"))
 }
 
 /// True iff `line` references the GeoLite2-ASN database anywhere — `IP-ASN,`
-/// or `SRC-IP-ASN,`, top-level or nested. Comment lines never match.
+/// or `SRC-IP-ASN,`, top-level, nested in a logic rule, or a SUB-RULE
+/// condition leaf. Comment lines never match.
 fn line_references_asn(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && asn_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| asn_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "IP-ASN" | "SRC-IP-ASN"))
+        })
 }
 
 /// Gather every rule line that can reference a geo database (issue #277):
@@ -4347,16 +5657,25 @@ fn collect_geo_scan_lines(
     // for providers the candidate does not carry (issue #543).
     let declared = raw.rule_providers.as_ref();
     for (name, bytes) in provider_payloads.iter() {
-        if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
+        let Some(cfg) = declared.and_then(|m| m.get(name)) else {
+            continue;
+        };
+        if meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
-        lines.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(String::from),
-        );
+        // Decode per the declared `format:` so a YAML payload's entries —
+        // not its raw `- "…"` source text — feed the geo scan (issue
+        // #974 review); an undecodable payload falls back to raw lines.
+        match rule_provider::payload_entries_for_scan(cfg, &text) {
+            Some(entries) => lines.extend(entries),
+            None => lines.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from),
+            ),
+        }
     }
     lines
 }
@@ -4477,6 +5796,9 @@ pub(crate) fn resolve_listener_bind(
 
 /// mihomo `listeners:` types meow has no inbound for (server-side protocols,
 /// and `tun`, which meow configures from the top-level `tun:` section).
+// meow-openwrt: `type: anytls` and named `type: tun` left this list in
+// 0.30.0 — upstream built the anytls inbound (#1013) and the named TUN
+// listener (#992); the loop handles `tun` ahead of this check.
 const SERVER_ONLY_INBOUNDS: &[&str] = &[
     "snell",
     "vmess",
@@ -4486,11 +5808,9 @@ const SERVER_ONLY_INBOUNDS: &[&str] = &[
     "hysteria2",
     "hysteria2-realm",
     "tunnel",
-    "anytls",
     "mieru",
     "sudoku",
     "trusttunnel",
-    "tun",
 ];
 
 /// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
@@ -4510,6 +5830,9 @@ const SERVER_ONLY_INBOUNDS: &[&str] = &[
 /// deprecated `tproxy-sni` synthesis on every arm that carries `sni`, or
 /// `tproxy-sni: true` + `sniffer.enable: false` would still sniff (the
 /// listener's synthesized runtime survives `with_sniffer`'s off state).
+///
+/// `TProxy` and `WireGuard` are fully resolved here; `Shadowsocks` returns
+/// a placeholder the caller completes via `build_ss_listener_spec`.
 fn parse_listener_spec(
     raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
@@ -4532,8 +5855,9 @@ fn parse_listener_spec(
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
-        // `socks` is mihomo's spelling (SOCKS4/4a/5 inbound).
-        "socks5" | "socks" => Ok(ListenerSpec::Socks5),
+        // mihomo spells the named SOCKS inbound `socks`; `socks5` stays
+        // the canonical meow-rs name.
+        "socks" | "socks5" => Ok(ListenerSpec::Socks5),
         // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
         // rules — the deployer's REDIRECT rules steer traffic here.
         "redir" => {
@@ -4637,8 +5961,13 @@ fn parse_listener_spec(
             udp: true,
             simple_obfs: None,
         })),
+        "wireguard" => Ok(ListenerSpec::WireGuard(build_wg_listener_spec(raw_l)?)),
+        // Placeholder like `Shadowsocks` — `build_named_listeners` fills
+        // the real spec via `build_anytls_listener_spec`, which needs the
+        // (possibly comma-listed) `listen` context.
+        "anytls" => Ok(ListenerSpec::Anytls(AnytlsListenerConfig::default())),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, or shadowsocks"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, anytls, or tun"
         ),
     }
 }
@@ -4706,6 +6035,624 @@ fn build_ss_listener_spec(raw_l: &raw::RawListener) -> Result<SsListenerConfig, 
     })
 }
 
+/// Decode a base64 WireGuard key field into exactly 32 bytes (standard
+/// alphabet — the spelling every WG tool emits; the same rule the
+/// outbound parser's `parse_wg_key` enforces). `ctx` carries the field
+/// path for the error, e.g. `listeners[wg].peers[0].public-key`.
+fn wg_b64_key(value: Option<&str>, ctx: &str) -> Result<[u8; 32], anyhow::Error> {
+    use base64::Engine;
+    let raw = match value {
+        None => anyhow::bail!("{ctx}: missing base64 key"),
+        // A present-but-empty key names a different defect than an absent
+        // one — don't call it "missing".
+        Some("") => anyhow::bail!("{ctx}: must not be empty"),
+        Some(s) => s,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|_| anyhow::anyhow!("{ctx}: must be base64"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{ctx}: must decode to exactly 32 bytes"))
+}
+
+/// `reserved` on a `type: wireguard` peer — the 3-byte Cloudflare
+/// WARP-style identifier, a YAML list of three bytes or a base64 string
+/// decoding to exactly 3 bytes (the same shapes the outbound `reserved`
+/// accepts). Inbound reserved bytes are cleared unconditionally; this
+/// only stamps the wire datagrams meow sends to the peer.
+fn wg_peer_reserved(
+    value: Option<&serde_json::Value>,
+    ctx: &str,
+) -> Result<Option<[u8; 3]>, anyhow::Error> {
+    use base64::Engine;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(list)) => {
+            if list.len() != 3 {
+                anyhow::bail!("{ctx}: must be a list of exactly 3 bytes");
+            }
+            let mut out = [0u8; 3];
+            for (i, v) in list.iter().enumerate() {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("{ctx}: entries must be bytes (0-255)"))?;
+                out[i] = u8::try_from(n)
+                    .map_err(|_| anyhow::anyhow!("{ctx}: entries must be bytes (0-255)"))?;
+            }
+            Ok(Some(out))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| anyhow::anyhow!("{ctx}: must be a 3-byte list or base64"))?;
+            <[u8; 3]>::try_from(bytes.as_slice())
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("{ctx}: base64 must decode to exactly 3 bytes"))
+        }
+        Some(_) => anyhow::bail!("{ctx}: must be a 3-byte list or base64"),
+    }
+}
+
+/// Build a validated [`WgListenerConfig`] from a raw `listeners:` entry
+/// (`type: wireguard`).
+///
+/// Hard errors (Class A per ADR-0002): a missing/undecodable
+/// `private-key` (or the all-zero key, refused exactly like the outbound
+/// adapter), missing or empty `peers`, `peers` at/over the 2^24
+/// demux-namespace cap, a peer `public-key` that is missing, not
+/// base64 → 32 bytes, or duplicated in the table, a `preshared-key` that
+/// does not decode to 32 bytes, `allowed-ips` missing, empty, or holding
+/// a non-CIDR entry, `reserved` that is not a 3-byte list or base64 → 3
+/// bytes, `mtu` outside `640..=9000`, or `udp-timeout: 0` (the same
+/// contract `tproxy`'s `udp-timeout` enforces).
+///
+/// A peer `public-key` equal to the listener's *own* public key
+/// (`x25519_dalek::PublicKey::from(&StaticSecret)`) is a self-peering
+/// misconfiguration: rejected here when the `wireguard` feature is
+/// compiled — its `dep:x25519-dalek` puts the basepoint multiply in
+/// scope — and re-checked at listener startup on every build
+/// (meow-listener holds meow-wireguard's x25519), so `meow-config`
+/// carries no unconditional crypto dep.
+///
+/// Keys the schema knows but `type: wireguard` does not consume
+/// (`cipher`, the opaque upstream sub-options, …) and schema-unknown
+/// keys (captured by `RawListener`'s flatten field) warn-and-ignore —
+/// the same policy every other listener arm applies (ADR-0002), keeping
+/// forward-compat with keys a newer schema adds. Tproxy-only keys set
+/// on a WG entry (`tproxy-sni`, `firewall`, `transparent`) warn in the
+/// generic arms of `build_named_listeners`, not here.
+fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, anyhow::Error> {
+    for (key, set) in [
+        ("cipher", raw_l.cipher.is_some()),
+        ("password", raw_l.password.is_some()),
+        ("simple-obfs", raw_l.simple_obfs.is_some()),
+        ("shadow-tls", raw_l.shadow_tls.is_some()),
+        ("res-tls", raw_l.res_tls.is_some()),
+        ("jls-config", raw_l.jls_config.is_some()),
+        ("kcp-tun", raw_l.kcp_tun.is_some()),
+        ("mux-option", raw_l.mux_option.is_some()),
+    ] {
+        if set {
+            warn!(
+                "listeners[{}]: `{key}` is ignored on `type: wireguard`; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+    let mut unknown_keys: Vec<&String> = raw_l.extra.keys().collect();
+    unknown_keys.sort();
+    for key in unknown_keys {
+        warn!(
+            "listeners[{}]: `{key}` is not a known `type: wireguard` field, ignored",
+            raw_l.name
+        );
+    }
+
+    let private_key = wg_b64_key(
+        raw_l.private_key.as_deref(),
+        &format!("listeners[{}].private-key", raw_l.name),
+    )?;
+    if private_key == [0u8; 32] {
+        anyhow::bail!(
+            "listeners[{}].private-key: the all-zero key is not a valid WireGuard key",
+            raw_l.name
+        );
+    }
+
+    let mtu = match raw_l.mtu.unwrap_or_else(default_wg_mtu) {
+        m if !(640..=9000).contains(&m) => anyhow::bail!(
+            "listeners[{}].mtu: {m} must be in 640..=9000 (outer MTU; inner = mtu - 64)",
+            raw_l.name
+        ),
+        m => m,
+    };
+    let udp_timeout = match raw_l.udp_timeout {
+        Some(0) => anyhow::bail!(
+            "listeners[{}].udp-timeout: must be at least 1 second",
+            raw_l.name
+        ),
+        // Same Instant+Duration overflow class as tproxy.udp-timeout —
+        // the bound keeps every future consumer honest (issue #648).
+        Some(s) if s > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+            "listeners[{}].udp-timeout: {s}s exceeds the {}s ceiling",
+            raw_l.name,
+            meow_common::MAX_DURATION_SECS
+        ),
+        Some(s) => std::time::Duration::from_secs(s),
+        None => default_wg_udp_timeout(),
+    };
+    // Same asymmetric-misuse diagnosis as the tproxy arm: with `udp:
+    // false` the timeout binds nothing.
+    if raw_l.udp == Some(false) && raw_l.udp_timeout.is_some() {
+        warn!(
+            "listeners[{}].udp-timeout: has no effect unless `udp: true` is set; \
+             remove it to suppress this warning",
+            raw_l.name
+        );
+    }
+
+    let raw_peers = raw_l.peers.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "listeners[{}]: wireguard listener requires 'peers' (non-empty)",
+            raw_l.name
+        )
+    })?;
+    if raw_peers.is_empty() {
+        anyhow::bail!(
+            "listeners[{}].peers: must contain at least one peer",
+            raw_l.name
+        );
+    }
+    // Peer slots feed the `index << 8` demux namespace: the low 8 bits are
+    // the per-peer session counter, so the table caps at 2^24 - 1.
+    if raw_peers.len() >= (1 << 24) {
+        anyhow::bail!(
+            "listeners[{}].peers: {} peers exceeds the 2^24-1 demux-namespace cap",
+            raw_l.name,
+            raw_peers.len()
+        );
+    }
+
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut peers = Vec::with_capacity(raw_peers.len());
+    for (i, rp) in raw_peers.iter().enumerate() {
+        let mut unknown_peer_keys: Vec<&String> = rp.extra.keys().collect();
+        unknown_peer_keys.sort();
+        for key in unknown_peer_keys {
+            warn!(
+                "listeners[{}].peers[{i}]: `{key}` is not a known wireguard peer field, ignored",
+                raw_l.name
+            );
+        }
+        let public_key = wg_b64_key(
+            rp.public_key.as_deref(),
+            &format!("listeners[{}].peers[{i}].public-key", raw_l.name),
+        )?;
+        if !seen_keys.insert(public_key) {
+            anyhow::bail!(
+                "listeners[{}].peers[{i}].public-key: duplicates an earlier peer",
+                raw_l.name
+            );
+        }
+        let preshared_key = match rp.preshared_key.as_deref() {
+            Some(_) => Some(wg_b64_key(
+                rp.preshared_key.as_deref(),
+                &format!("listeners[{}].peers[{i}].preshared-key", raw_l.name),
+            )?),
+            None => None,
+        };
+        let allowed_ips = match rp.allowed_ips.as_deref() {
+            None => anyhow::bail!(
+                "listeners[{}].peers[{i}]: wireguard peer requires 'allowed-ips' (non-empty; \
+                 write 0.0.0.0/0 and ::/0 explicitly for full openness)",
+                raw_l.name
+            ),
+            Some([]) => anyhow::bail!(
+                "listeners[{}].peers[{i}].allowed-ips: must not be empty (inbound ACL; \
+                 write 0.0.0.0/0 and ::/0 explicitly for full openness)",
+                raw_l.name
+            ),
+            Some(list) => list
+                .iter()
+                .map(|s| {
+                    s.parse::<ipnet::IpNet>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "listeners[{}].peers[{i}].allowed-ips: '{s}' is not a valid CIDR",
+                            raw_l.name
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let reserved = wg_peer_reserved(
+            rp.reserved.as_ref(),
+            &format!("listeners[{}].peers[{i}].reserved", raw_l.name),
+        )?;
+        peers.push(WgPeerConfig {
+            public_key,
+            preshared_key,
+            allowed_ips,
+            name: rp
+                .name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| SmolStr::from(format!("peer-{i}")), SmolStr::from),
+            reserved,
+        });
+    }
+
+    #[cfg(feature = "wireguard")]
+    {
+        let self_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+        if let Some(i) = peers
+            .iter()
+            .position(|p| p.public_key == *self_public.as_bytes())
+        {
+            anyhow::bail!(
+                "listeners[{}].peers[{i}].public-key: equals the listener's own public key \
+                 (self-peering is not a valid peer)",
+                raw_l.name
+            );
+        }
+    }
+
+    Ok(WgListenerConfig {
+        private_key,
+        peers,
+        mtu,
+        udp: raw_l.udp.unwrap_or_else(default_wg_udp),
+        udp_timeout,
+    })
+}
+
+/// Whether a `certificate`/`private-key` value is the inline-PEM form
+/// (vs. a filesystem path) — the two halves must use the SAME form.
+fn is_pem_literal(value: &str) -> bool {
+    value.contains("-----BEGIN")
+}
+
+/// `shadow-tls`/`res-tls`/`jls-config` opaque-block handling for
+/// `type: anytls`: present-and-enabled is a front layer (counted for
+/// mutual exclusivity); present-but-disabled warns and ignores. A value
+/// that is not a mapping, or whose `enable` is not a boolean, is a
+/// shape error.
+fn anytls_front_layer_enabled(
+    raw_l: &raw::RawListener,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<bool, anyhow::Error> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    let Some(obj) = value.as_object() else {
+        anyhow::bail!("listeners[{}].{key}: must be a mapping", raw_l.name);
+    };
+    match obj.get("enable") {
+        None => {
+            warn!(
+                "listeners[{}].{key}: present but `enable` unset — ignored \
+                 (no front layer is selected)",
+                raw_l.name
+            );
+            Ok(false)
+        }
+        Some(serde_json::Value::Bool(enabled)) => {
+            if !enabled {
+                warn!(
+                    "listeners[{}].{key}: `enable: false` selects no front layer — ignored",
+                    raw_l.name
+                );
+            }
+            Ok(*enabled)
+        }
+        Some(_) => anyhow::bail!("listeners[{}].{key}.enable: must be a boolean", raw_l.name),
+    }
+}
+
+/// Build a validated [`AnytlsListenerConfig`] from a raw `listeners:`
+/// entry — the single semantic entry point for `type: anytls`, reached
+/// identically by startup, `-t` and `PUT /configs` via
+/// `build_named_listeners`. Performs NO file I/O: certificate material
+/// stays as-written for bind-time resolution by the app.
+///
+/// `listen` may be ONE YAML string carrying comma-separated addresses;
+/// each segment resolves through `resolve_listener_bind` in declaration
+/// order (`port`/`listen:port` merge rules identical to single-address
+/// listeners). `default_bind` fills an absent `listen`.
+fn build_anytls_listener_spec(
+    raw_l: &raw::RawListener,
+    default_bind: &str,
+) -> Result<AnytlsListenerConfig, anyhow::Error> {
+    // Diagnostic order (spec §2.1): the security layer's SHAPE is judged
+    // before any other field can return — `enable`/`udp`/users errors
+    // must not mask a missing or malformed TLS declaration.
+    //
+    // ── certificate/private-key pairing shape — FIRST among the
+    // substantive checks: whether a TLS layer exists at all decides how
+    // every other key reads (`allow-insecure`, front layers, users).
+    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            if cert.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must not be empty",
+                    raw_l.name
+                );
+            }
+            if is_pem_literal(cert) != is_pem_literal(key) {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must use the same \
+                     form — both inline PEM or both filesystem paths, not mixed",
+                    raw_l.name
+                );
+            }
+            true
+        }
+        (None, None) => false,
+        _ => anyhow::bail!(
+            "listeners[{}]: `certificate` and `private-key` must be provided \
+             together",
+            raw_l.name
+        ),
+    };
+
+    // ── front-layer opaque blocks (shape + enabled flag type) ──
+    let shadow_tls_on = anytls_front_layer_enabled(raw_l, "shadow-tls", raw_l.shadow_tls.as_ref())?;
+    let res_tls_on = anytls_front_layer_enabled(raw_l, "res-tls", raw_l.res_tls.as_ref())?;
+    let jls_on = anytls_front_layer_enabled(raw_l, "jls-config", raw_l.jls_config.as_ref())?;
+
+    // ── security-mode mutual exclusivity (`allow-insecure` is excluded
+    // from the count, matching upstream's TLS-layer enumeration) ──
+    let mut enabled_layers: Vec<&str> = Vec::new();
+    if tls_selected {
+        enabled_layers.push("certificate/private-key");
+    }
+    if shadow_tls_on {
+        enabled_layers.push("shadow-tls");
+    }
+    if res_tls_on {
+        enabled_layers.push("res-tls");
+    }
+    if jls_on {
+        enabled_layers.push("jls-config");
+    }
+    if enabled_layers.len() > 1 {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` accepts at most one TLS/front layer \
+             — enabled together: {}",
+            raw_l.name,
+            enabled_layers.join(", ")
+        );
+    }
+    // A selected front layer is a hard gap, not an ignored key.
+    for (key, on) in [
+        ("shadow-tls", shadow_tls_on),
+        ("res-tls", res_tls_on),
+        ("jls-config", jls_on),
+    ] {
+        if on {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` front layers are not supported by \
+                 meow's `type: anytls` inbound — remove it or terminate it \
+                 upstream",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── mTLS / ECH — any non-empty RAW value is a hard error (never
+    // silently ignored). Whitespace-only counts as a request: the key
+    // carries a value the deployer typed, and meow cannot honour it.
+    for (key, value) in [
+        ("client-auth-type", raw_l.client_auth_type.as_deref()),
+        ("client-auth-cert", raw_l.client_auth_cert.as_deref()),
+        ("ech-key", raw_l.ech_key.as_deref()),
+    ] {
+        if value.is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` is not supported by meow's \
+                 `type: anytls` inbound — remove it",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── the no-security gate ──
+    let allow_insecure = raw_l.allow_insecure.unwrap_or(false);
+    if !tls_selected && !allow_insecure {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` requires `certificate` + `private-key` \
+             (TLS), or the explicit `allow-insecure: true` plaintext opt-in",
+            raw_l.name
+        );
+    }
+    if !tls_selected && allow_insecure {
+        warn!(
+            "listeners[{}]: `allow-insecure: true` — the AnyTLS listener accepts \
+             PLAINTEXT connections; credentials are visible to any on-path \
+             observer. Use only on a trusted network or behind a tunnel",
+            raw_l.name
+        );
+    }
+
+    // ── `enable` — upstream-accepted but meaningless here: the entry's
+    // presence is its enabled state. `false` is a hard error (silent
+    // disable would be a dead config line); `true` warns redundant.
+    match raw_l.enable {
+        Some(false) => anyhow::bail!(
+            "listeners[{}].enable: `false` is invalid — an AnyTLS listener entry \
+             is enabled by existing; remove the entry to disable it",
+            raw_l.name
+        ),
+        Some(true) => warn!(
+            "listeners[{}].enable: `true` is redundant — the entry's presence \
+             already enables the listener",
+            raw_l.name
+        ),
+        None => {}
+    }
+
+    // ── `udp` — always supported, so `false` would be a lie; warn `true`.
+    match raw_l.udp {
+        Some(false) => anyhow::bail!(
+            "listeners[{}].udp: `false` is invalid — AnyTLS inbound always \
+             supports UoT v2; remove the key or set `true`",
+            raw_l.name
+        ),
+        Some(true) => warn!(
+            "listeners[{}].udp: `true` is redundant — AnyTLS inbound always \
+             supports UoT v2",
+            raw_l.name
+        ),
+        None => {}
+    }
+
+    // ── `users:` — absent/null/`{}` all mean "authenticate nothing"
+    // (upstream's reject-all state): startup proceeds but warns once.
+    // Usernames and passwords stay verbatim — no trimming, no
+    // normalization — and empty values, duplicate keys and duplicate
+    // password digests are hard errors.
+    let mut digest_seen: std::collections::HashMap<[u8; 32], String> =
+        std::collections::HashMap::new();
+    let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut users: Vec<AnytlsUser> = Vec::new();
+    for (user, password) in raw_l.users.as_deref().unwrap_or(&[]) {
+        if user.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].users: empty username is not allowed",
+                raw_l.name
+            );
+        }
+        if password.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].users: empty password for user '{user}' is not allowed",
+                raw_l.name
+            );
+        }
+        if !name_seen.insert(user.as_str()) {
+            anyhow::bail!(
+                "listeners[{}].users: duplicate username '{user}'",
+                raw_l.name
+            );
+        }
+        let digest = {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(password.as_bytes());
+            let out: [u8; 32] = h.finalize().into();
+            out
+        };
+        if let Some(existing) = digest_seen.insert(digest, user.clone()) {
+            anyhow::bail!(
+                "listeners[{}].users: '{user}' shares a password (SHA-256 digest) \
+                 with earlier user '{existing}' — users must have distinct passwords",
+                raw_l.name
+            );
+        }
+        users.push(AnytlsUser {
+            name: user.clone(),
+            password_sha256: digest,
+        });
+    }
+    if users.is_empty() {
+        warn!(
+            "listeners[{}].users: empty/absent — the AnyTLS listener will \
+             REJECT every authentication (upstream reject-all); add at \
+             least one user to admit clients",
+            raw_l.name
+        );
+    }
+
+    // ── `padding-scheme` — shared contract with `PaddingFactory::new`;
+    // validated here so `-t` and PUT fail fast, and the protocol layer
+    // re-validates (it cannot fail after this gate). `""` is mihomo's
+    // "no scheme" spelling — the listener normalizes it to the default.
+    if let Some(scheme) = raw_l.padding_scheme.as_deref().filter(|s| !s.is_empty()) {
+        meow_common::anytls_padding::validate_scheme(scheme.as_bytes())
+            .map_err(|e| anyhow::anyhow!("listeners[{}].padding-scheme: {e}", raw_l.name))?;
+    }
+
+    // ── `kcp-tun`/`mux-option` — present but never consumed: warn like
+    // the shadowsocks arm does. Shadowsocks-only keys get the same.
+    for (key, set) in [
+        ("kcp-tun", raw_l.kcp_tun.is_some()),
+        ("mux-option", raw_l.mux_option.is_some()),
+        ("cipher", raw_l.cipher.is_some()),
+        ("password", raw_l.password.is_some()),
+        ("simple-obfs", raw_l.simple_obfs.is_some()),
+    ] {
+        if set {
+            warn!(
+                "listeners[{}].{key}: `{key}` is not supported on `type: anytls`, \
+                 ignored; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── `listen` — one YAML string, possibly comma-separated; each
+    // segment normalizes in declaration order via the shared bind
+    // resolver. An empty segment between commas is a shape error.
+    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
+    let mut addresses: Vec<ListenerBind> = Vec::new();
+    for segment in listen_raw.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
+                raw_l.name
+            );
+        }
+        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
+            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
+        addresses.push(ListenerBind { listen, port });
+    }
+    // Reject duplicate resolved targets — `::1` and `0:0:0:0:0:0:0:1`
+    // are the same bind and a second TcpListener::bind on it fails
+    // anyway; fail the config HERE with a clear diagnostic instead of a
+    // partial bind (F11). Comparison goes through `IpAddr`, not the
+    // string, so non-canonical spellings still collide.
+    let mut seen = std::collections::HashSet::new();
+    for b in &addresses {
+        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "listeners[{}].listen: '{}' is not an IP literal",
+                raw_l.name,
+                b.listen
+            )
+        })?;
+        if !seen.insert((ip, b.port)) {
+            anyhow::bail!(
+                "listeners[{}].listen: duplicate bind address '{}':{}",
+                raw_l.name,
+                b.listen,
+                b.port
+            );
+        }
+    }
+
+    Ok(AnytlsListenerConfig {
+        users,
+        certificate: raw_l.certificate.clone(),
+        private_key: raw_l.private_key.clone(),
+        allow_insecure,
+        // Normalize `""` to `None`: both select `PaddingFactory::default()`
+        // at bind time, so `PUT /configs` projection diffs treat them as
+        // identical (F18).
+        padding_scheme: raw_l
+            .padding_scheme
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        addresses,
+    })
+}
+
 /// Derive the `(default_bind, global_tproxy_sni)` inputs the listener
 /// builder needs — single source so `validate_named_listeners` checks
 /// exactly what `load_config` will enforce.
@@ -4742,6 +6689,105 @@ pub fn validate_named_listeners(raw: &raw::RawConfig) -> Result<(), anyhow::Erro
 pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener>, anyhow::Error> {
     let (bind_addr, global_tproxy_sni) = listener_bind_inputs(raw);
     build_named_listeners(raw, &bind_addr, global_tproxy_sni)
+}
+
+/// Why a `listeners[].proxy` name cannot force a route in this rebuilt
+/// map — `None` when it resolves. Built-ins count the way
+/// `resolve_listener_proxy` sees them: DIRECT/REJECT/PASS/COMPATIBLE and
+/// the auto-created GLOBAL are all ordinary map entries. A proxy-provider
+/// name is rejected explicitly: a provider feeds groups and is not a
+/// target — naming it would check against nothing and fail closed per
+/// flow. Shared by the build admission below and the API's prospective
+/// route guard so every publication path diagnoses the same way.
+pub fn listener_proxy_target_err(
+    name: &str,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Option<String> {
+    if proxy_providers.contains_key(name) {
+        return Some(format!(
+            "'{name}' is a proxy-provider — providers feed groups and are \
+             not forced-route targets"
+        ));
+    }
+    // meow-openwrt: a node that failed to parse stays as a dead placeholder
+    // (72a5c188), so it counts as a built target — the forced flows fail
+    // at dial, like mihomo's broken node, instead of rejecting the config.
+    (!proxies.contains_key(name))
+        .then(|| format!("'{name}' does not name a built proxy or proxy group"))
+}
+
+/// Admission check for `listeners[].proxy`: every forced target must
+/// name a proxy or group in the rebuilt map (`rule:` selects a
+/// `sub-rules:` block instead — `build_named_listeners` already gates
+/// that name against `raw.sub_rules`). Runs inside every
+/// `rebuild_from_raw_*` pass so `-t`, startup, `PUT /configs` and every
+/// warm mutation reject the same dangling reference with the same error
+/// instead of committing a document the inbound would only fail closed
+/// on per flow.
+pub fn validate_listener_proxy_targets(
+    raw: &raw::RawConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Result<(), anyhow::Error> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(why) = listener_proxy_target_err(name, proxies, proxy_providers) {
+            anyhow::bail!("listeners[{}].proxy: {why}", l.name);
+        }
+    }
+    Ok(())
+}
+
+/// The document-shape half of listener-proxy admission: a forced target
+/// must name something the document itself declares — a `proxies:` entry,
+/// a `proxy-groups:` entry, or a built-in the route table always carries.
+/// Provider members are not registry keys, so a name outside the declared
+/// set can never resolve; that defect is in the document, not the build —
+/// `PUT /configs` refuses it even when `force` would persist a declared
+/// name that merely failed to build. Returns the first offending
+/// listener's message.
+pub fn listener_proxy_target_shape_err(raw: &raw::RawConfig) -> Option<String> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if raw
+            .proxy_providers
+            .as_ref()
+            .is_some_and(|pp| pp.contains_key(name))
+        {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' is a proxy-provider — providers \
+                 feed groups and are not forced-route targets",
+                l.name
+            ));
+        }
+        let declared = raw
+            .proxies
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            || raw
+                .proxy_groups
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|g| g.name == name)
+            || BUILTIN_ADAPTER_NAMES.contains(&name)
+            || name == "GLOBAL";
+        if !declared {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' names no declared proxy, \
+                 proxy group, or built-in",
+                l.name
+            ));
+        }
+    }
+    None
 }
 
 /// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
@@ -4812,39 +6858,641 @@ pub fn resolve_tcp_keepalive(
             }
         }
     }
-    // Upstream mihomo applies `keep-alive-*` to BOTH inbound listeners
-    // (`net.ListenConfig.KeepAliveConfig` on accepted sockets) and
-    // outbound dials; `tcp-keepalive*` here covers the inbound side only
-    // — outbound dials carry no configurable keepalive (the residual
-    // gap). Captured only to warn on the plausible migration mistake —
-    // without this the keys are silently ignored by serde.
-    for (key, present, inbound_equivalent) in [
-        (
-            "keep-alive-idle",
-            raw.keep_alive_idle.is_some(),
-            "`tcp-keepalive-idle`",
-        ),
-        (
+    Ok(config)
+}
+
+/// The effective `profile:` flags — what the running config and
+/// `GET /configs` report (issue #974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedProfile {
+    /// `profile.store-selected` — selection persistence for `select`
+    /// groups and url-test/fallback `fix` pins. Upstream default `true`.
+    pub store_selected: bool,
+    /// `profile.store-fake-ip` resolved over `dns.store-fake-ip` —
+    /// explicit `profile` wins over explicit `dns`, which wins over the
+    /// `false` default (`false` is still an explicit value; `null`
+    /// falls through, matching upstream's absent-handling).
+    pub store_fake_ip: bool,
+}
+
+/// Resolve `profile:` — `store-selected` defaults to upstream's `true`;
+/// `store-fake-ip` follows `profile` > `dns` > `false`. When both
+/// explicit spellings disagree, `profile` wins and the caller warns once
+/// per admission (`validation::validate_and_warn`).
+pub fn resolve_profile(raw: &raw::RawConfig) -> ResolvedProfile {
+    let profile = raw.profile.as_ref();
+    ResolvedProfile {
+        store_selected: profile.and_then(|p| p.store_selected).unwrap_or(true),
+        store_fake_ip: profile
+            .and_then(|p| p.store_fake_ip)
+            .or_else(|| raw.dns.as_ref().and_then(|d| d.store_fake_ip))
+            .unwrap_or(false),
+    }
+}
+
+/// The resolved `ntp:` service configuration (issue #974) — what
+/// `Config` carries, `GET /configs` reports, and the supervisor
+/// reconciles against. `write-to-system` never appears here: it is
+/// warn-and-ignore at admission, not a runtime knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtpConfig {
+    pub enable: bool,
+    /// Host or IP literal (bracketed IPv6 unwrapped) — `time.apple.com`
+    /// by upstream default.
+    pub server: String,
+    pub port: u16,
+    /// Poll period — `interval` minutes, `1..=525600`, default 30.
+    pub interval_minutes: u32,
+    /// The named `dialer-proxy` target, `None` = direct dial. Admission
+    /// pins it to a built top-level proxy/group name or `DIRECT` when
+    /// enabled — see the check in `rebuild_from_raw_impl`.
+    pub dialer_proxy: Option<String>,
+}
+
+/// Resolve `ntp:` — ranges are checked even when disabled (`-t`
+/// rejects an out-of-range endpoint the same way a running load does).
+/// `server` must be a bare host or IP literal: bracketed IPv6 unwraps,
+/// a `host:port`/`scheme://` spelling fails; `port` and `interval`
+/// hold upstream-compatible bounds.
+pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
+    let ntp = raw.ntp.as_ref();
+    let server_raw = ntp
+        .and_then(|n| n.server.as_deref())
+        .unwrap_or("time.apple.com");
+    let server = {
+        let s = server_raw.trim();
+        anyhow::ensure!(!s.is_empty(), "ntp.server must not be empty");
+        // Bracketed IPv6 (`[::1]`) unwraps to the literal; anything else
+        // must be a hostname — `is_valid_host` is the same byte contract
+        // ingress applies, so whitespace, control bytes and every
+        // authority-shaped spelling (`host:port`, `scheme://`, `a@b`,
+        // `x/y`) fail here.
+        let inner = s
+            .strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .unwrap_or(s);
+        if inner.parse::<std::net::IpAddr>().is_err() {
+            anyhow::ensure!(
+                meow_common::is_valid_host(inner),
+                "ntp.server '{server_raw}': expected a host or IP literal, not a host:port or URI"
+            );
+        }
+        inner.to_string()
+    };
+    let port = ntp.and_then(|n| n.port).unwrap_or(123);
+    anyhow::ensure!(port >= 1, "ntp.port {port}: expected 1..=65535");
+    let interval = ntp.and_then(|n| n.interval).unwrap_or(30);
+    anyhow::ensure!(
+        (1..=525_600).contains(&interval),
+        "ntp.interval {interval}: expected 1..=525600 minutes"
+    );
+    let interval_minutes = u32::try_from(interval)
+        .map_err(|_| anyhow::anyhow!("ntp.interval {interval} is out of range"))?;
+    // `dialer-proxy` matches names verbatim — no trimming: `' DIRECT '`
+    // is not the DIRECT built-in (issue #974). Empty means direct like
+    // an absent key, and `DIRECT` normalizes to the same direct path so
+    // the two spellings compare equal at reconcile and never restart an
+    // unchanged worker.
+    let dialer_proxy = ntp
+        .and_then(|n| n.dialer_proxy.as_deref())
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != "DIRECT")
+        .map(str::to_string);
+    Ok(NtpConfig {
+        enable: ntp.and_then(|n| n.enable).unwrap_or(false),
+        server,
+        port,
+        interval_minutes,
+        dialer_proxy,
+    })
+}
+
+/// The `ntp.enable + dialer-proxy` reference gate every prospective
+/// routing publication runs (issue #974): an enabled named target must
+/// resolve to a built top-level proxy/group or `DIRECT` — provider-only
+/// names and non-transport built-ins are not valid dialers. Runs against
+/// the BUILT map, not the raw names, so a group dropped by lenient
+/// parsing still fails and a `use:`-only name never slips through.
+/// Called on every `rebuild_from_raw_impl` — startup, `-t`, PUT and the
+/// subscription/geodata republish lanes all pass through it.
+///
+/// `placeholder_names` is [`insert_parsed_leaves`]'s set: lenient builds
+/// bind a parse-failed placeholder-eligible node to an
+/// `UnavailableAdapter` that stays in the map but fails every dial — the
+/// same exclusion the declared-side fallback applies to `Some(true)`
+/// bindings (Codex review). Group names never appear in it — the
+/// duplicate-name gate keeps them disjoint — so a group whose members
+/// are unusable today still passes, matching how the target actually
+/// dials once membership changes (provider refresh, a re-pick).
+pub(crate) fn check_ntp_dialer_target(
+    cfg: &NtpConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
+) -> Result<(), anyhow::Error> {
+    // DIRECT/COMPATIBLE dial directly and GLOBAL is a real group — the
+    // map carries all three; DIRECT is also spelled out for hand-built
+    // `NtpConfig`s that skipped `resolve_ntp`'s normalization.
+    check_ntp_dialer_target_impl(cfg, |name| {
+        name == "DIRECT" || (proxies.contains_key(name) && !placeholder_names.contains(name))
+    })
+}
+
+/// The same `ntp.enable + dialer-proxy` gate where no built candidate
+/// exists — the forced verbatim-commit fallback (issue #974 review). The
+/// name must be one the candidate's own `proxies:`/`proxy-groups:`
+/// declare with a `type:` this build's dispatch can construct, or a
+/// transport built-in: only those can possibly enter its built map, so
+/// anything else would commit a document the next startup's built-map
+/// check hard-fails — including a same-name node whose unknown `type:`
+/// the lenient build drops. `use:`-only provider names fail here the
+/// same way they fail there — and only a *buildable* provider counts as
+/// supplying members, since `materialize_proxy_providers` warn-drops a
+/// def it cannot construct.
+///
+/// `cache_dir` is the provider-cache directory the rebuild would use —
+/// safe-path containment inside it is part of buildability. The check
+/// runs the real provider constructor, which canonicalizes paths on
+/// disk: callers must not hold the raw write guard and should dispatch
+/// it off the async lane.
+pub fn check_ntp_dialer_target_declared(
+    cfg: &NtpConfig,
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    check_ntp_dialer_target_impl(cfg, |name| {
+        // The transports the built map always carries are spelled out —
+        // there is no map to consult here.
+        matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
+            || declared_leaf_binding(name, raw) == Some(false)
+            || declared_group_lands(name, raw, cache_dir)
+    })
+}
+
+/// Whether a `proxies:` declaration named `name` would land in the
+/// lenient build's map — the same parse the build runs, restricted to
+/// the name's own blocks (local and synchronous; a parse never dials —
+/// issue #974 review). Mirrors [`insert_parsed_leaves`]: later same-name
+/// blocks win a live binding; a block on a `dialer-proxy` edge goes
+/// through [`parse_dialered_leaf`] against the earlier same-name
+/// binding; an unparseable block fills the slot with an unavailable
+/// placeholder only while nothing live is bound and its `type:` is
+/// placeholder-eligible — so a `{type: socks5}` without `server` drops
+/// out, while a compiled-out `trusttunnel` still binds a placeholder.
+/// The placeholder counts for *group membership* (a group listing it
+/// still lands) but not as the dialer target itself: it carries no
+/// transport, so an NTP dialer named on it would fail every dial.
+/// A build-fatal error (self-edge, a `strict` parse failure, a
+/// malformed-edges bail) can never land the name.
+/// Returns `Some(false)` for a live binding, `Some(true)` when only an
+/// unavailable placeholder holds the slot, `None` when nothing lands.
+fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
+    // A block shadowing a built-in is dropped before it binds — the
+    // built-in itself was already answered by the caller's arms.
+    if BUILTIN_ADAPTER_NAMES.contains(&name) {
+        return None;
+    }
+    // This mirror runs the real constructors for their verdicts only —
+    // an `ss` node's external SIP003 plugin must not spawn a local
+    // subprocess just to answer "would the name land" for a candidate
+    // that may still be rejected (Codex review). Every other check in
+    // the arm still applies, so the verdict stays the constructor's
+    // modulo the spawn itself.
+    #[cfg(feature = "ss")]
+    let _plugin_dry_run = proxy_parser::plugin_spawn_dry_run();
+    let raw_proxies = raw.proxies.as_ref()?;
+    let strict = raw.strict.unwrap_or(false);
+    let Ok(edges) = collect_dialer_edges(raw_proxies, strict) else {
+        // The whole build bails on the declared edges — no map exists
+        // for the name to land in.
+        return None;
+    };
+    let ipv6 = effective_ipv6(raw.ipv6);
+    let fp = raw.global_client_fingerprint.as_deref();
+    let registry = meow_proxy::dialer::ProxyRegistry::default();
+    // Dry-run verdicts only need a throwaway cell — a `type: dns` leaf
+    // lands either way; which resolver slot it would serve is runtime
+    // state this mirror never consults (issue #974).
+    let dns_cell = meow_dns::new_dns_outbound_cell();
+    let key = SmolStr::from(name);
+    // (binding, is_placeholder) — `parse_dialered_leaf` consults both.
+    let mut bound: Option<(Arc<dyn Proxy>, bool)> = None;
+    for (index, block) in raw_proxies.iter().enumerate() {
+        if block.get("name").and_then(|v| v.as_str()) != Some(name) {
+            continue;
+        }
+        if let Some(dialer) = edges.by_index.get(&index) {
+            let mut prior = HashMap::new();
+            let mut placeholder_names = std::collections::HashSet::new();
+            if let Some((proxy, placeholder)) = &bound {
+                prior.insert(key.clone(), Arc::clone(proxy));
+                if *placeholder {
+                    placeholder_names.insert(key.clone());
+                }
+            }
+            match parse_dialered_leaf(
+                block,
+                dialer,
+                &prior,
+                &placeholder_names,
+                None,
+                ipv6,
+                strict,
+                &registry,
+                fp,
+                &dns_cell,
+            ) {
+                Ok(Some(b)) => bound = Some(b),
+                // Skipped — the earlier same-name binding stands.
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            continue;
+        }
+        match proxy_parser::parse_static_proxy(block, ipv6, None, fp, Some(&dns_cell)) {
+            Ok(proxy) => bound = Some((proxy, false)),
+            Err(e) => {
+                if strict {
+                    return None;
+                }
+                if bound.is_none() {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(block) {
+                        bound = Some((
+                            unavailable_placeholder(name, &e.to_string(), declared),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    bound.map(|(_, placeholder)| placeholder)
+}
+
+/// Whether a `proxy-groups:` declaration named `name` lands in the
+/// lenient build — mirroring [`proxy_parser::parse_proxy_group_inner`]'s
+/// kept-verdict without fabricating provider objects: the group survives
+/// when at least one static member or provider slot resolves and its
+/// type-specific gates pass. Member names resolve against the set the
+/// build's map carries at group-parse time — the transports (built-ins),
+/// every landed leaf, and every group that already landed — settled by
+/// the same multi-pass structure `build_config` uses, not a plain
+/// fixpoint, so a late landing does not rescue an earlier deferred
+/// dependency (Codex review).
+///
+/// `cache_dir` must be the provider-cache directory the rebuild would
+/// use: it feeds [`declared_provider_buildable`]'s safe-path mirror, and
+/// that constructor's canonicalize touches the filesystem — keep this
+/// off the raw write guard and off the async lane.
+fn declared_group_lands(name: &str, raw: &raw::RawConfig, cache_dir: Option<&Path>) -> bool {
+    let Some(groups) = raw.proxy_groups.as_ref() else {
+        return false;
+    };
+    let strict = raw.strict.unwrap_or(false);
+    let mut resolvable: std::collections::HashSet<&str> =
+        BUILTIN_ADAPTER_NAMES.iter().copied().collect();
+    let mut landed_leaves = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for block in raw.proxies.as_deref().unwrap_or(&[]) {
+        let Some(n) = block.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(n) {
+            continue;
+        }
+        // Placeholder-bound names resolve as members too — they occupy
+        // the built map's slot exactly like a live adapter.
+        if declared_leaf_binding(n, raw).is_some() {
+            resolvable.insert(n);
+            landed_leaves += 1;
+        }
+    }
+    // Only a provider that would construct supplies member slots —
+    // `materialize_proxy_providers` warn-drops a def that fails
+    // `ProxyProvider::new_with_client_fingerprint` (an `http` provider
+    // without `url`, a `file` one without `path` or whose `path` escapes
+    // the cache dir, an unknown `type`), and the real build wires slots
+    // from its materialized map, not the declared one (Codex review:
+    // declared membership counted slots the construction drops).
+    let providers: std::collections::HashSet<&str> = raw
+        .proxy_providers
+        .as_ref()
+        .map(|defs| {
+            defs.iter()
+                .filter(|(name, def)| declared_provider_buildable(name, def, raw, cache_dir))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let declared: std::collections::HashSet<&str> =
+        groups.iter().map(|g| g.name.as_str()).collect();
+    let mut landed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Mirror the build's multi-pass settle (`build_config`'s group loop):
+    // a group whose `proxies:` member names a declared-but-unlanded group
+    // is deferred to a later pass — a member resolves only once its group
+    // landed in an earlier pass. When a pass lands nothing, the build
+    // makes one final lenient pass over what is left, in declaration
+    // order and without revisiting — so a group landing late in that
+    // pass does NOT rescue an earlier group's dependency on it. A plain
+    // fixpoint would revisit and admit it, letting a forced commit claim
+    // a `dialer-proxy` target the next boot drops (Codex review).
+    let mut remaining: Vec<&raw::RawProxyGroup> = groups.iter().collect();
+    loop {
+        let mut still = Vec::new();
+        let mut progress = false;
+        for g in remaining {
+            let dep_pending = g
+                .proxies
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|m| declared.contains(m.as_str()) && !landed.contains(m.as_str()));
+            if dep_pending {
+                still.push(g);
+                continue;
+            }
+            if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                landed.insert(g.name.as_str());
+                resolvable.insert(g.name.as_str());
+                progress = true;
+            } else {
+                still.push(g);
+            }
+        }
+        if still.is_empty() {
+            break;
+        }
+        if !progress {
+            for g in &still {
+                if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                    landed.insert(g.name.as_str());
+                    resolvable.insert(g.name.as_str());
+                }
+            }
+            break;
+        }
+        remaining = still;
+    }
+    landed.contains(name)
+}
+
+/// Whether the declared `proxy-providers:` def would construct — the
+/// exact gate `materialize_proxy_providers` applies when it decides
+/// whether a name enters the built map (`use:`/`include-all` wire slots
+/// against that map). Runs the real constructor with a throwaway dialer
+/// registry and the same `ipv6`/`strict`/fingerprint resolution the
+/// rebuild applies — including safe-path containment, which reads the
+/// filesystem, so callers must stay off the write guard and dispatch to
+/// the blocking pool.
+fn declared_provider_buildable(
+    name: &str,
+    def: &raw::RawProxyProvider,
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> bool {
+    proxy_provider::ProxyProvider::new_with_client_fingerprint(
+        name,
+        def,
+        cache_dir,
+        effective_ipv6(raw.ipv6),
+        raw.strict.unwrap_or(false),
+        meow_proxy::dialer::ProxyRegistry::default(),
+        raw.global_client_fingerprint.as_deref(),
+        // Dry-run verdict only: the candidate never serves, so dns leaves
+        // stay unbound here (issue #974).
+        None,
+    )
+    .is_ok()
+}
+
+/// The kept-verdict of one group parse — see [`declared_group_lands`].
+/// `resolvable` is the member-name set the built map would hold at this
+/// point (transports + landed leaves + landed groups); `providers` the
+/// declared `proxy-providers:` names — a slot wires for every declared
+/// name `use:` references and for `include-all*` only while providers
+/// exist, matching the map lookups in `parse_proxy_group_inner`.
+fn declared_group_would_land(
+    g: &raw::RawProxyGroup,
+    resolvable: &std::collections::HashSet<&str>,
+    providers: &std::collections::HashSet<&str>,
+    landed_leaves: usize,
+    strict: bool,
+) -> bool {
+    if !declared_group_type_buildable(&g.group_type) {
+        return false;
+    }
+    // A bad group filter rejects the parse outright.
+    if crate::proxy_provider::GroupFilter::from_raw_group(g).is_err() {
+        return false;
+    }
+    let is_relay = g.group_type == "relay";
+    let proxy_names = g.proxies.as_deref().unwrap_or(&[]);
+    // `parse_proxy_group_inner` consults `use:` only when include-all
+    // supplies no provider slots: with `include-all`/`include-all-providers`
+    // set the slot list is every provider and `use:` is never iterated —
+    // an unknown name there cannot fail the parse even under `strict`.
+    let include_all_providers =
+        g.include_all.unwrap_or(false) || g.include_all_providers.unwrap_or(false);
+    // Under `strict` an unresolved static member (or a non-relay group's
+    // unknown `use:`) fails the parse — and the build it belongs to.
+    if strict {
+        if proxy_names.iter().any(|n| !resolvable.contains(n.as_str())) {
+            return false;
+        }
+        if !is_relay
+            && !include_all_providers
+            && g.use_providers
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|p| !providers.contains(p.as_str()))
+        {
+            return false;
+        }
+    }
+    let mut members = proxy_names
+        .iter()
+        .filter(|n| resolvable.contains(n.as_str()))
+        .count();
+    if g.include_all_proxies.unwrap_or(false) {
+        members += landed_leaves;
+    }
+    // Provider slots never supply relay members — a `use:` there is
+    // inert (issue #533) — so they count only for the other types.
+    let slots = if is_relay {
+        0
+    } else if include_all_providers {
+        providers.len()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        g.use_providers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|p| providers.contains(p.as_str()) && seen.insert(p.as_str()))
+            .count()
+    };
+    if members == 0 && slots == 0 {
+        return false;
+    }
+    match g.group_type.as_str() {
+        "load-balance" => proxy_parser::parse_lb_strategy(g.strategy.as_deref()).is_ok(),
+        // `proxies` is the only member source a relay parses — it
+        // hard-errors below 2 members.
+        "relay" => members >= 2,
+        _ => true,
+    }
+}
+
+/// The `proxy-groups:` `type:` spellings the group builder dispatches
+/// on — anything else fails the parse before membership is read.
+fn declared_group_type_buildable(group_type: &str) -> bool {
+    matches!(
+        group_type,
+        "select" | "url-test" | "fallback" | "load-balance" | "relay"
+    )
+}
+
+fn check_ntp_dialer_target_impl(
+    cfg: &NtpConfig,
+    target_exists: impl Fn(&str) -> bool,
+) -> Result<(), anyhow::Error> {
+    if !cfg.enable {
+        return Ok(());
+    }
+    if let Some(name) = &cfg.dialer_proxy {
+        // REJECT/REJECT-DROP/PASS/PASS-RULE sit in the built map but are
+        // match-engine signals, not transports — they can never carry the
+        // exchange on either lane.
+        anyhow::ensure!(
+            !matches!(
+                name.as_str(),
+                "REJECT" | "REJECT-DROP" | "PASS" | "PASS-RULE"
+            ),
+            "ntp.dialer-proxy '{name}': non-transport built-ins cannot carry \
+             the exchange — name a built proxy/group, DIRECT, COMPATIBLE, \
+             or GLOBAL"
+        );
+        anyhow::ensure!(
+            target_exists(name.as_str()),
+            "ntp.dialer-proxy '{name}': no such top-level proxy or group — \
+             name a built proxy/group or DIRECT (provider-member and \
+             built-in non-dialer names are not valid targets)"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
+/// — mihomo's keepalive knobs, scoped here to *outbound* dials (the
+/// inbound side stays with `tcp-keepalive*` / [`resolve_tcp_keepalive`],
+/// an independence upstream's shared keys did not have) — into the
+/// [`meow_common::OutboundTcpKeepalive`] `connect_tcp` snapshots once per
+/// dial. Omitted or `0` timings resolve to the 15 s upstream default;
+/// `disable-keep-alive` defaults to `false`. Timing bounds hold at
+/// 0–32767 s even when disabled, like `tcp-keepalive*` — Linux EINVALs
+/// `TCP_KEEPIDLE`/`TCP_KEEPINTVL` above it. Negative values never reach
+/// here: the `u64` raw fields already failed serde.
+///
+/// `PUT`/`PATCH /configs` gate persistence on this resolver so a
+/// committed document cannot fail the next boot's `build_config`; the
+/// install itself happens at the caller's commit point, not here.
+pub fn resolve_outbound_tcp_keepalive(
+    raw: &raw::RawConfig,
+) -> Result<meow_common::OutboundTcpKeepalive, anyhow::Error> {
+    let bound = |key: &str, value: Option<u64>| -> Result<u64, anyhow::Error> {
+        match value {
+            None | Some(0) => Ok(meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "{key}: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
+            Some(secs) => Ok(secs),
+        }
+    };
+    Ok(meow_common::OutboundTcpKeepalive {
+        enabled: !raw.disable_keep_alive.unwrap_or(false),
+        idle: std::time::Duration::from_secs(bound("keep-alive-idle", raw.keep_alive_idle)?),
+        interval: std::time::Duration::from_secs(bound(
             "keep-alive-interval",
-            raw.keep_alive_interval.is_some(),
-            "`tcp-keepalive-interval`",
-        ),
-        (
-            "disable-keep-alive",
-            raw.disable_keep_alive.is_some(),
-            "`tcp-keepalive: false`",
-        ),
-    ] {
-        if present {
-            warn!(
-                "{key}: tunes inbound AND outbound sockets upstream and is \
-                 ignored; the inbound-socket equivalent here is \
-                 {inbound_equivalent} (outbound dials keep no keepalive \
-                 tuning)"
+            raw.keep_alive_interval,
+        )?),
+        probes: meow_common::tcp_opts::OUTBOUND_KEEPALIVE_PROBES,
+    })
+}
+
+/// `lan-allowed-ips`/`lan-disallowed-ips` nested under a `listeners:`
+/// entry would land in its `extra` map and silently do nothing — an
+/// access guard that never engages is worse than none, so misplacement
+/// is a hard error pointing at the top level. Shared by
+/// `build_named_listeners` (boot/`-t`/`PUT`) and [`resolve_lan_acl`]
+/// (which `PUT /configs` additionally gates on under `force`).
+fn check_listener_acl_placement(l: &raw::RawListener) -> Result<(), anyhow::Error> {
+    for key in ["lan-allowed-ips", "lan-disallowed-ips"] {
+        if l.extra.contains_key(key) {
+            anyhow::bail!(
+                "listeners[{}].{key}: the LAN ACL keys are top-level only — \
+                 move '{key}' to the config root",
+                l.name
             );
         }
     }
-    Ok(config)
+    Ok(())
+}
+
+/// `<ip>/<prefix>` with host bits accepted and normalized — the
+/// `lan-*-ips` contract (mihomo's `netip.Prefix` takes host bits; bare
+/// IPs and malformed prefixes are rejected).
+fn parse_lan_cidr(s: &str) -> Result<ipnet::IpNet, anyhow::Error> {
+    let (addr, plen) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("'{s}' is not a CIDR (expected 'addr/prefix')"))?;
+    let addr: std::net::IpAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("'{s}': bad address ({e})"))?;
+    let plen: u8 = plen
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}': bad prefix length '{plen}'"))?;
+    ipnet::IpNet::new(addr, plen)
+        .map(|n| n.trunc())
+        .map_err(|e| anyhow::anyhow!("'{s}': {e}"))
+}
+
+/// Resolve `lan-allowed-ips`/`lan-disallowed-ips` into the shared
+/// immutable [`meow_common::LanAcl`] the mixed/HTTP/SOCKS TCP accept
+/// loops consult (mihomo's `adapter/inbound/ipfilter`): admit = at
+/// least one allow match AND no deny match. An omitted allow list
+/// defaults to `0.0.0.0/0` + `::/0`; explicit `[]` admits nobody on the
+/// gated path. The deny list defaults to empty. Errors name the key
+/// and the offending element index.
+///
+/// `PUT /configs` calls this for validation only — the ACL is a startup
+/// snapshot like `listeners:`, never hot-applied — so a committed
+/// document cannot carry a value the next boot's `build_config` would
+/// hard-error on.
+pub fn resolve_lan_acl(raw: &raw::RawConfig) -> Result<meow_common::LanAcl, anyhow::Error> {
+    for l in raw.listeners.iter().flatten() {
+        check_listener_acl_placement(l)?;
+    }
+    let parse_list =
+        |key: &str, entries: Option<&[String]>| -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+            entries
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .map(|(i, s)| parse_lan_cidr(s).map_err(|e| anyhow::anyhow!("{key}[{i}]: {e}")))
+                .collect()
+        };
+    let allowed = match raw.lan_allowed_ips.as_deref() {
+        None => vec![
+            "0.0.0.0/0".parse().expect("static CIDR"),
+            "::/0".parse().expect("static CIDR"),
+        ],
+        Some(list) => parse_list("lan-allowed-ips", Some(list))?,
+    };
+    let denied = parse_list("lan-disallowed-ips", raw.lan_disallowed_ips.as_deref())?;
+    Ok(meow_common::LanAcl::new(allowed, denied))
 }
 
 /// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
@@ -4892,24 +7540,31 @@ fn build_named_listeners(
     let global_max_conns = raw.max_connections.unwrap_or_else(default_max_connections);
     validate_connection_limit(global_max_conns)?;
 
-    let mut listener_proxies: Vec<(String, String)> = Vec::new();
     let mut add = |name: &str,
                    spec: ListenerSpec,
                    port: u16,
                    listen: &str,
-                   max_connections: usize|
+                   max_connections: usize,
+                   route_override: Option<meow_common::InboundRouteOverride>,
+                   routing_mark: Option<u32>,
+                   extra_ports: &[u16]|
      -> Result<(), anyhow::Error> {
         validate_connection_limit(max_connections)
             .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
         // a distinct port at runtime, so they are not duplicates of each other.
-        if port != 0 {
-            if let Some(existing) = used_ports.get(&port) {
-                anyhow::bail!(
-                    "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
-                );
+        // `seen` dedupes candidates within one listener: an anytls entry may
+        // legitimately bind the same port on several addresses.
+        let mut seen = std::collections::HashSet::new();
+        for candidate in std::iter::once(port).chain(extra_ports.iter().copied()) {
+            if candidate != 0 && seen.insert(candidate) {
+                if let Some(existing) = used_ports.get(&candidate) {
+                    anyhow::bail!(
+                        "port {candidate} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
+                    );
+                }
+                used_ports.insert(candidate, name.to_string());
             }
-            used_ports.insert(port, name.to_string());
         }
         if !used_names.insert(name.to_string()) {
             anyhow::bail!(
@@ -4922,7 +7577,8 @@ fn build_named_listeners(
             port,
             listen: listen.to_string(),
             max_connections,
-            proxy: None,
+            route_override,
+            routing_mark,
         });
         Ok(())
     };
@@ -4938,6 +7594,9 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
+            &[],
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
@@ -4947,6 +7606,9 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
+            &[],
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
@@ -4956,6 +7618,9 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
+            &[],
         )?;
     }
     if raw.firewall.is_some() {
@@ -4996,6 +7661,9 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
+            &[],
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
@@ -5015,10 +7683,14 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
+            &[],
         )?;
     }
 
     // Explicit `listeners:` entries
+    let mut named_tun_seen: Option<String> = None;
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
         let kind = raw_l.listener_type.to_ascii_lowercase();
         if SERVER_ONLY_INBOUNDS.contains(&kind.as_str()) {
@@ -5035,7 +7707,126 @@ fn build_named_listeners(
         // `type: redir` lowers to a `TProxy` spec, which erases its origin —
         // the listen-default and warn-dedupe branches below still need it.
         let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
+        // `lan-*-ips` nested under a listener would land in `extra` as a
+        // silently-dead access guard — hard error before `warn_extra`
+        // can mislabel them unrecognized.
+        check_listener_acl_placement(raw_l)?;
+        // `type: tun` — a named TUN device, not a socket listener: it owns
+        // no port/listen and stays out of the socket-port registry, but it
+        // does share the name-uniqueness check (upstream `parseListeners`
+        // rejects duplicate names). meow admits ONE effective TUN — a
+        // named entry, or an enabled top-level `tun:` — because the single
+        // handle, the routes, the outbound binding, DNS hijack and the
+        // lwIP generation are not isolated for concurrent devices. The
+        // options are flat on the entry (upstream `TunOption`); a nested
+        // `tun:` map, `enable`, `listen` or `port` are shape errors.
+        if raw_l.listener_type.eq_ignore_ascii_case("tun") {
+            if raw.tun.as_ref().is_some_and(|t| t.enable) {
+                anyhow::bail!(
+                    "listeners[{}]: `type: tun` cannot coexist with `tun.enable: true` — \
+                     meow-rs runs one effective TUN; disable the top-level section \
+                     or remove this listener",
+                    raw_l.name
+                );
+            }
+            if let Some(first) = named_tun_seen.replace(raw_l.name.clone()) {
+                anyhow::bail!(
+                    "listeners[{}]: second named `type: tun` listener ('{first}' \
+                     already declares one) — meow-rs runs one effective TUN",
+                    raw_l.name
+                );
+            }
+            for (key, present) in [
+                ("enable", raw_l.enable.is_some()),
+                ("tun", raw_l.extra.contains_key("tun")),
+                ("listen", raw_l.listen.is_some()),
+                ("port", raw_l.port.is_some()),
+            ] {
+                if present {
+                    anyhow::bail!(
+                        "listeners[{}].{key}: a named `type: tun` takes its options \
+                         flat on the entry — `{key}` has no meaning here (the \
+                         entry itself is the enabled device; drop it, or use the \
+                         top-level `tun:` section instead)",
+                        raw_l.name
+                    );
+                }
+            }
+            validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
+            // Keys meaningful only on socket listener types — including
+            // the anytls-only set the shared diagnostics would warn
+            // about below, which this early-`continue` arm never reaches.
+            for (key, set) in [
+                ("firewall", raw_l.firewall.is_some()),
+                ("tproxy-sni", raw_l.tproxy_sni.is_some()),
+                ("transparent", raw_l.transparent.is_some()),
+                ("udp", raw_l.udp.is_some()),
+                ("cipher", raw_l.cipher.is_some()),
+                ("password", raw_l.password.is_some()),
+                ("private-key", raw_l.private_key.is_some()),
+                ("peers", raw_l.peers.is_some()),
+                // No inbound socket exists to mark — the ingress
+                // `routing-mark` contract does not reach a TUN device.
+                ("routing-mark", raw_l.routing_mark.is_some()),
+                ("users", raw_l.users.is_some()),
+                ("certificate", raw_l.certificate.is_some()),
+                ("client-auth-type", raw_l.client_auth_type.is_some()),
+                ("client-auth-cert", raw_l.client_auth_cert.is_some()),
+                ("ech-key", raw_l.ech_key.is_some()),
+                ("allow-insecure", raw_l.allow_insecure.is_some()),
+                ("padding-scheme", raw_l.padding_scheme.is_some()),
+            ] {
+                if set {
+                    warn!(
+                        "listeners[{}].{key}: not meaningful on `type: tun`, ignored; \
+                         remove it to suppress this warning",
+                        raw_l.name
+                    );
+                }
+            }
+            // Same `sub-rules:` selection contract as the socket types.
+            if let Some(name) = raw_l.rule.as_deref().filter(|s| !s.is_empty()) {
+                let defined = raw.sub_rules.as_ref().is_some_and(|m| m.contains_key(name));
+                if !defined {
+                    anyhow::bail!(
+                        "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                        raw_l.name
+                    );
+                }
+            }
+            let route_override = meow_common::InboundRouteOverride::new(
+                raw_l.proxy.as_deref(),
+                raw_l.rule.as_deref(),
+            );
+            let tun = parse_named_tun_config(raw_l, global_max_conns, raw.fake_ip_range())?;
+            add(
+                &raw_l.name,
+                ListenerSpec::Tun(tun),
+                // No socket port exists — `0`/"" keep the entry inert for
+                // the port registry (`0` never registers) and `GET
+                // /listeners` (which reports name/type only for it).
+                0,
+                "",
+                raw_l.max_connections.unwrap_or(global_max_conns),
+                route_override,
+                None,
+                &[],
+            )?;
+            continue;
+        }
         let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
+        // `type: wireguard` entries already warned their extra keys inside
+        // `build_wg_listener_spec` (peer extras too); on every other type the
+        // extras would drop silently — classify-and-warn here (issue #974).
+        if !matches!(spec, ListenerSpec::WireGuard(_)) {
+            validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
+            if let Some(obfs) = &raw_l.simple_obfs {
+                validation::warn_extra(
+                    &format!("listener '{}' simple-obfs", raw_l.name),
+                    &obfs.extra,
+                );
+            }
+        }
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
@@ -5051,7 +7842,11 @@ fn build_named_listeners(
             );
         }
         match (&spec, raw_l.udp_timeout) {
-            (ListenerSpec::TProxy { udp: true, .. }, _) | (_, None) => {}
+            // `wireguard` consumes `udp-timeout` itself (inner-UDP flow
+            // idle bound) — no warning on it either.
+            (ListenerSpec::TProxy { udp: true, .. }, _)
+            | (ListenerSpec::WireGuard(_), _)
+            | (_, None) => {}
             // `type: redir` already warned that `udp-timeout` is ignored
             // on it at spec-parse — don't warn a second time here.
             (ListenerSpec::TProxy { .. }, Some(_)) if is_redir => {}
@@ -5061,24 +7856,126 @@ fn build_named_listeners(
                 raw_l.name
             ),
             (_, Some(_)) => warn!(
-                "listeners[{}].udp-timeout: only meaningful on `type: tproxy`, ignored; \
+                "listeners[{}].udp-timeout: only meaningful on `type: tproxy`/`wireguard`, ignored; \
                  remove it to suppress this warning",
                 raw_l.name
             ),
         }
-        // `udp` is meaningful on tproxy (issue #564) and shadowsocks; any
-        // other listener type ignoring it is warned about.
+        // `udp` is meaningful on tproxy (issue #564), shadowsocks and
+        // wireguard; `type: anytls` diagnoses the key itself inside
+        // `build_anytls_listener_spec` (`true` redundant, `false` a hard
+        // error). Any other listener type ignoring it is warned about.
         if raw_l.udp.is_some()
             && !matches!(
                 spec,
-                ListenerSpec::TProxy { .. } | ListenerSpec::Shadowsocks(_)
+                ListenerSpec::TProxy { .. }
+                    | ListenerSpec::Shadowsocks(_)
+                    | ListenerSpec::WireGuard(_)
+                    | ListenerSpec::Anytls(_)
             )
         {
             warn!(
-                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`, \
+                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`, \
                  ignored; remove it to suppress this warning",
                 raw_l.name
             );
+        }
+        // WireGuard/TUN-only fields set on another listener type warn —
+        // the same shape as the `firewall`/`tproxy-sni` checks above
+        // (`type: tun` consumed them in its own arm above and never
+        // reaches here).
+        // `private-key` is shared with `type: anytls` (TLS material) —
+        // `mtu`/`peers` remain WG/TUN-only and warn there too.
+        if raw_l.private_key.is_some()
+            && !matches!(spec, ListenerSpec::WireGuard(_) | ListenerSpec::Anytls(_))
+        {
+            warn!(
+                "listeners[{}].private-key: only meaningful on `type: wireguard`/`anytls`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        for (key, set) in [
+            ("mtu", raw_l.mtu.is_some()),
+            ("peers", raw_l.peers.is_some()),
+        ] {
+            if set && !matches!(spec, ListenerSpec::WireGuard(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: wireguard`/`tun`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        // AnyTLS-only fields set on another listener type warn — same
+        // shape as the wireguard check above (`enable` is also consumed
+        // by `type: tun`... its arm errors before reaching here).
+        for (key, set) in [
+            ("users", raw_l.users.is_some()),
+            ("certificate", raw_l.certificate.is_some()),
+            ("client-auth-type", raw_l.client_auth_type.is_some()),
+            ("client-auth-cert", raw_l.client_auth_cert.is_some()),
+            ("ech-key", raw_l.ech_key.is_some()),
+            ("allow-insecure", raw_l.allow_insecure.is_some()),
+            ("padding-scheme", raw_l.padding_scheme.is_some()),
+        ] {
+            if set && !matches!(spec, ListenerSpec::Anytls(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: anytls`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        // `enable` is meaningful on `type: anytls` (diagnosed inside its
+        // builder) and hard-errors on `type: tun` above; elsewhere it is
+        // a silently-dead key unless warned about here.
+        if raw_l.enable.is_some() && !matches!(spec, ListenerSpec::Anytls(_)) {
+            warn!(
+                "listeners[{}].enable: only meaningful on `type: anytls`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        // Named-TUN-only fields set on another listener type warn —
+        // same shape as the wireguard-field check above.
+        for (key, set) in [
+            ("device", raw_l.device.is_some()),
+            ("stack", raw_l.stack.is_some()),
+            ("dns-hijack", raw_l.dns_hijack.is_some()),
+            ("auto-route", raw_l.auto_route.is_some()),
+            ("outbound-interface", raw_l.outbound_interface.is_some()),
+            ("inet4-address", raw_l.inet4_address.is_some()),
+            ("inet6-address", raw_l.inet6_address.is_some()),
+            ("dns-mode", raw_l.dns_mode.is_some()),
+            ("strict-route", raw_l.strict_route.is_some()),
+            (
+                "auto-detect-interface",
+                raw_l.auto_detect_interface.is_some(),
+            ),
+            ("auto-redirect", raw_l.auto_redirect.is_some()),
+            (
+                "endpoint-independent-nat",
+                raw_l.endpoint_independent_nat.is_some(),
+            ),
+            ("mtu-v6", raw_l.mtu_v6.is_some()),
+            ("route-address", raw_l.route_address.is_some()),
+            (
+                "route-exclude-address",
+                raw_l.route_exclude_address.is_some(),
+            ),
+            ("include-uid", raw_l.include_uid.is_some()),
+            ("exclude-uid", raw_l.exclude_uid.is_some()),
+            ("gso", raw_l.gso.is_some()),
+            ("file-descriptor", raw_l.file_descriptor.is_some()),
+        ] {
+            if set {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: tun`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
         }
         // `transparent` is tproxy-only — on `type: redir` it already
         // warned at spec-parse, so non-TProxy specs are all that remain.
@@ -5104,21 +8001,38 @@ fn build_named_listeners(
                         ..
                     }
                 );
-            if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
+            if matches!(spec, ListenerSpec::WireGuard(_)) {
+                // A WG responder exists to accept peers from the network —
+                // the spec pins `0.0.0.0` rather than the shared
+                // `default_bind` convention (spec §2.1); loopback is
+                // always writable explicitly for tests.
+                "0.0.0.0"
+            } else if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
                 default_bind
             } else {
                 "127.0.0.1"
             }
         });
-        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
-        // `parse_listener_spec` returns a placeholder for `Shadowsocks`; fold
-        // the real cipher/password/udp/simple-obfs fields in here. TProxy's
+        // `parse_listener_spec` returns a placeholder for `Shadowsocks` and
+        // `Anytls`; fold the real per-type fields in here BEFORE the bind
+        // resolve — `type: anytls` may carry a comma-separated `listen`
+        // list, which `resolve_listener_bind` cannot split. TProxy's
         // `sni` is already resolved inside `parse_listener_spec`.
         let spec = match spec {
             ListenerSpec::Shadowsocks(_) => {
                 ListenerSpec::Shadowsocks(build_ss_listener_spec(raw_l)?)
             }
+            ListenerSpec::Anytls(_) => {
+                ListenerSpec::Anytls(build_anytls_listener_spec(raw_l, default_bind)?)
+            }
             other => other,
+        };
+        // The anytls builder already normalized every bind target; its
+        // first address plays `NamedListener.listen`/`port` while the
+        // full `addresses` list stays on the spec.
+        let (listen, port) = match &spec {
+            ListenerSpec::Anytls(cfg) => (cfg.addresses[0].listen.clone(), cfg.addresses[0].port),
+            _ => resolve_listener_bind(listen_raw, raw_l.port)?,
         };
         // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
         // dual-stack on Linux and would silently accept v6 datagrams, so
@@ -5135,61 +8049,82 @@ fn build_named_listeners(
                 );
             }
         }
+        // `listeners[].rule` selects a `sub-rules:` block BY NAME — not a
+        // rule-provider and not an `IN-NAME` rule (upstream
+        // `WithSpecialRules`). Requiring the block in this same document
+        // is the `SUB-RULE,…` hard-error contract (Class A per ADR-0002);
+        // a block a later PUT removes fails closed in the resolver.
+        if let Some(name) = raw_l.rule.as_deref().filter(|s| !s.is_empty()) {
+            let defined = raw.sub_rules.as_ref().is_some_and(|m| m.contains_key(name));
+            if !defined {
+                anyhow::bail!(
+                    "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                    raw_l.name
+                );
+            }
+        }
+        let route_override =
+            meow_common::InboundRouteOverride::new(raw_l.proxy.as_deref(), raw_l.rule.as_deref());
+        // `listeners[].routing-mark` marks the LISTENER socket at bind
+        // (ingress SO_MARK, upstream `InboundOption.RoutingMark`) —
+        // Linux-only; the top-level `routing-mark` outbound key is a
+        // different consumer and is not altered. `0` normalizes to
+        // "unset" like the top-level key — a literal mark-0 `setsockopt`
+        // would tag the socket 0, the firewall-exempt wildcard.
+        // TPROXY (`redir` lowers to it) and WireGuard have no ingress
+        // mark contract — steered/responder sockets are not marked, so
+        // the key warns and ignores there.
+        let routing_mark = match spec {
+            ListenerSpec::TProxy { .. } | ListenerSpec::WireGuard(_) => {
+                if raw_l.routing_mark.is_some() {
+                    warn!(
+                        "listeners[{}].routing-mark: has no effect on `type: {}` — \
+                         only socket listeners with a client-facing bind honour it \
+                         (mixed/socks5/http/shadowsocks); ignored",
+                        raw_l.name,
+                        if is_redir {
+                            "redir"
+                        } else {
+                            raw_l.listener_type.as_str()
+                        }
+                    );
+                }
+                None
+            }
+            _ => raw_l.routing_mark.filter(|m| *m != 0),
+        };
+        // Same predicate the mark impls use (`SO_MARK` is set only under
+        // `all(linux, not(ohos))`): OHOS reports `target_os = "linux"` but
+        // its impl is cfg'd out, so a plain `not(linux)` guard would let an
+        // OHOS mark pass silently instead of warning like other platforms.
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        if routing_mark.is_some() {
+            warn!(
+                "listeners[{}].routing-mark: SO_MARK is Linux-only — ignored \
+                 on this platform; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        add(&raw_l.name, spec, port, &listen, max_connections)?;
-        if let Some(proxy) = raw_l
-            .proxy
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            check_listener_proxy(raw, &raw_l.name, proxy)?;
-            listener_proxies.push((raw_l.name.clone(), proxy.to_string()));
-        }
-    }
-    for (name, proxy) in listener_proxies {
-        if let Some(l) = result.iter_mut().find(|l| l.name == name) {
-            l.proxy = Some(proxy);
-        }
+        // Every port a multi-address `type: anytls` binds must join the
+        // duplicate-port registry, not just the primary one.
+        let extra_ports: Vec<u16> = match &spec {
+            ListenerSpec::Anytls(cfg) => cfg.addresses[1..].iter().map(|a| a.port).collect(),
+            _ => Vec::new(),
+        };
+        add(
+            &raw_l.name,
+            spec,
+            port,
+            &listen,
+            max_connections,
+            route_override,
+            routing_mark,
+            &extra_ports,
+        )?;
     }
 
     Ok(result)
-}
-
-/// A listener's `proxy:` must name a proxy, a group or a built-in, as mihomo
-/// requires. Nodes from `proxy-providers` are only known once fetched, so with
-/// providers present an unknown name is a warning (it fails each dial
-/// instead) rather than an error.
-fn check_listener_proxy(raw: &raw::RawConfig, listener: &str, proxy: &str) -> anyhow::Result<()> {
-    const BUILTIN: &[&str] = &[
-        "DIRECT",
-        "REJECT",
-        "REJECT-DROP",
-        "PASS",
-        "COMPATIBLE",
-        "GLOBAL",
-    ];
-    let named = |v: &HashMap<String, serde_json::Value>| {
-        v.get("name").and_then(|n| n.as_str()) == Some(proxy)
-    };
-    let known = BUILTIN.contains(&proxy)
-        || raw.proxies.as_deref().unwrap_or(&[]).iter().any(named)
-        || raw
-            .proxy_groups
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .any(|g| g.name == proxy);
-    if known {
-        return Ok(());
-    }
-    if raw.proxy_providers.as_ref().is_some_and(|p| !p.is_empty()) {
-        warn!(
-            "listeners[{listener}].proxy: '{proxy}' is not a static proxy or group;              it must come from a proxy-provider, or this listener's connections fail"
-        );
-        return Ok(());
-    }
-    anyhow::bail!("listeners[{listener}].proxy: proxy or group '{proxy}' not found")
 }
 
 /// Build a runnable [`Config`] from an already-parsed raw document. This is
@@ -5199,28 +8134,84 @@ fn check_listener_proxy(raw: &raw::RawConfig, listener: &str, proxy: &str) -> an
 /// [`resource_cache_dir_for_config_path`] of the config file, or `None`
 /// for a document with no backing file (`--config-string`).
 pub async fn build_config(
-    mut raw: raw::RawConfig,
+    raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
     dns_parser::validate_node_policy_sources(&raw)?;
-    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
-    // sync `parse_proxy` path that follows can stay sync. Failures warn
-    // and leave the map unchanged — except the `enable: true` with no
-    // query-source defect, which `strict` promotes to an error.
-    // Global like mihomo's: every delay probe (API, groups, providers).
-    meow_proxy::health::set_unified_delay(raw.unified_delay.unwrap_or(false));
-    if let Some(ps) = raw.proxies.as_mut() {
-        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+    // `global-ua` (issue #974): validate, then install the process-global
+    // *before* any provider/subscription/geodata/ECH fetch below emits a
+    // `User-Agent`. Unlike `routing-mark`/`interface-name` (application
+    // and API commit points install those), the install lives here so
+    // library callers — `load_config`/`load_config_from_str` — also send
+    // the UA on startup fetches. A `PUT`/`PATCH` candidate does not reach
+    // this lane; the API's commit point re-asserts it there.
+    //
+    // The install is live process state, so a failed build must not keep
+    // it: snapshot the installed value first and restore it on every
+    // error path out of `build_config_inner` — a rejected config's UA
+    // would otherwise linger on the emitters of whatever config stays
+    // live (issue #974 review).
+    let previous_ua = meow_common::global_ua();
+    meow_common::set_global_ua(validate_global_ua(raw.global_ua.as_deref())?);
+    let built = build_config_inner(raw, cache_dir).await;
+    if built.is_err() {
+        meow_common::set_global_ua(previous_ua.as_deref());
     }
+    built
+}
 
-    // Geodata config — parse and validate early so path errors surface before
-    // anything tries to load the DBs. `geox-url` is the mihomo top-level
-    // alias, merged per-key under the explicit `geodata.url.*` values.
-    let geodata = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
-
-    // General config
+/// [`build_config`]'s build body, split out so the wrapper can restore the
+/// previous process-global `User-Agent` on every error path — the
+/// candidate's UA is installed before the fetches below, and a late `?`
+/// must not leave it live (issue #974 review).
+async fn build_config_inner(
+    mut raw: raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> Result<Config, anyhow::Error> {
+    // Local shape/range gates BEFORE any candidate network work (issue
+    // #974): a defect in `ntp:`/`keep-alive-*`/`tcp-*`/`listeners:`/`tun:`
+    // must reject the document without the ECH pre-resolution or provider
+    // fetches below ever opening a socket. The resolvers are pure over
+    // `raw` — nothing they read is mutated by the passes that follow.
+    let ntp_resolved_for_config = resolve_ntp(&raw)?;
+    // `tcp-idle-timeout` — resolution and validation live in
+    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
+    // persistence and hot-apply on so a committed document cannot fail
+    // this boot path.
+    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
+    // `tcp-keepalive*` — the keepalive posture every inbound listener
+    // applies to accepted sockets. Resolution and validation live in
+    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
+    // persistence on so a committed document cannot fail this boot path.
+    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
+    // `keep-alive-*` — the keepalive posture `connect_tcp` applies to
+    // outbound dials. Validated here (and on `-t`) so a bad value fails
+    // admission; the process-global install belongs to the launcher's
+    // commit point — a candidate build must never mutate live policy.
+    let _ = resolve_outbound_tcp_keepalive(&raw)?;
+    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
+    // Startup-only like `listeners:` (upstream live-patches the prefix
+    // lists; meow deliberately matches its listener-auth lifecycle).
+    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
+    // The `listeners:` shape: duplicate names/ports, `rule:`/`proxy:`
+    // declaration checks, the one-TUN gates — all document-local.
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
+    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
+    // TUN inbound (issue #326) — parses `tun:`/`sniffer:` off raw only.
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
+    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
+    let auth = Arc::new(
+        auth::parse_auth_config(
+            raw.authentication.as_deref(),
+            raw.skip_auth_prefixes.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    // Geodata config — `geox-url` is the mihomo top-level alias, merged
+    // per-key under the explicit `geodata.url.*` values.
+    let geodata = geodata::parse_geodata(&raw)?;
+    // `mode` is a shape check too — under `strict` an unknown value
+    // hard-fails.
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
         Ok(m) => m,
         Err(e) if raw.strict.unwrap_or(false) => {
@@ -5231,6 +8222,28 @@ pub async fn build_config(
             TunnelMode::Rule
         }
     };
+
+    // `smux:`/`mux:` blocks on the static leaves are the last local
+    // shape check: a malformed one must reject here, before the ECH
+    // pre-resolution below opens sockets (issue #974 review). The gate
+    // mirrors the parse's strictness — the rejection it orders ahead of
+    // the socket work is the strict one; lenient mode warn-drops the
+    // node in the real parse below instead.
+    proxy_parser::check_mux_shape(&raw, raw.strict.unwrap_or(false))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Global like mihomo's: every delay probe (API, groups, providers).
+    meow_proxy::health::set_unified_delay(raw.unified_delay.unwrap_or(false));
+    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
+    // sync `parse_proxy` path that follows can stay sync. Failures warn
+    // and leave the map unchanged — except the `enable: true` with no
+    // query-source defect, which `strict` promotes to an error.
+    if let Some(ps) = raw.proxies.as_mut() {
+        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+    }
+
+    // General config
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
     // mihomo (and Clash Verge output) use `bind-address: '*'` as the
     // all-interfaces wildcard; normalize it here so listeners never see the
@@ -5242,12 +8255,6 @@ pub async fn build_config(
         Some(addr) => addr.to_string(),
     };
 
-    // `tcp-idle-timeout` — resolution and validation live in
-    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
-    // persistence and hot-apply on so a committed document cannot fail
-    // this boot path.
-    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
-
     let general = GeneralConfig {
         mode,
         log_level,
@@ -5257,6 +8264,8 @@ pub async fn build_config(
         connection_notes: raw.connection_notes.unwrap_or(false),
         logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
         tcp_idle_timeout,
+        tcp_concurrent: effective_tcp_concurrent(raw.tcp_concurrent),
+        find_process_mode: raw.find_process_mode.unwrap_or_default(),
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against
@@ -5264,6 +8273,13 @@ pub async fn build_config(
     // nodes parsed during the initial refresh already hold the handle; the
     // tunnel publishes the live route map into it on every routing install.
     let provider_dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
+    // The cell `type: dns` leaves bind (issue #974) — shared into every
+    // provider before it loads and every static leaf the passes below
+    // build, then handed to the tunnel (`Tunnel::set_dns_outbound_cell`)
+    // so `install_resolver_everywhere` republishes the live resolver
+    // slot into it. `Config::provider_dns_cell` retains it like
+    // `provider_dialer_registry`.
+    let provider_dns_cell = meow_dns::new_dns_outbound_cell();
 
     // Load proxy providers (async: may HTTP-fetch provider files). The build
     // passes below leave out the same ones again; this load's are kept.
@@ -5278,7 +8294,9 @@ pub async fn build_config(
                 general.ipv6,
                 raw.strict.unwrap_or(false),
                 &provider_dialer_registry,
+                raw.global_client_fingerprint.as_deref(),
                 provider_fetch_deadline(),
+                Some(&provider_dns_cell),
                 &mut dropped_providers,
             )
             .await?
@@ -5309,17 +8327,36 @@ pub async fn build_config(
     // Open the persistent selector store (one JSON file in cache_dir).
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
-    let selector_store = match cache_dir_buf.as_ref() {
-        Some(d) => Some(open_selector_store_async(d.join("selector-cache.json")).await?),
-        None => None,
-    };
+    // The config-scoped selection-persistence owner: the file-backed
+    // store opens lazily for an enabled `profile.store-selected` only —
+    // a disabled profile never touches disk, and `-t` validation never
+    // reaches this point's fs work at all (issue #974).
+    let selection_backing = std::sync::Arc::new(meow_proxy::SelectionBacking::new(
+        cache_dir_buf
+            .as_ref()
+            .map(|d| d.join("selector-cache.json")),
+    ));
+    let resolved_profile = resolve_profile(&raw);
+    if !is_offline_validate() {
+        selection_backing
+            .prepare(resolved_profile.store_selected)
+            .await;
+    }
+    let selector_writer = selection_backing.attach(resolved_profile.store_selected);
 
     // One shared pre-registry proxy layer for the two startup fetches that
     // can ride a proxy (rule-provider prefetch + geodata download). Built
     // only when at least one of them could need it — a full layer costs an
     // adapter construction per `proxies:` entry (issue #533).
     let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
-        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_store.as_ref()).await?
+        prefetch_proxy_layer_async(
+            &raw,
+            &proxy_providers,
+            selector_writer.as_ref(),
+            &provider_dialer_registry,
+            &provider_dns_cell,
+        )
+        .await?
     } else {
         None
     };
@@ -5370,11 +8407,12 @@ pub async fn build_config(
             cache_dir_buf.clone(),
             None,
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
             provider_dialer_registry.clone(),
+            Arc::clone(&provider_dns_cell),
             None,
         )
         .await?;
@@ -5421,39 +8459,39 @@ pub async fn build_config(
         None,
     )
     .await?;
+    // Bind the dns-outbound cell to the slot the embedder hands the
+    // tunnel (`Tunnel::new_with_slot(config.dns.resolver_slot)`): `type:
+    // dns` leaves parsed in pass 1 — and provider nodes parsed before
+    // this line — now resolve the live generation from their first
+    // query. A disabled `dns:` still binds: `ResolverGen.enabled` is the
+    // SERVFAIL verdict, not an unbound cell. `install_resolver_everywhere`
+    // re-asserts the same object on every later install (issue #974).
+    *provider_dns_cell.write() = Some(Arc::clone(&dns_config.resolver_slot));
 
-    let (proxies, rules, _) = {
+    let (proxies, rules, sub_rules, _) = {
         let res = rebuild_from_raw_impl_async(
             raw.clone(),
             cache_dir_buf.clone(),
             Some(Arc::clone(&dns_config.resolver_slot)),
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
             provider_dialer_registry.clone(),
+            Arc::clone(&provider_dns_cell),
             // Share the provider set already loaded for DNS so rules,
             // `rule-set:` matchers, and `Config.rule_providers` reference
             // one object per provider (issue #533 review).
             Some(rule_providers.clone()),
         )
         .await?;
-        (res.proxies, res.rules, res.dialer_registry)
+        (res.proxies, res.rules, res.sub_rules, res.dialer_registry)
     };
 
-    // Listener config
-    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
-
-    // Build the named-listener list, checking for duplicate ports/names.
-    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
-
-    // `tcp-keepalive*` — the keepalive posture every inbound listener
-    // applies to accepted sockets. Resolution and validation live in
-    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
-    // persistence on so a committed document cannot fail this boot path.
-    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
-
+    // Listener config — `named_listeners`, `tcp_keepalive` and `lan_acl`
+    // resolved in the local-gates block above, before the ECH/provider
+    // network passes (issue #974).
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -5467,11 +8505,9 @@ pub async fn build_config(
         // `FirewallGuard::setup`, which filters again defensively).
         routing_mark: raw.routing_mark.filter(|m| *m != 0),
         tcp_keepalive,
+        lan_acl,
         named: named_listeners,
     };
-
-    // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
 
     // API config
     let external_ui = raw
@@ -5486,11 +8522,59 @@ pub async fn build_config(
             }
             dir
         });
+    // `external-controller-{tls,unix,pipe}` keep their strings: `-t` must
+    // validate shape only, and each is resolved at endpoint bind (like
+    // upstream, which never parses them into SockAddrs). `""` disables.
+    let external_controller_tls = raw
+        .external_controller_tls
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // `tls.certificate`/`tls.private-key` are the HTTPS listener's
+    // identity. Like upstream, build validates *shape only*: a one-sided
+    // pair, malformed inline PEM, and unreadable file paths all defer to
+    // endpoint bind, where the failure logs and skips just that endpoint
+    // (issue #974). Deferring keeps a broken identity from killing the
+    // whole config — `-t` accepts the same documents upstream's does —
+    // and no PEM material or file I/O is touched here.
+    let tls_certificate = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.certificate.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let tls_private_key = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.private_key.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if external_controller_tls.is_none() && (tls_certificate.is_some() || tls_private_key.is_some())
+    {
+        warn!(
+            "tls.certificate/tls.private-key set without external-controller-tls; \
+             the keys only feed the HTTPS controller listener and are ignored"
+        );
+    }
     let api = ApiConfig {
         external_controller: parse_optional_socket_addr(
             "external-controller",
             raw.external_controller.as_deref(),
         )?,
+        external_controller_tls,
+        external_controller_unix: raw
+            .external_controller_unix
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        external_controller_pipe: raw
+            .external_controller_pipe
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        tls_certificate,
+        tls_private_key,
+        cors: ApiCorsConfig::from_raw(raw.external_controller_cors.as_ref()),
         secret: raw.secret.clone(),
         external_ui,
         external_ui_url: raw
@@ -5500,17 +8584,6 @@ pub async fn build_config(
             .map(String::from),
     };
 
-    // Sniffer config — also handles deprecated `tproxy_sni` alias.
-    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
-
-    // Auth config.
-    let auth = auth::parse_auth_config(
-        raw.authentication.as_deref(),
-        raw.skip_auth_prefixes.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let auth = Arc::new(auth);
-
     info!(
         "Config loaded: mode={}, proxies={}, rules={}",
         mode,
@@ -5518,16 +8591,26 @@ pub async fn build_config(
         rules.len()
     );
 
+    // Startup's route commit for the selection epoch: writers this build
+    // attached priced the pending enable transition, so publishing the
+    // resolved flag here is what un-fences them. A `-t` validation runs
+    // the same no-op on a throwaway backing — memory only, no fs.
+    selection_backing.commit(resolved_profile.store_selected);
+
     Ok(Config {
         general,
         dns: dns_config,
         proxies,
         proxy_providers,
         provider_dialer_registry,
+        provider_dns_cell,
         rules,
+        sub_rules,
         rule_providers,
         dropped_providers,
         dialer_registry,
+        selection: selection_backing,
+        ntp: ntp_resolved_for_config,
         listeners,
         tun,
         api,
@@ -5618,6 +8701,10 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
+            None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         let bound = proxies
@@ -5640,6 +8727,10 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             true,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
+            None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap_err();
         assert!(
@@ -5784,8 +8875,8 @@ mod missing_plugin_placeholder_tests {
     /// that came first — upstream dropped it, so it could never displace a
     /// working node; the placeholder fills only an empty slot. (A live
     /// duplicate still replaces an earlier placeholder, via the normal
-    /// insert — and the placeholder set must forget the name so
-    /// `apply_dialer_proxies` wraps it normally.)
+    /// insert — and the placeholder set must forget the name so a later
+    /// same-named edged block wraps it normally.)
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     #[test]
     fn placeholder_duplicate_never_shadows_a_live_binding() {
@@ -5819,6 +8910,10 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
+            None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         assert_eq!(
@@ -5842,6 +8937,10 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
+            None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         assert_eq!(
@@ -5921,9 +9020,9 @@ mod dialer_proxy_tests {
         !Arc::ptr_eq(b, a)
     }
 
-    /// Run the dialer pass against a fresh by-name registry and publish it on
-    /// success, the way `rebuild_from_raw_impl` does — without the publish the
-    /// chained adapters cannot resolve their front hop at dial time.
+    /// Run the dialer pipeline against a fresh by-name registry and publish it
+    /// on success, the way `rebuild_from_raw_impl` does — without the publish
+    /// the chained adapters cannot resolve their front hop at dial time.
     ///
     /// Returns the registry: `DialerTarget`s hold it weakly (issue #533), so a
     /// test that actually dials must keep the handle alive for the duration.
@@ -5939,21 +9038,32 @@ mod dialer_proxy_tests {
     /// for the group build by giving every declared group a registry entry —
     /// the cycle check models declared membership, so what the entry *is*
     /// does not matter, only that it exists.
+    ///
+    /// Mirrors `build_proxy_layer`'s order — collect the edges, single-parse
+    /// the leaves with them, validate targets, then stub groups and run the
+    /// membership-cycle check — minus the real group construction.
     fn apply_chains_with_groups(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
         raw_proxies: &[HashMap<String, serde_json::Value>],
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
-        let edges = apply_dialer_proxies(
+        let edges = collect_dialer_edges(raw_proxies, false)?;
+        let mut static_proxy_names = std::collections::HashSet::new();
+        let dns_cell = meow_dns::new_dns_outbound_cell();
+        insert_parsed_leaves(
             proxies,
+            &mut static_proxy_names,
             raw_proxies,
-            raw_groups,
-            &registry,
+            None,
             true,
             false,
-            &std::collections::HashSet::new(),
+            &registry,
+            &edges.by_index,
+            None,
+            &dns_cell,
         )?;
+        apply_dialer_proxies_validate(proxies, &edges.declared, raw_groups)?;
         for group in raw_groups {
             proxies
                 .entry(SmolStr::from(group.name.as_str()))
@@ -5966,7 +9076,7 @@ mod dialer_proxy_tests {
             .map(SmolStr::from)
             .collect();
         reject_group_membership_cycles(
-            &edges,
+            &edges.declared,
             raw_groups,
             proxies,
             &include_all_proxy_names,
@@ -6061,9 +9171,15 @@ mod dialer_proxy_tests {
         .unwrap();
 
         let providers = HashMap::new();
-        let mini = prefetch_proxy_map(&raw, &providers, None)
-            .expect("layer builds")
-            .expect("proxies configured");
+        let mini = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
         let metadata = meow_common::Metadata {
             network: meow_common::Network::Tcp,
             host: "example.invalid".into(),
@@ -6120,10 +9236,17 @@ mod dialer_proxy_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&store))
-            .expect("layer builds")
-            .expect("proxies configured");
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let writer = meow_proxy::SelectorWriter::standalone(store);
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            Some(&writer),
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
         } = super::resolve_geodata_egress(
@@ -6146,10 +9269,17 @@ mod dialer_proxy_tests {
         // A fresh store → the group falls back to its first member.
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_store))
-            .expect("layer builds")
-            .expect("proxies configured");
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            Some(&empty_writer),
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
         } = super::resolve_geodata_egress(
@@ -6233,6 +9363,175 @@ mod dialer_proxy_tests {
         assert!(!prefetch_proxy_layer_needed(&geoip_rules, &present_mmdb));
     }
 
+    /// Issue #974 — a config with no `proxies:` but provider-fed
+    /// `proxy-groups:` still owns a prefetch layer: `geodata.proxy`
+    /// naming the group must resolve. Selecting a provider's rematch
+    /// leaf then fails the dial loudly (`direct_fallback: false`)
+    /// instead of the download silently egressing direct off an
+    /// unresolved map.
+    #[tokio::test]
+    async fn prefetch_layer_resolves_group_egress_without_proxies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: inspect, type: rematch, target-rematch-name: stage1 }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "geodata:\n  mmdb-path: '{}'\n  proxy: G\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rules:\n  - GEOIP,CN,DIRECT",
+            dir.path().join("absent.mmdb").display()
+        ))
+        .unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
+        assert!(
+            prefetch_proxy_layer_needed(&raw, &geo),
+            "groups alone must not short-circuit the layer"
+        );
+
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("provider-fed groups produce a layer");
+        let GeodataEgress::Proxy {
+            proxy,
+            direct_fallback,
+        } = super::resolve_geodata_egress(
+            &raw,
+            &geo,
+            TunnelMode::Rule,
+            &layer.map,
+            &std::collections::HashSet::new(),
+        )
+        else {
+            panic!("explicit geodata.proxy must resolve to the group");
+        };
+        assert!(
+            !direct_fallback,
+            "an explicit geodata.proxy never falls back"
+        );
+        assert_eq!(proxy.name(), "G", "the egress binds the named group");
+
+        // The group selects the provider's rematch leaf — the dial must
+        // fail loudly rather than carry the download anywhere, and the
+        // failure must be *that* one: a rematch has no socket to open.
+        // Bare `is_err()` would also pass on an unrelated dial error.
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.invalid".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let err = proxy
+            .dial_tcp(&metadata)
+            .await
+            .err()
+            .expect("a rematch leaf owns no socket to dial with");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control outbound") && msg.contains("inspect"),
+            "the group dialled the provider's rematch leaf and it failed \
+             as a control node: {msg}"
+        );
+    }
+
+    /// A provider node's `dialer-proxy` binds the provider's registry
+    /// cell, not the prefetch layer's own: the publish must reach that
+    /// cell too or the node's front hop resolves to nothing and a fetch
+    /// through it cannot dial (issue #974 review). The fetch itself
+    /// fails — the counting listener accepts then drops — but the TCP
+    /// connect to B proves `pn` dialled its front hop.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
+    #[tokio::test]
+    async fn prefetch_layer_resolves_provider_node_front_hops() {
+        let (port_b, b_hits) = counting_listener().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: pn, type: trojan, server: 127.0.0.1, port: 9, \
+             password: x, dialer-proxy: B }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            provider_registry.clone(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "proxies:\n\
+             \x20 - {{ name: B, type: trojan, server: 127.0.0.1, port: {port_b}, password: x }}\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:9/rs.yaml\n    path: ./rs.yaml\n    proxy: G\n"
+        ))
+        .unwrap();
+
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &provider_registry,
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
+        let payloads =
+            prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
+        assert_eq!(
+            payloads.iter().count(),
+            0,
+            "the counting listener accepts then drops — the fetch ran and got nothing"
+        );
+        assert!(
+            hits(&b_hits) >= 1,
+            "the provider node's dialer-proxy front resolves via the prefetch publish"
+        );
+    }
+
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
     /// shared prefetch layer, so its HTTP fetch dials the chained front
     /// hop rather than the leaf's own (or a direct) egress.
@@ -6264,9 +9563,15 @@ mod dialer_proxy_tests {
 
         let providers = HashMap::new();
         let layer = Arc::new(
-            prefetch_proxy_map(&raw, &providers, None)
-                .expect("layer builds")
-                .expect("proxies configured"),
+            prefetch_proxy_map(
+                &raw,
+                &providers,
+                None,
+                &Default::default(),
+                &meow_dns::new_dns_outbound_cell(),
+            )
+            .expect("layer builds")
+            .expect("proxies configured"),
         );
         // The fetch itself fails — the counting listener accepts then drops
         // — but the TCP connect to B proves `proxy: A` dialled its front hop.
@@ -6407,6 +9712,10 @@ mod dialer_proxy_tests {
         assert!(!was_wrapped(&before, &proxies, "fast"));
     }
 
+    /// A self-referencing dialer is rejected during edge collection — before
+    /// any leaf is built — in *both* modes. Lenient never warn-skipped it even
+    /// in the old pass: keeping the node unchained would dial past the chain
+    /// the config asked for (Class A, ADR-0002).
     #[test]
     fn self_reference_is_a_config_error() {
         let mut proxies = registry(&["A"]);
@@ -6418,16 +9727,26 @@ mod dialer_proxy_tests {
             "unexpected: {err}"
         );
         assert!(!was_wrapped(&before, &proxies, "A"));
+
+        // Strict bails at the same collection stage.
+        let err = collect_dialer_edges(&[raw_proxy("A", Some("A"))], true)
+            .err()
+            .expect("strict mode rejects a self-reference at edge collection");
+        assert!(
+            err.to_string().contains("points to itself"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
     fn missing_dialer_is_a_config_error() {
         let mut proxies = registry(&["A"]);
-        let before = proxies.clone();
         let err = apply_chains(&mut proxies, &[raw_proxy("A", Some("ghost"))])
             .expect_err("an unknown dialer must not silently dial direct");
         assert!(err.to_string().contains("not found"), "unexpected: {err}");
-        assert!(!was_wrapped(&before, &proxies, "A"));
+        // The leaf pass may already have wrapped A's entry in-flight — the
+        // single-parse stage runs before target validation by design — but
+        // the build is discarded with the error, so the wrap never ships.
     }
 
     #[test]
@@ -6572,7 +9891,6 @@ mod dialer_proxy_tests {
     /// direct-dial the node (upstream parity; issue #489 review).
     #[test]
     fn malformed_dialer_proxy_is_a_config_error() {
-        let mut proxies = registry(&["A", "B"]);
         let mut raw = raw_proxy("A", None);
         raw.insert(
             "dialer-proxy".to_string(),
@@ -6580,18 +9898,11 @@ mod dialer_proxy_tests {
         );
         // Malformed values are a hard error under `strict` — the lenient
         // fail-at-dial sentinel arm is covered by `strict_mode_tests` at the
-        // rebuild level. `apply_chains` runs the lenient path.
-        let err = apply_dialer_proxies(
-            &mut proxies,
-            &[raw],
-            &[],
-            &meow_proxy::dialer::ProxyRegistry::default(),
-            true,
-            true,
-            &std::collections::HashSet::new(),
-        )
-        .map(|_| ())
-        .expect_err("malformed dialer-proxy must fail under strict");
+        // rebuild level. The check lives in edge collection, before any
+        // leaf is built.
+        let err = collect_dialer_edges(&[raw], true)
+            .err()
+            .expect("malformed dialer-proxy must fail under strict");
         assert!(
             err.to_string().contains("malformed dialer-proxy"),
             "error must name the field: {err}"
@@ -6692,7 +10003,19 @@ mod dialer_proxy_tests {
         let mut names = std::collections::HashSet::new();
 
         tracing::subscriber::with_default(subscriber, || {
-            insert_parsed_leaves(&mut proxies, &mut names, &raws, None, false, false).unwrap();
+            insert_parsed_leaves(
+                &mut proxies,
+                &mut names,
+                &raws,
+                None,
+                false,
+                false,
+                &meow_proxy::dialer::ProxyRegistry::default(),
+                &HashMap::new(),
+                None,
+                &meow_dns::new_dns_outbound_cell(),
+            )
+            .unwrap();
         });
 
         assert_eq!(proxies.len(), 1, "last-wins is unchanged");
@@ -6719,7 +10042,6 @@ mod dialer_proxy_tests {
     #[test]
     fn stale_duplicate_dialer_edge_is_ignored() {
         let mut proxies = registry(&["A", "front"]);
-        let before = proxies.clone();
 
         let mut first = raw_socks5_proxy("A", Some("front"), false);
         first.insert(
@@ -6734,10 +10056,17 @@ mod dialer_proxy_tests {
 
         apply_chains(&mut proxies, &[first, last]).expect("the effective block declares no dialer");
 
+        let bound = proxies.get("A").expect("present after");
         assert!(
-            !was_wrapped(&before, &proxies, "A"),
+            !bound.has_configured_dialer(),
             "the last duplicate block declares no dialer-proxy, so no chain \
-             may be applied"
+             may be applied — the single-parse pass must not leak the stale \
+             block's edge into the surviving construction"
+        );
+        assert_eq!(
+            bound.addr(),
+            "127.0.0.1:2222",
+            "the effective (last) block still wins the name"
         );
     }
 
@@ -6824,7 +10153,8 @@ mod dialer_proxy_tests {
     }
 
     /// A raw `type: <ty>` block with a `server`/`port` and optional
-    /// `dialer-proxy` — for the types that cannot carry an injected dialer.
+    /// `dialer-proxy` — for types whose dialer edge needs a dedicated
+    /// assertion (injection acceptance, or the uninjectable fallback).
     fn raw_typed_proxy(
         name: &str,
         ty: &str,
@@ -6838,36 +10168,85 @@ mod dialer_proxy_tests {
         m
     }
 
-    /// `anytls` / `hysteria2` establish their own transport and never call the
-    /// pluggable dialer. Accepting the injected dialer there would silently
-    /// drop the user's `dialer-proxy` and egress from the real source path, so
-    /// the parser rejects it and the relay-based wrapper takes over — which
-    /// fails loudly at dial time rather than dialing direct.
-    #[test]
-    fn types_that_cannot_carry_a_dialer_fall_back_to_the_wrapper() {
-        for ty in ["anytls", "hysteria2"] {
-            let mut proxies = registry(&["A", "front"]);
-            let before = proxies.clone();
+    /// `anytls` carries the injected dialer itself: the vendored client
+    /// establishes every session's transport through it (TLS + pooling
+    /// unchanged), so the leaf comes back injected — `WrappedProxy`
+    /// reporting the configured hop under the `ChainedProxy` marker — not
+    /// wrapped in the relay-based `DialerProxyAdapter`. `#[tokio::test]`
+    /// because the adapter spawns its session-pool reaper on a reactor.
+    ///
+    /// The marker reports `!support_udp` (issue #969): `udp` unset is
+    /// the UDP-incapable chain shape a matched UDP flow dies on; `udp:
+    /// true` is not marked because its UoT rides the same chained
+    /// session — the chain carries the flow, so there is nothing to
+    /// fail closed on.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn anytls_carries_its_dialer_by_injection() {
+        let mut proxies = registry(&["A", "B", "front"]);
+        let before = proxies.clone();
 
-            apply_chains(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))])
-                .expect("valid chain applies via the wrapper fallback");
+        let mut raw_a = raw_typed_proxy("A", "anytls", Some("front"));
+        raw_a.insert(
+            "password".to_string(),
+            serde_json::Value::String("pw".to_string()),
+        );
+        let mut raw_b = raw_typed_proxy("B", "anytls", Some("front"));
+        raw_b.insert(
+            "password".to_string(),
+            serde_json::Value::String("pw".to_string()),
+        );
+        raw_b.insert("udp".to_string(), serde_json::Value::Bool(true));
+        apply_chains(&mut proxies, &[raw_a, raw_b]).expect("anytls accepts the injected dialer");
 
-            let after = proxies.get("A").expect("entry survives");
-            assert!(
-                was_wrapped(&before, &proxies, "A"),
-                "{ty}: entry must be replaced by the relay wrapper, not left \
-                 dialing direct"
-            );
-            assert!(
-                !after.support_udp(),
-                "{ty}: the wrapper must not advertise UDP over the chain"
-            );
-        }
+        let after = proxies.get("A").expect("entry survives");
+        assert!(
+            was_wrapped(&before, &proxies, "A"),
+            "the injected leaf replaces the registry entry"
+        );
+        assert!(
+            after.has_configured_dialer(),
+            "the injected leaf reports the configured chain"
+        );
+        // The `ChainedProxy` marker proves injection (issue #969): the
+        // relay-based `DialerProxyAdapter` answers `as_any` with itself,
+        // so its absence here plus the marker's verdict is the
+        // injected-leaf shape. `udp` stays unset on A — the marker's
+        // verdict is what fails a matched UDP flow closed.
+        assert!(after.is_dialer_proxy_non_transparent());
+        assert!(
+            after
+                .as_any()
+                .and_then(|any| any.downcast_ref::<meow_proxy::DialerProxyAdapter>())
+                .is_none(),
+            "injection must not fall back to the relay wrapper"
+        );
+        assert!(
+            after
+                .as_any()
+                .and_then(|any| any.downcast_ref::<proxy_parser::WrappedProxy>())
+                .is_some(),
+            "the injected leaf stays a WrappedProxy under the marker"
+        );
+
+        // `udp: true` + injection: UoT rides the chained TCP session, so
+        // the leaf advertises UDP and the marker stays unset — a chained
+        // leaf that can carry the flow is not the #969 fail-closed shape.
+        let after_udp = proxies.get("B").expect("entry survives");
+        assert!(after_udp.support_udp());
+        assert!(after_udp.has_configured_dialer());
+        assert!(
+            !after_udp.is_dialer_proxy_non_transparent(),
+            "a chained leaf whose transport carries UDP must not be marked"
+        );
     }
 
-    /// `ss` with an *external* SIP003 plugin must not be re-parsed: the
-    /// constructor spawns the plugin subprocess, so a second parse would leave
-    /// two copies running whenever a group still holds the original Arc.
+    /// `ss` with an *external* SIP003 plugin must not reach its constructor
+    /// twice: it spawns the plugin subprocess, and a second `Plugin::start`
+    /// would leave two copies running. The single-parse pipeline makes that
+    /// structural — the injected-dialer attempt bails before
+    /// `ShadowsocksAdapter::new` (the defensive `ss` early-reject stays), the
+    /// direct re-parse spawns once, and the wrapper carries the chain.
     #[test]
     fn external_sip003_plugin_is_not_re_parsed() {
         let mut proxies = registry(&["A", "front"]);
@@ -6928,8 +10307,9 @@ mod dialer_proxy_tests {
     fn fallback_wraps_when_re_parse_fails() {
         // A raw proxy with no `type` field cannot be re-parsed — the fallback
         // DialerProxyAdapter wrapper should be used instead. We verify this
-        // by checking that support_udp is false (DialerProxyAdapter always
-        // returns false, even if the inner proxy supported UDP).
+        // by checking that support_udp is false: the wrapper only advertises
+        // UDP for a *transparent* (direct-class) inner, and a socks5 inner
+        // is not one.
         let mut proxies = registry(&["A", "front"]);
         // Give "A" a real socks5 adapter so the fallback has something to wrap.
         let parsed_a = proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true)
@@ -7105,13 +10485,14 @@ mod dialer_proxy_tests {
     }
 
     /// Issue #554 — a `dialer-proxy` member must share ONE health handle
-    /// with its registry adapter. `apply_dialer_proxies` runs before group
-    /// construction (issue #513), so the adapter a group captured is the
-    /// same object `route.proxies` and `group.member_proxies()` serve the
-    /// sweep and API probes. Marking the registry adapter dead must move
-    /// the group's selection — a second `ProxyHealth` minted after group
-    /// capture would leave the group reading a default-alive private
-    /// handle while probes recorded results on the other.
+    /// with its registry adapter. The chain is applied during the leaf
+    /// parse, before group construction (issue #513), so the adapter a
+    /// group captured is the same object `route.proxies` and
+    /// `group.member_proxies()` serve the sweep and API probes. Marking
+    /// the registry adapter dead must move the group's selection — a second
+    /// `ProxyHealth` minted after group capture would leave the group
+    /// reading a default-alive private handle while probes recorded results
+    /// on the other.
     #[test]
     fn dialer_proxy_member_shares_health_with_group_selection() {
         let raw: raw::RawConfig = serde_saphyr::from_str(
@@ -7166,6 +10547,276 @@ rules:
             "a dead registry adapter must stop being selected — a second \
              ProxyHealth minted after group capture would stay default-alive"
         );
+    }
+
+    /// `type: direct` refuses the injected dialer (a resolver-threaded dial
+    /// belongs on the real path — see `reject_unthreaded_dialer`), so a
+    /// `direct` + `dialer-proxy` node takes the relay-wrapper fallback: the
+    /// wrapper over a *live* Direct inner stays transparent and reports the
+    /// chain. The fallback re-parses through `parse_static_proxy`, which is
+    /// also what wires the `dns.direct-nameserver` slot — verified
+    /// end-to-end below by dialling through the chain: the front `direct`
+    /// hop (itself a `parse_static_proxy` product) resolves the final
+    /// target's name through the configured slot, not the main resolver.
+    #[test]
+    fn direct_node_with_dialer_proxy_wraps_not_injects() {
+        let mut proxies = registry(&["d", "front"]);
+        let mut raw = raw_proxy("d", Some("front"));
+        raw.insert(
+            "type".to_string(),
+            serde_json::Value::String("direct".to_string()),
+        );
+
+        apply_chains(&mut proxies, &[raw])
+            .expect("direct + dialer-proxy falls back to the relay wrapper");
+
+        let bound = proxies.get("d").expect("d survives");
+        let wrapper = bound
+            .as_any()
+            .and_then(|any| any.downcast_ref::<meow_proxy::DialerProxyAdapter>())
+            .expect(
+                "a direct node cannot inject the dialer — it must be the \
+                 relay wrapper",
+            );
+        assert_eq!(wrapper.dialer_name(), "front");
+        assert_eq!(bound.adapter_type(), meow_common::AdapterType::Direct);
+        assert!(
+            bound.has_configured_dialer(),
+            "the declared chain must be reported even through the wrapper"
+        );
+        // A transparent (direct-class) inner makes the wrapper transparent:
+        // `support_udp` true here *proves* the inner is a live Direct
+        // adapter — an unavailable placeholder or an absent parse would
+        // leave it false.
+        assert!(bound.support_udp());
+        // ...and the probe predicate agrees: a transparent chain carries
+        // UDP over the front's association, so it is NOT the #969
+        // fail-closed shape.
+        assert!(!bound.is_dialer_proxy_non_transparent());
+    }
+
+    /// End-to-end: the `dns.direct-nameserver` slot survives the chained
+    /// build. `front` resolves `node.test` through the slot's direct
+    /// resolver (hosts-mapped to loopback), so the dial through `d`'s
+    /// wrapper lands on the listener — a build that dropped the slot on
+    /// either direct node would fail to resolve and never connect.
+    #[tokio::test]
+    async fn direct_chain_keeps_the_direct_nameserver_slot() {
+        use meow_dns::{HostEntry, Resolver};
+        use meow_trie::DomainTrie;
+
+        let (port, accepts) = counting_listener().await;
+
+        let hosts_only = |ip: std::net::IpAddr| {
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("node.test", vec![ip].into());
+            Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            )
+        };
+        // The main resolver answers `node.test` with an unroutable
+        // documentation-range address; the direct-nameserver resolver maps
+        // it to loopback. Only the slot path can reach the listener.
+        let mut main = hosts_only(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+        main.set_direct_resolver(Arc::new(hosts_only(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))));
+        let slot = meow_dns::new_resolver_slot(Arc::new(main));
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: d\n    type: direct\n    dialer-proxy: front\n\
+             \x20 - name: front\n    type: direct\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&slot),
+            None,
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("direct chain builds");
+
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "node.test".into(),
+            dst_port: port,
+            ..Default::default()
+        };
+        // `result.dialer_registry` stays alive in `result` for the dial —
+        // `DialerTarget`s bind it weakly (issue #533).
+        let mut conn = result.proxies["d"]
+            .dial_tcp(&metadata)
+            .await
+            .expect("the chain must resolve `node.test` through the slot");
+        // TCP `connect` returns at SYN-ACK, which can precede the spawned
+        // accept task by a scheduling quantum. The listener drops every
+        // accepted stream after bumping the counter, so reading this conn
+        // to EOF is the barrier that proves `accept()` already ran.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf)).await;
+        assert_eq!(
+            hits(&accepts),
+            1,
+            "the chain must dial the slot-resolved loopback address — a \
+             dropped direct-nameserver slot resolves `node.test` to the \
+             unreachable main-resolver answer instead"
+        );
+    }
+
+    /// Issue #969 on the injected path: an `http` node carrying
+    /// `dialer-proxy` registers behind the `ChainedProxy` marker, so the
+    /// UDP probe reads the configured chain
+    /// (`is_dialer_proxy_non_transparent`) instead of a plain `udp: false`
+    /// node that would slide a matched UDP flow to a later rule.
+    #[test]
+    fn injected_http_leaf_is_marked_for_udp_fail_closed() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: front\n    type: socks5\n    server: 127.0.0.1\n    port: 1080\n\
+             \x20 - name: leaf\n    type: http\n    server: 127.0.0.1\n    port: 8080\n    dialer-proxy: front\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("http chain builds");
+        let leaf = &result.proxies["leaf"];
+
+        assert!(!leaf.support_udp(), "http cannot carry UDP");
+        assert!(
+            leaf.is_dialer_proxy_non_transparent(),
+            "the ChainedProxy marker must pin the #969 fail-closed verdict"
+        );
+        assert!(
+            leaf.has_configured_dialer(),
+            "the declared chain must still be reported through the marker"
+        );
+        // The marker is transparent to the downcasts the bare leaf
+        // previously answered: the injected `WrappedProxy` stays reachable.
+        assert!(
+            leaf.as_any()
+                .and_then(|any| any.downcast_ref::<proxy_parser::WrappedProxy>())
+                .is_some(),
+            "as_any must keep resolving the injected WrappedProxy leaf"
+        );
+        // And the front it chains through is untouched — an unmarked leaf
+        // keeps the trait's default `false`.
+        assert!(
+            !result.proxies["front"].is_dialer_proxy_non_transparent(),
+            "the unchained front must not be marked"
+        );
+    }
+
+    /// The `ss` twin (issue #969): `udp: true` folds the *front's* UDP
+    /// capability into `support_udp` — an `http` front yields `false` —
+    /// and the `ChainedProxy` marker still reports the configured chain,
+    /// so a matched UDP rule fails closed instead of sliding.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn injected_ss_via_http_front_udp_fails_closed() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: front\n    type: http\n    server: 127.0.0.1\n    port: 8080\n\
+             \x20 - name: leaf\n    type: ss\n    server: 127.0.0.1\n    port: 8388\n\
+             \x20   cipher: aes-128-gcm\n    password: pw\n    udp: true\n    dialer-proxy: front\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("ss-via-http chain builds");
+        let leaf = &result.proxies["leaf"];
+
+        assert!(
+            !leaf.support_udp(),
+            "the http front cannot carry UDP, so the fold must report false"
+        );
+        assert!(
+            leaf.is_dialer_proxy_non_transparent(),
+            "the ChainedProxy marker must pin the #969 fail-closed verdict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declared_dns_names_tests {
+    use super::*;
+
+    fn node(name: Option<&str>, ty: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        if let Some(name) = name {
+            m.insert(
+                "name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+        m.insert(
+            "type".to_string(),
+            serde_json::Value::String(ty.to_string()),
+        );
+        m
+    }
+
+    /// A plain dns declaration marks its name; non-dns leaves and an
+    /// empty document do not (issue #974 review).
+    #[test]
+    fn marks_dns_decls_and_skips_others() {
+        let names = declared_dns_names(&[node(Some("dns-out"), "dns"), node(Some("web"), "ss")]);
+        assert!(names.contains("dns-out"));
+        assert!(!names.contains("web"));
+        assert!(declared_dns_names(&[]).is_empty());
+    }
+
+    /// Last-wins still applies when the LAST declaration is the dns one —
+    /// a later dns decl over an earlier transport marks the name.
+    #[test]
+    fn later_dns_decl_marks_the_name() {
+        let names = declared_dns_names(&[node(Some("x"), "ss"), node(Some("x"), "dns")]);
+        assert!(names.contains("x"));
+    }
+
+    /// The conservative half of the contract (issue #974 review): an
+    /// earlier dns decl is NOT unmarked by a later same-named transport
+    /// decl — that later decl may warn-drop at lenient parse and leave
+    /// the dns binding effective, so the name stays suspect on lanes
+    /// that cannot prove the later decl binds.
+    #[test]
+    fn earlier_dns_decl_survives_a_later_shadow() {
+        let names = declared_dns_names(&[node(Some("x"), "dns"), node(Some("x"), "ss")]);
+        assert!(
+            names.contains("x"),
+            "a later decl that may not bind must not unmark the dns leaf"
+        );
+    }
+
+    /// A decl named after a built-in never binds a leaf — the built-in
+    /// wins regardless of the declared type — so it is never a dns name.
+    /// The shadow check is exact-case like `insert_parsed_leaves`: a
+    /// lowercase "direct" is an ordinary leaf name.
+    #[test]
+    fn builtin_names_never_bind_a_dns_leaf() {
+        for builtin in BUILTIN_ADAPTER_NAMES {
+            let names = declared_dns_names(&[node(Some(builtin), "dns")]);
+            assert!(
+                !names.contains(builtin),
+                "'{builtin}' is built-in-shadowed and cannot be a dns leaf"
+            );
+        }
+        let names = declared_dns_names(&[node(Some("direct"), "dns")]);
+        assert!(names.contains("direct"));
+    }
+
+    /// Decls without a usable `name` are unreferenceable — a nameless
+    /// `type: dns` map and a null-named one mark nothing, while a sibling
+    /// decl under another name still marks its own.
+    #[test]
+    fn nameless_and_unrelated_decls() {
+        let names = declared_dns_names(&[node(None, "dns"), node(Some("d"), "dns")]);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("d"));
     }
 }
 
@@ -7248,6 +10899,118 @@ mod geoip_context_tests {
         );
     }
 
+    /// Issue #974 review — the scan must read type fields only: a
+    /// `GEOIP,…` in a payload slot is data, not a declaration, and must
+    /// not trigger an MMDB load or an allowlist entry.
+    #[test]
+    fn geo_scan_ignores_payload_position_mentions() {
+        let lines: Vec<String> = [
+            "DOMAIN-KEYWORD,GEOIP,CN,REJECT",
+            "IP-CIDR,GEOIP,x,DIRECT",
+            "AND,((DOMAIN-KEYWORD,GEOIP,CN),(DST-PORT,443)),Proxy",
+            "DOMAIN-SUFFIX,GEOSITE,x,DIRECT",
+            "DOMAIN-KEYWORD,IP-ASN,13335,DIRECT",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(
+            collect_geoip_countries(&lines).is_empty(),
+            "payload-position GEOIP must not bin a country"
+        );
+        assert!(
+            collect_geosite_categories(&lines).is_empty(),
+            "payload-position GEOSITE must not bin a category"
+        );
+        assert!(
+            collect_asn_numbers(&lines).is_empty(),
+            "payload-position IP-ASN must not bin an ASN"
+        );
+        for line in &lines {
+            assert!(
+                !line_references_geoip(line),
+                "'{line}' must not trigger GeoIP"
+            );
+            assert!(
+                !line_references_geosite(line),
+                "'{line}' must not trigger geosite"
+            );
+            assert!(!line_references_asn(line), "'{line}' must not trigger ASN");
+        }
+    }
+
+    /// Issue #974 review — the scan descends logic nesting *before* the
+    /// rule parser sees the line, so it must apply the parser's own
+    /// bounds: a line over `MAX_RULE_LINE_LEN` contributes nothing, and
+    /// a nesting past `MAX_LOGIC_DEPTH` stops the descent. Without them
+    /// `AND,((`×N — eight bytes per level — overflows the stack here
+    /// long before the parse stage reports its "nesting exceeds" error.
+    #[test]
+    fn geo_scan_bounds_logic_nesting_and_line_length() {
+        // 8000 levels stay inside the length cap — only the depth bound
+        // stops the descent. The innermost GEOIP leg sits below the cap,
+        // so nothing is classified.
+        let mut deep = String::new();
+        for _ in 0..8000 {
+            deep.push_str("AND,((");
+        }
+        deep.push_str("GEOIP,CN");
+        for _ in 0..8000 {
+            deep.push_str("))");
+        }
+        deep.push_str(",DIRECT");
+        assert!(deep.len() <= meow_rules::parser::MAX_RULE_LINE_LEN);
+        let countries = collect_geoip_countries(std::slice::from_ref(&deep));
+        assert!(
+            countries.is_empty(),
+            "a branch the parser rejects for depth must not be scanned: {countries:?}"
+        );
+        // The parse stage then owns the failure — the same line errors
+        // on the depth cap instead of overflowing either stack.
+        let Err(err) =
+            meow_rules::parser::parse_rule(&deep, &meow_rules::parser::ParserContext::empty())
+        else {
+            panic!("the parser must reject the over-deep line");
+        };
+        assert!(err.contains("nesting"), "{err}");
+
+        // One byte past the length cap and the line contributes nothing —
+        // the parser rejects it for length, so its geo keys never exist.
+        let mut overlong = deep.clone();
+        overlong.push_str(&"x".repeat(meow_rules::parser::MAX_RULE_LINE_LEN));
+        let countries = collect_geoip_countries(&[overlong]);
+        assert!(
+            countries.is_empty(),
+            "an over-cap line must not be scanned at all: {countries:?}"
+        );
+
+        // The bound mirrors the parser exactly: 64 nested groups is the
+        // most a legal line carries — the GEOIP leaf inside still scans;
+        // one level more and the whole line (and its leaves) is dead.
+        let nested = |levels: usize| {
+            let mut line = String::new();
+            for _ in 0..levels {
+                line.push_str("AND,((");
+            }
+            line.push_str("GEOIP,CN");
+            for _ in 0..levels {
+                line.push_str("))");
+            }
+            line.push_str(",DIRECT");
+            line
+        };
+        let countries = collect_geoip_countries(&[nested(64)]);
+        assert!(
+            countries.contains("CN"),
+            "a GEOIP leaf at the legal boundary must still be found: {countries:?}"
+        );
+        let countries = collect_geoip_countries(&[nested(65)]);
+        assert!(
+            countries.is_empty(),
+            "a GEOIP leaf under an over-deep group must not be found: {countries:?}"
+        );
+    }
+
     /// Issue #277 — geo keys referenced only inside `sub-rules:` blocks must
     /// be seen by the scan (both for the DB-load trigger and the allowlist).
     #[test]
@@ -7294,6 +11057,7 @@ mod geoip_context_tests {
                 proxy: None,
                 header: None,
                 payload: Some(vec!["GEOIP,KR".to_string(), "GEOSITE,youtube".to_string()]),
+                extra: Default::default(),
             },
         );
         let raw = raw::RawConfig {
@@ -7322,6 +11086,7 @@ mod geoip_context_tests {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         };
         let raw = raw::RawConfig {
             rule_providers: Some(HashMap::from([
@@ -7358,6 +11123,31 @@ mod geoip_context_tests {
             "payloads for undeclared providers must be ignored"
         );
         assert!(collect_asn_numbers(&lines).contains(&15169));
+    }
+
+    /// Issue #974 — a GEOIP key that appears only inside a condition leaf
+    /// likewise triggers the mmdb load, observed as the fail-fast error
+    /// naming the nonexistent DB path.
+    #[test]
+    fn cond_only_geoip_triggers_mmdb_load() {
+        let mut sub_rules = HashMap::new();
+        sub_rules.insert("blk".to_string(), vec!["DOMAIN,x.test,DIRECT".to_string()]);
+        let raw = raw::RawConfig {
+            rules: Some(vec!["SUB-RULE,(GEOIP,JP),blk".to_string()]),
+            sub_rules: Some(sub_rules),
+            ..Default::default()
+        };
+        let nonexistent = PathBuf::from("/nonexistent-test-path-974/Country.mmdb");
+        let err = build_parser_context_at(
+            &raw,
+            &nonexistent,
+            &nonexistent_asn(),
+            &nonexistent_geosite(),
+            None,
+            &rule_provider::PrefetchedPayloads::default(),
+        )
+        .expect_err("a cond-only GEOIP leaf must trigger the mmdb load");
+        assert!(format!("{err}").contains("/nonexistent-test-path-974/Country.mmdb"));
     }
 
     /// Issue #277 — a GEOIP rule that appears only inside a sub-rules block
@@ -7399,6 +11189,51 @@ mod geoip_context_tests {
             "DOMAIN,example.com,DIRECT".to_string(),
         ];
         assert!(collect_geoip_countries(&lines).is_empty());
+    }
+
+    /// Issue #974 — a GEOIP/GEOSITE key that exists only inside a
+    /// `SUB-RULE,(cond),…` predicate still triggers and bins the database
+    /// load, across every condition grammar form: prefix composites,
+    /// infix `&`/`|`/`!`, and `category@attr` payloads.
+    #[test]
+    fn cond_leaves_feed_geo_discovery() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,JP),blk".to_string(),
+            "SUB-RULE,((GEOIP,KR)|(GEOSITE,youtube@ads)),blk2,T".to_string(),
+            "SUB-RULE,(AND,((GEOSITE,cn),(GEOIP,US,src))),blk3".to_string(),
+            "SUB-RULE,(NOT,((GEOIP,TW))),blk4".to_string(),
+            // A plain reference's block name is never a geo declaration.
+            "SUB-RULE,GEOIP-fake-name".to_string(),
+        ];
+        let countries = collect_geoip_countries(&lines);
+        for code in ["JP", "KR", "US", "TW"] {
+            assert!(countries.contains(code), "missing cond country {code}");
+        }
+        assert_eq!(countries.len(), 4);
+        let categories = collect_geosite_categories(&lines);
+        // `@ads` keys the category, not the attribute — same split the
+        // leaf build performs.
+        assert!(categories.contains("youtube"));
+        assert!(categories.contains("cn"));
+        assert_eq!(categories.len(), 2);
+    }
+
+    /// A malformed condition contributes nothing — the parse stage owns
+    /// that error; discovery must not read a geo declaration out of text
+    /// it cannot validate (issue #974).
+    #[test]
+    fn malformed_cond_declares_no_geo() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,XX".to_string(),                 // unbalanced
+            "SUB-RULE,(GEOIP,YY),blk,junk,extra".to_string(), // too many fields
+            "SUB-RULE,(PROCESS-NAME,GEOIP,ZZ),blk".to_string(),
+            "PROCESS-NAME-REGEX,GEOIP,XX,DIRECT".to_string(),
+            "PROCESS-PATH-WILDCARD,GEOSITE-*-cn,DIRECT".to_string(),
+        ];
+        assert!(collect_geoip_countries(&lines).is_empty());
+        assert!(collect_geosite_categories(&lines).is_empty());
+        assert!(!lines.iter().any(|l| line_references_geoip(l)));
+        assert!(!lines.iter().any(|l| line_references_geosite(l)));
     }
 
     fn nonexistent_asn() -> PathBuf {
@@ -7685,6 +11520,49 @@ mod geoip_context_tests {
         );
     }
 
+    /// With no proxy layer at all (no `proxies:`/`proxy-groups:`), a
+    /// `geodata.proxy`/`MATCH` builtin still classifies: `REJECT` gates
+    /// the download instead of falling back to direct egress (issue
+    /// #974 review).
+    #[tokio::test]
+    async fn ensure_geodata_builtins_apply_without_a_proxy_map() {
+        let (addr, hits) = crate::test_support::serve_body(b"mmdb").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mmdb_target = dir.path().join("absent.mmdb");
+        let geo = GeoDataConfig {
+            mmdb_path: Some(mmdb_target.clone()),
+            mmdb_url: format!("http://{addr}/country.mmdb"),
+            proxy: Some("REJECT".to_string()),
+            ..GeoDataConfig::default()
+        };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,DIRECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        assert_eq!(
+            super::missing_geodata_downloads(&geo, geo_references(&raw, &scan)).len(),
+            1,
+            "the mmdb is referenced and missing"
+        );
+
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "geodata.proxy: REJECT skips the download even without a map"
+        );
+        assert!(!mmdb_target.exists());
+
+        // The same gate through the mode's default route: MATCH,REJECT.
+        let geo = GeoDataConfig { proxy: None, ..geo };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,REJECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "MATCH,REJECT gates the download without a map too"
+        );
+    }
+
     /// A live reload that references a DB startup never needed downloads it
     /// before the rules that need it are parsed; a validation rebuild
     /// (`rebuild_from_raw`) never reaches the network.
@@ -7720,6 +11598,8 @@ mod geoip_context_tests {
                 &HashMap::new(),
                 None,
                 &meow_proxy::dialer::ProxyRegistry::default(),
+                &meow_proxy::SelectionBacking::unpersisted(),
+                &meow_dns::new_dns_outbound_cell(),
             )
         })
         .await
@@ -7765,7 +11645,7 @@ mod geoip_context_tests {
         chained: &[&str],
     ) -> (GeodataEgress, HashMap<SmolStr, Arc<dyn Proxy>>) {
         let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let map = proxy_map(names);
         let chained = chained.iter().map(ToString::to_string).collect();
         (
@@ -8463,11 +12343,15 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by geodata_fetch's
         // rules-only rebuilds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect(
-                    "trusted rebuild with the real cache dir must not hard-fail on a file provider",
-                );
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("trusted rebuild with the real cache dir must not hard-fail on a file provider");
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
@@ -8478,6 +12362,8 @@ rules:
             &HashMap::new(),
             Some(dir.path()),
             &Default::default(),
+            &meow_proxy::SelectionBacking::unpersisted(),
+            &meow_dns::new_dns_outbound_cell(),
         )
         .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
@@ -8518,9 +12404,15 @@ rules:
             parking_lot::RwLock::new(HashMap::new());
 
         // Commit path: swap the returned set in after validation succeeds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         assert!(live.read().contains_key("ads"));
 
@@ -8533,6 +12425,7 @@ rules:
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .expect("rebuild ok");
         *live.write() = result.rule_providers;
@@ -8544,9 +12437,15 @@ rules:
             "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
         )
         .unwrap();
-        let result =
-            rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw_ok,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         let raw_bad: raw::RawConfig =
             serde_saphyr::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
@@ -8555,7 +12454,8 @@ rules:
             None,
             Some(dir.path()),
             &HashMap::new(),
-            None
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .is_err());
         assert!(
@@ -8727,6 +12627,307 @@ rules:
         );
     }
 
+    /// A `type: rematch` leaf is a routing control, never a relay
+    /// transport hop (issue #974): a declared member naming one is a
+    /// structural error in *both* modes — a relaxed warn-drop would
+    /// silently remove the chain's fail-closed semantics.
+    #[test]
+    fn rejects_static_rematch_relay_member() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1 }}
+  - {{ name: node, type: direct }}
+proxy-groups:
+  - {{ name: chain, type: relay, proxies: [node, inspect] }}
+rules:
+  - "MATCH,chain"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a static rematch relay hop must fail the build");
+            };
+            assert!(
+                err.to_string().contains("cannot be a relay transport hop"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// The same membership arriving through `include-all-proxies` keeps
+    /// the gate — the expansion feeds the member vec `parse_relay_group`
+    /// checks.
+    #[test]
+    fn rejects_include_all_rematch_relay_member() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: direct }
+proxy-groups:
+  - { name: chain, type: relay, include-all-proxies: true }
+rules:
+  - "MATCH,chain"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("an include-all rematch relay hop must fail the build");
+        };
+        assert!(
+            err.to_string().contains("cannot be a relay transport hop"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: dns` leaf beside a transport builds like any other node —
+    /// and lands as `AdapterType::Dns`, never wrapped or degraded
+    /// (issue #974).
+    #[test]
+    fn dns_leaf_builds_alongside_transports() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: direct }
+rules:
+  - "DST-PORT,53,dns-out"
+  - "MATCH,node"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a dns leaf beside a transport builds");
+        assert_eq!(
+            proxies["dns-out"].adapter_type(),
+            meow_common::AdapterType::Dns
+        );
+    }
+
+    /// `dialer-proxy` on a dns node collects no edge and no wrapper —
+    /// mihomo reads no chain options off the leaf (issue #974).
+    #[test]
+    fn dns_leaf_dialer_proxy_collects_no_edge() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: dns-out, type: dns, dialer-proxy: front }}
+  - {{ name: front, type: direct }}
+rules:
+  - "MATCH,dns-out"
+"#,
+            );
+            let RebuildResult { proxies, .. } = rebuild_from_raw(&raw_config(&yaml))
+                .unwrap_or_else(|e| {
+                    panic!("strict={strict}: a dns leaf's dialer-proxy is ignored: {e}")
+                });
+            let leaf = &proxies["dns-out"];
+            assert_eq!(leaf.adapter_type(), meow_common::AdapterType::Dns);
+            assert!(
+                !leaf
+                    .as_any()
+                    .is_some_and(<dyn std::any::Any>::is::<meow_proxy::DialerProxyAdapter>),
+                "strict={strict}: the dns leaf must not be chain-wrapped"
+            );
+        }
+    }
+
+    /// A `type: dns` leaf is an in-process resolver endpoint — naming it
+    /// as a `dialer-proxy` front is a structural error in *both* modes,
+    /// exactly like a rematch front (issue #974).
+    #[test]
+    fn rejects_dns_leaf_as_dialer_front() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: node, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: dns-out }}
+  - {{ name: dns-out, type: dns }}
+rules:
+  - "MATCH,node"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a dns leaf cannot carry a dialer front");
+            };
+            assert!(
+                err.to_string().contains("cannot carry a dialer front"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// A provider node's `dialer-proxy` binds late — against the finished
+    /// registry — so it cannot be shape-checked at edge-collection time.
+    /// When that name resolves to a static `type: dns` leaf the verdict is
+    /// the same hard failure a static edge gets (issue #974 review).
+    #[test]
+    fn rejects_provider_dialer_front_on_dns_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: hop, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: dns-out}\n",
+        )
+        .unwrap();
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+proxy-providers:
+  airport:
+    type: file
+    path: nodes.yaml
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw_config(yaml),
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
+            panic!("a provider dialer front landing on a dns leaf must fail the build");
+        };
+        assert!(
+            err.to_string().contains("cannot carry a dialer front"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: dns` leaf can never be a relay transport hop — a declared
+    /// member naming one is a structural error in *both* modes (issue
+    /// #974).
+    #[test]
+    fn rejects_static_dns_relay_member() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: dns-out, type: dns }}
+  - {{ name: node, type: direct }}
+proxy-groups:
+  - {{ name: chain, type: relay, proxies: [node, dns-out] }}
+rules:
+  - "MATCH,chain"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a static dns relay hop must fail the build");
+            };
+            assert!(
+                err.to_string().contains("cannot be a relay transport hop"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// The same membership arriving through `include-all-proxies` keeps
+    /// the gate — the expansion feeds the member vec `parse_relay_group`
+    /// checks (issue #974).
+    #[test]
+    fn rejects_include_all_dns_relay_member() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: direct }
+proxy-groups:
+  - { name: chain, type: relay, include-all-proxies: true }
+rules:
+  - "MATCH,chain"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("an include-all dns relay hop must fail the build");
+        };
+        assert!(
+            err.to_string().contains("cannot be a relay transport hop"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: rematch` leaf must not become the synthesized GLOBAL's
+    /// primary: the first member is global mode's default pick, and a
+    /// control outbound cannot carry traffic. It still lists as a member
+    /// (upstream `proxyList` semantics) so an explicit selection fails
+    /// closed at dial (issue #974).
+    #[test]
+    fn auto_global_never_primes_a_rematch_leaf() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: socks5, server: 127.0.0.1, port: 1 }
+rules:
+  - "MATCH,inspect"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a rematch leaf beside a transport builds");
+        let members = proxies["GLOBAL"]
+            .member_proxies()
+            .expect("a select group exposes members");
+        let names: Vec<&str> = members.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"inspect"),
+            "the rematch leaf stays a GLOBAL member: {names:?}"
+        );
+        // meow-openwrt keeps mihomo's GLOBAL order, so DIRECT is the
+        // default pick — a control leaf can never be primed either way.
+        assert_eq!(names[0], "DIRECT", "mihomo order: DIRECT is the default");
+    }
+
+    /// The same verdict for a `type: dns` leaf (issue #974 review): it
+    /// is a resolver endpoint, not a dialable outbound — a `MATCH,dns-out`
+    /// rule must not prime it, and the member-order fallback must skip it
+    /// too. It still lists as a member so an explicit selection fails
+    /// closed at dial.
+    #[test]
+    fn auto_global_never_primes_a_dns_leaf() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: socks5, server: 127.0.0.1, port: 1 }
+rules:
+  - "MATCH,dns-out"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a dns leaf beside a transport builds");
+        let members = proxies["GLOBAL"]
+            .member_proxies()
+            .expect("a select group exposes members");
+        let names: Vec<&str> = members.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"dns-out"),
+            "the dns leaf stays a GLOBAL member: {names:?}"
+        );
+        // meow-openwrt keeps mihomo's GLOBAL order, so DIRECT is the
+        // default pick — a control leaf can never be primed either way.
+        assert_eq!(names[0], "DIRECT", "mihomo order: DIRECT is the default");
+    }
+
+    /// A blank `dialer-proxy` on a `type: rematch` node is unset, not a
+    /// malformed edge — `check_rematch_node` treats blank-or-null as
+    /// absent, and binding the fail-at-dial sentinel would wrap the leaf
+    /// in `DialerProxyAdapter` and hide its rematch action (issue #974).
+    #[test]
+    fn blank_dialer_proxy_on_rematch_node_is_unset() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1, dialer-proxy: " " }}
+rules:
+  - "MATCH,DIRECT"
+"#,
+            );
+            let RebuildResult { proxies, .. } = rebuild_from_raw(&raw_config(&yaml))
+                .expect("a blank dialer-proxy on a rematch node is unset");
+            assert!(
+                proxies["inspect"].rematch_action().is_some(),
+                "strict={strict}: the rematch leaf must keep its action"
+            );
+        }
+    }
+
     #[test]
     fn rejects_absurd_tcp_connect_timeout() {
         // Same `Instant + Duration` class via `tokio::time::timeout`
@@ -8762,11 +12963,20 @@ rules:
             let raw = parse_raw_yaml(&yaml(ok)).unwrap();
             let named = resolve_named_listeners(&raw).unwrap();
             let fetch = named.iter().find(|l| l.name == "fetch").unwrap();
-            assert_eq!(fetch.proxy.as_deref(), Some(ok));
+            assert_eq!(
+                fetch
+                    .route_override
+                    .as_ref()
+                    .and_then(|o| o.proxy.as_deref()),
+                Some(ok)
+            );
         }
+        // upstream split admission in two: the document-shape half
+        // (`listener_proxy_target_shape_err`) runs at resolve/PUT, the
+        // built-map half inside the rebuild.
         let raw = parse_raw_yaml(&yaml("Proxy")).unwrap();
-        let err = resolve_named_listeners(&raw).unwrap_err().to_string();
-        assert!(err.contains("'Proxy' not found"), "{err}");
+        let err = listener_proxy_target_shape_err(&raw).expect("undeclared target");
+        assert!(err.contains("listeners[fetch].proxy: 'Proxy'"), "{err}");
     }
 
     #[test]
@@ -9079,7 +13289,7 @@ rules:
     }
 
     /// A `dialer-proxy` on an adapter that cannot carry an injected dialer
-    /// (`direct`, `anytls`, `hysteria2`, SS + external SIP003) fails the
+    /// (`direct`, SS + external SIP003) fails the
     /// by-name re-parse. Lenient falls back to the relay-based
     /// `DialerProxyAdapter` wrapper; strict surfaces the defect at load
     /// (issue #533 review).
@@ -9201,9 +13411,15 @@ rules:
 "#;
         let raw = raw_config(yaml);
         // Empty live map — the declaration itself must authorize `use:`.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must accept use: of a candidate-declared provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must accept use: of a candidate-declared provider");
         assert!(result.proxies.contains_key("g"));
         assert!(result.proxy_providers.contains_key("airport"));
     }
@@ -9231,15 +13447,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) = rebuild_from_raw_with_resolver(&raw, None, None, &live, None) else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("use: of a removed provider must fail strict");
         };
         assert!(err.to_string().contains("airport"), "unexpected: {err}");
 
         // Lenient keeps the group — the zombie Arc is not consulted.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result = rebuild_from_raw_with_resolver(&raw, None, None, &live, None)
-            .expect("lenient mode must tolerate the removal");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient mode must tolerate the removal");
         assert!(result.proxies.contains_key("g"));
         assert!(
             result.proxy_providers.is_empty(),
@@ -9289,8 +13519,15 @@ rules:
 "#
             );
             let raw = raw_config(&yaml);
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
+            rebuild_from_raw_with_resolver(
+                &raw,
+                None,
+                Some(dir.path()),
+                &HashMap::new(),
+                None,
+                &meow_proxy::SelectionBacking::unpersisted(),
+            )
+            .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
         }
     }
 
@@ -9332,9 +13569,15 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must keep an unreadable provider as a known-empty set");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must keep an unreadable provider as a known-empty set");
         assert!(result.rule_providers.contains_key("remote"));
         assert_eq!(
             result.rules.len(),
@@ -9363,9 +13606,14 @@ rule-providers:
     url: 'not a url'
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("strict must reject an unparseable provider url");
         };
         assert!(err.to_string().contains("url"), "unexpected: {err}");
@@ -9373,8 +13621,15 @@ rule-providers:
         // Lenient keeps the acquisition-failure contract: the bad URL is a
         // fetch-time error → empty registered provider.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .expect("lenient registers an empty provider on bad url");
+        rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient registers an empty provider on bad url");
     }
 
     /// A bad `format:` is a DEFECT in the definition, not an acquisition
@@ -9395,9 +13650,14 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("a bogus format: is a defect — strict must reject");
         };
         assert!(err.to_string().contains("bad"), "unexpected: {err}");
@@ -9428,16 +13688,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        if rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .is_ok()
+        if rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .is_ok()
         {
             panic!("strict must reject a non-string payload item");
         }
 
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("lenient drops the non-string item and keeps the provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient drops the non-string item and keeps the provider");
         assert!(result.rule_providers.contains_key("mixed"));
     }
 
@@ -9619,6 +13892,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
@@ -9631,6 +13905,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("reuse");
@@ -9645,6 +13920,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("changed def materializes fresh");
@@ -9682,6 +13958,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
@@ -9694,12 +13971,106 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("interval-only change must reuse the provider");
         assert!(
             Arc::ptr_eq(again.get("p").unwrap(), &provider),
             "interval is a schedule knob, not provider identity"
+        );
+    }
+
+    /// A `global-client-fingerprint` flip rebuilds the provider (its
+    /// adapters bake the profile), but the rebuild must not serve an
+    /// empty slot until a fetch lands: the predecessor's last committed
+    /// payload is re-parsed under the new fingerprint instead — with no
+    /// cache directory (the `--config-string` shape) there is nothing
+    /// else to serve from, and `origin.hits()` proves no request ran
+    /// (issue #974 review). A `vmess` `tls: true` node reports its baked
+    /// fingerprint, so `client_fingerprint()` reads which global the
+    /// parse ran under.
+    #[cfg(feature = "vmess")]
+    #[tokio::test]
+    async fn fingerprint_only_rebuild_inherits_last_good_payload() {
+        const PAYLOAD: &str = "proxies:\n  - {name: n1, type: vmess, server: 127.0.0.1, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, tls: true}\n";
+        let origin = crate::test_support::Origin::spawn(Some(PAYLOAD), true).await;
+        let yaml = |fp: &str| {
+            format!(
+                "global-client-fingerprint: {fp}\nproxy-providers:\n  p:\n    type: http\n    url: '{}'\n",
+                origin.url
+            )
+        };
+        let registry: meow_proxy::dialer::ProxyRegistry = Default::default();
+
+        // The live provider fetches once and commits the payload.
+        let raw = raw_config(&yaml("chrome"));
+        let live = materialize_proxy_providers(
+            &raw,
+            &HashMap::new(),
+            None,
+            false,
+            &registry,
+            &meow_dns::new_dns_outbound_cell(),
+            &mut DroppedProviders::default(),
+        )
+        .expect("provider materializes");
+        live["p"]
+            .acquire_initial()
+            .await
+            .expect("the initial fetch lands");
+        assert_eq!(live["p"].proxies().len(), 1);
+        assert_eq!(origin.hits(), 1);
+
+        // Fingerprint-only candidate — identical def, new global: rebuilt,
+        // but populated from the predecessor's retained payload rather
+        // than serving empty until the detached post-commit fetch.
+        let next = materialize_proxy_providers(
+            &raw_config(&yaml("firefox")),
+            &live,
+            None,
+            false,
+            &registry,
+            &meow_dns::new_dns_outbound_cell(),
+            &mut DroppedProviders::default(),
+        )
+        .expect("fingerprint-only rebuild materializes");
+        let rebuilt = &next["p"];
+        assert!(
+            !Arc::ptr_eq(rebuilt, &live["p"]),
+            "a changed global fingerprint must rebuild the provider"
+        );
+        assert_eq!(
+            rebuilt.proxies().len(),
+            1,
+            "the rebuild inherits the predecessor's payload instead of starting empty"
+        );
+        assert_eq!(
+            rebuilt.proxies()[0].client_fingerprint(),
+            Some("firefox"),
+            "the payload re-parsed under the candidate fingerprint, not the old adapters"
+        );
+        assert_eq!(
+            origin.hits(),
+            1,
+            "no request ran — the payload transferred without a fetch"
+        );
+
+        // A def change is not fingerprint-only: no transfer, the provider
+        // keeps the detached-fetch contract (empty until one lands).
+        let changed = materialize_proxy_providers(
+            &raw_config(&yaml("firefox").replace(&origin.url, "http://127.0.0.1:9/dead")),
+            &next,
+            None,
+            false,
+            &registry,
+            &meow_dns::new_dns_outbound_cell(),
+            &mut DroppedProviders::default(),
+        )
+        .expect("def change materializes fresh");
+        assert!(
+            changed["p"].proxies().is_empty(),
+            "a changed def must not inherit the predecessor's payload"
         );
     }
 
@@ -10055,9 +14426,15 @@ mod dns_provider_sharing_tests {
             rule_provider::test_provider("p", rule_provider::ProviderType::Http, 0),
         );
 
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, None, &HashMap::new(), Some(shared))
-                .expect("a shared rebuild must not need the network");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            Some(shared),
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("a shared rebuild must not need the network");
         // Any would-be fetch attempt gets a beat to reach the listener.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
@@ -10231,5 +14608,428 @@ mod connection_limit_tests {
             parse_tun_config(None, None, None).unwrap().max_connections,
             default_max_connections()
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_surface_tests {
+    use super::*;
+
+    fn proxies_with_direct() -> HashMap<SmolStr, Arc<dyn Proxy>> {
+        HashMap::from([(
+            SmolStr::from("DIRECT"),
+            Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::DirectAdapter::new(),
+            ))) as Arc<dyn Proxy>,
+        )])
+    }
+
+    #[test]
+    fn routing_mark_zero_normalizes_to_unset() {
+        // `0` is the firewall-exempt wildcard, not a real mark — it must
+        // never reach `setsockopt`.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 0\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None);
+    }
+
+    #[test]
+    fn routing_mark_drops_on_transparent_and_responder_listeners() {
+        // Marking a TPROXY/WireGuard socket would tag the steered reply
+        // packets the policy rules must route back — the key is ignored
+        // there even when nonzero.
+        for ty in ["tproxy", "redir"] {
+            let raw: raw::RawConfig = crate::parse_raw_yaml(&format!(
+                "listeners:\n  - name: t\n    type: {ty}\n    port: 0\n    routing-mark: 7\n"
+            ))
+            .unwrap();
+            let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+            assert_eq!(listeners[0].routing_mark, None, "{ty}");
+        }
+        // WireGuard responder: same drop arm, a real key pair is needed to
+        // reach the mark resolution (RFC 7748 Alice scalar + Bob public).
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: w\n    type: wireguard\n    port: 0\n    routing-mark: 7\n    private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=\"\n    peers:\n      - public-key: \"3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=\"\n        allowed-ips: [10.0.0.0/8]\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None, "wireguard");
+    }
+
+    #[test]
+    fn routing_mark_survives_on_socket_listeners() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 7\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, Some(7));
+    }
+
+    #[test]
+    fn routing_mark_negative_is_a_parse_error() {
+        // Upstream rejected nonnumeric marks; a negative one is no "unset"
+        // spelling and must not coerce — u32 decode fails outright.
+        let err = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: -1\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("routing-mark"), "{err}");
+    }
+
+    /// Admission accepts the references the listener surface supports: a
+    /// `proxy:` naming a rebuilt group and a `rule:` naming a `sub-rules:`
+    /// block — the pair a `-t`/startup/PUT pass must let through
+    /// (spec §2).
+    #[test]
+    fn listener_group_and_block_references_admit() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxy-groups:\n  - name: pick\n    type: select\n    proxies: [DIRECT]\nsub-rules:\n  side:\n    - DOMAIN,example.com,DIRECT\nlisteners:\n  - name: m\n    type: mixed\n    port: 0\n    proxy: pick\n    rule: side\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let over = listeners[0].route_override.as_ref().unwrap();
+        assert_eq!(over.proxy.as_deref(), Some("pick"));
+        assert_eq!(over.rule.as_deref(), Some("side"));
+        // The map-level gate admits the same pair — no false positive
+        // from validating `proxy` against leaf names only.
+        let built = rebuild_from_raw(&raw).unwrap();
+        validate_listener_proxy_targets(&raw, &built.proxies, &built.proxy_providers).unwrap();
+    }
+
+    #[test]
+    fn listener_proxy_target_err_names_only_built_targets() {
+        let proxies = proxies_with_direct();
+        let dir = tempfile::tempdir().unwrap();
+        let raw_def: raw::RawProxyProvider =
+            serde_saphyr::from_str("type: file\npath: p.yaml\n").unwrap();
+        let provider = ProxyProvider::new(
+            "feed",
+            &raw_def,
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("feed".to_string(), Arc::new(provider))]);
+        // A missing name and a provider name fail; a built adapter passes.
+        assert!(listener_proxy_target_err("ghost", &proxies, &providers).is_some());
+        let err = listener_proxy_target_err("feed", &proxies, &providers).unwrap();
+        assert!(err.contains("proxy-provider"), "{err}");
+        assert!(listener_proxy_target_err("DIRECT", &proxies, &providers).is_none());
+    }
+
+    /// The PUT `force`-floor half: an undeclared name or a provider name
+    /// fails at the document level, while every *declared* name — leaf,
+    /// group, built-in, auto GLOBAL — is admitted so a name that merely
+    /// fails to build stays force-degradable (environment, not shape).
+    #[test]
+    fn listener_proxy_target_shape_err_gates_undeclared_names() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxies:\n  - {name: leaf, type: direct}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [leaf]\nproxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: bad\n    type: mixed\n    port: 0\n    proxy: ghost\n  - name: worse\n    type: mixed\n    port: 0\n    proxy: feed\n",
+        )
+        .unwrap();
+        for (decl, want) in [
+            ("ghost", true),
+            ("feed", true),
+            ("leaf", false),
+            ("g", false),
+            ("DIRECT", false),
+            ("GLOBAL", false),
+        ] {
+            let mut probe = raw.clone();
+            probe.listeners.as_mut().unwrap()[0].proxy = Some(decl.to_string());
+            probe.listeners.as_mut().unwrap()[1].proxy = None;
+            assert_eq!(
+                listener_proxy_target_shape_err(&probe).is_some(),
+                want,
+                "{decl}"
+            );
+        }
+    }
+
+    // ── `type: anytls` listener spec ─────────────────────────────────
+    //
+    // The C1/W1 config matrix of the inbound spec: user table, security
+    // modes, opaque front layers, `enable`/`udp`, padding, multi-address
+    // `listen`, and the duplicate-port registry's reach into extra
+    // addresses.
+
+    fn anytls_named(extra: &str) -> Result<Vec<NamedListener>, anyhow::Error> {
+        let yaml = format!("listeners:\n  - name: a\n    type: anytls\n    port: 0\n{extra}");
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&yaml).unwrap();
+        build_named_listeners(&raw, "127.0.0.1", false)
+    }
+
+    fn anytls_named_err(extra: &str) -> String {
+        anytls_named(extra)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    const ANYTLS_USERS: &str = "    users: {alice: pw1, bob: pw2}\n";
+    const ANYTLS_INSECURE: &str = "    allow-insecure: true\n";
+    const ANYTLS_CERT: &str =
+        "    certificate: \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----\"\n";
+
+    #[test]
+    fn anytls_users_multi_in_declaration_order() {
+        let listeners = anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}")).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(
+            cfg.users
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_ne!(cfg.users[0].password_sha256, cfg.users[1].password_sha256);
+        assert_eq!(cfg.users[0].password_sha256.len(), 32);
+        assert!(cfg.allow_insecure);
+        assert_eq!(cfg.addresses.len(), 1);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+    }
+
+    #[test]
+    fn anytls_users_empty_is_reject_all_not_an_error() {
+        // Upstream's `userMap` empty state: the listener still serves
+        // and every authentication fails — warn-only at build.
+        let listeners = anytls_named(ANYTLS_INSECURE).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert!(cfg.users.is_empty());
+    }
+
+    #[test]
+    fn anytls_users_empty_name_and_password_error() {
+        let err = anytls_named_err(&format!("    users: {{\"\": x}}\n{ANYTLS_INSECURE}"));
+        assert!(err.contains("empty username"), "{err}");
+        let err = anytls_named_err(&format!("    users: {{a: \"\"}}\n{ANYTLS_INSECURE}"));
+        assert!(err.contains("empty password"), "{err}");
+    }
+
+    #[test]
+    fn anytls_users_duplicate_name_and_password_error() {
+        // serde-saphyr's duplicate-key policy rejects a repeated
+        // `users:` key at parse time, before the builder runs.
+        let err = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users:\n      alice: one\n      alice: two\n",
+        )
+        .map(|_: raw::RawConfig| "PARSED".to_string())
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("alice"), "{err}");
+
+        let err = anytls_named_err(&format!(
+            "    users: {{alice: same, bob: same}}\n{ANYTLS_INSECURE}"
+        ));
+        assert!(err.contains("distinct passwords"), "{err}");
+    }
+
+    #[test]
+    fn anytls_users_nonstring_password_is_parse_error() {
+        assert!(crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    users: {a: 5}\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn anytls_security_mode_matrix() {
+        // Nothing at all → hard error naming both escapes.
+        let err = anytls_named_err(ANYTLS_USERS);
+        assert!(err.contains("certificate"), "{err}");
+        assert!(err.contains("allow-insecure"), "{err}");
+
+        // Full pair → TLS; `allow-insecure` is not counted into the
+        // mode exclusivity (upstream's TLS-layer enumeration).
+        let listeners =
+            anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_CERT}{ANYTLS_INSECURE}")).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert!(cfg.certificate.is_some() && cfg.private_key.is_some());
+
+        // Half pairs → hard error either way.
+        let err = anytls_named_err(
+            "    users: {a: x}\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n",
+        );
+        assert!(err.contains("provided together"), "{err}");
+        let err = anytls_named_err(
+            "    users: {a: x}\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n",
+        );
+        assert!(err.contains("provided together"), "{err}");
+
+        // PEM literal in one half, path in the other → mixed forms.
+        let err = anytls_named_err(
+            "    users: {a: x}\n    certificate: /etc/cert.pem\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n",
+        );
+        assert!(err.contains("same"), "{err}");
+    }
+
+    #[test]
+    fn anytls_mtls_and_ech_hard_error_only_when_non_empty() {
+        for key in ["client-auth-type", "client-auth-cert", "ech-key"] {
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    {key}: present\n"));
+            assert!(err.contains(key), "{err}");
+            assert!(err.contains("not supported"), "{err}");
+        }
+        // Emptiness is judged on the RAW value (spec §2.1): a
+        // whitespace-only request is still a request meow cannot honour.
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_CERT}    client-auth-type: \"  \"\n"
+        ));
+        assert!(err.contains("client-auth-type"), "{err}");
+        // Literal "" IS the empty case — the build passes.
+        anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    ech-key: \"\"\n")).unwrap();
+    }
+
+    #[test]
+    fn anytls_front_layers_enabled_error_disabled_warn() {
+        // Enabled front layer alone → exclusivity gate, then the
+        // unsupported-layer hard error.
+        for key in ["shadow-tls", "res-tls", "jls-config"] {
+            let err = anytls_named_err(&format!(
+                "{ANYTLS_USERS}{ANYTLS_CERT}    {key}: {{enable: true}}\n"
+            ));
+            assert!(err.contains("at most one"), "{err}");
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}    {key}: {{enable: true}}\n"));
+            assert!(err.contains("not supported"), "{err}");
+            // Disabled → warn-ignore, TLS still required.
+            anytls_named(&format!(
+                "{ANYTLS_USERS}{ANYTLS_CERT}    {key}: {{enable: false}}\n"
+            ))
+            .unwrap();
+            // Non-mapping shape errors.
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    {key}: 5\n"));
+            assert!(err.contains("mapping"), "{err}");
+        }
+    }
+
+    #[test]
+    fn anytls_enable_and_udp_flags() {
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    enable: false\n"
+        ));
+        assert!(err.contains("enable"), "{err}");
+        let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}    udp: false\n"));
+        assert!(err.contains("udp"), "{err}");
+        // `true` spellings pass with a redundancy warn.
+        anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    enable: true\n    udp: true\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn anytls_padding_scheme_validated_by_shared_contract() {
+        let listeners = anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    padding-scheme: \"stop=9\\n0=30-30\"\n"
+        ))
+        .unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.padding_scheme.as_deref(), Some("stop=9\n0=30-30"));
+
+        for bad in ["stop=abc", "0=30-30", "stop=1\\n0=0-30"] {
+            let err = anytls_named_err(&format!(
+                "{ANYTLS_USERS}{ANYTLS_INSECURE}    padding-scheme: \"{bad}\"\n"
+            ));
+            assert!(err.contains("padding-scheme"), "{err}");
+        }
+    }
+
+    #[test]
+    fn anytls_multi_address_listen_and_port_registry() {
+        // Comma-separated `listen` — each segment resolves with the
+        // entry's `port` like a single address does.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 1080\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1,::1\"\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.addresses.len(), 2);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+        assert_eq!(cfg.addresses[1].listen, "::1");
+        assert!(cfg.addresses.iter().all(|a| a.port == 1080));
+        // NamedListener keeps the first address as its endpoint pair.
+        assert_eq!(listeners[0].listen, "127.0.0.1");
+        assert_eq!(listeners[0].port, 1080);
+
+        // Different ports per segment need `port` unset — a segment's
+        // explicit `listen:port` merges exactly like the single-address
+        // case, and a mismatching entry `port` is a conflict error.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080,0.0.0.0:3080\"\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.addresses[0].port, 2080);
+        assert_eq!(cfg.addresses[1].port, 3080);
+
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 1080\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080\"\n",
+        )
+        .unwrap();
+        let err = build_named_listeners(&raw, "127.0.0.1", false)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("conflicts with port"), "{err}");
+
+        // A secondary address's port joins the duplicate-port registry:
+        // another listener on it must conflict like the primary does.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080,0.0.0.0:3080\"\n  - name: m\n    type: mixed\n    port: 3080\n",
+        )
+        .unwrap();
+        let err = build_named_listeners(&raw, "127.0.0.1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3080"), "{err}");
+
+        // An empty segment between commas is a shape error.
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    listen: \"127.0.0.1:1,,0.0.0.0:2\"\n"
+        ));
+        assert!(err.contains("empty address"), "{err}");
+    }
+
+    #[test]
+    fn anytls_foreign_keys_and_type_name() {
+        assert_eq!(
+            anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}")).unwrap()[0]
+                .spec
+                .type_name(),
+            "anytls"
+        );
+        // `users:`/`certificate:` on a non-anytls type warn, not error.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    users: {a: x}\n    allow-insecure: true\n    enable: true\n",
+        )
+        .unwrap();
+        build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        // `cipher:`/`kcp-tun:` on anytls warn, not error.
+        anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    cipher: aes-256-gcm\n    kcp-tun: {{}}\n"
+        ))
+        .unwrap();
     }
 }

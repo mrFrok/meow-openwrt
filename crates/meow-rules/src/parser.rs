@@ -27,6 +27,8 @@ use crate::network::NetworkRule;
 use crate::port::PortRule;
 use crate::process::ProcessRule;
 use crate::process_path::ProcessPathRule;
+use crate::process_pattern::ProcessPatternRule;
+use crate::rematch_name::RematchNameRule;
 use crate::rule_set::RuleSet;
 use crate::rule_set_rule::RuleSetRule;
 use crate::src_geoip::SrcGeoIpRule;
@@ -80,9 +82,12 @@ impl ParserContext {
 /// surfaces (subscriptions, rule-provider payloads): a line like
 /// `AND,((AND,((…` recurses one stack frame per nesting level and copies
 /// the inner text per level, so an unbounded line overflows the stack and
-/// amplifies transient allocation (issue #533 review).
-const MAX_LOGIC_DEPTH: usize = 64;
-pub(crate) const MAX_RULE_LINE_LEN: usize = 64 * 1024;
+/// amplifies transient allocation (issue #533 review). `pub` so the config
+/// loader's geo-discovery scan — which walks the same logic nesting before
+/// the parser sees the line — can apply the identical bounds instead of
+/// overflowing first (issue #974 review).
+pub const MAX_LOGIC_DEPTH: usize = 64;
+pub const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
@@ -149,6 +154,15 @@ fn parse_rule_depth(
         Some(t) => t.as_str(),
         None => rule_type,
     };
+    // Upstream dispatches the type field through `strings.ToUpper`, so
+    // `rematch-name` parses too (issue #974). Folding every token would
+    // widen the grammar past upstream's for types meow has always matched
+    // exactly — keep the fold to the one token upstream guarantees.
+    let rule_type: &str = if rule_type.eq_ignore_ascii_case("REMATCH-NAME") {
+        "REMATCH-NAME"
+    } else {
+        rule_type
+    };
 
     // MATCH only needs adapter
     if rule_type == "MATCH" {
@@ -212,6 +226,45 @@ fn parse_rule_depth(
         "DST-PORT" => PortRule::new(payload, adapter, false).map(|r| Box::new(r) as Box<dyn Rule>),
         "NETWORK" => NetworkRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "PROCESS-NAME" => Ok(Box::new(ProcessRule::new(payload, adapter))),
+        "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX" => {
+            // Comma-protected like DOMAIN-REGEX (upstream parser.go treats
+            // both process regex types that way): the adapter is the last
+            // comma field, the pattern is everything between the type and
+            // it — `TYPE,pattern,DIRECT,no-resolve` therefore targets
+            // `no-resolve` over the pattern `pattern,DIRECT`, never a flag.
+            let ty = if rule_type == "PROCESS-NAME-REGEX" {
+                meow_common::RuleType::ProcessNameRegex
+            } else {
+                meow_common::RuleType::ProcessPathRegex
+            };
+            let Some((_, rest)) = line.split_once(',') else {
+                return Err(format!("rule needs at least 3 parts: {line}"));
+            };
+            let (pattern, adapter) = rest
+                .rsplit_once(',')
+                .map(|(p, a)| (p.trim(), a.trim()))
+                .ok_or_else(|| format!("rule needs at least 3 parts: {line}"))?;
+            if adapter.is_empty() {
+                return Err(format!("{rule_type}: empty adapter"));
+            }
+            ProcessPatternRule::new_regex(ty, pattern, adapter)
+                .map(|r| Box::new(r) as Box<dyn Rule>)
+        }
+        "PROCESS-NAME-WILDCARD" | "PROCESS-PATH-WILDCARD" => {
+            // Fixed slots, not comma-protected: field 2 is the glob,
+            // field 3 the target, and anything later is an upstream-style
+            // params list these rules do not consume (`no-resolve`/`src`
+            // included — they change nothing, like upstream).
+            let ty = if rule_type == "PROCESS-NAME-WILDCARD" {
+                meow_common::RuleType::ProcessNameWildcard
+            } else {
+                meow_common::RuleType::ProcessPathWildcard
+            };
+            if adapter.is_empty() {
+                return Err(format!("{rule_type}: empty adapter"));
+            }
+            ProcessPatternRule::new_glob(ty, payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "GEOIP" => {
             let index = ctx.geoip.as_ref().ok_or_else(|| {
                 "GEOIP rule requires a GeoIP database, but none is configured".to_string()
@@ -254,6 +307,15 @@ fn parse_rule_depth(
         "IN-NAME" => InNameRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "IN-TYPE" => InTypeRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "IN-USER" => InUserRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
+        "REMATCH-NAME" => {
+            // Field three is always the target — `splitn(4)` leaves
+            // trailing params (`no-resolve` included) in `extra`, ignored
+            // exactly like upstream's `ParseParams` leftovers (issue #974).
+            if adapter.is_empty() {
+                return Err(format!("REMATCH-NAME: missing target in '{line}'"));
+            }
+            RematchNameRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "DSCP" => DscpRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "UID" => UidRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "PROCESS-PATH" => {
@@ -352,6 +414,63 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(&str, &str)> {
     s.split_once(sep).map(|(l, r)| (l.trim(), r.trim_start()))
 }
 
+/// Whether a rule line names `REMATCH-NAME` in a *type* position — the
+/// head type (any spelling, config or API) or the type field of a
+/// `(REMATCH-NAME,…)` predicate inside a logic group or `SUB-RULE`
+/// condition. meow-config uses it to fail malformed rematch grammar
+/// *structurally* instead of warn-skipping the line (issue #974): a
+/// typo'd rematch predicate that silently disappears takes the flow's
+/// first routing decision with it. Payload text never reports — a token
+/// after a comma (`IP-CIDR,REMATCH-NAME,…`, `DOMAIN-KEYWORD,REMATCH-NAME`)
+/// is data, not a declaration, and so is a `(` that opens inside a token
+/// (`^(REMATCH-NAME)x` in a regex).
+pub fn line_mentions_rematch_name(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    // `(` opens a predicate whose first token is again a type field —
+    // but only at a token boundary (line start, after `,`, after another
+    // `(`). Mid-token it is payload text: regex groups like
+    // `^(REMATCH-NAME)x` must not flag the line (issue #974 review).
+    let mut type_position = true;
+    let mut prev: Option<u8> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                if matches!(prev, None | Some(b',') | Some(b'(')) {
+                    type_position = true;
+                }
+                prev = Some(b'(');
+            }
+            b',' | b')' => {
+                type_position = false;
+                prev = Some(bytes[i]);
+            }
+            b' ' | b'\t' => {}
+            _ => {
+                let start = i;
+                while i < bytes.len() && !matches!(bytes[i], b',' | b'(' | b')') {
+                    i += 1;
+                }
+                let tok = line[start..i].trim();
+                if type_position
+                    && (tok.eq_ignore_ascii_case("REMATCH-NAME")
+                        || matches!(
+                            meow_common::RuleType::from_mihomo_name(tok),
+                            Some(meow_common::RuleType::RematchName)
+                        ))
+                {
+                    return true;
+                }
+                type_position = false;
+                prev = Some(bytes[i - 1]);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Parse `AND,((r1),(r2),...),ADAPTER` / `OR,(...)`, / `NOT,((r1)),ADAPTER`.
 /// `rule_type` is already upper-cased; `rest` is the line content after the
 /// leading `TYPE,`.
@@ -374,22 +493,8 @@ fn parse_logic_rule(
         ));
     }
     // Find the matching ')' for the outer group-list parenthesis.
-    let mut depth: i32 = 0;
-    let mut end: Option<usize> = None;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| format!("{rule_type} rule: unbalanced parentheses"))?;
+    let end =
+        matching_paren(rest).ok_or_else(|| format!("{rule_type} rule: unbalanced parentheses"))?;
     let inner = &rest[1..end];
     let tail = rest[end + 1..].trim_start();
     // Upstream `ParseRulePayload` takes the *last* comma field as the
@@ -417,33 +522,10 @@ fn parse_logic_rule(
 
     let mut inner_rules: Vec<Box<dyn Rule>> = Vec::with_capacity(groups.len());
     for g in &groups {
-        // Upstream `payloadToRule` rejects MATCH inside logic sub-rules —
-        // it would splice into an always-true `FinalRule` leg. Nested
-        // groups recurse through here, so the check covers any depth.
-        let mut fields = g.splitn(3, ',');
-        let first = fields.next().map_or("", str::trim);
-        // The guards below compare the config grammar's names, so a mihomo
-        // API spelling must translate first, the same way `parse_rule_depth`
-        // does — otherwise `(Match,X)` parses an always-true inner leg and
-        // `(DomainRegex,a,b)` silently truncates its payload.
-        let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
-        if first == "MATCH" {
-            return Err(format!(
-                "{rule_type} rule: MATCH is not allowed inside logic groups"
-            ));
-        }
-        // An empty or missing payload silently degrades to match-all for
-        // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
-        // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
-        // Reject loudly.
-        if fields.next().map_or("", str::trim).is_empty() {
-            return Err(format!("{rule_type} rule: '{g}' has no payload"));
-        }
-        // A comma-containing DOMAIN-REGEX payload parses through the
-        // last-field adapter split below — upstream comma-protects it
-        // the same way (inner `payloadToRule` joins all fields).
-        let patched = splice_inner_adapter(g.trim());
-        inner_rules.push(parse_rule_depth(&patched, ctx, rule_sets, logic_depth + 1)?);
+        inner_rules.push(
+            parse_inner_leg(g.trim(), ctx, rule_sets, logic_depth + 1)
+                .map_err(|e| format!("{rule_type} rule: {e}"))?,
+        );
     }
 
     match rule_type {
@@ -465,45 +547,134 @@ fn parse_logic_rule(
     }
 }
 
-/// Split the body of a logic payload — a sequence of `(...)` groups optionally
-/// separated by commas — into the string contents of each group, preserving
-/// balanced parens inside.
-fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
-    let mut groups = Vec::new();
-    let mut chars = inner.char_indices().peekable();
-    loop {
-        while let Some(&(_, c)) = chars.peek() {
-            if c == ' ' || c == ',' {
-                chars.next();
-            } else {
-                break;
-            }
+/// The leaf types whose payload is expression text: inside a
+/// `(DOMAIN-REGEX,…)` / `(PROCESS-NAME-REGEX,…)` / `(PROCESS-PATH-REGEX,…)`
+/// group a `\` escapes the next byte and `[…]` is a character class, so
+/// literal parens there stay data. Every other payload is literal text —
+/// a glob's `[`, a path's `\` — and scans by paren count alone, the way
+/// it always has (issue #974 review).
+const REGEX_PAYLOAD_TYPES: [&str; 3] = ["DOMAIN-REGEX", "PROCESS-NAME-REGEX", "PROCESS-PATH-REGEX"];
+
+/// Whether the group just opened by the `(` before `after_open` is a
+/// regex-payload leaf — the only context where escape/class bytes hide
+/// structural parens. Reads the `TYPE,` head: an identifier run,
+/// optional whitespace, a comma. Anything else — `((expr)`, `(!(expr)`,
+/// `(AND,(…))`, a bare `(name` — is a plain group.
+/// `pub(crate)` for `sub_rule_cond`'s item splitter, which must
+/// classify the same groups identically.
+pub(crate) fn group_is_regex_payload(after_open: &str) -> bool {
+    let head = after_open.trim_start();
+    let len = head
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        .count();
+    if !head[len..].trim_start().starts_with(',') {
+        return false;
+    }
+    let ty = meow_common::RuleType::from_mihomo_name(&head[..len]).map_or_else(
+        || head[..len].to_ascii_uppercase(),
+        |t| t.as_str().to_string(),
+    );
+    REGEX_PAYLOAD_TYPES.contains(&ty.as_str())
+}
+
+/// Byte offset of the `)` closing the `(` at `text[0]`, or `None` when
+/// unbalanced. Inside a regex-payload group, `\`-escaped bytes and
+/// `[...]`-class contents never count as structural parens, so a literal
+/// paren inside a regex payload — `(DOMAIN-REGEX,a\),b)` or `[(]` —
+/// stays data instead of ending the group (issue #974 review; upstream
+/// counts them all, so this is a deliberate permissiveness superset).
+/// Everywhere else `\` and `[` are literal payload bytes — a wildcard's
+/// `worker[*` must not shadow the group's closing paren. Byte scan —
+/// the structural bytes are ASCII.
+pub fn matching_paren(text: &str) -> Option<usize> {
+    debug_assert!(text.starts_with('('));
+    // One flag per open group — whether its payload is regex expression
+    // text. A Vec of bools is the depth stack itself.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut in_class = false;
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
         }
-        let Some(&(_, c)) = chars.peek() else { break };
+        let in_regex = stack.last().copied().unwrap_or(false);
+        match b {
+            b'\\' if in_regex => escaped = true,
+            b'[' if in_regex && !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => stack.push(group_is_regex_payload(&text[i + 1..])),
+            b')' if !in_class => {
+                stack.pop();
+                if stack.is_empty() {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split the body of a logic payload — a sequence of `(...)` groups
+/// separated by commas/whitespace — into each group's inner text.
+/// `(`/`)` recognition follows [`matching_paren`]: escaped and
+/// char-class parens inside regex payloads stay literal.
+pub fn split_logic_groups(inner: &str) -> Result<Vec<&str>, String> {
+    let mut groups = Vec::new();
+    let mut rest = inner;
+    loop {
+        rest = rest.trim_start_matches([' ', ',']);
+        let Some(c) = rest.chars().next() else { break };
         if c != '(' {
             return Err(format!("expected '(' starting a group, got '{c}'"));
         }
-        chars.next(); // consume '('
-        let start = chars.peek().map_or(inner.len(), |&(i, _)| i);
-        let mut depth = 1i32;
-        let mut end: Option<usize> = None;
-        for (i, c) in chars.by_ref() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let end = end.ok_or_else(|| "unbalanced parentheses in logic payload".to_string())?;
-        groups.push(inner[start..end].to_string());
+        let end = matching_paren(rest)
+            .ok_or_else(|| "unbalanced parentheses in logic payload".to_string())?;
+        groups.push(&rest[1..end]);
+        rest = &rest[end + 1..];
     }
     Ok(groups)
+}
+
+/// The one leg grammar `AND`/`OR`/`NOT` groups and `SUB-RULE` conditions
+/// share — upstream's `payloadToRule` runs the same `ParseRulePayload`
+/// + `ParseRule` chain for both (rules/logic/logic.go).
+///
+/// Only `MATCH` (an always-true leg that would splice into a `FinalRule`)
+/// and `SUB-RULE` (no adapter slot to carry the block name) are excluded
+/// — every other rule type, comma-protected ones included, parses exactly
+/// as it does inside a logic group.
+pub(crate) fn parse_inner_leg(
+    entry: &str,
+    ctx: &ParserContext,
+    rule_sets: &RuleSets,
+    logic_depth: usize,
+) -> Result<Box<dyn Rule>, String> {
+    let mut fields = entry.splitn(3, ',');
+    let first = fields.next().map_or("", str::trim);
+    // The guards below compare the config grammar's names, so a mihomo
+    // API spelling must translate first, the same way `parse_rule_depth`
+    // does — otherwise `(Match,X)` parses an always-true inner leg and
+    // `(DomainRegex,a,b)` silently truncates its payload.
+    let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
+    if matches!(first, "MATCH" | "SUB-RULE") {
+        return Err(format!("{first} is not allowed as an inner rule"));
+    }
+    // An empty or missing payload silently degrades to match-all for
+    // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
+    // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
+    // Reject loudly.
+    if fields.next().map_or("", str::trim).is_empty() {
+        return Err(format!("'{entry}' has no payload"));
+    }
+    // A comma-containing DOMAIN-REGEX / process-regex payload parses
+    // through the splice's last-field adapter split — upstream
+    // comma-protects them identically (`ParseRulePayload` joins all
+    // middle fields into the payload even at needTarget=false).
+    let patched = splice_inner_adapter(entry.trim());
+    parse_rule_depth(&patched, ctx, rule_sets, logic_depth)
 }
 
 /// Adapter slot filler spliced into logic sub-rules by
@@ -523,12 +694,16 @@ fn splice_inner_adapter(entry: &str) -> String {
     // DOMAIN-REGEX joins that class: its payload may contain commas and its
     // adapter slot is the *last* field, so the placeholder must likewise go
     // at the end (`DOMAIN-REGEX,a,b` → `DOMAIN-REGEX,a,b,<PH>` keeps `a,b`
-    // — inserting it mid-entry would splice into the expression).
+    // — inserting it mid-entry would splice into the expression). The two
+    // process regex types share that comma protection (issue #974).
     if let Some((ty, _)) = entry.split_once(',') {
         let ty = meow_common::RuleType::from_mihomo_name(ty.trim())
             .map_or(ty.trim(), |t| t.as_str())
             .to_ascii_uppercase();
-        if matches!(ty.as_str(), "AND" | "OR" | "NOT" | "DOMAIN-REGEX") {
+        if matches!(
+            ty.as_str(),
+            "AND" | "OR" | "NOT" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
+        ) {
             return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
@@ -864,6 +1039,45 @@ mod tests {
         assert!(parse_rule("OR,((DOMAIN-KEYWORD,),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
     }
 
+    /// Issue #974 review — delimiter bytes are literal in non-regex
+    /// payloads: a glob's `[` or a path's `\` must not shadow the
+    /// structural parens around a plain leg, exactly as the naive
+    /// paren count scanned them before the escape/class pass existed.
+    #[test]
+    fn test_parse_logic_literal_delimiters_in_plain_legs() {
+        use meow_common::Network;
+        // `[` inside the wildcard glob is data, not a class opener —
+        // the leg's `)` must still close it.
+        let rule = parse_rule(
+            "AND,((PROCESS-NAME-WILDCARD,worker[*),(NETWORK,tcp)),DIRECT",
+            &ctx(),
+        )
+        .expect("literal `[` must not unbalance the group");
+        let meta = Metadata {
+            process: "worker[5".into(),
+            network: Network::Tcp,
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+        let miss = Metadata {
+            process: "worker5".into(),
+            network: Network::Tcp,
+            ..Default::default()
+        };
+        assert!(!rule.match_metadata(&miss, &noop_helper()));
+        // A `\` in a literal payload is just a byte — it does not eat
+        // the closing paren either.
+        assert!(parse_rule(
+            "AND,((PROCESS-PATH-WILDCARD,C:\\dir\\),(DST-PORT,443)),DIRECT",
+            &ctx()
+        )
+        .is_ok());
+        // And the regex legs keep their escapes/classes — `a\),b`
+        // and `x[(]y` still scan as one group each.
+        assert!(parse_rule("AND,((DOMAIN-REGEX,a\\),b),(DST-PORT,443)),Proxy", &ctx()).is_ok());
+        assert!(parse_rule("AND,((DOMAIN-REGEX,x[(]y),(DST-PORT,443)),Proxy", &ctx()).is_ok());
+    }
+
     /// The inner-leg guards compare the config grammar's names, so the
     /// mihomo API spellings `GET /rules` reports must hit them too —
     /// `(Match,X)` is still an always-true `FinalRule` leg, while
@@ -905,6 +1119,115 @@ mod tests {
         // `domain_payload_defect` machinery owns that warning (issue
         // #869), same as `DOMAIN-KEYWORD,,X`.
         assert!(parse_rule("DOMAIN-REGEX,,DIRECT", &ctx()).is_ok());
+    }
+
+    /// Issue #974 — the process regex types are comma-protected exactly
+    /// like `DOMAIN-REGEX` (upstream treats them through the same
+    /// needTarget path): the adapter is the last comma field, the
+    /// pattern is everything between the type and it — including commas
+    /// and flag-looking text.
+    #[test]
+    fn test_parse_process_regex_comma_protected() {
+        let make_proc = |name: &str| Metadata {
+            process: name.into(),
+            ..Default::default()
+        };
+        // `no-resolve` is the *target* here, not a flag — the pattern is
+        // `pattern,DIRECT` and matches a literal comma in the name.
+        let rule = parse_rule("PROCESS-NAME-REGEX,pattern,DIRECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessNameRegex);
+        assert_eq!(rule.adapter(), "no-resolve");
+        assert_eq!(rule.payload(), "pattern,DIRECT");
+        assert!(rule.match_metadata(&make_proc("pattern,direct"), &noop_helper()));
+        assert!(!rule.match_metadata(&make_proc("pattern"), &noop_helper()));
+
+        // Repetition bounds keep their commas.
+        let rule = parse_rule(r"PROCESS-NAME-REGEX,^fo{1,3}$,DIRECT", &ctx()).unwrap();
+        assert_eq!(rule.adapter(), "DIRECT");
+        assert!(rule.match_metadata(&make_proc("foo"), &noop_helper()));
+        assert!(!rule.match_metadata(&make_proc("foooo"), &noop_helper()));
+
+        // Path axis keeps the whole string; the mihomo API spelling
+        // (`ProcessPathRegex`) parses too.
+        let rule = parse_rule(r"ProcessPathRegex,^/usr/bin/cu[rR]l$,Proxy", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessPathRegex);
+        let path_meta = Metadata {
+            process_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&path_meta, &noop_helper()));
+
+        // Two-field and empty-adapter lines are errors; an empty pattern
+        // is rejected by the constructor.
+        assert!(parse_rule("PROCESS-NAME-REGEX,onlyone", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-REGEX,p,", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-REGEX,,T", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-PATH-REGEX,[,T", &ctx()).is_err());
+    }
+
+    /// Wildcard process rules use fixed fields: field 2 is the glob,
+    /// field 3 the target, and anything later is an unused upstream
+    /// params slot (`no-resolve`/`src`/junk all ignored — issue #974).
+    #[test]
+    fn test_parse_process_wildcard_fixed_fields() {
+        let rule = parse_rule("PROCESS-NAME-WILDCARD,Cu?l*,DIRECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessNameWildcard);
+        assert_eq!(rule.adapter(), "DIRECT");
+        assert_eq!(rule.payload(), "Cu?l*");
+        let curl = Metadata {
+            process: "CURL.EXE".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&curl, &noop_helper()));
+
+        let path = parse_rule("PROCESS-PATH-WILDCARD,/opt/*/tool,Proxy,src", &ctx()).unwrap();
+        let meta = Metadata {
+            process_path: "/opt/a/b/tool".into(),
+            ..Default::default()
+        };
+        assert!(path.match_metadata(&meta, &noop_helper()));
+
+        // Empty glob / empty adapter are rejected; a glob containing a
+        // comma is truncated to its first field exactly like every
+        // other fixed-field rule (no comma protection for wildcards).
+        assert!(parse_rule("PROCESS-NAME-WILDCARD,,T", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-WILDCARD,g,", &ctx()).is_err());
+        let comma = parse_rule("PROCESS-NAME-WILDCARD,a,b,c", &ctx()).unwrap();
+        assert_eq!(comma.payload(), "a");
+        assert_eq!(comma.adapter(), "b");
+    }
+
+    /// A comma-containing process regex inside a logic group must not be
+    /// truncated by the placeholder splice — the same protection the
+    /// top-level arm gives (issue #974).
+    #[test]
+    fn test_parse_process_regex_inside_logic_group() {
+        let meta = Metadata {
+            process: "foo,direct".into(),
+            host: "a.example".into(),
+            ..Default::default()
+        };
+        // `(PROCESS-NAME-REGEX,foo,direct)` — payload `foo,direct` keeps
+        // its comma; the placeholder adapter is spliced *after* it.
+        let rule = parse_rule(
+            "AND,((PROCESS-NAME-REGEX,foo,direct),(DOMAIN,a.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+
+        // The wildcard types splice mid-position normally.
+        let rule = parse_rule(
+            "AND,((PROCESS-NAME-WILDCARD,foo*),(DOMAIN,a.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        let meta2 = Metadata {
+            process: "foobar".into(),
+            host: "a.example".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&meta2, &noop_helper()));
     }
 
     /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.
@@ -1028,5 +1351,131 @@ mod depth_tests {
             panic!("overlong line must error");
         };
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod rematch_name_tests {
+    use super::*;
+    use meow_common::{Metadata, RuleMatchHelper, RuleType};
+
+    fn ctx() -> ParserContext {
+        ParserContext::empty()
+    }
+
+    /// Config and API spellings plus upstream's `ToUpper` fold all reach
+    /// the one rule type, adapter in field three (issue #974).
+    #[test]
+    fn parses_every_spelling() {
+        for line in [
+            "REMATCH-NAME,stage1,REJECT",
+            "rematch-name,stage1,REJECT",
+            "RematchName,stage1,REJECT",
+        ] {
+            let rule =
+                parse_rule(line, &ctx()).unwrap_or_else(|e| panic!("'{line}' must parse: {e}"));
+            assert_eq!(rule.rule_type(), RuleType::RematchName, "'{line}'");
+            assert_eq!(rule.adapter(), "REJECT", "'{line}'");
+            assert_eq!(rule.payload(), "stage1", "'{line}'");
+        }
+    }
+
+    /// A missing target and an empty alternative list both fail — the
+    /// latter would otherwise read as "also match the unset marker".
+    #[test]
+    fn rejects_missing_target_and_empty_alternatives() {
+        assert!(parse_rule("REMATCH-NAME,stage1", &ctx()).is_err());
+        assert!(parse_rule("REMATCH-NAME,a//b,REJECT", &ctx()).is_err());
+        assert!(parse_rule("REMATCH-NAME,,REJECT", &ctx()).is_err());
+    }
+
+    /// Extra fields after the adapter are ignored like every leaf type's
+    /// `ParseParams` leftovers upstream — `no-resolve` included.
+    #[test]
+    fn trailing_suffixes_ignored() {
+        let rule = parse_rule("REMATCH-NAME,stage1,REJECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::RematchName);
+        assert_eq!(rule.adapter(), "REJECT");
+    }
+
+    /// `*` and `|` are literal bytes — no wildcard, regex, substring or
+    /// pipe-alternation semantics (issue #974): `a|b` matches only the
+    /// marker literally spelled `a|b`.
+    #[test]
+    fn special_bytes_stay_literal() {
+        let rule = parse_rule("REMATCH-NAME,a|b,REJECT", &ctx()).unwrap();
+        let mut m = Metadata::default();
+        m.set_rematch_name("a|b");
+        assert!(rule.match_metadata(&m, &RuleMatchHelper));
+        for miss in ["a", "b", "a|", "|b"] {
+            m.set_rematch_name(miss);
+            assert!(
+                !rule.match_metadata(&m, &RuleMatchHelper),
+                "'{miss}' must not match 'a|b'"
+            );
+        }
+    }
+
+    /// A `(REMATCH-NAME,…)` leg inside a logic group parses through the
+    /// shared inner-leg grammar with the group's adapter (issue #974).
+    #[test]
+    fn logic_leg_parses_and_matches() {
+        let rule = parse_rule(
+            "AND,((REMATCH-NAME,stage1),(DOMAIN-SUFFIX,x.test)),REJECT",
+            &ctx(),
+        )
+        .unwrap();
+        let mut m = Metadata {
+            host: "a.x.test".into(),
+            ..Default::default()
+        };
+        m.set_rematch_name("stage1");
+        assert!(rule.match_metadata(&m, &RuleMatchHelper));
+        m.set_rematch_name("other");
+        assert!(!rule.match_metadata(&m, &RuleMatchHelper));
+    }
+
+    /// The `sub-rules` conditional form shares the same leg grammar — a
+    /// REMATCH-NAME leaf inside `(cond)` reaches the block dispatch.
+    #[test]
+    fn sub_rule_condition_leaf_parses() {
+        let leaf = parse_inner_leg("REMATCH-NAME,stage1", &ctx(), &Default::default(), 0)
+            .expect("condition leaf parses");
+        assert_eq!(leaf.rule_type(), RuleType::RematchName);
+    }
+
+    /// `line_mentions_rematch_name` is the type-position gate meow-config
+    /// applies to lines that already failed to parse (issue #974): true
+    /// on head spellings and nested predicates, false on unrelated lines
+    /// *and on payload text* — `IP-CIDR,REMATCH-NAME,x` is a bad CIDR
+    /// line, not a rematch predicate.
+    #[test]
+    fn mentions_gate_flags_rematch_lines() {
+        for line in [
+            "REMATCH-NAME,stage1,REJECT",
+            "rematch-name,stage1,REJECT",
+            "RematchName,stage1,REJECT",
+            "AND,((REMATCH-NAME,a),(DOMAIN,x)),REJECT",
+            "SUB-RULE,(REMATCH-NAME,a),blk",
+            "SUB-RULE,(AND,(REMATCH-NAME,a),(DOMAIN,x)),blk",
+            "REMATCH-NAME,a//b,REJECT",
+        ] {
+            assert!(line_mentions_rematch_name(line), "'{line}'");
+        }
+        for line in [
+            "DOMAIN,x,REJECT",
+            "MATCH,DIRECT",
+            "REMATCHNAMES,x,D",
+            // Payload position is data, never a type (issue #974 review).
+            "IP-CIDR,REMATCH-NAME,x,REJECT",
+            "DOMAIN-KEYWORD,REMATCH-NAME,REJECT",
+            "AND,((DOMAIN-KEYWORD,REMATCH-NAME),(DOMAIN,x)),REJECT",
+            // A `(` inside a token is payload text — regex groups do not
+            // open a type position (issue #974 review).
+            "DOMAIN-REGEX,^(REMATCH-NAME)x,REJECT",
+            "AND,((DOMAIN-REGEX,^(REMATCH-NAME)x),(DOMAIN,y)),REJECT",
+        ] {
+            assert!(!line_mentions_rematch_name(line), "'{line}'");
+        }
     }
 }

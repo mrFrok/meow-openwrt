@@ -31,6 +31,7 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | Protocol        | Upstream | Rust port | Status  | Notes |
 |-----------------|:--------:|:---------:|---------|-------|
 | Direct          | Yes      | Yes       | OK      | `direct.rs` |
+| Dns             | Yes      | Yes       | OK      | `dns_adapter.rs` (#974): `type: dns` leaf answers the flow's DNS payload through the in-process resolver, never contacting the nominal destination — see [specs/dns-outbound.md](specs/dns-outbound.md) |
 | Reject          | Yes      | Yes       | OK      | `reject.rs` (single behaviour; upstream also has `RejectDrop`) |
 | RejectDrop      | Yes      | No        | **Gap** | `AdapterType::RejectDrop` exists in the enum but no adapter |
 | Pass            | Yes      | No        | **Gap** | Enum variant only |
@@ -43,11 +44,12 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | Hysteria v1     | Yes      | No        | **Gap** | Medium priority, QUIC-based |
 | Hysteria2       | Yes      | Yes       | OK      | QUIC via quiche (BoringSSL-native) |
 | TUIC            | Yes      | No        | **Gap** | QUIC-based, medium priority |
-| WireGuard       | Yes      | No        | **Gap** | Upstream uses `wireguard-go`; Rust can use `boringtun` |
+| WireGuard       | Yes      | Yes       | OK      | Userspace client (#899): vendored `boringtun` 0.7.1 with `ring` replaced by RustCrypto, over smoltcp — behind the `wireguard` feature (in `full`, not `minimal`). Phase-1: `dns` accepted-but-ignored, `ip-stack` always smoltcp, `amnezia-wg-option` hard-rejected; `dialer-proxy` supported (UDP-capable fronts only — a TCP-only front fails the endpoint bind at dial time). See [wireguard.md](wireguard.md) |
 | SSH             | Yes      | No        | **Gap** | Niche |
 | HTTP (outbound) | Yes      | No        | **Gap** | HTTP CONNECT outbound |
 | SOCKS5 (outbound)| Yes     | No        | **Gap** | SOCKS5 outbound |
-| anytls / mieru / trusttunnel / sudoku / masque | Yes | No | Low | Niche/new protocols — defer |
+| anytls          | Yes      | Yes       | OK      | Outbound (`anytls` feature) + `listeners: type: anytls` server inbound (`listener-anytls`, `full` not `minimal`) — v1/v2 sessions, multi-user, multi-address, UoT v2; see [specs/listener-anytls.md](specs/listener-anytls.md) |
+| mieru / trusttunnel / sudoku / masque | Yes | No | Low | Niche/new protocols — defer |
 | Reality (transport) | Yes  | Yes       | OK      | In-tree REALITY client; the ClientHello is shaped by `client-fingerprint` (chrome / firefox / safari / ios / edge / random) |
 | ECH (TLS)       | Yes      | No        | Gap     | Encrypted Client Hello — defer |
 
@@ -55,18 +57,19 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 
 Upstream `adapter/outbound` supports these pluggable transports layered on top of adapters: `tls`, `ws`, `h2`, `http`, `grpc`, `httpupgrade`, `shadowtls`, `v2ray-plugin`, `simple-obfs`, `restls`, `mux/smux`.
 
-Rust port currently supports (each SS plugin sits behind its same-named
-cargo feature; `simple-obfs`/`v2ray-plugin` ride `ss` itself, the rest are
-opt-in and re-bundled into `default`/`full` but excluded from `minimal`):
+Rust port currently supports (each SS plugin sits behind its own cargo
+feature — `simple-obfs` behind `ss-obfs`, `v2ray-plugin` behind
+`ss-v2ray-plugin`, the rest same-named; all are re-bundled into
+`default`/`full`, and `minimal` carries `ss-obfs` only):
 
-- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs` (`ss`)
+- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs` (`ss-v2ray-plugin`)
 - `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs` (`gost-plugin`)
 - `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs` (`shadow-tls`)
 - `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs` (`restls`)
 - `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs` (`jls`)
 - `kcptun` (KCP ARQ + crypt/FEC/snappy over UDP, smux v1 pool, UDP-over-TCP relay) — `crates/meow-proxy/src/kcptun_plugin.rs` (`kcptun`)
 - `ech-tls-tunnel` (TLS-in-TLS with ECH) — `crates/meow-proxy/src/ech_tls_tunnel.rs` (`ech-tls-tunnel`)
-- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`) (`ss`)
+- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`) (`ss-obfs`)
 
 | Transport        | Upstream | Rust | Status |
 |------------------|:--------:|:----:|--------|
@@ -81,7 +84,7 @@ opt-in and re-bundled into `default`/`full` but excluded from `minimal`):
 | kcptun           | Yes      | Yes (SS plugin, smux v1 only) | OK |
 | Reality          | Yes      | Yes  | OK |
 | simple-obfs      | Yes      | Yes  | OK |
-| SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option + gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
+| SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option incl. `brutal-opts` TCP Brutal negotiation; gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
 
 ### Proxy groups
 
@@ -116,6 +119,7 @@ Upstream lives in `listener/`. Rust listeners live in `crates/meow-listener/src/
 | VLESS (inbound)       | Yes | No | Gap |
 | Hysteria2 (inbound)   | Yes | No | Gap |
 | TUIC (inbound)        | Yes | No | Gap |
+| AnyTLS (inbound)      | Yes | Yes | OK — BoringSSL/plaintext modes, multi-user, multi-address atomic bind, TCP + UoT v2 routing; see [specs/listener-anytls.md](specs/listener-anytls.md) |
 | Inner / Inbound auth  | Yes | Partial | Auth framework not yet exposed |
 | TUN inbound           | Yes | **Excluded** | Non-goal |
 | sing-* variants       | Yes | **Excluded** | Depend on sing-box; not a port priority |
@@ -257,7 +261,43 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 
 ### Supported
 
-`port`, `socks-port`, `mixed-port`, `allow-lan`, `bind-address`, `mode`, `log-level`, `ipv6`, `external-controller`, `secret`, `external-ui` / `external-ui-name` (serves a static third-party dashboard at `/ui`; `external-ui-url` is parsed but auto-download is not performed), `dns`, `proxies`, `proxy-groups`, `rules`, `rule-providers`, `tproxy-port`, `tproxy-sni`, `routing-mark`, and the custom `subscriptions`. Per-outbound `dialer-proxy` (chained dialing via any proxy/group, TCP) is supported on the stream-based outbound types — `ss`, `trojan`, `vless`, `vmess`, `snell`, `http`, `socks5` — where an injected `TcpDialer` carries the adapter's own handshake. `anytls` and `hysteria2` own their transport (QUIC) and do not honour it; nor does `ss` with an external SIP003 plugin. Those fall back to the relay-based wrapper, which fails loudly rather than dialing direct. `dialer-proxy` is honoured on provider-sourced nodes as well (per-node field, provider-level `dialer-proxy`, and `override.dialer-proxy` — mihomo's unconditional-write precedence applies: `override` > provider > node); the target must be a top-level `proxies:`/`proxy-groups:` entry — provider node names are not resolvable targets, same as mihomo. UDP rides the front's own datagram association (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE), failing closed when the front cannot carry UDP; mux-carried UDP traverses the chain. See [the migration guide](migration-from-go-mihomo.md) for details.
+`port`, `socks-port`, `mixed-port`, `allow-lan`, `bind-address`, `mode`, `log-level`, `ipv6`, `external-controller`, `secret`, `external-controller-tls` (HTTPS controller, ALPN `h2`/`http/1.1`, identity from nested `tls.certificate`/`tls.private-key` or an ephemeral self-signed pair; the endpoint itself is the `api-tls` build feature — `full`/`default` only, so `minimal` parses the key as dead config and warns at startup that it is not compiled in), `external-controller-unix` (Unix socket — owner-only `0600`, Bearer auth kept, verified-stale reclaim only), `external-controller-pipe` (parsed everywhere, served on Windows only), `external-controller-cors` (`allow-origins`/`allow-private-network`, upstream's configured `cors.New` wire shape), `external-ui` / `external-ui-name` (serves a static third-party dashboard at `/ui`; `external-ui-url` is parsed but auto-download is not performed), `dns`, `proxies`, `proxy-groups`, `rules`, `rule-providers`, `tproxy-port`, `tproxy-sni`, `routing-mark`, `interface-name`, `global-client-fingerprint`, `global-ua`, and the custom `subscriptions`. Per-node dialer options (`routing-mark`, `interface-name`, `ip-version`, `tfo`, `mptcp`) are honoured on every `proxies:` leaf — resolved node-over-global at dial time, with `routing-mark: 0` meaning unset and the loopback exemption `binds_peer` already gives the TUN binding; `ip-version` filters/reorders hostname resolution (`ipv4`/`ipv6` fail when no candidate of that family remains, `*-prefer` stable-sort their family first) while IP literals bypass it. Per-outbound `dialer-proxy` (chained dialing via any proxy/group, TCP) is supported on the stream-based outbound types — `ss`, `trojan`, `vless`, `vmess`, `snell`, `http`, `socks5` — where an injected `TcpDialer` carries the adapter's own handshake. `wireguard` honours it through a different shape: the endpoint's UDP transport rides the front's UDP association, so the front must be UDP-capable (`direct` with routing-mark, `ss`, `socks5`, a group whose live member carries UDP) — a TCP-only front fails the endpoint bind at dial time, never a silent direct egress (`amnezia-wg-option` on the node stays rejected — deferred to Phase-3). `hysteria2` owns its transport (QUIC) and honours it through a different shape: the QUIC endpoint rides the front's UDP association (a TCP-only front fails loudly; `ports`/`hop-interval` hopping is disabled with a warning). `anytls` takes a per-instance transport dialer — sessions pool and `udp: true` UoT rides the chained session. `direct` and `ss` with an external SIP003 plugin still cannot take an injected dialer. Those fall back to the relay-based wrapper, which fails loudly rather than dialing direct. `dialer-proxy` is honoured on provider-sourced nodes as well (per-node field, provider-level `dialer-proxy`, and `override.dialer-proxy` — mihomo's unconditional-write precedence applies: `override` > provider > node); the target must be a top-level `proxies:`/`proxy-groups:` entry — provider node names are not resolvable targets, same as mihomo. UDP rides the front's own datagram association (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE), failing closed when the front cannot carry UDP; mux-carried UDP traverses the chain. See [the migration guide](migration-from-go-mihomo.md) for details.
+
+`global-client-fingerprint` (issue #974) is the default uTLS ClientHello
+profile for `proxies:`/`proxy-providers:` nodes that omit
+`client-fingerprint` — the node value wins, an omitted or `""`
+value inherits the global, an explicit `none` opts out, and an
+unsupported name warns and falls back to the TLS
+backend's defaults. It is baked into the adapters at parse time, so it
+changes only through a full config load. `global-ua` (issue #974)
+overrides the `User-Agent` internal HTTP fetches (providers,
+subscriptions, geodata, external-ui) and latency probes send —
+`clash.meta/<version>` by default, `""` clears, and a request-supplied
+`User-Agent` still wins; `PATCH /configs` applies it live.
+
+Per-node dialer options reach every socket meow itself opens, with three
+deliberate carve-outs, all matching how the fields behave in mihomo:
+
+- **External SIP003 plugin sockets.** An `obfs`/`v2ray-plugin` node spawns
+  the plugin as a subprocess that owns its own outbound sockets — the
+  node's `routing-mark`/`interface-name`/`tfo`/`mptcp` cannot reach them
+  (the only socket meow opens is the loopback hop to the plugin's local
+  endpoint, which is loopback-exempt anyway). Same boundary as
+  `dialer-proxy`: plugins cannot take an injected dialer either.
+- **Managed-tproxy firewall exemptions match only the global mark.** The
+  nftables/pf rules meow installs exempt the top-level `routing-mark`
+  from redirection; a per-node `routing-mark` is *not* exempted and its
+  traffic is caught by the tproxy rules like any other unmarked flow —
+  extend the firewall yourself if a node mark must bypass redirection.
+  This asymmetry is also why only the global mark is pin-refused while
+  the managed firewall is live.
+- **Resolver/DoH sockets run under the global options only.** A node's
+  fields never steer DNS plumbing: upstream exchange sockets — including
+  a DoH provider's pooled HTTP/2 connection — carry the global
+  `routing-mark`/`interface-name` and ignore the node's `tfo`/`mptcp`,
+  keeping a node-specific mark/interface out of shared resolver state.
+  The node's `ip-version` still filters the *results* before the dial,
+  exactly like the global filter would.
 
 ### Missing top-level keys (gaps)
 
@@ -274,8 +314,6 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `experimental` | Various flags (`sniff-tls-sni`, etc.) |
 | `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction), plus `sniff.QUIC` on TUN UDP flows (SNI from client Initials, v1/v2) |
 | `geodata-mode`, `geo-auto-update`, `geodata-loader` | GeoIP/GeoSite DB management |
-| `global-client-fingerprint` | Reality/uTLS fingerprint |
-| `global-ua` | User-Agent override for subscription fetch |
 | `keep-alive-interval` | TCP keepalive (upstream's knob tunes *inbound listeners AND outbound dials*; meow-rs parses it only to warn — the inbound-socket equivalent is `tcp-keepalive*` + `tcp-idle-timeout`, see `config.example.yaml`; the outbound-dialer tuning is the residual gap) |
 | `find-process-mode` | `off` / `strict` / `always` |
 | `tcp-concurrent` | Happy Eyeballs fast-open |
@@ -321,7 +359,7 @@ These surfaced during the audit and warrant engineer follow-up even before new f
 6. **Hosts trie**: allocated in `Resolver::new` but never populated from config.
 7. **In-flight dedup**: allocated but unused (`#[allow(dead_code)]`).
 8. **Logic rules reachability**: `meow-rules/src/logic.rs` exists but `parser.rs` never dispatches `AND/OR/NOT` — verify whether logic rules can be loaded from YAML at all.
-9. **`AdapterType` enum has variants without implementations**: `RejectDrop`, `Compatible`, `Pass`, `Dns`, `Relay`, `LoadBalance`, plus many protocol variants. Either implement or remove to avoid false signals.
+9. **`AdapterType` enum has variants without implementations**: `RejectDrop`, `Compatible`, `Pass`, `Relay`, `LoadBalance`, plus many protocol variants. Either implement or remove to avoid false signals.
 
 ---
 

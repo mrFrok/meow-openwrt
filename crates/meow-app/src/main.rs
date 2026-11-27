@@ -34,12 +34,16 @@ use meow_listener::SnifferRuntime;
 use meow_listener::TProxyListener;
 #[cfg(feature = "listener-tun")]
 use meow_listener::TunListener;
+#[cfg(feature = "listener-wireguard")]
+use meow_listener::WireGuardListener;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+mod ntp;
 #[cfg(target_os = "windows")]
 mod windows_service;
 
@@ -96,6 +100,10 @@ struct Args {
     /// Override secret for RESTful API
     #[arg(long = "secret")]
     secret: Option<String>,
+
+    /// Read the REST API secret from a single-line file
+    #[arg(long = "secret-file", conflicts_with = "secret")]
+    secret_file: Option<PathBuf>,
 
     /// Set post-up script
     #[arg(long = "post-up")]
@@ -230,7 +238,7 @@ fn main() -> Result<()> {
     let _profiler = dhat_profiler();
 
     // nyanpasu uses -v to query version (mihomo format)
-    if std::env::args().any(|a| a == "-v") {
+    if std::env::args_os().any(|a| a == "-v") {
         println!("Meow Meta {}", env!("MEOW_VERSION"));
         return Ok(());
     }
@@ -248,15 +256,8 @@ fn main() -> Result<()> {
     if args.age_secret_key.is_some() {
         anyhow::bail!("--age-secret-key is not yet supported");
     }
-    if args.ext_ctl_tls.is_some() {
-        anyhow::bail!("--ext-ctl-tls is not yet supported");
-    }
-    if args.ext_ctl_unix.is_some() {
-        anyhow::bail!("--ext-ctl-unix is not yet supported");
-    }
-    if args.ext_ctl_pipe.is_some() {
-        anyhow::bail!("--ext-ctl-pipe is not yet supported");
-    }
+    // `--ext-ctl-{tls,unix,pipe}` map onto the `external-controller-*`
+    // overrides applied after config load (issue #974).
 
     // Accepted for mihomo CLI compatibility but not implemented. Frontends may
     // pass these blindly, so warn instead of bailing (tracing is not yet
@@ -518,6 +519,12 @@ fn run_application_inner(
 ) -> Result<()> {
     info!("meow-rs starting...");
 
+    let file_secret = args
+        .secret_file
+        .as_deref()
+        .map(read_api_secret)
+        .transpose()?;
+
     // Raise RLIMIT_NOFILE before the runtime and any listener come up —
     // every proxied conn costs two fds (inbound + outbound), and the
     // macOS/launchd default of 256 EMFILEs at ~120 live conns while the
@@ -635,8 +642,37 @@ fn run_application_inner(
         );
 
         // mihomo's `routing-mark` marks every outbound socket, from the first
-        // provider fetch on (meow-openwrt; the deployer's rules exempt it).
+        // provider fetch on (the deployer's rules exempt it). meow-openwrt:
+        // auto-redirect implies its own bypass mark when none is set.
         meow_common::set_routing_mark(meow_config::effective_routing_mark(&raw));
+        // provider fetch on (the deployer's rules exempt it).
+        meow_common::set_routing_mark(raw.routing_mark);
+        // mihomo's `interface-name` (issue #974) binds every outbound
+        // socket likewise — installed before the build so the first
+        // provider fetch already takes it. A node's own `interface-name`
+        // and the loopback exemption outrank it inside the dial scope;
+        // `None`/empty clears.
+        meow_common::set_global_interface_name(raw.interface_name.as_deref());
+        // `global-ua` (issue #974) — same process-wide shape as
+        // `interface-name`/`routing-mark`: validate and install before the
+        // build's first provider/geodata fetch emits a `User-Agent`.
+        // `build_config` re-asserts it ahead of those fetches.
+        meow_common::set_global_ua(meow_config::validate_global_ua(raw.global_ua.as_deref())?);
+        // `tcp-concurrent` — live dial policy on the same process-global
+        // lane: installed before the build's first provider fetch dials,
+        // so those candidates already honor it. `-t` validation never
+        // reaches here; PUT/PATCH re-assert at their commit points.
+        meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
+            raw.tcp_concurrent,
+        ));
+        // `keep-alive-*` — the outbound-dial keepalive policy, same
+        // lane and same ordering rationale: `connect_tcp` snapshots it
+        // per dial, so it must be installed before the build's first
+        // provider/geodata fetch opens a socket. `-t` never reaches here;
+        // PUT/PATCH re-assert at their commit points.
+        meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(&raw)?);
+        // `interface-name`/`global-ua`/`tcp-concurrent`/`keep-alive-*` as
+        // upstream installs them above.
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -658,8 +694,11 @@ fn run_application_inner(
         meow_proxy::health::set_unified_delay(config.raw.unified_delay.unwrap_or(false));
 
         // Apply CLI overrides to the loaded config.
-        if let Some(ref s) = args.secret {
-            config.api.secret = Some(s.clone());
+        if let Some(secret) = file_secret {
+            config.api.secret = Some(secret);
+            info!("API secret overridden by --secret-file");
+        } else if let Some(secret) = args.secret {
+            config.api.secret = Some(secret);
             info!("API secret overridden by --secret");
         }
         if let Some(ref ctl) = args.ext_ctl {
@@ -669,6 +708,12 @@ fn run_application_inner(
             config.api.external_controller = Some(addr);
             info!("External controller overridden by --ext-ctl: {addr}");
         }
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut config.api,
+        );
         if let Some(ref ui) = args.ext_ui {
             config.api.external_ui = Some(std::path::PathBuf::from(ui));
             info!("External UI overridden by --ext-ui");
@@ -694,6 +739,60 @@ fn run_application_inner(
         )
         .await
     })
+}
+
+fn read_api_secret(path: &Path) -> Result<String> {
+    let mut secret = std::fs::read_to_string(path)
+        .with_context(|| format!("--secret-file: could not read {}", path.display()))?;
+    let line = secret
+        .strip_suffix("\r\n")
+        .or_else(|| secret.strip_suffix('\n'))
+        .unwrap_or(&secret);
+    if line.is_empty() || line.ends_with(' ') || !line.bytes().all(|b| matches!(b, b' '..=b'~')) {
+        anyhow::bail!(
+            "--secret-file: expected a nonempty line of printable ASCII without trailing spaces"
+        );
+    }
+    secret.truncate(line.len());
+    Ok(secret)
+}
+
+/// The extended controller flags (`--ext-ctl-tls` / `-unix` / `-pipe`)
+/// override the matching raw keys verbatim (issue #974): strings,
+/// resolved at endpoint bind like the config values they replace. Like
+/// upstream, an *empty* override is not applied — `--ext-ctl-tls ''`
+/// must not erase a YAML endpoint.
+fn apply_ext_controller_overrides(
+    ext_ctl_tls: Option<&str>,
+    ext_ctl_unix: Option<&str>,
+    ext_ctl_pipe: Option<&str>,
+    api: &mut meow_config::ApiConfig,
+) {
+    if let Some(ctl) = ext_ctl_tls.filter(|s| !s.is_empty()) {
+        api.external_controller_tls = Some(ctl.to_owned());
+        info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_unix.filter(|s| !s.is_empty()) {
+        api.external_controller_unix = Some(ctl.to_owned());
+        info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_pipe.filter(|s| !s.is_empty()) {
+        api.external_controller_pipe = Some(ctl.to_owned());
+        info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
+    }
+}
+
+/// Whether this binary can actually serve one of the configured
+/// controller endpoints. `ApiConfig::has_servable_endpoint` reports the
+/// *configured* set; `external-controller-tls` additionally needs the
+/// `api-tls` build feature (`minimal` compiles the endpoint out,
+/// ADR-0007), so a TLS-only config on a TLS-less build is headless and
+/// must not spawn an API server that binds nothing (issue #974).
+fn api_endpoint_servable(api: &meow_config::ApiConfig) -> bool {
+    api.external_controller.is_some()
+        || (cfg!(feature = "api-tls") && api.external_controller_tls.is_some())
+        || (cfg!(unix) && api.external_controller_unix.is_some())
+        || (cfg!(windows) && api.external_controller_pipe.is_some())
 }
 
 /// Owner of the outbound-interface binding installed ahead of the config
@@ -726,7 +825,8 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// before, and until then no global route exists for a socket to loop on.
 #[cfg(feature = "listener-tun")]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    meow_api::preinstall_global_route_binding(raw).into_binding()
+    meow_api::preinstall_global_route_binding(raw, meow_api::PreinstallScope::Startup)
+        .into_binding()
 }
 
 #[cfg(not(feature = "listener-tun"))]
@@ -753,6 +853,9 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
         S::Shadowsocks(_) => {
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         }
+        S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
+        S::Tun(_) => (!cfg!(feature = "listener-tun")).then_some("listener-tun"),
+        S::Anytls(_) => (!cfg!(feature = "listener-anytls")).then_some("listener-anytls"),
     }
 }
 
@@ -1412,6 +1515,49 @@ fn bind_socket_addr(listen: &str, port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Bind ALL of one AnyTLS listener's addresses, then apply its
+/// `routing-mark` — atomically: any failure returns the error and the
+/// already-bound sockets drop with the `Vec`, so a half-bound group is
+/// never left holding ports (F09/F11). `listeners[].routing-mark`
+/// applies to every socket this listener binds — the same
+/// `apply_listener_mark` contract the other socket listeners keep; a
+/// mark failure is a startup failure, not a skip: the group must not
+/// half-publish.
+#[cfg(feature = "listener-anytls")]
+async fn bind_anytls_sockets(
+    name: &str,
+    addrs: &[meow_config::ListenerBind],
+    routing_mark: Option<u32>,
+) -> Result<Vec<tokio::net::TcpListener>> {
+    let mut sockets = Vec::with_capacity(addrs.len());
+    for a in addrs {
+        let addr = bind_socket_addr(&a.listen, a.port).map_err(|e| {
+            listener_failed(name, &format!("invalid listen address '{}': {e}", a.listen));
+            anyhow::anyhow!(
+                "listener '{name}': invalid listen address '{}': {e}",
+                a.listen
+            )
+        })?;
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(s) => sockets.push(s),
+            Err(e) => {
+                listener_failed(name, &format!("bind {addr} failed: {e}"));
+                return Err(anyhow::anyhow!(
+                    "listener '{name}': bind {addr} failed: {e}"
+                ));
+            }
+        }
+    }
+    for s in &sockets {
+        if !apply_listener_mark(name, s, routing_mark) {
+            return Err(anyhow::anyhow!(
+                "listener '{name}': routing-mark setup failed"
+            ));
+        }
+    }
+    Ok(sockets)
+}
+
 async fn run(
     config: meow_config::Config,
     config_path: Option<String>,
@@ -1480,8 +1626,17 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    // The config-scoped `profile.store-selected` persistence owner — every
+    // rebuild lane (API PUT, subscription/geodata republish) attaches
+    // through it so groups share the startup store and enable epoch.
+    tunnel.set_selection_backing(Arc::clone(&config.selection));
+    // The `ntp:` supervisor holds only a Weak at the tunnel so shutdown's
+    // drop order can't strand it; the worker starts after TUN binding
+    // settles below, and PUT reconciles it through the API lane
+    // (issue #974).
+    let ntp_supervisor = Arc::new(ntp::NtpSupervisor::new(&tunnel));
     meow_tunnel::nftset::install(&tunnel, meow_config::effective_nftset(&config.raw));
-    if config.api.external_controller.is_none() {
+    if !api_endpoint_servable(&config.api) {
         // No API can inspect individual connections. Keep cancellation handles
         // for cold reloads without storing their display metadata.
         tunnel.statistics().set_headless();
@@ -1490,18 +1645,24 @@ async fn run(
     // registry; install before the first `update_routing` so it publishes
     // the initial route map (issue #489).
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
+    // `type: dns` leaves — static and provider-sourced alike — resolve the
+    // live resolver through this cell; `install_resolver_everywhere`
+    // republishes the tunnel's slot into it on every DNS install
+    // (issue #974).
+    tunnel.set_dns_outbound_cell(Arc::clone(&config.provider_dns_cell));
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
-    tunnel.set_listener_proxies(
-        config
-            .listeners
-            .named
-            .iter()
-            .filter_map(|l| Some((l.name.as_str().into(), l.proxy.as_deref()?.into())))
-            .collect(),
-    );
     tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
-    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    // `find-process-mode` — install before dispatch starts: the cell is
+    // shared with the traffic ledger's app lookup (issue #974). `-t`
+    // validation never reaches here; PUT/PATCH re-assert at commit.
+    tunnel.set_process_lookup_mode(config.general.find_process_mode);
+    tunnel.update_routing(
+        config.proxies,
+        config.rules,
+        config.sub_rules,
+        config.dialer_registry,
+    );
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -1526,6 +1687,7 @@ async fn run(
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("dns.listen {listen_addr}: {e}"))?;
+        let socket = bound.socket_weak();
         let task = tokio::spawn(async move {
             if let Err(e) = bound.run().await {
                 error!("DNS server error: {}", e);
@@ -1535,6 +1697,7 @@ async fn run(
             listen: listen_addr,
             task,
             resolver_slot: slot,
+            socket: Some(socket),
         });
     }
 
@@ -1579,6 +1742,9 @@ async fn run(
         let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
         let proxy_provider_refresh = Arc::clone(&proxy_provider_refresh);
         let provider_dialer_registry = config.provider_dialer_registry.clone();
+        // Refresh never rebinds listeners, so the startup snapshot is the
+        // right dependency set for the prospective-route sweep.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -1590,6 +1756,7 @@ async fn run(
                 provider_dialer_registry,
                 rule_provider_refresh,
                 proxy_provider_refresh,
+                running_listeners,
             )
             .await;
         });
@@ -1615,6 +1782,9 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir.clone();
+        // Refreshes never rebind listeners — the startup snapshot is the
+        // republish sweep's dependency set, as subscription_refresh's.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::missing_geosite_retry_loop(
                 geodata,
@@ -1622,6 +1792,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -1641,6 +1812,7 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir;
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,
@@ -1649,6 +1821,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -1662,6 +1835,10 @@ async fn run(
     // Suppress unused-variable warnings: sniffer_runtime and auth are
     // consumed only inside feature-gated listener blocks below.
     let _ = (&sniffer_runtime, &auth);
+    // `take()`d by the TUN spawn paths below, which exist only under
+    // `listener-tun`; the not-feature build moves it once at the end.
+    #[cfg(feature = "listener-tun")]
+    let mut early_binding = early_binding;
 
     // Start listeners. Bind before spawning the accept loops so a `port: 0`
     // (ephemeral) listener resolves to its OS-assigned port up front; the
@@ -1671,6 +1848,42 @@ async fn run(
 
     let mut named_listeners = config.listeners.named.clone();
     for nl in &mut named_listeners {
+        // A named `type: tun` owns no socket — skip the bind entirely
+        // (`""` is not a bindable address). It spawns here like every
+        // named inbound, but its startup failures are fatal: the sole
+        // effective TUN cannot be left half-started behind a "running"
+        // banner, and no PUT-path rollback exists for it.
+        if let ListenerSpec::Tun(cfg) = &nl.spec {
+            #[cfg(feature = "listener-tun")]
+            {
+                if let Err(msg) = spawn_named_tun(
+                    &tunnel,
+                    cfg,
+                    &nl.name,
+                    nl.route_override.clone(),
+                    Arc::clone(&sniffer_runtime),
+                    early_binding.take(),
+                    &rule_providers,
+                )
+                .await
+                {
+                    listener_failed(&nl.name, &format!("TUN failed to start: {msg}"));
+                    return Err(anyhow::anyhow!(
+                        "listener '{}': TUN failed to start: {msg}",
+                        nl.name
+                    ));
+                }
+            }
+            #[cfg(not(feature = "listener-tun"))]
+            {
+                let _ = cfg;
+                tracing::warn!(
+                    "listener '{}': type tun requires feature 'listener-tun'",
+                    nl.name
+                );
+            }
+            continue;
+        }
         let addr = bind_socket_addr(&nl.listen, nl.port)
             .map_err(|e| anyhow::anyhow!("listener '{}': {e}", nl.name))?;
         // Suppress unused-variable warning: addr is consumed only inside
@@ -1687,13 +1900,24 @@ async fn run(
                             continue;
                         }
                     };
+                    // `listeners[].routing-mark` — ingress SO_MARK on the
+                    // listen socket; accepted sockets inherit it.
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
+                        .with_lan_acl(Arc::clone(&config.listeners.lan_acl))
                         .with_max_connections(nl.max_connections)
-                        .with_tcp_keepalive(config.listeners.tcp_keepalive);
+                        .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                        .with_route_override(nl.route_override.clone())
+                        // The SOCKS5 UDP-associate relay socket binds per
+                        // association inside the listener — its mark cannot
+                        // come from the listen socket's inheritance.
+                        .with_routing_mark(nl.routing_mark);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
@@ -1723,6 +1947,10 @@ async fn run(
                             continue;
                         }
                     };
+                    // No `routing-mark` here: the parser already warns and
+                    // drops it on `type: tproxy` — marking the transparent
+                    // socket would mark the reply packets the policy rules
+                    // must route back.
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = TProxyListener::new(
@@ -1737,7 +1965,8 @@ async fn run(
                     .with_firewall(*firewall)
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
                     .with_tcp_keepalive(config.listeners.tcp_keepalive)
-                    .with_transparent(*transparent);
+                    .with_transparent(*transparent)
+                    .with_route_override(nl.route_override.clone());
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1780,6 +2009,9 @@ async fn run(
                             continue;
                         }
                     };
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let obfs = cfg.simple_obfs.as_ref().map(|o| match o.mode {
@@ -1797,7 +2029,12 @@ async fn run(
                     ) {
                         Ok(l) => l
                             .with_max_connections(nl.max_connections)
-                            .with_tcp_keepalive(config.listeners.tcp_keepalive),
+                            .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                            .with_route_override(nl.route_override.clone())
+                            // The UDP relay socket binds inside the
+                            // listener — the TCP listen socket's mark
+                            // can't reach it.
+                            .with_routing_mark(nl.routing_mark),
                         Err(e) => {
                             listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
@@ -1828,6 +2065,169 @@ async fn run(
                     );
                 }
             }
+            ListenerSpec::WireGuard(cfg) => {
+                #[cfg(feature = "listener-wireguard")]
+                {
+                    // UDP bind here (not inside the listener) so a
+                    // `port: 0` resolves to the real port for the
+                    // `/listeners` snapshot — the same bind-before-spawn
+                    // contract the TCP listeners follow.
+                    let socket = match WireGuardListener::bind(addr) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
+                            continue;
+                        }
+                    };
+                    // No `routing-mark` here either — the parser warns and
+                    // drops it on `type: wireguard`; marking the responder
+                    // socket would mark handshake replies the policy rules
+                    // must route back.
+                    let bound = socket.local_addr().unwrap_or(addr);
+                    nl.port = bound.port();
+                    // meow-listener takes plain ctor args, never a
+                    // meow-config type — map the validated config onto
+                    // the listener-facing spec.
+                    let spec = meow_listener::WgListenerSpec {
+                        private_key: cfg.private_key,
+                        peers: cfg
+                            .peers
+                            .iter()
+                            .map(|p| meow_listener::WgPeerSpec {
+                                public_key: p.public_key,
+                                preshared_key: p.preshared_key,
+                                allowed_ips: p.allowed_ips.clone(),
+                                name: p.name.clone(),
+                                reserved: p.reserved,
+                            })
+                            .collect(),
+                        mtu: cfg.mtu,
+                        udp: cfg.udp,
+                        udp_timeout: cfg.udp_timeout,
+                    };
+                    let listener = WireGuardListener::new(tunnel.clone(), spec, nl.name.clone())
+                        .with_max_connections(nl.max_connections)
+                        .with_sniffer(Arc::clone(&sniffer_runtime))
+                        .with_route_override(nl.route_override.clone());
+                    match listener.spawn(socket) {
+                        Ok(guard) => {
+                            tokio::spawn(async move {
+                                if let Err(e) = guard.wait().await {
+                                    error!("WireGuard listener error: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("spawn failed: {e}"));
+                        }
+                    }
+                }
+                #[cfg(not(feature = "listener-wireguard"))]
+                {
+                    let _ = cfg;
+                    tracing::warn!(
+                        "listener '{}': wireguard requires feature 'listener-wireguard'",
+                        nl.name
+                    );
+                }
+            }
+            ListenerSpec::Anytls(cfg) => {
+                #[cfg(feature = "listener-anytls")]
+                {
+                    // TLS material + padding resolve BEFORE any socket is
+                    // bound: a bad PEM, mixed cert/key form, or broken
+                    // scheme fails the listener outright — never leaves
+                    // bound sockets behind on a "skipped" entry.
+                    let spec = meow_listener::AnytlsListenerSpec {
+                        users: cfg
+                            .users
+                            .iter()
+                            .map(|u| (u.name.clone(), u.password_sha256))
+                            .collect(),
+                        certificate: cfg.certificate.clone(),
+                        private_key: cfg.private_key.clone(),
+                        allow_insecure: cfg.allow_insecure,
+                        padding_scheme: cfg.padding_scheme.clone(),
+                    };
+                    let listener = match meow_listener::AnytlsListener::new(
+                        tunnel.clone(),
+                        nl.name.clone(),
+                        spec,
+                    ) {
+                        Ok(l) => std::sync::Arc::new(
+                            l.with_max_connections(nl.max_connections)
+                                .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                                .with_route_override(nl.route_override.clone()),
+                        ),
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("invalid anytls config: {e}"));
+                            return Err(anyhow::anyhow!(
+                                "listener '{}': invalid anytls config: {e}",
+                                nl.name
+                            ));
+                        }
+                    };
+                    // Bind every configured address eagerly and
+                    // atomically: any bind/mark failure fails the whole
+                    // listener and the already-bound sockets drop with
+                    // the returned Vec (upstream iterates all listen
+                    // addresses; partial binds release on drop here).
+                    let sockets =
+                        bind_anytls_sockets(&nl.name, &cfg.addresses, nl.routing_mark).await?;
+                    // Publish the REAL bound endpoints: `local_addr()`
+                    // from EVERY socket, collected atomically — a single
+                    // failure used to drop that entry and `zip`-misalign
+                    // the rest. Snapshot top-level `listen`/`port` and
+                    // the `addresses` array from this ONE complete list
+                    // so they can never diverge (F11).
+                    let bound_addrs: Vec<(String, u16)> = sockets
+                        .iter()
+                        .map(|s| {
+                            s.local_addr()
+                                .map(|b| (b.ip().to_string(), b.port()))
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "listener '{}': bound address read failed: {e}",
+                                        nl.name
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if let ListenerSpec::Anytls(cfg) = &mut nl.spec {
+                        for (a, (ip, port)) in cfg.addresses.iter_mut().zip(&bound_addrs) {
+                            a.listen = ip.clone();
+                            a.port = *port;
+                        }
+                    }
+                    if let Some((ip, port)) = bound_addrs.first() {
+                        nl.listen = ip.clone();
+                        nl.port = *port;
+                    }
+                    for socket in sockets {
+                        let listener = std::sync::Arc::clone(&listener);
+                        tokio::spawn(async move {
+                            if let Err(e) = listener.run_on(socket).await {
+                                error!("AnyTLS listener error: {}", e);
+                            }
+                        });
+                    }
+                }
+                #[cfg(not(feature = "listener-anytls"))]
+                {
+                    let _ = cfg;
+                    // Same contract as the feature-on arm: a listener that
+                    // cannot start fails startup — a silent skip would
+                    // still publish it in the /listeners snapshot (F09).
+                    listener_failed(&nl.name, "anytls requires feature 'listener-anytls'");
+                    return Err(anyhow::anyhow!(
+                        "listener '{}': anytls requires feature 'listener-anytls'",
+                        nl.name
+                    ));
+                }
+            }
+            // Spawned above the bind (a TUN owns no socket) — this arm
+            // is unreachable, kept only for exhaustiveness.
+            ListenerSpec::Tun(_) => {}
         }
     }
 
@@ -1835,7 +2235,31 @@ async fn run(
     // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
     // (ephemeral) listeners rather than the configured `0`.
     let mut controller_file = None;
-    if let Some(api_addr) = config.api.external_controller {
+    // Owns the `external-controller-unix` socket-path cleanup for the
+    // daemon's lifetime — declared out here so the guard drops at shutdown,
+    // not when the endpoint block ends (issue #974).
+    #[cfg(unix)]
+    let mut _unix_socket_guard: Option<meow_api::endpoint::UnixSocketGuard> = None;
+    // Non-native transports configured by config key or CLI override warn
+    // here too — `api_endpoint_servable` already excludes them, so an
+    // unsupported-only config would otherwise go silent (issue #974).
+    #[cfg(not(unix))]
+    if let Some(ref unix_path) = config.api.external_controller_unix {
+        warn!("external-controller-unix '{unix_path}' ignored — Unix sockets are unsupported on this platform");
+    }
+    #[cfg(not(windows))]
+    if let Some(ref pipe_name) = config.api.external_controller_pipe {
+        warn!("external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
+    }
+    // The HTTPS endpoint is a build feature, not just a platform gate:
+    // `minimal` leaves it out (ADR-0007) and parses the key as dead
+    // config — loud like the plugin placeholders, never silently dropped
+    // (issue #974).
+    #[cfg(not(feature = "api-tls"))]
+    if let Some(ref tls_addr) = config.api.external_controller_tls {
+        warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
+    }
+    if api_endpoint_servable(&config.api) {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
         // the ADR-0007 size caps). Without the feature we just hint the user to
@@ -1866,10 +2290,11 @@ async fn run(
                 }
             }
         }
-        let api_server = ApiServer::new(
+        let api_server = std::sync::Arc::new(ApiServer::new(
             tunnel.clone(),
-            api_addr,
+            config.api.external_controller,
             config.api.secret.clone(),
+            config.api.cors.clone(),
             config_path.clone(),
             Arc::clone(&raw_config),
             log_tx.clone(),
@@ -1878,26 +2303,103 @@ async fn run(
             Arc::clone(&rule_provider_refresh),
             Arc::clone(&proxy_provider_refresh),
             named_listeners.clone(),
-            config.api.external_ui.clone(),
+            config.api.external_ui.as_deref(),
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
-        );
-        // Bind eagerly like the DNS listener and the `listeners:` entries:
-        // an `external-controller` failure is a hard startup error, not a
-        // detached task that dies one log line deep (issue #641).
-        let socket = tokio::net::TcpListener::bind(api_addr)
+            Some({
+                let supervisor = Arc::clone(&ntp_supervisor);
+                Arc::new(move |cfg| supervisor.reconcile(cfg)) as meow_api::routes::NtpReconcile
+            }),
+        ));
+        // Every configured endpoint attempts its own bind: the plain TCP
+        // controller stays startup-fatal (issue #641), while the TLS/unix/
+        // pipe listeners are best-effort — a bad one is logged and skipped
+        // so the rest still serve (issue #974).
+        let mut bound_any = false;
+        if let Some(api_addr) = config.api.external_controller {
+            let socket = tokio::net::TcpListener::bind(api_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
+            controller_file = publish_controller(
+                &socket,
+                config.api.secret.as_deref(),
+                config_path.as_deref(),
+            );
+            bound_any = true;
+            let server = std::sync::Arc::clone(&api_server);
+            tokio::spawn(async move {
+                if let Err(e) = server.run_on(socket).await {
+                    error!("API server error: {}", e);
+                }
+            });
+        }
+        // On builds without `api-tls` the field is dead config — the warn
+        // above already named it; this arm is what the feature compiles.
+        #[cfg(feature = "api-tls")]
+        if let Some(ref tls_addr) = config.api.external_controller_tls {
+            match meow_api::endpoint::bind_tls(
+                tls_addr,
+                config.api.tls_certificate.as_deref(),
+                config.api.tls_private_key.as_deref(),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
-        controller_file = publish_controller(
-            &socket,
-            config.api.secret.as_deref(),
-            config_path.as_deref(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = api_server.run_on(socket).await {
-                error!("API server error: {}", e);
+            {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API (TLS) listening on https://{}", endpoint.addr());
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_tls_on(endpoint).await {
+                            error!("API TLS server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-tls {tls_addr}: {e:#} — endpoint skipped");
+                }
             }
-        });
+        }
+        #[cfg(unix)]
+        if let Some(ref unix_path) = config.api.external_controller_unix {
+            match meow_api::endpoint::bind_unix(unix_path).await {
+                Ok((endpoint, guard)) => {
+                    bound_any = true;
+                    info!("REST API listening on unix://{}", guard.path().display());
+                    _unix_socket_guard = Some(guard);
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API unix server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-unix {unix_path}: {e:#} — endpoint skipped");
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(ref pipe_name) = config.api.external_controller_pipe {
+            match meow_api::endpoint::bind_pipe(pipe_name) {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API listening on named pipe {pipe_name}");
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API pipe server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-pipe '{pipe_name}': {e:#} — endpoint skipped");
+                }
+            }
+        }
+        if !bound_any {
+            error!("external-controller endpoints are configured but no controller is available");
+        }
     }
 
     // TUN inbound (issue #326) — spawned from the top-level `tun:` section,
@@ -1915,11 +2417,12 @@ async fn run(
                 "meow-tun".to_string(),
             )
             .with_readiness_signal(ready_tx)
-            .with_sniffer(Arc::clone(&sniffer_runtime));
+            .with_sniffer(Arc::clone(&sniffer_runtime))
+            .with_tcp_dns_hijack(config.tun.dns_hijack);
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
             // or right away if startup fails (issue #695).
-            if let Some(binding) = early_binding {
+            if let Some(binding) = early_binding.take() {
                 listener = listener.with_outbound_binding(binding);
             }
 
@@ -1944,6 +2447,7 @@ async fn run(
                         &startup_tun,
                         meow_tunnel::TunHandle {
                             task: handle,
+                            owner: meow_tunnel::TunOwner::TopLevel,
                             core_done: Some(core_done),
                             udp_flows,
                         },
@@ -1991,6 +2495,33 @@ async fn run(
         }
     }
 
+    // Start the NTP worker now that routing, the resolver hook, and any
+    // TUN binding are settled — its own dial may ride the tunnel.
+    // Reconcile from the COMMITTED document rather than the boot
+    // `config.ntp` snapshot: the API lane has been serving since before
+    // the TUN wait, and a PUT committed in that window already swapped
+    // `raw_config` and fired its own reconcile — firing the stale boot
+    // target now would resurrect a worker the operator just disabled
+    // (issue #974 review). The resolve+reconcile pair runs inside the
+    // `CONFIG_MUTATION` lane so it cannot split a PUT's commit (publish
+    // seen, its reconcile still pending) — either this fires before the
+    // PUT's own reconcile or it already sees the fully committed
+    // document. A committed document always resolves (PUT admission
+    // gates `resolve_ntp`); on a defect leave the worker stopped and
+    // say so.
+    {
+        let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+        // Arm the supervisor only now that readiness settled: a PUT
+        // committed while the TUN wait was open already fired its own
+        // reconcile — stored, never spawned — and its stored config
+        // starts below (issue #974 review).
+        ntp_supervisor.settle();
+        match meow_config::resolve_ntp(&raw_config.read()) {
+            Ok(ntp) => ntp_supervisor.reconcile(ntp),
+            Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+        }
+    }
+
     // Only now: a signal before `shutdown.wait()` installs its handler
     // kills the process, which must not read as an unclean exit.
     meow_common::logbook::engine_started(config_path.as_deref().unwrap_or("--config-string"));
@@ -2002,13 +2533,14 @@ async fn run(
     // Wait for shutdown signal
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
+    ntp_supervisor.shutdown().await;
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
     drop(controller_file);
     // Kernel WireGuard links of `type: wireguard` nodes outlive their
     // adapters at exit (statics never drop): remove them here.
-    #[cfg(all(feature = "wireguard", target_os = "linux"))]
-    meow_proxy::wireguard::cleanup_all();
+    #[cfg(all(feature = "wireguard-kernel", target_os = "linux"))]
+    meow_proxy::wireguard_kernel::cleanup_all();
 
     Ok(())
 }
@@ -2035,11 +2567,12 @@ fn publish_controller(
 
 /// A listener that did not start: logged, recorded in the logbook, and
 /// skipped — the rest of the engine runs without it.
-#[cfg(any(
-    feature = "listener-mixed",
-    feature = "listener-tproxy",
-    feature = "listener-shadowsocks"
-))]
+#[allow(
+    dead_code,
+    reason = "needed whenever ANY listener feature or the linux mark \
+              path compiles — --no-default-features makes every call site \
+              cfg'd out"
+)]
 fn listener_failed(name: &str, message: &str) {
     error!("listener '{name}': {message}");
     meow_common::logbook::event(
@@ -2049,6 +2582,48 @@ fn listener_failed(name: &str, message: &str) {
     )
     .subject(name)
     .record();
+}
+
+/// `listeners[].routing-mark` — `SO_MARK` on the listener's own socket
+/// (ingress; upstream `InboundOption.RoutingMark`). Linux only — the
+/// config layer already warned and ignored the key elsewhere, so the
+/// non-Linux arm is a silent no-op. A failed `setsockopt` (missing
+/// `CAP_NET_ADMIN`) is a listener startup failure like a bind error: a
+/// silently unmarked socket would evade the policy routing the mark was
+/// declared for. Returns `false` when the listener must be skipped.
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
+fn apply_listener_mark<F: std::os::fd::AsRawFd>(name: &str, sock: &F, mark: Option<u32>) -> bool {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(mark) = mark {
+        if let Err(e) = meow_common::set_listener_socket_mark(sock.as_raw_fd(), mark) {
+            listener_failed(
+                name,
+                &format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"),
+            );
+            return false;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    let _ = (name, sock, mark);
+    true
+}
+
+/// Windows has no `AsRawFd` (its socket handle type differs); the
+/// `routing-mark` key is Linux-only anyway and already warned off at
+/// parse time.
+#[cfg(not(unix))]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
+fn apply_listener_mark<F>(_name: &str, _sock: &F, _mark: Option<u32>) -> bool {
+    true
 }
 
 /// #625: roll the committed `tun.enable` back to false after an initial
@@ -2136,9 +2711,271 @@ async fn publish_tun_if_committed(
     tunnel.set_tun_handle(tun_handle).await;
 }
 
+/// Spawn a named `listeners: type: tun` device and publish it as the
+/// effective TUN ([`meow_tunnel::TunOwner::Named`]). Unlike the top-level
+/// section's spawn there is no committed-config re-validation and no
+/// `tun.enable` rollback — a named device is a startup-snapshot object no
+/// PUT can restart or roll back, so any failure here is returned to the
+/// caller, which fails startup instead of logging-and-continuing.
+/// `binding` is the early global-route binding installed before the
+/// config build ([`preinstall_global_route_binding`], issue #695) —
+/// adopted by this listener or given up with it on failure.
+#[cfg(feature = "listener-tun")]
+async fn spawn_named_tun(
+    tunnel: &Tunnel,
+    cfg: &meow_config::TunConfig,
+    name: &str,
+    route_override: Option<meow_common::InboundRouteOverride>,
+    sniffer: Arc<SnifferRuntime>,
+    binding: Option<meow_listener::OutboundBinding>,
+    rule_providers: &meow_api::ProviderRegistry,
+) -> Result<(), String> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut listener = TunListener::new(
+        tunnel.clone(),
+        tun_config_to_listener_config(cfg, rule_providers),
+        name.to_string(),
+    )
+    .with_readiness_signal(ready_tx)
+    .with_sniffer(sniffer)
+    .with_route_override(route_override);
+    if let Some(binding) = binding {
+        listener = listener.with_outbound_binding(binding);
+    }
+    let task_name = name.to_string();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = listener.run().await {
+            error!("TUN listener '{task_name}' error: {e}");
+        }
+    });
+
+    let (core_done, udp_flows) =
+        match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(meow_listener::TunReady::Ready {
+                core_done,
+                udp_flows,
+            })) => (core_done, udp_flows),
+            Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err("TUN readiness signal dropped unexpectedly".into());
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(format!(
+                    "TUN startup timed out after {} s",
+                    meow_api::TUN_STARTUP_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
+    let tun_handle = meow_tunnel::TunHandle {
+        task: handle,
+        owner: meow_tunnel::TunOwner::Named(name.to_string()),
+        core_done: Some(core_done),
+        udp_flows,
+    };
+    if tun_handle.task.is_finished() {
+        // Reported ready, then exited before the handle could publish —
+        // the same dead-handle refusal the top-level publish applies.
+        tunnel.teardown_tun_handle(tun_handle).await;
+        return Err("TUN listener exited after reporting ready".into());
+    }
+    tunnel.set_tun_handle(tun_handle).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F09/F11: a multi-address AnyTLS listener is all-or-nothing — a
+    /// bind failure on a LATER address must return the error AND release
+    /// the sockets already bound (the returned `Vec` drops them), never
+    /// leaving a half-bound group holding ports.
+    #[cfg(feature = "listener-anytls")]
+    #[tokio::test]
+    async fn anytls_partial_bind_failure_releases_the_whole_group() {
+        let blocked = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked_port = blocked.local_addr().unwrap().port();
+        // A port verified free, then released for the listener to take.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let addrs = [
+            meow_config::ListenerBind {
+                listen: "127.0.0.1".into(),
+                port: free_port,
+            },
+            meow_config::ListenerBind {
+                listen: "127.0.0.1".into(),
+                port: blocked_port,
+            },
+        ];
+        let err = bind_anytls_sockets("t", &addrs, None)
+            .await
+            .expect_err("second address is occupied");
+        assert!(err.to_string().contains(&blocked_port.to_string()), "{err}");
+        // The first bind was rolled back: its port binds again.
+        tokio::net::TcpListener::bind(("127.0.0.1", free_port))
+            .await
+            .expect("first address stayed bound — group not released");
+    }
+
+    #[test]
+    fn api_secret_file_requires_a_valid_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller-secret");
+        assert!(read_api_secret(&path).is_err());
+
+        for contents in [
+            "synthetic token",
+            "synthetic token\n",
+            "synthetic token\r\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(read_api_secret(&path).unwrap(), "synthetic token");
+        }
+
+        for contents in [
+            b"".as_slice(),
+            b"\n",
+            b"synthetic token \n",
+            b"synthetic token\n\n",
+            b"synthetic\r token",
+            b"synthetic\ttoken",
+            b"synthetic token\0",
+            b"synthetic token\xff",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(read_api_secret(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn api_secret_file_conflicts_with_inline_secret() {
+        let result = Args::try_parse_from([
+            "meow",
+            "--secret",
+            "synthetic-token",
+            "--secret-file",
+            "controller-secret",
+        ]);
+        assert!(matches!(result, Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict));
+    }
+
+    #[test]
+    fn empty_ext_ctl_overrides_keep_yaml_endpoints() {
+        // `--ext-ctl-tls ''` is an empty override: applied verbatim it
+        // would erase a configured endpoint — upstream skips empties
+        // (issue #974).
+        let args = Args::try_parse_from([
+            "meow",
+            "--ext-ctl-tls",
+            "",
+            "--ext-ctl-unix",
+            "",
+            "--ext-ctl-pipe",
+            "",
+        ])
+        .unwrap();
+        let mut api = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            external_controller_unix: Some("/tmp/meow.sock".into()),
+            external_controller_pipe: Some(r"\\.\pipe\meow".into()),
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/meow.sock")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
+
+        // Nonempty overrides replace — and a mix replaces only its own key.
+        let args = Args::try_parse_from(["meow", "--ext-ctl-unix", "/tmp/cli.sock"]).unwrap();
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/cli.sock")
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
+    }
+
+    #[test]
+    fn servable_gate_applies_the_api_tls_build_flag() {
+        // `ApiConfig::has_servable_endpoint` is the *configured* set;
+        // the startup predicate adds the compile gate: a TLS-only config
+        // is servable exactly when `api-tls` built the endpoint, else the
+        // daemon is headless (issue #974).
+        let base = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: None,
+            external_controller_unix: None,
+            external_controller_pipe: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        let mut api = meow_config::ApiConfig {
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            ..base
+        };
+        assert_eq!(api_endpoint_servable(&api), cfg!(feature = "api-tls"));
+        // Dead TLS config never drags a live endpoint down — a TLS+unix
+        // config on a TLS-less build still serves the socket.
+        api.external_controller = Some("127.0.0.1:9090".parse().unwrap());
+        assert!(api_endpoint_servable(&api));
+        api.external_controller = None;
+        // The platform arms below assert on unix/pipe alone — a
+        // lingering TLS endpoint would answer true on an api-tls
+        // Windows build before the unix arm is even asked.
+        api.external_controller_tls = None;
+        api.external_controller_unix = Some("meow.sock".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(unix));
+        api.external_controller_pipe = Some(r"\\.\pipe\meow".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(any(unix, windows)));
+    }
 
     // Upstream `MRS\x01` fixture writers — the same shapes the
     // `meow_rules::mrs_parser` tests build (their encoders are
@@ -2452,6 +3289,17 @@ mod tests {
         })
     }
 
+    fn anytls_spec() -> meow_config::ListenerSpec {
+        meow_config::ListenerSpec::Anytls(meow_config::AnytlsListenerConfig {
+            allow_insecure: true,
+            addresses: vec![meow_config::ListenerBind {
+                listen: "0.0.0.0".into(),
+                port: 23301,
+            }],
+            ..Default::default()
+        })
+    }
+
     /// The spawn-loop feature mapping is `listener-mixed` for
     /// mixed/http/socks5, `listener-tproxy` for tproxy, and
     /// `listener-shadowsocks` for shadowsocks (in `full`, not `minimal`).
@@ -2488,6 +3336,20 @@ mod tests {
             gate(&ss_spec()),
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         );
+        assert_eq!(
+            gate(&S::WireGuard(meow_config::WgListenerConfig {
+                private_key: [0u8; 32],
+                peers: vec![],
+                mtu: 1420,
+                udp: true,
+                udp_timeout: std::time::Duration::from_secs(60),
+            })),
+            (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard")
+        );
+        assert_eq!(
+            gate(&anytls_spec()),
+            (!cfg!(feature = "listener-anytls")).then_some("listener-anytls")
+        );
     }
 
     /// `tun:` rides its own gate — disabled is always servable, enabled
@@ -2518,7 +3380,8 @@ mod tests {
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
-            proxy: None,
+            route_override: None,
+            routing_mark: None,
         }];
         let err = meow_api::ensure_listeners_supported(&named, without_shadowsocks)
             .expect_err("ss listener must fail on a feature-less build");
@@ -2526,6 +3389,32 @@ mod tests {
         assert_eq!(
             meow_api::ensure_listeners_supported(&named, super::listener_feature_gate).is_ok(),
             cfg!(feature = "listener-shadowsocks")
+        );
+    }
+
+    /// Same contract for `type: anytls`: on a build without
+    /// `listener-anytls` the config must fail `ensure_inbounds_supported`
+    /// (and therefore `-t`), not warn-and-skip into a dead port.
+    #[test]
+    fn ensure_rejects_uncompiled_anytls_listener() {
+        fn without_anytls(spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+            matches!(spec, meow_config::ListenerSpec::Anytls(_)).then_some("listener-anytls")
+        }
+        let named = [meow_config::NamedListener {
+            name: "anytls-in".into(),
+            spec: anytls_spec(),
+            port: 23301,
+            listen: "0.0.0.0".into(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        }];
+        let err = meow_api::ensure_listeners_supported(&named, without_anytls)
+            .expect_err("anytls listener must fail on a feature-less build");
+        assert!(err.to_string().contains("listener-anytls"), "{err}");
+        assert_eq!(
+            meow_api::ensure_listeners_supported(&named, super::listener_feature_gate).is_ok(),
+            cfg!(feature = "listener-anytls")
         );
     }
 
@@ -2637,6 +3526,7 @@ mod tests {
                     let _tx = tx;
                     std::future::pending::<()>().await;
                 }),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             };
@@ -2771,6 +3661,7 @@ mod tests {
         fn finished_handle() -> TunHandle {
             TunHandle {
                 task: tokio::spawn(async {}),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             }

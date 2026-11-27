@@ -19,6 +19,10 @@ pub enum RuleType {
     Dscp,
     ProcessName,
     ProcessPath,
+    ProcessNameRegex,
+    ProcessPathRegex,
+    ProcessNameWildcard,
+    ProcessPathWildcard,
     Network,
     Uid,
     Match,
@@ -35,6 +39,7 @@ pub enum RuleType {
     InName,
     InType,
     InUser,
+    RematchName,
 }
 
 impl RuleType {
@@ -55,6 +60,10 @@ impl RuleType {
             RuleType::Dscp => "DSCP",
             RuleType::ProcessName => "PROCESS-NAME",
             RuleType::ProcessPath => "PROCESS-PATH",
+            RuleType::ProcessNameRegex => "PROCESS-NAME-REGEX",
+            RuleType::ProcessPathRegex => "PROCESS-PATH-REGEX",
+            RuleType::ProcessNameWildcard => "PROCESS-NAME-WILDCARD",
+            RuleType::ProcessPathWildcard => "PROCESS-PATH-WILDCARD",
             RuleType::Network => "NETWORK",
             RuleType::Uid => "UID",
             RuleType::Match => "MATCH",
@@ -71,6 +80,7 @@ impl RuleType {
             RuleType::InName => "IN-NAME",
             RuleType::InType => "IN-TYPE",
             RuleType::InUser => "IN-USER",
+            RuleType::RematchName => "REMATCH-NAME",
         }
     }
 
@@ -101,6 +111,10 @@ impl RuleType {
             RuleType::InType => "InType",
             RuleType::ProcessName => "ProcessName",
             RuleType::ProcessPath => "ProcessPath",
+            RuleType::ProcessNameRegex => "ProcessNameRegex",
+            RuleType::ProcessPathRegex => "ProcessPathRegex",
+            RuleType::ProcessNameWildcard => "ProcessNameWildcard",
+            RuleType::ProcessPathWildcard => "ProcessPathWildcard",
             RuleType::Match => "Match",
             RuleType::RuleSet => "RuleSet",
             RuleType::Network => "Network",
@@ -110,6 +124,7 @@ impl RuleType {
             RuleType::And => "AND",
             RuleType::Or => "OR",
             RuleType::Not => "NOT",
+            RuleType::RematchName => "RematchName",
         }
     }
 
@@ -139,6 +154,10 @@ impl RuleType {
             "InType" => RuleType::InType,
             "ProcessName" => RuleType::ProcessName,
             "ProcessPath" => RuleType::ProcessPath,
+            "ProcessNameRegex" => RuleType::ProcessNameRegex,
+            "ProcessPathRegex" => RuleType::ProcessPathRegex,
+            "ProcessNameWildcard" => RuleType::ProcessNameWildcard,
+            "ProcessPathWildcard" => RuleType::ProcessPathWildcard,
             "Match" => RuleType::Match,
             "RuleSet" => RuleType::RuleSet,
             "Network" => RuleType::Network,
@@ -148,6 +167,7 @@ impl RuleType {
             "AND" => RuleType::And,
             "OR" => RuleType::Or,
             "NOT" => RuleType::Not,
+            "RematchName" => RuleType::RematchName,
             _ => return None,
         })
     }
@@ -171,6 +191,10 @@ impl fmt::Display for RuleType {
             RuleType::Dscp => write!(f, "DSCP"),
             RuleType::ProcessName => write!(f, "PROCESS-NAME"),
             RuleType::ProcessPath => write!(f, "PROCESS-PATH"),
+            RuleType::ProcessNameRegex => write!(f, "PROCESS-NAME-REGEX"),
+            RuleType::ProcessPathRegex => write!(f, "PROCESS-PATH-REGEX"),
+            RuleType::ProcessNameWildcard => write!(f, "PROCESS-NAME-WILDCARD"),
+            RuleType::ProcessPathWildcard => write!(f, "PROCESS-PATH-WILDCARD"),
             RuleType::Network => write!(f, "NETWORK"),
             RuleType::Uid => write!(f, "UID"),
             RuleType::Match => write!(f, "MATCH"),
@@ -187,6 +211,7 @@ impl fmt::Display for RuleType {
             RuleType::InName => write!(f, "IN-NAME"),
             RuleType::InType => write!(f, "IN-TYPE"),
             RuleType::InUser => write!(f, "IN-USER"),
+            RuleType::RematchName => write!(f, "REMATCH-NAME"),
         }
     }
 }
@@ -208,13 +233,27 @@ pub struct RuleMatchHelper;
 pub enum TargetCheck {
     /// The adapter resolves and may carry this connection.
     Usable,
-    /// Absent from the registry, or present but incapable for this
-    /// connection class (e.g. no UDP support on a UDP flow) — the rule is
-    /// skipped with a warning, mihomo's `continue`.
+    /// Absent from the registry — the rule is skipped with a warning,
+    /// mihomo's `continue` (issue #513 continue-on-missing semantics).
     Missing,
+    /// Present in the registry but incapable for this connection class —
+    /// today only a `dialer-proxy` chain over a non-transparent inner
+    /// reports it, on a UDP flow. Unlike [`Missing`], the scan stops *on*
+    /// the match rather than sliding past it: a chain the operator pinned
+    /// cannot be silently replaced by a later rule's target, so the
+    /// connection fails at the dial (issue #969).
+    ///
+    /// [`Missing`]: TargetCheck::Missing
+    Unusable,
     /// The adapter unwraps to the `PASS` built-in — the rule is skipped
     /// silently (upstream `continue GetRules` on `C.Pass`).
     Pass,
+    /// The adapter unwraps to a `type: rematch` control outbound — the
+    /// match is terminal for this pass but commits a routing re-entry:
+    /// the leaf's `target-rematch-name`/`target-sub-rule` are applied to
+    /// the metadata and the rule scan restarts (issue #974, mihomo's
+    /// `C.Rematch` unwrap verdict).
+    Rematch,
 }
 
 /// Registry probe consulted by the match engines for every matched rule.
@@ -255,6 +294,48 @@ impl<F: Fn(&str) -> bool> TargetProbe for F {
         } else {
             TargetCheck::Missing
         }
+    }
+}
+
+/// Which metadata demands a staged rule evaluation may still ask the
+/// caller to materialize — the rule-side view of the tunnel's demand
+/// gate (issue #974 conditional `SUB-RULE`).
+///
+/// A [`MatchDemand::NONE`] context means "evaluate with what you have":
+/// a predicate that would need missing metadata simply reads as false.
+/// `ip`/`process` report whether the engine's enrichment loop can
+/// actually fulfill that demand — the tunnel folds the flow's one-shot
+/// lookup memo into the flag, so an already-attempted miss cannot be
+/// re-requested.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatchDemand {
+    /// The caller can resolve `metadata.host` into `dst_ip`.
+    pub ip: bool,
+    /// The caller can run the flow's one OS process lookup.
+    pub process: bool,
+}
+
+impl MatchDemand {
+    /// No enrichment available — every demand evaluates as unactionable.
+    pub const NONE: Self = Self {
+        ip: false,
+        process: false,
+    };
+
+    /// `dst_ip` is absent but resolvable: `host` is the name enrichment
+    /// resolves (`sniff_host` alone does not qualify).
+    pub fn needs_ip(&self, metadata: &Metadata) -> bool {
+        self.ip && metadata.dst_ip.is_none() && !metadata.host.is_empty()
+    }
+
+    /// Process info is absent but discoverable: the source socket tuple
+    /// a lookup needs exists. Process-granular, like the tunnel's gate —
+    /// a UID-only rule and a name rule share the same demand.
+    pub fn needs_process(&self, metadata: &Metadata) -> bool {
+        self.process
+            && metadata.process.is_empty()
+            && metadata.src_ip.is_some()
+            && metadata.src_port != 0
     }
 }
 

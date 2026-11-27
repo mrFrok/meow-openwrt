@@ -97,11 +97,29 @@ pub async fn handle_udp_associate(
     requested_ip: Option<IpAddr>,
     requested_port: u16,
     inbound: &Metadata,
+    routing_mark: Option<u32>,
 ) -> io::Result<()> {
     // Bind the relay on the same local IP the client reached us on, so the
     // address we hand back is reachable by the client.
     let local_ip = control.local_addr()?.ip();
     let relay = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
+    // `listeners[].routing-mark` — the relay binds per association, so the
+    // listen socket's mark cannot reach it; apply before the reply goes
+    // out so every relayed datagram carries it. Same failure contract as
+    // the listen-socket mark: an association that would silently evade
+    // the declared policy routing must not run.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(mark) = routing_mark {
+        use std::os::fd::AsRawFd;
+        meow_common::set_listener_socket_mark(relay.as_raw_fd(), mark).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"),
+            )
+        })?;
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    let _ = routing_mark;
     let bnd = relay.local_addr()?;
 
     write_associate_reply(&mut control, bnd).await?;
@@ -228,6 +246,13 @@ fn handle_client_datagram(
     }
     let host = Metadata::lower_host(&host);
     let payload = &datagram[data_off..];
+    // The destination the client claimed, captured before
+    // `pre_handle_metadata` can clear `dst_ip` on a fake-IP rewrite: a
+    // flow committed to a `type: dns` leaf echoes this address as the
+    // reply source, never a resolved replacement (issue #974).
+    let claimed = dst_ip
+        .or_else(|| metadata_ip_literal(&host))
+        .map(|ip| SocketAddr::new(ip.to_canonical(), dst_port));
 
     // Provisional session key — identical to the post-pipeline key for
     // every input that survives `pre_handle_metadata` unchanged: `dst_ip`
@@ -266,6 +291,10 @@ fn handle_client_datagram(
         in_name: inbound.in_name.clone(),
         in_port: inbound.in_port,
         in_user: inbound.in_user.clone(),
+        // The named listener's `proxy:`/`rule:` override — stamped onto
+        // the handshake's inbound tag by the caller, carried here so the
+        // association's flows route through it too.
+        special_route: inbound.special_route.clone(),
         ..Default::default()
     };
 
@@ -314,6 +343,7 @@ fn handle_client_datagram(
         key,
         client,
         metadata,
+        claimed,
         SmallVec::from_slice(payload),
     )
 }
@@ -385,6 +415,10 @@ fn deliver_to_existing(
 /// Insert a new session for `key` whose task performs resolution, routing,
 /// `dial_udp`, and the ordered client→upstream write loop off the read loop.
 /// `first` is the payload that triggered the session (already copied).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "moved state: session identity, the client endpoint and the claimed destination are all computed on the loop where the NAT table lives"
+)]
 fn start_session(
     inner: &Arc<TunnelInner>,
     relay: &Arc<UdpSocket>,
@@ -392,6 +426,7 @@ fn start_session(
     key: SessionKey,
     client: SocketAddr,
     metadata: Metadata,
+    claimed: Option<SocketAddr>,
     first: SmallVec<[u8; 1500]>,
 ) -> Result<(), String> {
     // Capacity bound: a unique-destination flood must not grow the table
@@ -410,6 +445,7 @@ fn start_session(
         Arc::clone(inner),
         Arc::clone(relay),
         metadata,
+        claimed,
         client,
         rx,
         Arc::clone(&last_activity_ms),
@@ -451,11 +487,18 @@ fn evict_for_admission(nat: &mut HashMap<SessionKey, Session>) {
 /// One destination's outbound session: resolve → route → `dial_udp`, then
 /// write queued client datagrams in order while a reply task pumps
 /// server→client traffic back. Exiting for any reason marks `dead` so the
-/// next datagram re-establishes (issue #514).
+/// next datagram re-establishes (issue #514). `claimed` is the pre-resolution
+/// socket form of the request — a `type: dns`-committed flow echoes it as
+/// the reply source verbatim (issue #974).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "session state: the tunnel, relay socket, metadata, claimed destination, client endpoint and the NAT bookkeeping are all moved in, not computed here"
+)]
 async fn run_session(
     inner: Arc<TunnelInner>,
     relay: Arc<UdpSocket>,
     mut metadata: Metadata,
+    claimed: Option<SocketAddr>,
     client: SocketAddr,
     mut rx: mpsc::Receiver<SmallVec<[u8; 1500]>>,
     last_activity_ms: Arc<AtomicU>,
@@ -481,32 +524,48 @@ async fn run_session(
         ) {
             return Err("unmapped fake-ip destination".into());
         }
-        // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
-        // needs a resolved dst_ip regardless of what the rules demand.
+        // UDP keeps the eager pre_resolve (no lazy enrichment): transports
+        // dial `dst_ip` regardless of what the rules demand.
         inner.pre_resolve(&mut metadata).await;
-        inner.resolve_udp_dst(&mut metadata).await;
-        let Some(dst_ip) = metadata.dst_ip else {
-            return Err(format!(
-                "dst_ip not resolved for {}",
-                metadata.remote_address()
-            ));
-        };
-        let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
+        let probed = inner.resolve_udp_dst(&mut metadata).await;
 
         // Client UDP follows the configured routing policy, including port 53.
         // `_route` pins this generation's dialer registry across `dial_udp`
-        // (issue #533 review).
+        // (issue #533 review). A `resolve_udp_dst` probe already produced
+        // the committed decision — use it so the direct-nameserver verdict
+        // and the route agree (issue #974).
+        let resolved = match probed {
+            Some(target) => Some(target),
+            None => inner.resolve_proxy_flow(&mut metadata).await,
+        };
         let Some(ResolvedTarget {
             adapter: proxy,
             rule_name,
             rule_payload,
             route: _route,
-        }) = inner.resolve_proxy(&metadata).await
+        }) = resolved
         else {
             return Err(format!(
                 "no matching rule for {}",
                 metadata.remote_address()
             ));
+        };
+        // A `type: dns` leaf never contacts the destination — its conn only
+        // echoes this addr back as the reply source, so mandatory
+        // pre-resolution must not gate it and the CLAIMED destination is
+        // what gets stamped (a fake-IP flow's recovered host must not
+        // rewrite replies to the resolved IP). Transports keep requiring
+        // `dst_ip` — they actually dial it (issue #974 review).
+        let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+            metadata.dns_udp_dst(claimed)
+        } else {
+            let Some(dst_ip) = metadata.dst_ip else {
+                return Err(format!(
+                    "dst_ip not resolved for {}",
+                    metadata.remote_address()
+                ));
+            };
+            SocketAddr::new(dst_ip, metadata.dst_port)
         };
         info!(
             "UDP {} --> {} match {} using {}",
@@ -1159,6 +1218,8 @@ mod tests {
                     None,
                     "socks",
                     addr.port(),
+                    None,
+                    None,
                 )
                 .await;
             });
@@ -1480,6 +1541,7 @@ mod tests {
                 key.clone(),
                 client,
                 Metadata::default(),
+                None,
                 SmallVec::from_slice(b"payload"),
             )
             .unwrap();

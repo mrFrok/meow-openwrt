@@ -33,6 +33,13 @@ impl UdpSession {
         }
     }
 
+    /// Queue one datagram for `addr` — the session form of
+    /// [`UdpSender::send`], for callers that do not need the separate half.
+    #[allow(dead_code, reason = "upstream driver_tests call this form")]
+    pub fn send(&self, data: &[u8], addr: impl Into<smol_str::SmolStr>) -> Result<()> {
+        self.sender().send(data, addr)
+    }
+
     /// The send half, usable while a reader awaits [`Self::recv`].
     pub fn sender(&self) -> UdpSender {
         UdpSender {
@@ -60,8 +67,8 @@ pub struct UdpSender {
 }
 
 impl UdpSender {
-    pub fn send(&self, data: &[u8], addr: smol_str::SmolStr) -> Result<()> {
-        send_udp(&self.cmd_tx, self.session_id, data, addr)
+    pub fn send(&self, data: &[u8], addr: impl Into<smol_str::SmolStr>) -> Result<()> {
+        send_udp(&self.cmd_tx, self.session_id, data, addr.into())
     }
 
     /// Unregister the session now: a pending `recv` then ends `Closed`.

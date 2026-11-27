@@ -27,8 +27,7 @@ aarch64)
 	SDK_TGT=mediatek/filogic; SDK_SHA=1c04ac47bdfc361d6aab299eb520d570e368013dedcb8d29cf39dc7168ae642e
 	SDK_FILE=openwrt-sdk-$SDK_REL-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
 	RT=aarch64-unknown-linux-musl; GCC=aarch64-openwrt-linux-musl
-	# No unwind tables for the C side either (panic=abort): -66 KB.
-	CFL="-Os -mcpu=cortex-a53 -mno-outline-atomics -fno-asynchronous-unwind-tables -fno-unwind-tables"; RFL="" ;;
+	CFL="-Os -mcpu=cortex-a53 -mno-outline-atomics"; RFL="" ;;
 armv7)
 	SDK_TGT=ipq40xx/generic; SDK_SHA=72b2a064190a46b8026e192e29b8ff357dc040850eb3309573124509acbb8a05
 	SDK_FILE=openwrt-sdk-$SDK_REL-ipq40xx-generic_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst
@@ -88,7 +87,10 @@ export PATH=$TC/bin:$PATH STAGING_DIR=$TCROOT RUSTC_BOOTSTRAP=1
 
 T=${RT//-/_}; TU=${T^^}
 export "CC_$T=$GCC-gcc" "CXX_$T=$GCC-g++" "AR_$T=$GCC-gcc-ar"
-export "CFLAGS_$T=$CFL" "CXXFLAGS_$T=$CFL"
+# panic=abort and no C++ exceptions (upstream #995): drops the C-side
+# .eh_frame/.gcc_except_table payload; CXX keeps -fno-exceptions.
+NOUNWIND="-fno-asynchronous-unwind-tables -fno-unwind-tables"
+export "CFLAGS_$T=$CFL $NOUNWIND" "CXXFLAGS_$T=$CFL $NOUNWIND -fno-exceptions"
 export "BINDGEN_EXTRA_CLANG_ARGS_$T=--sysroot=$TC"
 export "CARGO_TARGET_${TU}_LINKER=$GCC-gcc"
 export "BORING_BSSL_RUST_CPPLIB_$T=static=stdc++"
@@ -157,8 +159,8 @@ case $ARCH in mips|mipsel) FLAGS="$FLAGS -Crelocation-model=static -Clink-arg=-l
 PGO_FILE=openwrt-fork/pgo/$ARCH.profdata.xz
 if [ "${MEOW_PGO:-1}" = 1 ] && [ "$PROFILE" != tiny ] && [ -f "$PGO_FILE" ]; then
 	mkdir -p "$TGT"
-	xz -dc "$PGO_FILE" > "$TGT/pgo.profdata"
-	FLAGS="$FLAGS -Cprofile-use=$PWD/$TGT/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch"
+	xz -dc "$PGO_FILE" > "$(realpath "$TGT")/pgo.profdata"
+	FLAGS="$FLAGS -Cprofile-use=$(realpath "$TGT")/pgo.profdata -Cllvm-args=-no-pgo-warn-mismatch"
 	echo "PGO: $PGO_FILE"
 fi
 export RUSTFLAGS="$FLAGS"

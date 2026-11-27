@@ -10,6 +10,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+/// The per-`proxies:`-entry dialer fields mihomo supports on a leaf node
+/// (issue #974): `routing-mark`, `interface-name`, `ip-version`, `tfo`,
+/// `mptcp`. The config parser builds one per leaf and stores it on the
+/// node's `WrappedProxy`, which resolves it over
+/// [`crate::GlobalDialerOpts`] at dial time and installs the result as the
+/// task-local scope (`crate::dialer_opts_scope`) around the adapter call —
+/// so `connect_tcp`, `bind_udp_for_peer` and `resolve_addrs` see the
+/// node's own options wherever its dial leads, WireGuard's endpoint
+/// socket included. Proxy groups carry none: mihomo v1.19 removed
+/// group-level dialer fields, so a member's own opts govern its hop.
+///
+/// An unset field means "inherit the global": `routing-mark: 0` and a
+/// missing `interface-name` both normalize to `None` at parse, before
+/// this record is built.
+#[derive(Debug, Clone, Default)]
+pub struct NodeDialerOpts {
+    /// `SO_MARK` override (`0` already normalized to unset). Linux only;
+    /// skipped with a warning elsewhere.
+    pub routing_mark: Option<u32>,
+    /// Interface to bind this node's sockets to — resolved name→index at
+    /// dial time, no cache. Beats the global `interface-name` and the TUN
+    /// owner binding; loopback peers stay exempt.
+    pub interface_name: Option<Arc<str>>,
+    /// Address-family selection for this node's hostname resolution.
+    pub ip_version: crate::socket_protect::IpVersion,
+    /// `TCP_FASTOPEN_CONNECT` on this node's TCP sockets. Linux only.
+    pub tfo: bool,
+    /// Build this node's TCP sockets as MPTCP (`IPPROTO_MPTCP`). Linux only.
+    pub mptcp: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelayHistory {
     #[serde(with = "rfc3339_system_time")]
@@ -48,6 +79,20 @@ mod rfc3339_system_time {
 pub struct ProxyState {
     pub alive: bool,
     pub history: Vec<DelayHistory>,
+}
+
+/// The re-entry a `type: rematch` control outbound applies when a routing
+/// scan selects it (issue #974, mihomo's `RematchParams`): which fields it
+/// overwrites on the flow before the rule scan restarts. `None` leaves the
+/// field unchanged; `Some("")` is the explicit-empty form that *clears* it
+/// (mihomo serializes an empty `target-rematch-name` as a clear).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RematchAction<'a> {
+    /// `target-rematch-name` — stamps `Metadata.rematch_name`.
+    pub rematch_name: Option<&'a str>,
+    /// `target-sub-rule` — replaces the active rule list (`""` returns
+    /// the scan to the top-level rules).
+    pub sub_rule: Option<&'a str>,
 }
 
 /// Per-adapter liveness + rolling delay history. Owned by every concrete
@@ -234,6 +279,23 @@ pub trait ProxyAdapter: Send + Sync {
     /// writes must stay observable — each group's `alive()` reads this bit
     /// alongside its delegated member check (issue #681).
     fn health(&self) -> &ProxyHealth;
+    /// The uTLS `client-fingerprint` profile baked at parse (issue #974)
+    /// — node value or the `global-client-fingerprint` it inherited —
+    /// `None` for outbounds whose handshake is unshaped or not
+    /// uTLS-driven (H3 QUIC, restls/jls, hysteria2's pinned-hello QUIC).
+    /// Observational: parsers and wrappers forward the leaf's answer.
+    #[doc(hidden)]
+    fn client_fingerprint(&self) -> Option<&str> {
+        None
+    }
+    /// The re-entry this adapter applies when a routing scan selects it:
+    /// `Some` only for `type: rematch` control outbounds (issue #974);
+    /// every transport answers `None`. The tunnel's match probe reads it
+    /// off the *unwrapped* leaf so a group pick of a rematch member
+    /// reports the same action as a direct rule target.
+    fn rematch_action(&self) -> Option<RematchAction<'_>> {
+        None
+    }
 }
 
 /// The `hidden:` and `icon:` keys of a proxy-group. Only GUIs read them —
@@ -285,6 +347,37 @@ pub trait Proxy: ProxyAdapter {
     fn delay_history(&self) -> Vec<DelayHistory>;
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
+    }
+    /// `true` only for a `dialer-proxy` wrapper over a non-transparent
+    /// inner — the one UDP-incapable target a matched rule must stop on
+    /// (`TargetCheck::Unusable`, issue #969): the operator chained every
+    /// flow through the named node, so sliding to a later rule would
+    /// silently reroute what the config pinned. Every other UDP-incapable
+    /// adapter keeps mihomo's `continue` — an `udp: false` node is a
+    /// routing preference, not a chain the flow must die inside.
+    ///
+    /// Two registry shapes answer this: the relay-based
+    /// `DialerProxyAdapter` over a non-transparent inner (`true`), and the
+    /// config layer's `ChainedProxy` marker on a `dialer-proxy` leaf whose
+    /// chain was applied by *injection* (no `DialerProxyAdapter` exists
+    /// there to answer — it reports `!inner.support_udp()`, so an
+    /// injected leaf whose chain still carries UDP, e.g. anytls
+    /// `udp: true`, correctly answers `false`). `DialerProxyAdapter` is
+    /// always the outermost entry when it is used, so this default stays
+    /// unreachable for it; any future wrapper that can sit above one must
+    /// forward it (same contract as `dialer_hop`).
+    ///
+    /// Group adapters forward the verdict to the same member their UDP
+    /// flow would pick — the pick `support_udp` answers for: the
+    /// selector's selected member, the url-test/fallback pick, the
+    /// relay's UDP exit hop, or the load-balance live member set. A
+    /// chained pick pins the flow inside the declared chain just as a
+    /// chained leaf target does, so a group must not answer `false` for
+    /// one. The pick-at-check vs pick-at-dial race is the same one
+    /// `support_udp` already accepts, and a group with no pick answers
+    /// `false` — `Missing`, the slide, is the safe failure side.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        false
     }
     /// For group adapters: the ordered list of member proxy names.
     /// Leaf adapters return `None`.

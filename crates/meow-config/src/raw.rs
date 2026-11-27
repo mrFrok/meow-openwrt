@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A `header:` map value: mihomo's `map[string][]string` list form, or the
 /// single-string form meow-rs historically accepted. A list sends one field
@@ -31,6 +31,87 @@ pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(St
     // contractually).
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
+}
+
+/// `users:` on `type: anytls` — a YAML mapping of username → password
+/// decoded into ORDERED pairs. Collecting pairs instead of a map keeps
+/// duplicate YAML keys visible (a map silently collapses last-wins);
+/// non-string values hard-error on the spot. `null` is absent; anything
+/// that is not a mapping is a shape error.
+fn deser_user_map<'de, D>(deserializer: D) -> Result<Option<Vec<(String, String)>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, MapAccess, Visitor};
+    use std::fmt;
+
+    struct UserMap;
+    impl<'de> Visitor<'de> for UserMap {
+        type Value = Option<Vec<(String, String)>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a mapping of string usernames to string passwords")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            // Keys and values are read as `Value` first: YAML happily
+            // coerces `123: x` or `~: x` scalars; the spec's user table
+            // is string→string, so a non-string key or password is a
+            // hard error, never a coercion.
+            while let Some(key) = map.next_key::<serde_json::Value>()? {
+                let serde_json::Value::String(user) = key else {
+                    return Err(de::Error::custom("users: username must be a string"));
+                };
+                let value = map.next_value::<serde_json::Value>()?;
+                let serde_json::Value::String(password) = value else {
+                    return Err(de::Error::custom(format!(
+                        "users: password for '{user}' must be a string"
+                    )));
+                };
+                v.push((user, password));
+            }
+            Ok(Some(v))
+        }
+    }
+
+    deserializer.deserialize_option(UserMap)
+}
+
+/// Serialize `users` back as the YAML mapping it was read from —
+/// `Vec<(String, String)>`'s derived form is a *sequence* of pairs
+/// (and `Some([])` would emit `[]`), which `deser_user_map` refuses.
+/// Persisted configs (PUT /configs) must round-trip (F03).
+fn ser_user_map<S>(value: &Option<Vec<(String, String)>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        None => s.serialize_none(),
+        Some(pairs) => {
+            use serde::ser::SerializeMap;
+            let mut map = s.serialize_map(Some(pairs.len()))?;
+            for (user, password) in pairs {
+                map.serialize_entry(user, password)?;
+            }
+            map.end()
+        }
+    }
 }
 
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -71,6 +152,46 @@ where
     }
 
     deserializer.deserialize_any(StringOrSeq)
+}
+
+/// `lan-allowed-ips`/`lan-disallowed-ips`: a list of CIDR strings, and
+/// nothing else. Absence (`#[serde(default)]` → `None`) is the
+/// allow-all/empty-deny default; explicit `null` or a non-list value is
+/// a hard parse error — silently mapping a malformed allow policy to
+/// the allow-all default would widen the ACL beyond what the operator
+/// wrote, while `Some([])` must stay distinguishable ("admit nobody").
+fn deserialize_lan_acl<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct LanAclList;
+
+    impl<'de> Visitor<'de> for LanAclList {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of CIDR strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "lan-*-ips must be a list of CIDRs, not null; remove the key or supply []",
+            ))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            self.visit_none()
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            Vec::<String>::deserialize(d).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(LanAclList)
 }
 
 /// `expected-status` accepts either a bare integer (`204`) or a string
@@ -117,11 +238,502 @@ where
     deserializer.deserialize_any(StatusOrInt)
 }
 
+/// Element of a `#[serde(flatten)] extra` map: a `serde_json::Value`
+/// whose nested map keys need not be strings.
+///
+/// serde's flatten capture buffers an unknown key's subtree through
+/// `deserialize_any`, so a nested mapping's keys arrive *typed* —
+/// `x: {123: a}` hands the inner map a `u64` key where `Value`'s own
+/// visitor demands a string and used to fail the whole config load (the
+/// subtree previously dropped via `IgnoredAny`, so it loaded). Scalar
+/// keys stringify instead (`123` → `"123"`, `true` → `"true"`); null and
+/// container keys keep erroring, as a `String`-keyed map did.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct UnknownYamlValue(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for UnknownYamlValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UnknownValueVisitor).map(Self)
+    }
+}
+
+struct UnknownValueVisitor;
+
+// Scalar visits mirror `serde_json::Value`'s own visitor so a captured
+// subtree keeps identical values — ints narrow through `Number`, a
+// non-finite float becomes `Null`.
+impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid YAML value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        serde_json::Number::deserialize(serde::de::value::I128Deserializer::new(v))
+            .map(serde_json::Value::Number)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        serde_json::Number::deserialize(serde::de::value::U128Deserializer::new(v))
+            .map(serde_json::Value::Number)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(serde_json::Number::from_f64(v)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        UnknownYamlValue::deserialize(d).map(|w| w.0)
+    }
+
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> Result<Self::Value, D::Error> {
+        UnknownYamlValue::deserialize(d).map(|w| w.0)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(v) = seq.next_element::<UnknownYamlValue>()? {
+            items.push(v.0);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(k) = map.next_key::<ScalarKey>()? {
+            out.insert(k.0, map.next_value::<UnknownYamlValue>()?.0);
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+}
+
+/// A nested map key inside an unknown-key subtree — see
+/// [`UnknownYamlValue`]. Only the *nested* keys need this: the `extra`
+/// map's own keys are struct-adjacent names that arrive through
+/// `deserialize_identifier`, which yields source-spelling strings.
+struct ScalarKey(String);
+
+impl<'de> Deserialize<'de> for ScalarKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ScalarKeyVisitor).map(Self)
+    }
+}
+
+struct ScalarKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ScalarKeyVisitor {
+    type Value = String;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a scalar mapping key")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(v.to_owned())
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(v)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_char<E: serde::de::Error>(self, v: char) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(E::custom("null mapping key"))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(E::custom("null mapping key"))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+        Err(<A::Error as serde::de::Error>::custom(
+            "non-scalar mapping key",
+        ))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(<A::Error as serde::de::Error>::custom(
+            "non-scalar mapping key",
+        ))
+    }
+}
+
+/// Weak YAML→string coercion, matching mihomo's Go decoder (issue #974):
+/// a scalar — string verbatim, number rendered, boolean `"true"`/`"false"`
+/// — coerces into a string field (`external-controller-tls: 5` parses as
+/// `"5"`); a sequence or mapping is a hard decode error. `null`/absent
+/// stays `None`.
+fn deserialize_weak_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct WeakString;
+
+    impl<'de> Visitor<'de> for WeakString {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a scalar (string, number or boolean)")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_char<E: de::Error>(self, v: char) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal sequence into string",
+            ))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into string",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(WeakString)
+}
+
+/// One `allow-origins` element under mihomo's weak decoder — scalar items
+/// coerce to their string form, containers error (issue #974).
+struct WeakOrigin(String);
+
+impl<'de> Deserialize<'de> for WeakOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_weak_string(deserializer).map(|opt| WeakOrigin(opt.unwrap_or_default()))
+    }
+}
+
+/// `external-controller-cors.allow-origins`: a sequence of (weak) strings
+/// or `null` — a bare scalar is a hard error upstream (`cannot unmarshal
+/// !!str into []string`), so it is one here too (issue #974).
+fn deserialize_allow_origins<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct Origins;
+
+    impl<'de> Visitor<'de> for Origins {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a sequence of origin strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(WeakOrigin(s)) = seq.next_element::<WeakOrigin>()? {
+                v.push(s);
+            }
+            Ok(Some(v))
+        }
+
+        fn visit_bool<E: de::Error>(self, _v: bool) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal bool into []string"))
+        }
+
+        fn visit_i64<E: de::Error>(self, _v: i64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal int into []string"))
+        }
+
+        fn visit_u64<E: de::Error>(self, _v: u64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal int into []string"))
+        }
+
+        fn visit_f64<E: de::Error>(self, _v: f64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal float into []string"))
+        }
+
+        fn visit_str<E: de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal string into []string"))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into []string",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(Origins)
+}
+
+/// `external-controller-cors.allow-private-network` under mihomo's
+/// decoder (issue #974): `true`/`false` plus the legacy YAML bool
+/// spellings (`yes`/`no`/`on`/`off`/`y`/`n`, any case) are accepted;
+/// numbers and the quoted strings `"true"`/`"false"` are rejected, and
+/// `null` retains the default.
+fn deserialize_legacy_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct LegacyBool;
+
+    impl<'de> Visitor<'de> for LegacyBool {
+        type Value = Option<bool>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a boolean")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            match v.to_ascii_lowercase().as_str() {
+                "y" | "yes" | "on" => Ok(Some(true)),
+                "n" | "no" | "off" => Ok(Some(false)),
+                _ => Err(E::custom(format!(
+                    "cannot unmarshal string '{v}' into bool"
+                ))),
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal int '{v}' into bool")))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal int '{v}' into bool")))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal float '{v}' into bool")))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal sequence into bool",
+            ))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into bool",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(LegacyBool)
+}
+
+/// The `external-controller-cors:` section (issue #974) — mihomo's
+/// `RawCors`. A partial map overrides only the supplied keys;
+/// [`crate::ApiCorsConfig`] resolves the rest (`allow-origins: ["*"]`,
+/// `allow-private-network: true`). Under a configured secret, absent and
+/// present maps resolve identically — upstream's permissive `AllowAll`
+/// middleware fires only on an explicit `secret: ""` — but the `Option`
+/// stays so a saved config preserves whether the map was written.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawCors {
+    /// `allow-origins` — sequence of origins/`globs`; `null` or absent
+    /// resolves `["*"]`, and an explicit `[]` allow-lists every origin
+    /// (weird-but-real, probe-verified). Scalar items weak-decode.
+    #[serde(default, deserialize_with = "deserialize_allow_origins")]
+    pub allow_origins: Option<Vec<String>>,
+    /// `allow-private-network` — gate the `Access-Control-Allow-
+    /// Private-Network` preflight response header; default `true`.
+    #[serde(default, deserialize_with = "deserialize_legacy_bool")]
+    pub allow_private_network: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The top-level `tls:` section (issue #974) — mihomo's `RawTLS`.
+/// `certificate`/`private-key` serve the `external-controller-tls`
+/// listener (they never start a listener by themselves); the remaining
+/// upstream members are parsed and warn-ignored this batch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawTls {
+    /// `certificate` — inline PEM or a path (resolved under the meow
+    /// home, subject to the home/`SAFE_PATHS` check), paired with
+    /// `private-key`. Scalar coercion like the listener keys.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub certificate: Option<String>,
+    /// `private-key` — same contract as `certificate`.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub private_key: Option<String>,
+    /// `client-auth-type` — upstream mTLS client-auth mode. Parsed for
+    /// compatibility, warn-ignored this batch.
+    pub client_auth_type: Option<serde_json::Value>,
+    /// `client-auth-certificates` — upstream client CA pool. Parsed for
+    /// compatibility, warn-ignored this batch.
+    pub client_auth_certificates: Option<serde_json::Value>,
+    /// `ech-key` — upstream ECH key material. Parsed for compatibility,
+    /// warn-ignored this batch.
+    pub ech_key: Option<serde_json::Value>,
+    /// `custom-certifactes` — upstream's misspelled key (sic), parsed
+    /// for compatibility and warn-ignored this batch.
+    pub custom_certifactes: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
 /// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
 ///
-/// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
-/// upstream Go mihomo but are not meaningful here. They are accepted and
-/// produce a `warn!` (Class B per ADR-0002, forward-compat).
+/// Fields `geodata-mode`, `geodata-loader`, `geosite-matcher`, and
+/// `geoip-matcher` exist in upstream Go mihomo but are not meaningful
+/// here. They are accepted and produce a `warn!` (Class B per ADR-0002,
+/// forward-compat); the flat top-level spellings alias onto the same
+/// machinery (`parse_geodata` resolves explicit nested > flat > default).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawGeoDataConfig {
@@ -132,8 +744,9 @@ pub struct RawGeoDataConfig {
     /// Explicit path to geosite `.mrs` file. Skips discovery chain when set.
     pub geosite_path: Option<String>,
     /// If true, spawn a background task that periodically re-downloads DBs.
-    #[serde(default)]
-    pub auto_update: bool,
+    /// `Option` so an absent key differs from an explicit `false` — only
+    /// the explicit value shadows the `geo-auto-update` flat alias.
+    pub auto_update: Option<bool>,
     /// Hours between update checks. Minimum 1 (sub-hour polling hammers CDN
     /// rate limits). Hard parse error on 0.
     pub auto_update_interval: Option<u32>,
@@ -149,6 +762,12 @@ pub struct RawGeoDataConfig {
     pub geodata_mode: Option<serde_json::Value>,
     pub geodata_loader: Option<serde_json::Value>,
     pub geoip_matcher: Option<serde_json::Value>,
+    /// `geodata.geosite-matcher` — mihomo's nested spelling of the matcher
+    /// selector; opaque like the others, warn-and-ignore.
+    pub geosite_matcher: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `geodata.url.*` — download URL overrides.
@@ -158,6 +777,9 @@ pub struct RawGeoDataUrls {
     pub mmdb: Option<String>,
     pub asn: Option<String>,
     pub geosite: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Top-level `geox-url:` block (mihomo's flat alias for `geodata.url.*`).
@@ -177,6 +799,9 @@ pub struct RawGeoXUrl {
     pub asn: Option<String>,
     pub geosite: Option<String>,
     pub geoip: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -191,6 +816,31 @@ pub struct RawConfig {
     pub log_level: Option<String>,
     pub ipv6: Option<bool>,
     pub external_controller: Option<String>,
+    /// `external-controller-tls` — a separate HTTPS controller listener
+    /// (issue #974). Kept as a string until endpoint bind so `-t`
+    /// validates shape only; `""`/unset disables it. Weak scalar coercion
+    /// matches mihomo's decoder (`5` → `"5"`).
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_tls: Option<String>,
+    /// `external-controller-unix` — HTTP over a Unix-domain socket,
+    /// resolved relative to the daemon home at bind time (issue #974).
+    /// `""`/unset disables it. Same weak coercion.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_unix: Option<String>,
+    /// `external-controller-pipe` — Windows named-pipe controller
+    /// (issue #974); parsed on every platform but served only on Windows.
+    /// `""`/unset disables it. Same weak coercion.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_pipe: Option<String>,
+    /// `external-controller-cors:` — the controller's CORS policy
+    /// (issue #974). The `Option` preserves whether the map was written
+    /// for round-tripping; for serving, absent and present resolve
+    /// identically under a configured secret.
+    pub external_controller_cors: Option<RawCors>,
+    /// `tls:` — mihomo's top-level TLS section (issue #974); this batch
+    /// uses only `certificate`/`private-key` for the
+    /// `external-controller-tls` listener.
+    pub tls: Option<RawTls>,
     /// Path to a directory of static files for a third-party web dashboard
     /// (e.g. metacubexd, yacd). When set, it is served at `/ui` instead of the
     /// built-in panel (issue #223, mihomo-compatible).
@@ -237,9 +887,25 @@ pub struct RawConfig {
     pub redir_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
+    /// mihomo's top-level `interface-name` (issue #974): every outbound
+    /// socket binds to this interface unless a `proxies:` node's own
+    /// `interface-name` overrides it or the peer is loopback. Resolved
+    /// name→index per dial; `None`/empty = unset.
+    pub interface_name: Option<String>,
     /// mihomo `unified-delay`: delay probes report the second
     /// request on a warm connection, without the dial/handshake cost.
     pub unified_delay: Option<bool>,
+    /// mihomo's top-level `global-client-fingerprint` (issue #974):
+    /// default uTLS ClientHello profile (`chrome`, `firefox`, `safari`,
+    /// `ios`, `android`, `edge`, `random`) for `proxies:` and
+    /// `proxy-providers:` nodes that omit their own `client-fingerprint`.
+    /// Node-level values win; `"none"`/`""` means unset.
+    pub global_client_fingerprint: Option<String>,
+    /// mihomo's top-level `global-ua` (issue #974): overrides the default
+    /// `User-Agent` (`clash.meta/<version>`) on internal HTTP fetches
+    /// (providers, subscriptions, geodata, external-ui) and latency
+    /// probes. `None`/`""` keeps the built-in default.
+    pub global_ua: Option<String>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
     /// `TcpStream::connect`. Unset = unbounded (legacy behaviour, subject
     /// only to the OS connect timeout). Motivated by iOS/macOS
@@ -249,6 +915,22 @@ pub struct RawConfig {
     /// Explicit `type: direct` proxy blocks are NOT covered by this
     /// global; they accept their own per-proxy `connect-timeout` field.
     pub tcp_connect_timeout: Option<u64>,
+    /// mihomo's `tcp-concurrent` — the live dial-candidate policy.
+    /// `true` (or unset, the meow-rs default — upstream defaults `false`)
+    /// keeps the candidate race; explicit `false` dials the filtered,
+    /// ordered list strictly sequentially. Applied through the
+    /// `meow_common::dial` process-global at startup/PATCH/PUT-commit,
+    /// never per-node (`NodeDialerOpts` stays untouched) and never UDP.
+    pub tcp_concurrent: Option<bool>,
+    /// mihomo's `find-process-mode` — when the tunnel may walk the OS
+    /// socket table to name a flow's owning process: `always` looks up
+    /// every eligible new inbound flow before mode dispatch, `strict`
+    /// (the default) only at the first reached rule predicate that needs
+    /// it, `off` never (issue #974). Applied to the tunnel's live
+    /// `meow_common::ProcessLookupPolicy`, which the traffic ledger's app
+    /// lookup shares. Invalid spellings fail at the raw boundary even in
+    /// lenient mode, matching upstream's parse.
+    pub find_process_mode: Option<meow_common::ProcessLookupMode>,
     /// `connection-notes: true` records a timestamped account of how each
     /// TCP connection was handled (fake-IP reversal, DNS lookups, matched
     /// rule, dial, close), served by `GET /connections/{id}`. A meow
@@ -273,11 +955,48 @@ pub struct RawConfig {
     pub listeners: Option<Vec<RawListener>>,
     pub authentication: Option<Vec<String>>,
     pub skip_auth_prefixes: Option<Vec<String>>,
+    /// mihomo's top-level `lan-allowed-ips`: CIDRs the mixed/HTTP/SOCKS
+    /// TCP accept loops admit remote addresses from. `None` = omitted →
+    /// the allow-all default; `Some([])` admits nobody. Explicit `null`
+    /// or a non-list value is a parse error — see `deserialize_lan_acl`.
+    /// `skip_serializing_if` keeps a PUT-saved document free of
+    /// `lan-allowed-ips: null`, which would not re-parse.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_allowed_ips: Option<Vec<String>>,
+    /// mihomo's top-level `lan-disallowed-ips`: deny CIDRs checked before
+    /// the allow list. Same presence/null contract as `lan_allowed_ips`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_disallowed_ips: Option<Vec<String>>,
     pub geodata: Option<RawGeoDataConfig>,
     /// Top-level `geox-url:` — mihomo's flat download-URL alias. Merged
     /// into [`GeoDataConfig`](crate::GeoDataConfig) by
     /// `geodata::parse_geodata` below `geodata.url.*`.
     pub geox_url: Option<RawGeoXUrl>,
+    /// mihomo's flat `geo-auto-update` — alias for
+    /// `geodata.auto-update`; the explicit nested key wins when both are
+    /// set.
+    pub geo_auto_update: Option<bool>,
+    /// mihomo's flat `geo-update-interval` (hours) — alias for
+    /// `geodata.auto-update-interval`.
+    pub geo_update_interval: Option<u32>,
+    /// mihomo's flat `geodata-mode` — `true` selects the `geoip.dat`
+    /// backend upstream, which meow-rs has no consumer for; accepted and
+    /// warned on, matching the nested selector's contract.
+    pub geodata_mode: Option<bool>,
+    /// mihomo's flat `geodata-loader` — DAT loader selection, unsupported
+    /// here; accepted and warned on.
+    pub geodata_loader: Option<String>,
+    /// mihomo's flat `geosite-matcher` — matcher algorithm selection,
+    /// unsupported here; accepted and warned on.
+    pub geosite_matcher: Option<String>,
     /// TUN inbound (issue #326) — mihomo-compatible `tun:` section.
     /// Requires a build with the `listener-tun` feature.
     pub tun: Option<RawTun>,
@@ -336,13 +1055,80 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
-    /// Upstream mihomo's `keep-alive-*` keys tune BOTH inbound listeners
-    /// and outbound dials — captured only to warn on the plausible
-    /// migration mistake (`tcp-keepalive*` above covers the inbound
-    /// side; the outbound-dialer tuning is not honored).
-    pub keep_alive_idle: Option<serde_json::Value>,
-    pub keep_alive_interval: Option<serde_json::Value>,
-    pub disable_keep_alive: Option<serde_json::Value>,
+    /// `keep-alive-idle` — seconds of outbound-socket silence before the
+    /// first keepalive probe (`TCP_KEEPIDLE` / `TCP_KEEPALIVE` /
+    /// `SIO_KEEPALIVE_VALS.keepalivetime`). Upstream mihomo applies the
+    /// `keep-alive-*` keys to BOTH inbound listeners and outbound dials;
+    /// here they cover the outbound side only (`tcp-keepalive*` above
+    /// covers inbound). Omitted or `0` resolves to
+    /// [`meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS`]; max
+    /// [`meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS`] (Linux's
+    /// `TCP_KEEPIDLE` ceiling — larger would EINVAL at setsockopt).
+    pub keep_alive_idle: Option<u64>,
+    /// `keep-alive-interval` — seconds between outbound keepalive probes
+    /// (`TCP_KEEPINTVL`); same 0→default resolution and 32767 ceiling as
+    /// `keep-alive-idle`.
+    pub keep_alive_interval: Option<u64>,
+    /// `disable-keep-alive` — `true` clears `SO_KEEPALIVE` on outbound
+    /// dials instead of applying the timing knobs above.
+    pub disable_keep_alive: Option<bool>,
+    /// `profile:` — mihomo's selection/fake-IP persistence switches
+    /// ([`RawProfile`]).
+    pub profile: Option<RawProfile>,
+    /// `ntp:` — mihomo's protocol-clock sync service ([`RawNtp`]).
+    pub ntp: Option<RawNtp>,
+    /// Keys no field above models land here — `validation::validate_and_warn`
+    /// warns on them by name (forward-compat, ADR-0002) instead of serde
+    /// dropping them silently (issue #974). `BTreeMap` so the save path
+    /// writes them back in sorted order.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `profile:` section — mihomo's two persistence switches (issue
+/// #974). Both are optional so an explicit value always wins over the
+/// fallback chain [`crate::resolve_profile`] applies; unmodeled children
+/// (`selected`, `tracing`, …) land in `extra` and get a scoped
+/// warn-and-ignore like every other section.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawProfile {
+    /// `store-selected` — persist `select`/url-test/fallback pins to the
+    /// config's selector cache and restore them into newly built groups.
+    /// Absent resolves `true` (upstream's default); `false` builds groups
+    /// with no persistence handle at all — in-memory selection still
+    /// works, nothing reads or writes the file.
+    pub store_selected: Option<bool>,
+    /// `store-fake-ip` — persist fake-IP forward/reverse mappings to a
+    /// JSON file. Resolution is `profile` > `dns.store-fake-ip` > `false`.
+    pub store_fake_ip: Option<bool>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `ntp:` section — mihomo's SNTP clock-sync service (issue #974).
+/// Ranges are validated at [`crate::resolve_ntp`] even when `enable` is
+/// false; unmodeled children land in `extra` for the scoped warning.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawNtp {
+    /// `enable` — run the supervisor. Absent resolves `false`.
+    pub enable: Option<bool>,
+    /// `server` — host or IP literal (bracketed IPv6 accepted) to poll;
+    /// absent resolves `time.apple.com` like upstream.
+    pub server: Option<String>,
+    /// `port` — `1..=65535`, default `123`.
+    pub port: Option<u16>,
+    /// `interval` — poll period in minutes, `1..=525600`, default `30`.
+    pub interval: Option<u64>,
+    /// `dialer-proxy` — a top-level proxy/group name to carry the poll;
+    /// absent or empty dials direct.
+    pub dialer_proxy: Option<String>,
+    /// `write-to-system` — parsed for compatibility and always ignored
+    /// (with a warning when true): meow never invokes a clock syscall.
+    pub write_to_system: Option<bool>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 impl RawConfig {
@@ -468,6 +1254,9 @@ pub struct RawTun {
     pub block_encrypted_dns_address: Option<Vec<String>>,
     pub include_uid: Option<serde_json::Value>,
     pub exclude_uid: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
@@ -480,16 +1269,12 @@ pub enum RawAutoRoute {
 }
 
 /// One entry in the `listeners:` array.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawListener {
     pub name: String,
     #[serde(rename = "type")]
     pub listener_type: String,
-    /// mihomo `proxy:` — every connection this listener accepts skips the
-    /// rules and goes straight to this proxy or group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
     /// Optional when `listen` is a `host:port` socket address. `0` (or omitted
     /// with no port in `listen`) means the OS assigns an ephemeral port at bind.
     #[serde(default)]
@@ -501,25 +1286,134 @@ pub struct RawListener {
     /// an external system — no nft/pfctl invocation, no bypass-IP
     /// collection, no cleanup on exit (issue #563).
     pub firewall: Option<bool>,
-    /// `tproxy` listeners only: UDP flow idle timeout in seconds
-    /// (default 60, issue #564). `0` is a config error. The companion `udp`
+    /// `tproxy`/`wireguard`/`tun` listeners: UDP flow idle timeout in
+    /// seconds (default 60 on tproxy/wireguard, 300 on `type: tun`,
+    /// issue #564). `0` is a config error on tproxy/wireguard but means
+    /// "default" on the named-TUN path. The companion `udp`
     /// key itself lives in the shadowsocks field block below — one raw key,
     /// two consumers: for tproxy `udp` defaults to `false` and requires
-    /// `firewall: false` (meow does not manage UDP gateway rules).
+    /// `firewall: false` (meow does not manage UDP gateway rules); for
+    /// wireguard `udp` defaults to `true` and gates the inner-UDP path.
     pub udp_timeout: Option<u64>,
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
 
+    // ── named-routing overrides (upstream `BaseOption` Additions) ──
+    /// `proxy:` — force every flow through this proxy/group name,
+    /// bypassing mode dispatch and rule matching entirely. Resolved per
+    /// flow against the live route table (a group keeps its current
+    /// membership); a missing target fails closed.
+    pub proxy: Option<String>,
+    /// `rule:` — the name of a `sub-rules:` block scanned *instead of*
+    /// the top-level rule list for this listener's flows (upstream
+    /// `SpecialRules`). NOT a rule-provider and not an `IN-NAME` rule —
+    /// the block is selected by name.
+    pub rule: Option<String>,
+    /// `routing-mark:` — `SO_MARK` stamped on this listener's socket at
+    /// bind (ingress; Linux only — warned about and ignored elsewhere).
+    /// Distinct from the top-level `routing-mark`, which marks outbound
+    /// dials and feeds the tproxy firewall exemption.
+    pub routing_mark: Option<u32>,
+
     // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
     pub cipher: Option<String>,
     pub password: Option<String>,
+    /// `shadowsocks`/`tproxy`/`wireguard` consumers — see `udp_timeout`.
     #[serde(default)]
     pub udp: Option<bool>,
     pub simple_obfs: Option<RawSimpleObfs>,
     /// `tproxy`: take TCP by real TPROXY (`IP_TRANSPARENT`; mihomo's
     /// `type: tproxy`) instead of REDIRECT. Requires `firewall: false`.
     pub transparent: Option<bool>,
+
+    // ── wireguard-listener fields (only meaningful when `type: wireguard`) ──
+    /// Listener static private key, base64 decoding to exactly 32 bytes
+    /// (required for `type: wireguard`).
+    pub private_key: Option<String>,
+    /// `wireguard`: outer (wire) MTU, default 1420, range `640..=9000`.
+    /// `type: tun` shares the field: device MTU, named default 9000,
+    /// `0` meaning "default".
+    pub mtu: Option<u16>,
+    /// Static peer table; required and non-empty for `type: wireguard`.
+    pub peers: Option<Vec<RawWgPeer>>,
+
+    // ── named-TUN fields (only meaningful when `type: tun`) ──
+    // Upstream decodes these FLAT on the listener entry (`TunOption`
+    // embedding `BaseOption`) — there is no nested `tun:` map and no
+    // `enable` (the entry's presence is its enabled state). `mtu`,
+    // `udp-timeout` and `max-connections` above are shared with the
+    // wireguard/tproxy consumers; everything TUN-only lives here.
+    /// Device name; absent = platform-chosen (like `tun.device`).
+    pub device: Option<String>,
+    /// Stack selector — free-form like `RawTun::stack`: `system`/`mixed`
+    /// pick the kernel TCP path, `lwip` (meow extension) and the upstream
+    /// `mips`/`gvisor` spellings stay on lwIP (the latter two warn);
+    /// any other value is a hard error on the named path.
+    pub stack: Option<serde_json::Value>,
+    /// DNS-hijack targets; `[]` turns hijacking off, a `:53` target
+    /// (`any:53`, `0.0.0.0:53`) keeps it on, other entries warn+ignore.
+    pub dns_hijack: Option<Vec<String>>,
+    /// `auto-route` — the named default is OFF, unlike the top-level
+    /// `tun:` section; same bool-or-mode-string shape as `RawAutoRoute`.
+    pub auto_route: Option<RawAutoRoute>,
+    /// Physical-interface binding under `auto-route: global`
+    /// (loop avoidance); ignored elsewhere.
+    pub outbound_interface: Option<String>,
+    /// Device IPv4/IPv6 addresses — a string or mihomo's list form
+    /// (first entry used); the IPv4 default derives from
+    /// `dns.fake-ip-range` like the top-level section.
+    pub inet4_address: Option<serde_json::Value>,
+    pub inet6_address: Option<serde_json::Value>,
+    // Recognized-but-unsupported named-TUN keys — modeled so their
+    // presence produces a specific warn (ADR-0002) instead of landing in
+    // `extra` as unknown.
+    pub dns_mode: Option<serde_json::Value>,
+    pub strict_route: Option<serde_json::Value>,
+    pub auto_detect_interface: Option<serde_json::Value>,
+    pub auto_redirect: Option<serde_json::Value>,
+    pub endpoint_independent_nat: Option<serde_json::Value>,
+    pub mtu_v6: Option<serde_json::Value>,
+    pub route_address: Option<serde_json::Value>,
+    pub route_exclude_address: Option<serde_json::Value>,
+    pub include_uid: Option<serde_json::Value>,
+    pub exclude_uid: Option<serde_json::Value>,
+    pub gso: Option<serde_json::Value>,
+    pub file_descriptor: Option<serde_json::Value>,
+
+    // ── anytls-listener fields (only meaningful when `type: anytls`) ──
+    /// `users:` — username → password map, decoded as ordered pairs so
+    /// duplicate YAML keys stay detectable instead of collapsing into a
+    /// map's last-wins. `None`/empty/`{}` all mean "authenticate
+    /// nothing" per the spec (warn once, still serve). Serialized back
+    /// as a mapping so persisted configs round-trip.
+    #[serde(
+        default,
+        deserialize_with = "deser_user_map",
+        serialize_with = "ser_user_map"
+    )]
+    pub users: Option<Vec<(String, String)>>,
+    /// `certificate` / `private-key` — each is an inline PEM block or a
+    /// filesystem path; mixing the two forms is a build error.
+    /// `private_key` above is shared with `type: wireguard`.
+    pub certificate: Option<String>,
+    /// `client-auth-type`/`client-auth-cert` — mTLS is NOT implemented;
+    /// a non-empty value hard-errors (never silently ignored).
+    pub client_auth_type: Option<String>,
+    pub client_auth_cert: Option<String>,
+    /// `ech-key` — ECH is NOT implemented for the inbound; a non-empty
+    /// value hard-errors.
+    pub ech_key: Option<String>,
+    /// `allow-insecure` — explicit plaintext opt-in, only legal when no
+    /// TLS material exists; warns loudly when it takes effect.
+    pub allow_insecure: Option<bool>,
+    /// `padding-scheme` — validated at build by the shared
+    /// `meow_common::anytls_padding` contract; carried as raw bytes.
+    pub padding_scheme: Option<String>,
+    /// `enable` — upstream accepts it but an entry's presence already is
+    /// its enabled state: `true` warns redundant, `false` hard-errors
+    /// (remove the entry instead).
+    pub enable: Option<bool>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about
@@ -530,15 +1424,53 @@ pub struct RawListener {
     pub jls_config: Option<serde_json::Value>,
     pub kcp_tun: Option<serde_json::Value>,
     pub mux_option: Option<serde_json::Value>,
+
+    /// Keys no listener type's schema models land here — let the typed
+    /// consumer warn-and-ignore them by name (forward-compat, ADR-0002)
+    /// instead of serde dropping them silently.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// One `peers:` element of a `type: wireguard` listener (kebab-case).
+///
+/// The raw layer only shapes the fields; every presence/format check
+/// (required `public-key`/`allowed-ips`, base64 → 32-byte keys, CIDR
+/// entries, 3-byte `reserved`) happens in `build_wg_listener_spec` — the
+/// same "raw loose, typed strict" split the rest of `raw.rs` follows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawWgPeer {
+    /// Peer static public key, base64 → exactly 32 bytes (required).
+    pub public_key: Option<String>,
+    /// Optional pre-shared symmetric key, base64 → exactly 32 bytes.
+    pub preshared_key: Option<String>,
+    /// Inbound inner-source-IP ACL for this peer (required, non-empty) —
+    /// a list of CIDR strings.
+    pub allowed_ips: Option<Vec<String>>,
+    /// Log/diagnostic label only; defaults to `peer-<index>` when absent.
+    pub name: Option<String>,
+    /// Cloudflare WARP-style 3-byte `reserved` field: a list of three
+    /// bytes or a base64 string decoding to exactly 3 bytes (same shapes
+    /// as the outbound `reserved`, mirrored server-side).
+    pub reserved: Option<serde_json::Value>,
+    /// Unmodelled keys land here so the typed builder can warn-and-ignore
+    /// them by name (ADR-0002) — e.g. a `pre-shared-key` typo otherwise
+    /// drops the peer's PSK silently.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawSimpleObfs {
     #[serde(default)]
     pub enable: bool,
     pub mode: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `dns.nftset`: `family#table#set` per address family and
@@ -549,6 +1481,9 @@ pub struct RawNftset {
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub timeout: Option<u64>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 impl RawNftset {
@@ -637,6 +1572,9 @@ pub struct RawDns {
     /// that asks for HTTP/3 is a hard load error rather than a silent
     /// downgrade (ADR-0002 Class A).
     pub prefer_h3: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.
@@ -709,6 +1647,9 @@ pub struct RawFallbackFilter {
     pub geoip_code: Option<String>,
     pub ipcidr: Option<Vec<String>>,
     pub domain: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -753,6 +1694,10 @@ pub struct RawProxyGroup {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Keys no field above models land here — `validation` warns on them
+    /// (e.g. `test-timeout`, which mihomo spells `timeout`; issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -800,6 +1745,9 @@ pub struct RawProxyProvider {
     /// (issue #489); other keys warn at load time.
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<HashMap<String, serde_json::Value>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -816,6 +1764,9 @@ pub struct RawHealthCheck {
     )]
     pub expected_status: Option<String>,
     pub lazy: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// A single entry in the top-level `rule-providers:` map.
@@ -845,10 +1796,13 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `traffic-ledger:` section.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawTrafficLedger {
     /// Record traffic under `<home>/traffic/`. Default true.
@@ -859,7 +1813,14 @@ pub struct RawTrafficLedger {
     /// the owning process of a flow from this host elsewhere, looked up
     /// for every such flow. Default true.
     pub apps: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
+
+// `serde_json::Value` cannot derive `Eq` but never holds NaN, so its
+// `PartialEq` is reflexive — the impl stays valid with `extra` present.
+impl Eq for RawTrafficLedger {}
 
 impl RawTrafficLedger {
     /// The effective `traffic-ledger.enable` of a config.
@@ -877,12 +1838,18 @@ impl RawTrafficLedger {
 }
 
 /// `logbook:` section.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawLogbook {
     /// Record events under `<home>/logbook/`. Default true.
     pub enable: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
+
+// Same `serde_json::Value`-in-`Eq` justification as `RawTrafficLedger`.
+impl Eq for RawLogbook {}
 
 impl RawLogbook {
     /// The effective `logbook.enable` of a config.
@@ -911,6 +1878,9 @@ pub struct RawSniffer {
     pub sniff: Option<HashMap<String, RawSniffProtocol>>,
     pub force_domain: Option<Vec<String>>,
     pub skip_domain: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -918,6 +1888,9 @@ pub struct RawSniffer {
 pub struct RawSniffProtocol {
     #[serde(default, deserialize_with = "deserialize_port_list")]
     pub ports: Option<Vec<u16>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Cumulative cap on expanded sniff port entries: the u16 space holds at
@@ -1100,6 +2073,9 @@ pub struct RawSubscription {
     pub applied_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied_rules: Vec<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `subscriptions[].proxy`: absent/`""` → unset (fetches direct); a

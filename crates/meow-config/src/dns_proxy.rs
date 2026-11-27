@@ -20,6 +20,7 @@ pub(crate) fn registry(
                 adapter_type: proxy.adapter_type(),
                 health: ProxyHealth::new(),
                 configured_dialer: proxy.has_configured_dialer(),
+                fingerprint: proxy.client_fingerprint().map(Box::from),
             });
             (name.clone(), bound)
         })
@@ -34,6 +35,13 @@ struct DnsProxy {
     adapter_type: AdapterType,
     health: ProxyHealth,
     configured_dialer: bool,
+    /// The published entry's baked uTLS `client-fingerprint`. Bound at
+    /// construction like `configured_dialer` because the trait's
+    /// `Option<&str>` cannot borrow through `resolve()`'s temporary
+    /// `Arc` — and it need not: `ProxyRegistry::publish` runs once per
+    /// generation cell, so the name resolves to this same adapter for
+    /// the wrapper's whole generation (issue #974 review).
+    fingerprint: Option<Box<str>>,
 }
 
 impl DnsProxy {
@@ -73,6 +81,11 @@ impl ProxyAdapter for DnsProxy {
     fn support_udp(&self) -> bool {
         self.target.resolve().is_some_and(|p| p.support_udp())
     }
+    /// Forward the published entry's own answer — bound at construction
+    /// because the resolved proxy is a temporary `Arc` (see the field).
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
+    }
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.resolve()?.dial_tcp(metadata).await
     }
@@ -100,6 +113,14 @@ impl Proxy for DnsProxy {
         self.target
             .resolve()
             .map_or_else(Vec::new, |p| p.delay_history())
+    }
+    /// Forward like `support_udp`: the published entry's own verdict, so
+    /// a chained member resolved through this wrapper reads exactly as the
+    /// route generation reports it (issue #969 — the wrapper contract).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.target
+            .resolve()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
@@ -151,6 +172,43 @@ mod tests {
             .dial_udp(&Metadata::default())
             .await
             .is_err());
+    }
+
+    /// Issue #974 review: a `type: dns` leaf fails `ConnType::Inner`
+    /// closed — a dialer-hop metadata must never reach its answer path.
+    /// The guard has to hold end-to-end, not just on a direct adapter
+    /// call: here through the DnsProxy nameserver wrapper (`#dns-out`)
+    /// and again through a selector group (`#sel` → dns-out), whose
+    /// picked member is only known at dial time.
+    #[tokio::test]
+    async fn dns_leaf_rejects_inner_dials_through_wrappers() {
+        use meow_common::ConnType;
+        let config = crate::load_config_from_str(
+            "\
+            proxies:\n  - {name: dns-out, type: dns}\n\
+            proxy-groups:\n  - {name: sel, type: select, proxies: [dns-out]}\n\
+            dns:\n  enable: true\n  use-system-hosts: false\n\
+              \x20 nameserver: ['udp://192.0.2.53:53#dns-out', 'udp://192.0.2.54:53#sel']\n\
+            rules: [MATCH,dns-out]\n",
+        )
+        .await
+        .unwrap();
+        let inner = Metadata {
+            conn_type: ConnType::Inner,
+            ..Default::default()
+        };
+        let leaf = config.dns.resolver.main_nameservers()[0].proxy().unwrap();
+        let group = config.dns.resolver.main_nameservers()[1].proxy().unwrap();
+        for (tag, proxy) in [("direct tag", leaf), ("selector pick", group)] {
+            assert!(
+                proxy.dial_tcp(&inner).await.is_err(),
+                "{tag}: a dns leaf must refuse the inner dial"
+            );
+            assert!(
+                proxy.dial_udp(&inner).await.is_err(),
+                "{tag}: a dns leaf must refuse the inner dial"
+            );
+        }
     }
 
     #[tokio::test]

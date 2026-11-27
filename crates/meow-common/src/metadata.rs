@@ -1,13 +1,17 @@
-use crate::{ConnType, DnsMode, Network};
+use crate::{ConnType, DnsMode, InboundRouteOverride, Network};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 // M2 layout change (ADR-0011 T1/T4/T5):
 //   String fields → SmolStr (inline ≤23 B, heap-backed above that)
 //   Vec<String> geo-IP fields → Vec<SmolStr> (same 24-B struct, cheaper elements)
 //   Option<String> in_user → Option<SmolStr>
+//   special_proxy/special_rules (2 × SmolStr, 48 B on every flow for a
+//   per-listener feature) → special_route: Option<Arc<InboundRouteOverride>>
+//   (8 B, allocated only where a named listener carries the override)
 // Breaking change permitted per ADR-0009 §"Public-API stability stance".
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +68,28 @@ pub struct Metadata {
     /// Authenticated username; `None` when auth was skipped or not configured.
     #[serde(rename = "inboundUser", skip_serializing_if = "Option::is_none")]
     pub in_user: Option<SmolStr>,
-    #[serde(rename = "specialProxy")]
-    pub special_proxy: SmolStr,
+    /// `listeners[].proxy` + `listeners[].rule` — a named inbound's
+    /// forced-route override (upstream `SpecialProxy`/`SpecialRules`,
+    /// set by `WithSpecialProxy`/`WithSpecialRules` in
+    /// `BaseOption.Additions`), stamped by
+    /// [`InboundRouteOverride::apply`] where upstream's `Additions`
+    /// execute. One shared pointer so the override costs every
+    /// default-listener flow nothing: `None` unless the listener
+    /// carries an override, and every `Metadata::clone` of a stamped
+    /// flow shares the refcount like `flow_lookup` rather than copying
+    /// the names. Read through [`Self::special_proxy`] /
+    /// [`Self::special_rules`]; [`Self::pure`] drops it.
+    ///
+    /// Internal-only like `internal`: the `rule` half never serializes.
+    /// The `proxy` half keeps mihomo's flat `specialProxy` string on
+    /// the wire — dashboards read it unconditionally.
+    #[serde(
+        rename = "specialProxy",
+        default,
+        serialize_with = "special_proxy_json::serialize",
+        deserialize_with = "special_proxy_json::deserialize"
+    )]
+    pub special_route: Option<Arc<InboundRouteOverride>>,
     /// Marks housekeeping traffic that is not a user connection: health
     /// probes, provider/geodata/subscription fetches, and DNS-via-proxy
     /// exchanges.
@@ -83,6 +107,90 @@ pub struct Metadata {
     /// claiming it.
     #[serde(skip)]
     pub internal: bool,
+    /// The marker a `type: rematch` control outbound stamped on this flow
+    /// (issue #974, upstream `Metadata.RematchName`/`C.Rematch`): the
+    /// value `REMATCH-NAME` rules compare against. `None` costs the
+    /// ordinary flow nothing; serializes as the flat `rematchName`
+    /// string mihomo emits on `/connections` metadata (`""` when unset,
+    /// so dashboards read it unconditionally) and defaults back to
+    /// unset on older JSON that lacks the key.
+    ///
+    /// Held behind a pointer like `special_route`: the marker rides on
+    /// the rare flow a `type: rematch` leaf actually stamped, and it is
+    /// per-clone state — each transition stamps its own copy — so it
+    /// cannot live in the clones-shared `flow_lookup` `Arc` where one
+    /// hop's stamp would leak into the next. `None` keeps the field one
+    /// pointer wide on the ordinary path.
+    #[serde(
+        rename = "rematchName",
+        default,
+        serialize_with = "rematch_name_json::serialize",
+        deserialize_with = "rematch_name_json::deserialize"
+    )]
+    pub rematch_name: Option<Arc<SmolStr>>,
+    /// Flow-local lookup state (issue #974 `find-process-mode`): the
+    /// owning-process scan's one-shot memo and submission lock,
+    /// `Arc`-shared with every clone the routing passes, the UDP route
+    /// probe and tracking make of this metadata — the scan runs at most
+    /// once per flow, a concurrent caller waits out the one in flight
+    /// rather than walking the table twice, and a miss is remembered
+    /// too. Runtime-only: not part of the flow's API-visible identity.
+    #[serde(skip)]
+    pub flow_lookup: Arc<crate::FlowLookup>,
+}
+
+/// The JSON form of [`Metadata::special_route`]: mihomo's flat
+/// `specialProxy` string, always emitted (`""` when unset). Reading
+/// back, a nonempty name repopulates the route's `proxy` slot; the
+/// `rule` half stays empty — it never crosses the wire.
+mod special_proxy_json {
+    use crate::InboundRouteOverride;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use smol_str::SmolStr;
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        route: &Option<Arc<InboundRouteOverride>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(
+            route
+                .as_ref()
+                .and_then(|r| r.proxy.as_deref())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<InboundRouteOverride>>, D::Error> {
+        let proxy = SmolStr::deserialize(deserializer)?;
+        Ok(InboundRouteOverride::new(Some(proxy.as_str()), None).map(Arc::new))
+    }
+}
+
+/// The JSON form of [`Metadata::rematch_name`]: mihomo's flat
+/// `rematchName` string, always emitted (`""` when unset). Reading
+/// back, an empty or missing value stays unset — the marker only ever
+/// carries a nonempty name.
+mod rematch_name_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use smol_str::SmolStr;
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        name: &Option<Arc<SmolStr>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(name.as_deref().map_or("", SmolStr::as_str))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<SmolStr>>, D::Error> {
+        let name = SmolStr::deserialize(deserializer)?;
+        Ok((!name.is_empty()).then(|| Arc::from(name)))
+    }
 }
 
 /// The JSON form of [`Metadata::dscp`]: always a number, `0` when the
@@ -126,6 +234,54 @@ impl Metadata {
         std::mem::swap(&mut self.src_geo_ip, &mut self.dst_geo_ip);
     }
 
+    /// The listener `proxy:` override this flow carries (upstream
+    /// `SpecialProxy`), `""` when unset — resolved per flow against the
+    /// live proxy map, before mode dispatch and process lookup.
+    pub fn special_proxy(&self) -> &str {
+        self.special_route
+            .as_ref()
+            .and_then(|r| r.proxy.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The listener `rule:` override — the `sub-rules:` block name this
+    /// flow scans instead of the top-level rule list (upstream
+    /// `SpecialRules`), `""` when unset.
+    pub fn special_rules(&self) -> &str {
+        self.special_route
+            .as_ref()
+            .and_then(|r| r.rule.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The marker a `type: rematch` hop stamped on this flow (upstream
+    /// `Metadata.RematchName`), `""` when unset. `REMATCH-NAME` rules
+    /// compare against it exactly; an unset marker never matches.
+    pub fn rematch_name(&self) -> &str {
+        self.rematch_name.as_deref().map_or("", |s| s.as_str())
+    }
+
+    /// Apply a rematch leaf's `target-rematch-name`: `Some("")` clears
+    /// the marker (an explicit empty field, issue #974), `Some(name)`
+    /// stamps it verbatim — no trimming or case folding, matching
+    /// upstream's `Metadata.SetRematchName` — and `None` leaves it.
+    /// The caller unwraps `Option`-vs-supplied itself; this setter only
+    /// receives a *supplied* value.
+    pub fn set_rematch_name(&mut self, name: &str) {
+        self.rematch_name = (!name.is_empty()).then(|| Arc::from(SmolStr::from(name)));
+    }
+
+    /// Stamp `proxy`/`rule` as this flow's listener override, replacing
+    /// whatever it carried — the same normalization
+    /// [`InboundRouteOverride::new`] applies: an empty half means unset,
+    /// and both empty yields `None` (no override, no alloc). Listeners
+    /// stamp through [`InboundRouteOverride::apply`] instead, which
+    /// merges per-field; this setter is the convenience for tests and
+    /// other whole-override writers.
+    pub fn set_special_route(&mut self, proxy: Option<&str>, rule: Option<&str>) {
+        self.special_route = InboundRouteOverride::new(proxy, rule).map(Arc::new);
+    }
+
     /// A *domain-carrying* UDP association request (`dialer-proxy` inner
     /// hops, issue #657): `host` set, `dst_ip` absent.
     ///
@@ -164,8 +320,10 @@ impl Default for Metadata {
             in_name: SmolStr::default(),
             in_port: 0,
             in_user: None,
-            special_proxy: SmolStr::default(),
+            special_route: None,
+            rematch_name: None,
             internal: false,
+            flow_lookup: Arc::default(),
         }
     }
 }
@@ -240,6 +398,26 @@ impl Metadata {
         }
     }
 
+    /// The `SocketAddr` a `type: dns`-committed UDP flow hands to its
+    /// conn's `write_packet` (issue #974): the leaf never dials the
+    /// destination — the addr is echoed back as the reply's source, like
+    /// a bound datagram socket, so it must be the destination the client
+    /// *claimed*, not a resolved replacement (a fake-IP flow whose
+    /// `dst_ip` `pre_handle_metadata` cleared still owes the client
+    /// replies from the fake address). `claimed` is the listener-captured
+    /// pre-resolution socket form of the request — `Some` for IP-typed
+    /// claims, `None` for domain-typed ones. A domain claim has no IP
+    /// form; a resolved `dst_ip` stands in when it exists, else the
+    /// unspecified wildcard carries the port.
+    pub fn dns_udp_dst(&self, claimed: Option<SocketAddr>) -> SocketAddr {
+        claimed
+            .or_else(|| self.dst_ip.map(|ip| SocketAddr::new(ip, self.dst_port)))
+            .unwrap_or(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                self.dst_port,
+            ))
+    }
+
     pub fn source_address(&self) -> AddrDisplay<'_> {
         AddrDisplay {
             host: "",
@@ -300,8 +478,14 @@ impl Metadata {
             in_name: SmolStr::default(),
             in_port: 0,
             in_user: None,
-            special_proxy: SmolStr::default(),
+            special_route: None,
+            // The final rematch marker is part of the flow's API-visible
+            // routing story — `/connections` reports it like mihomo.
+            rematch_name: self.rematch_name.clone(),
             internal: self.internal,
+            // The tracked copy shares the flow's lookup memo: the ledger
+            // reuses an `always` scan (miss included) instead of rescanning.
+            flow_lookup: Arc::clone(&self.flow_lookup),
         }
     }
 }
@@ -470,6 +654,38 @@ mod tests {
         assert_eq!(m.dst_port, before.dst_port);
     }
 
+    /// `dns_udp_dst` ordering (issue #974): the listener-captured claim
+    /// wins over any resolved `dst_ip` — a fake-IP flow must echo replies
+    /// from the fake address the client believes in. A domain claim has
+    /// no IP form, so resolution stands in; with neither, the unspecified
+    /// wildcard still carries the port the reply pretends to come from.
+    #[test]
+    fn dns_udp_dst_prefers_claimed_then_resolved() {
+        let claimed: SocketAddr = "198.51.100.53:53".parse().unwrap();
+        let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+        let m = Metadata {
+            host: "example.com".into(),
+            dst_ip: Some(resolved),
+            dst_port: 53,
+            ..Default::default()
+        };
+        assert_eq!(m.dns_udp_dst(Some(claimed)), claimed);
+
+        // Domain claim: the resolved address stands in for it.
+        assert_eq!(m.dns_udp_dst(None), SocketAddr::new(resolved, 53));
+
+        // Nothing resolved and nothing claimed: wildcard + the port.
+        let m = Metadata {
+            host: "example.com".into(),
+            dst_port: 5353,
+            ..Default::default()
+        };
+        assert_eq!(
+            m.dns_udp_dst(None),
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 5353)
+        );
+    }
+
     #[test]
     fn is_valid_host_accepts_hostnames_and_ip_literals() {
         for host in [
@@ -574,5 +790,52 @@ mod tests {
         );
         assert_eq!(long.len(), 254);
         assert!(!is_valid_host(&long));
+    }
+
+    /// `rematchName` serializes like mihomo — a flat string, `""` when
+    /// unset, emitted unconditionally — and older JSON that lacks the
+    /// key defaults back to unset (issue #974).
+    #[test]
+    fn rematch_name_json_round_trip() {
+        let mut m = Metadata::default();
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["rematchName"], "", "unset serializes as empty");
+        m.set_rematch_name("stage1");
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["rematchName"], "stage1");
+
+        // Read back: a stamped marker survives; "" and a missing key
+        // (older JSON) both stay unset.
+        let back: Metadata = serde_json::from_value(json).unwrap();
+        assert_eq!(back.rematch_name(), "stage1");
+        let mut old = serde_json::to_value(Metadata::default()).unwrap();
+        old.as_object_mut().unwrap().remove("rematchName");
+        let old: Metadata = serde_json::from_value(old).unwrap();
+        assert_eq!(old.rematch_name(), "");
+        let mut doc = serde_json::to_value(Metadata::default()).unwrap();
+        doc["rematchName"] = serde_json::json!("");
+        let empty: Metadata = serde_json::from_value(doc).unwrap();
+        assert_eq!(empty.rematch_name(), "");
+    }
+
+    /// `set_rematch_name` verbatim: no trimming or case folding —
+    /// `Some("")` clears, a nonempty string stamps exactly (issue #974).
+    #[test]
+    fn set_rematch_name_verbatim() {
+        let mut m = Metadata::default();
+        m.set_rematch_name(" Stage1 ");
+        assert_eq!(m.rematch_name(), " Stage1 ");
+        m.set_rematch_name("");
+        assert_eq!(m.rematch_name(), "", "explicit empty clears");
+        assert!(m.rematch_name.is_none());
+    }
+
+    /// The `pure()` tracked copy carries the marker to `/connections`,
+    /// like the rest of the flow's routing story (issue #974).
+    #[test]
+    fn tracking_copy_keeps_the_marker() {
+        let mut m = Metadata::default();
+        m.set_rematch_name("stage1");
+        assert_eq!(m.pure().rematch_name(), "stage1");
     }
 }

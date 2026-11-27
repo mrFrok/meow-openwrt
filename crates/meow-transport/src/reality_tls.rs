@@ -747,7 +747,9 @@ fn build_reality_client_hello(
     aead_key.copy_from_slice(&auth_key);
 
     let mut reality_plain = [0u8; 16];
-    let unix = SystemTime::now()
+    // Protocol timestamp: the injected protocol clock when present
+    // (`ntp:` offset per issue #974), else the OS clock.
+    let unix = reality.protocol_clock.unwrap_or(SystemTime::now)()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| TransportError::Tls(format!("system clock before UNIX_EPOCH: {e}")))?
         .as_secs() as u32;
@@ -1583,6 +1585,7 @@ mod tests {
             public_key: [9u8; 32],
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             support_x25519_mlkem768: false,
+            protocol_clock: None,
         };
         let random = [7u8; 32];
         let client_public = [3u8; 32];
@@ -1985,6 +1988,7 @@ mod tests {
             public_key: [9u8; 32],
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             support_x25519_mlkem768: false,
+            protocol_clock: None,
         };
         let random = [7u8; 32];
         let client_public = [3u8; 32];
@@ -2492,6 +2496,7 @@ mod tests {
             public_key: [0x11u8; 32],
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             support_x25519_mlkem768: false,
+            protocol_clock: None,
         };
 
         let server_task = tokio::spawn(async move {
@@ -2631,6 +2636,7 @@ mod tests {
             public_key: x25519_public_from_private(&reality_private),
             short_id,
             support_x25519_mlkem768: hybrid,
+            protocol_clock: None,
         };
 
         let server_task = tokio::spawn(async move {
@@ -2815,6 +2821,7 @@ mod tests {
             public_key: [0x11u8; 32],
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             support_x25519_mlkem768: false,
+            protocol_clock: None,
         };
 
         let server_task = tokio::spawn(async move {

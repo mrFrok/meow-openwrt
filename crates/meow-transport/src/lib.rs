@@ -104,6 +104,13 @@ pub mod jls;
 #[cfg(feature = "simple-obfs")]
 pub mod simple_obfs;
 
+/// `SocketIo` — the connected-datagram endpoint abstraction shared by the
+/// QUIC/UDP transports: `kcptun`'s KCP stream and `meow-proxy`'s hysteria2 /
+/// trusttunnel-h3 QUIC drivers. Gated by the `datagram` feature (kcptun
+/// implies it) so the QUIC drivers need none of kcptun's crypto deps.
+#[cfg(feature = "datagram")]
+pub mod datagram;
+
 /// kcptun SS-plugin transport (issue #533): a kcp-go wire-compatible
 /// KCP-over-UDP stream plus the crypt/FEC/snappy packet layers.
 /// Gated by the `kcptun` feature; the smux session and client pool live
@@ -241,6 +248,13 @@ pub trait Transport: Send + Sync {
 
     /// Forget the connection kept for [`Self::reuse`].
     fn reset(&self) {}
+
+    /// Concrete-type downcast for observational reads (e.g. the baked
+    /// uTLS fingerprint a `TlsLayer` carries, issue #974). Layers that do
+    /// not expose anything keep the default.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Crate-level `Result` alias.  Errors are always [`TransportError`].

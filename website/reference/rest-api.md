@@ -10,12 +10,34 @@ external-controller: 127.0.0.1:9090
 secret: "a-long-random-string"
 ```
 
-Without `external-controller`, the API does not start. See
+Without any `external-controller*` key, the API does not start. See
 [Authentication](../guide/authentication) for the auth model.
+
+Additional controller endpoints can run alongside the plain listener —
+all of them serve the same API, auth and CORS policy:
+
+```yaml
+external-controller-tls: 127.0.0.1:9443   # HTTPS (ALPN h2 / http/1.1);
+                                          # `api-tls` build feature — not
+                                          # in the `minimal` bundle
+tls:
+  certificate: /path/to/cert.pem          # or an inline PEM pair
+  private-key: /path/to/key.pem           # unset pair = ephemeral self-signed
+external-controller-unix: api.sock        # Unix socket under the daemon home
+external-controller-pipe: '\\.\pipe\meow' # Windows only
+external-controller-cors:
+  allow-origins: ["https://board.example"]
+  allow-private-network: true
+```
 
 - **REST auth:** `Authorization: Bearer <secret>`.
 - **WebSocket auth:** the bearer header *or* `?token=<secret>`.
-- **CORS:** permissive (`Access-Control-Allow-Origin: *`).
+- **Browser access:** With a secret, an unset `external-controller-cors:` resolves
+  allow-all defaults (`Access-Control-Allow-Origin: *`) in upstream's configured
+  `cors.New` shape. Without a secret, use an IP
+  address or `localhost` and keep the dashboard on the controller's origin — an
+  `https://` origin counts as same-origin over `external-controller-tls`.
+  This applies to both REST and WebSocket requests, on every transport.
 
 ```bash
 curl -H 'Authorization: Bearer <secret>' http://127.0.0.1:9090/proxies
@@ -154,6 +176,8 @@ saved.
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
 (logged). Returns 204 on success, or 400 `{ message }` on a parse/validation failure.
+Changing or removing the configured `secret` requires a restart. A reload that changes
+it returns 400 even with `?force=true`.
 For `subscriptions:` entries kept by name+URL the daemon carries its
 `applied-*` contribution tracking forward — a PUT that omits those
 bookkeeping fields does not orphan the subscription's tracked content.
@@ -252,7 +276,7 @@ route map).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`; tproxy entries also report `firewall`, `udp`, `udp-timeout`) |
+| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`; tproxy entries also report `firewall`, `udp`, `udp-timeout`; a multi-address `type: anytls` entry additionally reports `addresses: [{listen, port}, …]` — user digests and TLS material are never disclosed) |
 
 ## WebSocket streams
 

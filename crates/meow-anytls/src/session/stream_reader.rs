@@ -3,7 +3,7 @@
 //! 负责从 Session 接收数据并提供给上层读取
 //! 与 Stream 的写入操作完全分离
 
-use bytes::Bytes;
+use crate::session::session::PendingBytes;
 use std::io;
 use tokio::sync::mpsc;
 
@@ -19,11 +19,15 @@ pub struct StreamReader {
 
     /// 从 Session 接收数据的 channel
     /// 注意：recv() 是 async 方法，需要 &mut self
-    reader_rx: mpsc::UnboundedReceiver<Bytes>,
+    reader_rx: mpsc::UnboundedReceiver<PendingBytes>,
 
-    /// 缓冲不完整的数据
-    /// 当 read buffer 小于接收到的数据时使用
-    reader_buffer: Vec<u8>,
+    /// 缓冲不完整的数据 — the unread remainder of the last `Bytes`
+    /// chunk, kept as the chunk itself plus a read offset. Compared to
+    /// the old `Vec<u8>` this is zero-copy on deposit (the remainder
+    /// shares the channel item's allocation instead of
+    /// `extend_from_slice` copying it) and O(1) per read (an offset bump
+    /// instead of a `drain(..n)` memmove).
+    reader_buffer: Option<(PendingBytes, usize)>,
 
     /// EOF 标志
     eof: bool,
@@ -31,13 +35,37 @@ pub struct StreamReader {
 
 impl StreamReader {
     /// 创建新的 StreamReader
-    pub fn new(id: u32, reader_rx: mpsc::UnboundedReceiver<Bytes>) -> Self {
+    pub fn new(id: u32, reader_rx: mpsc::UnboundedReceiver<PendingBytes>) -> Self {
         Self {
             id,
             reader_rx,
-            reader_buffer: Vec::new(),
+            reader_buffer: None,
             eof: false,
         }
+    }
+
+    /// Bytes still unread in the buffered remainder.
+    fn buffered_len(&self) -> usize {
+        self.reader_buffer
+            .as_ref()
+            .map_or(0, |(b, off)| b.len() - off)
+    }
+
+    /// Copy out of the buffered remainder, advancing its offset and
+    /// releasing the `Bytes` once fully consumed.
+    fn read_buffered(&mut self, buf: &mut [u8]) -> usize {
+        let Some((b, off)) = self.reader_buffer.as_mut() else {
+            return 0;
+        };
+        let avail = b.len() - *off;
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&b[*off..*off + n]);
+        *off += n;
+        let consumed = *off == b.len();
+        if consumed {
+            self.reader_buffer = None;
+        }
+        n
     }
 
     /// 读取数据到 buffer
@@ -48,48 +76,26 @@ impl StreamReader {
     /// 3. 处理 EOF 情况
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // 1. 先检查 EOF
-        if self.eof && self.reader_buffer.is_empty() {
+        if self.eof && self.buffered_len() == 0 {
             return Ok(0);
         }
 
         // 2. 从 buffer 读取（如果有数据）
-        if !self.reader_buffer.is_empty() {
-            let n = std::cmp::min(self.reader_buffer.len(), buf.len());
-            buf[..n].copy_from_slice(&self.reader_buffer[..n]);
-            self.reader_buffer.drain(..n);
-
-            tracing::trace!(
-                "[StreamReader] Read {} bytes from buffer (stream_id={}, buffer_remaining={})",
-                n,
-                self.id,
-                self.reader_buffer.len()
-            );
-
-            return Ok(n);
+        if self.buffered_len() > 0 {
+            return Ok(self.read_buffered(buf));
         }
 
         // 3. buffer 为空，从 channel 接收新数据
         match self.reader_rx.recv().await {
             Some(data) => {
-                let data_len = data.len();
-                tracing::debug!(
-                    "[StreamReader] Received {} bytes from channel (stream_id={})",
-                    data_len,
-                    self.id
-                );
-
                 // 直接填充到 buf
                 let n = std::cmp::min(data.len(), buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
 
-                // 剩余数据放入 buffer
+                // 剩余数据放入 buffer — the same `Bytes` allocation at
+                // offset `n`; no copy.
                 if n < data.len() {
-                    self.reader_buffer.extend_from_slice(&data[n..]);
-                    tracing::trace!(
-                        "[StreamReader] Stored {} bytes in buffer (stream_id={})",
-                        data.len() - n,
-                        self.id
-                    );
+                    self.reader_buffer = Some((data, n));
                 }
 
                 Ok(n)
@@ -118,7 +124,7 @@ impl StreamReader {
 
     /// 获取缓冲区大小（用于诊断）
     pub fn buffer_len(&self) -> usize {
-        self.reader_buffer.len()
+        self.buffered_len()
     }
 
     /// 精确读取指定数量的字节（辅助方法）
@@ -157,13 +163,16 @@ impl tokio::io::AsyncRead for StreamReader {
     ) -> std::task::Poll<io::Result<()>> {
         use std::task::Poll;
 
-        if self.eof && self.reader_buffer.is_empty() {
+        if self.eof && self.buffered_len() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if !self.reader_buffer.is_empty() {
-            let n = std::cmp::min(self.reader_buffer.len(), buf.remaining());
-            buf.put_slice(&self.reader_buffer[..n]);
-            self.reader_buffer.drain(..n);
+        if self.buffered_len() > 0 {
+            let take = buf.remaining().min(self.buffered_len());
+            let dst = buf.initialize_unfilled_to(take);
+            let n = self.read_buffered(dst);
+            // `read_buffered` wrote `n` bytes into the initialised
+            // prefix of `dst`.
+            buf.advance(n);
             return Poll::Ready(Ok(()));
         }
         match self.reader_rx.poll_recv(cx) {
@@ -171,7 +180,7 @@ impl tokio::io::AsyncRead for StreamReader {
                 let n = std::cmp::min(data.len(), buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
-                    self.reader_buffer.extend_from_slice(&data[n..]);
+                    self.reader_buffer = Some((data, n));
                 }
                 Poll::Ready(Ok(()))
             }
@@ -187,6 +196,7 @@ impl tokio::io::AsyncRead for StreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn test_stream_reader_basic() {
@@ -194,7 +204,7 @@ mod tests {
         let mut reader = StreamReader::new(1, rx);
 
         // 发送数据
-        tx.send(Bytes::from("hello")).unwrap();
+        tx.send(Bytes::from("hello").into()).unwrap();
 
         // 读取数据
         let mut buf = vec![0u8; 10];
@@ -210,7 +220,7 @@ mod tests {
         let mut reader = StreamReader::new(1, rx);
 
         // 发送较大的数据
-        tx.send(Bytes::from("hello world")).unwrap();
+        tx.send(Bytes::from("hello world").into()).unwrap();
 
         // 分两次读取
         let mut buf = vec![0u8; 5];
@@ -243,15 +253,74 @@ mod tests {
         assert!(reader.is_eof());
     }
 
+    /// B4: the leftover keeps the channel item's allocation — the
+    /// remainder shares the sent `Bytes`' storage (no `extend_from_slice`
+    /// copy), reads advance an offset, and `buffer_len` tracks it.
+    #[tokio::test]
+    async fn leftover_rides_the_channel_bytes_allocation() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = StreamReader::new(1, rx);
+
+        let sent = Bytes::from(vec![0xEEu8; 1024]);
+        let sent_ptr = sent.as_ptr();
+        tx.send(sent.into()).unwrap();
+
+        // Read less than the chunk — the rest must stay in the SAME
+        // allocation the channel delivered.
+        let mut buf = vec![0u8; 100];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(reader.buffer_len(), 924);
+        let (leftover, off) = reader.reader_buffer.as_ref().expect("leftover buffered");
+        assert_eq!(*off, 100);
+        assert_eq!(
+            leftover.as_ptr(),
+            sent_ptr,
+            "leftover shares the allocation"
+        );
+
+        // Draining the leftover returns the same bytes and releases it.
+        let mut rest = vec![0u8; 1024];
+        let mut got = 0;
+        while reader.buffer_len() > 0 {
+            got += reader.read(&mut rest[got..]).await.unwrap();
+        }
+        assert_eq!(got, 924);
+        assert!(rest[..got].iter().all(|b| *b == 0xEE));
+        assert!(reader.reader_buffer.is_none());
+    }
+
+    /// B4: EOF + leftover interplay — reads after the channel closes
+    /// must still drain the buffered remainder before reporting EOF,
+    /// and `read` returns 0 only once both are empty.
+    #[tokio::test]
+    async fn eof_drains_leftover_before_zero() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = StreamReader::new(1, rx);
+        tx.send(Bytes::from_static(b"abcdef").into()).unwrap();
+        drop(tx);
+
+        let mut buf = vec![0u8; 2];
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"ab");
+        // Channel is closed but the leftover must still be served.
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"cd");
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"ef");
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+        assert!(reader.is_eof());
+    }
+
     #[tokio::test]
     async fn test_stream_reader_multiple_chunks() {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut reader = StreamReader::new(1, rx);
 
         // 发送多个数据块
-        tx.send(Bytes::from("chunk1")).unwrap();
-        tx.send(Bytes::from("chunk2")).unwrap();
-        tx.send(Bytes::from("chunk3")).unwrap();
+        tx.send(Bytes::from("chunk1").into()).unwrap();
+        tx.send(Bytes::from("chunk2").into()).unwrap();
+        tx.send(Bytes::from("chunk3").into()).unwrap();
 
         // 关闭 channel 以触发 EOF
         drop(tx);

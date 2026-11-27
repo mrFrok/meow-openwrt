@@ -9,21 +9,28 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["wireguard", "ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix", "shadow-tls", "restls", "jls", "gost-plugin"]
+default = ["wireguard-kernel", "ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix", "shadow-tls", "restls", "jls", "gost-plugin"]
 # The embedded public-suffix list (`psl`) behind load-balance
 # `consistent-hashing`'s eTLD+1 key — about 500 KB of lookup tables, so it
 # is in the app `full` profile and kept out of `minimal` (ADR-0007
 # binary-size caps), where the key falls back to the last two labels.
 public-suffix = ["dep:psl"]
-ss = ["dep:shadowsocks", "meow-transport/simple-obfs"]
-# meow-openwrt: `type: wireguard` (+ AmneziaWG) on the kernel module; Linux only.
-wireguard = []
-# Built-in SIP003 plugin transports on the `ss` adapter. `minimal` keeps
-# only simple-obfs + v2ray-plugin (bundled in `ss`); these four are opt-in
-# and re-bundled into `default`/`full` so release binaries are unchanged
-# (ADR-0007 binary-size caps). Each implies `ss` and its meow-transport
-# layer; gost-plugin rides the always-on ws/tls transports and pulls `mux`
-# because its `mux:` option defaults to true.
+ss = ["dep:shadowsocks"]
+# Built-in SIP003 plugin transports on the `ss` adapter — each an opt-in
+# feature implying `ss`; all are re-bundled into `default`/`full` so
+# release binaries are unchanged, while `minimal` carries `ss-obfs` only
+# (ADR-0007 binary-size caps). A `plugin:` line naming a compiled-out
+# built-in fails at parse with a "not compiled" error naming the feature
+# (`obfs`/`simple-obfs` → `ss-obfs`, `v2ray-plugin` → `ss-v2ray-plugin`);
+# the SIP003 name `obfs-local` errors the same way without `ss-obfs` but
+# keeps its external-subprocess spawn wherever the feature is compiled
+# in. `gost-plugin` also pulls `mux` because its `mux:` option defaults
+# to true.
+ss-obfs = ["ss", "meow-transport/simple-obfs"]
+ss-v2ray-plugin = ["ss"]
+# meow-openwrt: `type: wireguard` (+ AmneziaWG) on the kernel module; Linux
+# only. The userspace `wireguard` feature above stays upstream's.
+wireguard-kernel = []
 shadow-tls = ["ss", "meow-transport/shadow-tls"]
 restls = ["ss", "meow-transport/restls"]
 jls = ["ss", "meow-transport/jls"]
@@ -59,7 +66,9 @@ anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
 # QUIC + HTTP/3), so it links no rustls and no second crypto library. On
 # big-endian targets (no BoringSSL) it runs on quinn + rustls instead
-# (build.rs `cfg(hy2_quiche)`; meow-openwrt stage 7).
+# (build.rs `cfg(hy2_quiche)`; meow-openwrt stage 7). `meow-transport/datagram`
+# provides `SocketIo` — the injected `dialer-proxy` UDP endpoint the QUIC
+# driver can run on.
 hysteria2 = [
     "dep:quiche",
     "dep:boring",
@@ -68,6 +77,7 @@ hysteria2 = [
     "dep:quinn",
     "dep:octets",
     "meow-transport/tls",
+    "meow-transport/datagram",
 ]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["dep:h2", "dep:tokio-util"]
@@ -80,6 +90,7 @@ trusttunnel-h3 = [
     "dep:quiche",
     "dep:boring",
     "meow-transport/tls",
+    "meow-transport/datagram",
 ]
 # sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess. Pulls h2 + yamux +
 # tokio-util/compat — opt-out in `minimal` builds (ADR-0007 binary-size caps).
@@ -95,6 +106,21 @@ ech-tls-tunnel = ["ss"]
 # `full` bundle; excluded from `minimal` (ADR-0007 — the cipher suite,
 # reed-solomon and snappy deps are only reachable via `plugin: kcptun`).
 kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
+# WireGuard outbound (issue #899): the vendored, ring-free boringtun noise
+# module (`meow-wireguard`) encrypts packets for a smoltcp userspace TCP/IP
+# stack running on a dedicated actor thread. Opt-in — the app `full`
+# bundle is expected to enable it; keep it out of `minimal` (ADR-0007
+# binary-size caps). `meow-wireguard/wireguard-boring` moves the session
+# data-path AEAD onto the BoringSSL `boring` already in this crate's
+# graph — no new build surface — and is the ~5x faster path for the
+# per-packet ChaCha20-Poly1305.
+wireguard = [
+    "dep:meow-wireguard",
+    "meow-wireguard/wireguard-boring",
+    "dep:meow-wgstack",
+    "dep:smoltcp",
+    "dep:ipnet",
+]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -111,6 +137,16 @@ quinn = { workspace = true, optional = true }
 octets = { version = "0.3", features = ["huffman_hpack"], optional = true }
 # Mozilla CA roots for the hysteria2 quiche verify store (mirrors meow-transport).
 webpki-root-certs = { workspace = true, optional = true }
+# Vendored boringtun 0.7.1 noise module with ring replaced by RustCrypto
+# (`meow-wireguard`), and the smoltcp userspace stack it encrypts for —
+# both pulled in only by the `wireguard` feature.
+meow-wireguard = { workspace = true, optional = true }
+# Shared smoltcp/tokio plumbing the pump drives — same optional gate as
+# meow-wireguard above it.
+meow-wgstack = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
+# quiche and boring stay target-gated below: big-endian MIPS has no BoringSSL.
 blake2 = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }

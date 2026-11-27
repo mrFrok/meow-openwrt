@@ -4,7 +4,9 @@ mod udp;
 
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
-use meow_common::{with_dial_timeout, ConnType, Metadata, Network, TcpKeepaliveConfig};
+use meow_common::{
+    with_dial_timeout, ConnType, InboundRouteOverride, Metadata, Network, TcpKeepaliveConfig,
+};
 use meow_tunnel::{
     copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, tcp_view, MatchedRule,
     ResolvedTarget, Tunnel, UsingProxy, RELAY_BUF_SIZE,
@@ -52,6 +54,9 @@ pub struct TProxyListener {
     /// Fallible setup performed by [`Self::prepare`] — carried so `run_on`
     /// spawns nothing that can fail inside a detached task (issue #641).
     prepared: Option<Prepared>,
+    /// `listeners[].proxy`/`rule` — the named-listener route override
+    /// stamped onto every flow's `Metadata` (TCP and UDP TPROXY).
+    route_override: Option<InboundRouteOverride>,
 }
 
 /// Fallible setup artifacts held on the listener between
@@ -117,6 +122,7 @@ impl TProxyListener {
             transparent: false,
             tcp_keepalive: TcpKeepaliveConfig::default(),
             prepared: None,
+            route_override: None,
         }
     }
 
@@ -177,6 +183,14 @@ impl TProxyListener {
     /// no keepalive `setsockopt` at all.
     pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
         self.tcp_keepalive = cfg;
+        self
+    }
+
+    /// Install the named listener's `proxy:`/`rule:` route override —
+    /// stamped onto every flow's `Metadata` before routing (TCP and the
+    /// UDP TPROXY path alike).
+    pub fn with_route_override(mut self, ov: Option<InboundRouteOverride>) -> Self {
+        self.route_override = ov;
         self
     }
 
@@ -276,7 +290,7 @@ impl TProxyListener {
         // binds — programmatic constructors get the same contract.
         #[cfg(target_os = "linux")]
         let udp_socket = if self.udp {
-            Some(udp::bind_transparent(bound_addr).map_err(
+            let sock = udp::bind_transparent(bound_addr).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!(
                         "tproxy `udp` transparent socket on {bound_addr} failed \
@@ -284,7 +298,8 @@ impl TProxyListener {
                     )
                     .into()
                 },
-            )?)
+            )?;
+            Some(sock)
         } else {
             None
         };
@@ -351,6 +366,7 @@ impl TProxyListener {
             let udp_name = self.name.clone();
             let udp_port = bound_addr.port();
             let udp_addrs = local_addrs.clone();
+            let udp_override = self.route_override.clone();
             // `run_udp` retries socket errors internally and only ends
             // via abort — there is no error return to surface here.
             tokio::spawn(async move {
@@ -362,6 +378,7 @@ impl TProxyListener {
                     udp_name,
                     udp_port,
                     udp_addrs,
+                    udp_override,
                 )
                 .await;
             });
@@ -421,12 +438,14 @@ impl TProxyListener {
         let max_connections = self.max_connections;
         let transparent = self.transparent;
         let tcp_keepalive = self.tcp_keepalive;
+        let route_override = self.route_override;
         bounded_accept_loop(listener, max_connections, name.clone(), {
             move |stream, src_addr| {
                 let tunnel = tunnel.clone();
                 let sniffer = sniffer.clone();
                 let name = name.clone();
                 let local_addrs = local_addrs.clone();
+                let route_override = route_override.clone();
                 // First thing on the accepted socket — before orig-dest
                 // recovery, sniffer peek, or relay, and in the accept loop
                 // itself rather than the spawned task (matching mixed and
@@ -443,6 +462,7 @@ impl TProxyListener {
                         local_addrs,
                         sniffer,
                         name,
+                        route_override,
                     )
                     .await
                     {
@@ -765,6 +785,7 @@ async fn handle_tproxy_conn(
     local_addrs: Option<Arc<HashSet<IpAddr>>>,
     sniffer: Option<Arc<SnifferRuntime>>,
     name: String,
+    route_override: Option<InboundRouteOverride>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Recover the original destination address: under TPROXY the kernel
     // hands over the connection with its original destination as the local
@@ -796,6 +817,7 @@ async fn handle_tproxy_conn(
         listen_addr,
         sniffer,
         name,
+        route_override,
     )
     .await
 }
@@ -803,6 +825,11 @@ async fn handle_tproxy_conn(
 /// Everything after original-destination recovery, split out so tests can
 /// drive the flow with a plain loopback socket (`SO_ORIGINAL_DST` /
 /// `DIOCNATLOOK` only succeed on genuinely redirected connections).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 async fn handle_tproxy_flow(
     tunnel: Tunnel,
     mut stream: tokio::net::TcpStream,
@@ -811,6 +838,7 @@ async fn handle_tproxy_flow(
     listen_addr: SocketAddr,
     sniffer: Option<Arc<SnifferRuntime>>,
     name: String,
+    route_override: Option<InboundRouteOverride>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Build initial metadata with IP-literal host for sniffer / DNS-snoop.
     let mut metadata = Metadata {
@@ -824,6 +852,11 @@ async fn handle_tproxy_flow(
         in_port: listen_addr.port(),
         ..Default::default()
     };
+    // The named listener's `proxy:`/`rule:` override stamps before the
+    // sniff and the route scan (upstream Additions order).
+    if let Some(ov) = &route_override {
+        ov.apply(&mut metadata);
+    }
 
     // Recover hostname:
     // 1. SnifferRuntime (TLS SNI or HTTP Host) — replaces the old enable_sni path
@@ -869,18 +902,20 @@ async fn handle_tproxy_flow(
     ) {
         return Err("unmapped fake-ip destination".into());
     }
-    // Strict `resolve_proxy` below requires the dst-IP pre-resolution
-    // contract (match_engine doc): fake-IP rescue above may have cleared
-    // `dst_ip` after recovering the hostname, and without this, IP rules
-    // never matched on the TProxy TCP path at all (issue #625 review).
-    inner.pre_resolve(&mut metadata).await;
+    // Lazy resolution, the same contract plain TCP flows get: fake-IP
+    // rescue above may have cleared `dst_ip` after recovering the
+    // hostname, and a staged conditional SUB-RULE reports its IP demand
+    // to the demand gate — the lazy path resolves then re-scans. A flow
+    // matched by a domain rule never pays the resolution (issue #974
+    // review — the eager `pre_resolve` could not answer a staged demand
+    // at all).
     let admission = inner.tcp_admission();
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route,
-    }) = inner.resolve_proxy(&metadata).await
+    }) = inner.resolve_proxy_lazy(&mut metadata).await
     else {
         return Err("no matching rule".into());
     };
@@ -1346,11 +1381,11 @@ mod tests {
         );
     }
 
-    /// Issue #625 review: the strict `resolve_proxy` match requires the
-    /// pre-resolve contract — a fake-IP-rescued flow arrives with
-    /// `dst_ip=None` and a recovered host, so `pre_resolve` must run or the
-    /// IP-CIDR slot can never match and the flow silently falls through to
-    /// `MATCH`. Without the call, this test would observe `MATCH/DIRECT`.
+    /// Issue #625 review: `resolve_proxy_lazy` must satisfy a fake-IP-rescued
+    /// flow's IP demand — it arrives with `dst_ip=None` and a recovered host,
+    /// so the lazy resolver must resolve it or the IP-CIDR slot can never
+    /// match and the flow silently falls through to `MATCH`. Without it this
+    /// test would observe `MATCH/DIRECT`.
     #[tokio::test]
     async fn tcp_flow_pre_resolves_dst_ip_for_ip_rules() {
         use meow_dns::fakeip::{MemoryStore, Pool};
@@ -1397,6 +1432,7 @@ mod tests {
                 listen_addr,
                 None,
                 "tproxy".into(),
+                None,
             ));
             // The relay waits for client EOF — close our end so the flow
             // completes after the REJECT adapter yields its eof stream.

@@ -9,10 +9,14 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["wireguard", "ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
+default = ["wireguard-kernel", "ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
 ss = ["meow-proxy/ss"]
 # Built-in SIP003 plugin transports on the `ss` outbound — opt-in, each
-# implies `ss`; `ss` alone keeps only simple-obfs + v2ray-plugin.
+# implies `ss`; plain `ss` carries none of them. The app `minimal`
+# bundle ships `ss-obfs`; `ss-v2ray-plugin` stays out (ADR-0007 8 MiB
+# aarch64-musl budget).
+ss-obfs = ["ss", "meow-proxy/ss-obfs"]
+ss-v2ray-plugin = ["ss", "meow-proxy/ss-v2ray-plugin"]
 shadow-tls = ["ss", "meow-proxy/shadow-tls"]
 restls = ["ss", "meow-proxy/restls"]
 jls = ["ss", "meow-proxy/jls"]
@@ -31,7 +35,18 @@ vless-encryption = ["vless", "meow-proxy/vless-encryption"]
 vmess = ["meow-proxy/vmess"]
 anytls = ["meow-proxy/anytls"]
 hysteria2 = ["meow-proxy/hysteria2"]
-wireguard = ["meow-proxy/wireguard"]
+# WireGuard userspace outbound (issue #899 Phase-1) — vendored ring-free
+# boringtun noise over a smoltcp stack; opt-in, bundled into the app `full`
+# profile, kept out of `default`/`minimal` (ADR-0007 binary-size caps).
+# `dep:x25519-dalek` rides along: the `type: wireguard` *listener* schema
+# parses unconditionally (no config-side feature gate — see
+# ListenerSpec::WireGuard), and this build mode additionally validates at
+# config time that no peer public-key equals the listener's own derived
+# public key; on other build modes that one check is deferred to listener
+# startup (meow-listener holds meow-wireguard's x25519).
+wireguard = ["meow-proxy/wireguard", "dep:x25519-dalek"]
+# meow-openwrt: the kernel-module outbound (+ AmneziaWG), Linux only.
+wireguard-kernel = ["meow-proxy/wireguard-kernel"]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["meow-proxy/trusttunnel"]
 # `quic: true` for that outbound; see meow-proxy's `trusttunnel-h3`.
@@ -69,13 +84,16 @@ meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "htt
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 serde-saphyr = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 maxminddb = { workspace = true }
-ipnet = { workspace = true }
+# `serde` for the typed `WgPeerConfig::allowed_ips` (`ListenerSpec` derives
+# serde for persisted-config round-trip); additive impls for other users.
+ipnet = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 regex = { workspace = true }
 parking_lot = { workspace = true }
@@ -87,6 +105,11 @@ httparse = "1"
 # `deflate` is the only codec GitHub release zips use; skip the heavier ones.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 dashmap = { workspace = true }
+# Optional: only needed by the `wireguard`-feature config-time check that a
+# `type: wireguard` listener peer's public-key differs from the listener's
+# own derived public key (X25519 basepoint multiply). Without the feature —
+# and in every build lacking it — the listener startup path re-checks.
+x25519-dalek = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

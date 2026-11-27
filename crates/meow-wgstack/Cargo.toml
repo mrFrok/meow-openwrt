@@ -1,0 +1,55 @@
+# Shared userspace plumbing for WireGuard peers (#899 outbound pump, WG
+# inbound listener): the channel-backed smoltcp `Device`, the per-conn
+# stream shim, their queue/buffer constants, and the endpoint-socket
+# SO_RCVBUF enlarger. Deliberately free of `meow-wireguard` — the boringtun
+# `Tunn` stays owned by the caller's actor.
+[package]
+name = "meow-wgstack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared smoltcp/tokio plumbing for the meow-rs WireGuard outbound pump and inbound listener."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+# Opt-out escape hatch: `endpoint.rs` uses Darwin's private
+# `sendmsg_x`/`recvmsg_x` SPI for batched UDP I/O on macOS. Enabling
+# this feature (e.g. `cargo test -p meow-wgstack --features
+# no-macos-sendmsg-x`, or `meow-wgstack/no-macos-sendmsg-x` from a
+# direct dependent — meow-proxy/meow-listener, the release bundles do
+# not re-export it) compiles the per-datagram `try_*` loop instead, for
+# environments that audit or shim out private SPI.
+no-macos-sendmsg-x = []
+
+[dependencies]
+# `ProxyConn` is implemented for `WgStream` here — the trait is
+# meow-common's, so the impl cannot live in a downstream crate (orphan
+# rule). Same meow-common edge meow-anytls already carries.
+meow-common = { workspace = true }
+smoltcp = { workspace = true }
+# `time`: `endpoint.rs`'s TX bridge bounds `conn.write_packet` with
+# `tokio::time::timeout` — declare it rather than ride a transitive
+# unification of someone else's feature set.
+tokio = { version = "1", features = ["net", "sync", "time"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+
+# `force_recv_buffer` (SO_RCVBUFFORCE inside `enlarge_recv_buffer`) and
+# the batched-syscall types/constants in `endpoint.rs`: `sendmmsg`/
+# `recvmmsg` on Linux, the `msghdr_x` wire layout + `sockaddr_in`'s
+# `sin_len` for `sendmsg_x`/`recvmsg_x` on macOS.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# `endpoint.rs` batch tests drive loopback `tokio::net::UdpSocket`s.
+# `rt-multi-thread`/`test-util`: the proxy-bridge tests spawn on a
+# multi-thread runtime and pause/advance the clock past
+# `PROXY_WRITE_TIMEOUT`.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "test-util"] }
+
+[lints]
+workspace = true

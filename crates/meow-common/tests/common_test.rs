@@ -20,6 +20,7 @@ fn test_adapter_type_display() {
         (AdapterType::Vless, "Vless"),
         (AdapterType::Trojan, "Trojan"),
         (AdapterType::Hysteria2, "Hysteria2"),
+        (AdapterType::WireGuard, "WireGuard"),
     ];
     for (variant, expected) in cases {
         assert_eq!(variant.to_string(), expected, "AdapterType::{variant:?}");
@@ -304,7 +305,7 @@ fn test_metadata_pure_clears_extra_fields() {
         sniff_host: "sniffed.com".into(),
         in_name: "mixed-in".into(),
         in_port: 7890,
-        special_proxy: "special".into(),
+        special_route: InboundRouteOverride::new(Some("special"), None).map(std::sync::Arc::new),
         internal: true,
         ..Default::default()
     };
@@ -331,7 +332,7 @@ fn test_metadata_pure_clears_extra_fields() {
     assert!(pure.sniff_host.is_empty());
     assert!(pure.in_name.is_empty());
     assert_eq!(pure.in_port, 0);
-    assert!(pure.special_proxy.is_empty());
+    assert!(pure.special_route.is_none());
     // `internal` is a property of the traffic, not the inbound — it must
     // survive the sanitizing copy so usage accounting still skips it.
     assert!(pure.internal);
@@ -457,6 +458,31 @@ fn test_metadata_dscp_json_is_always_a_number() {
     assert_eq!(read_back(None), None, "no key is no DSCP");
 }
 
+/// `special_route`'s wire shape is mihomo's flat `specialProxy` string —
+/// always emitted (`""` when unset), and the `rule` half never crosses
+/// the wire just as `special_rules` never did.
+#[test]
+fn test_metadata_special_route_json_is_flat_proxy_string() {
+    let m = Metadata {
+        special_route: InboundRouteOverride::new(Some("sel"), Some("blk")).map(std::sync::Arc::new),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"specialProxy\":\"sel\""), "{json}");
+    assert!(
+        !json.contains("blk"),
+        "rule half must not serialize: {json}"
+    );
+
+    let back: Metadata = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.special_proxy(), "sel");
+    assert_eq!(back.special_rules(), "", "rule half does not read back");
+
+    // Unset still emits the key (dashboards read it unconditionally).
+    let unset = serde_json::to_string(&Metadata::default()).unwrap();
+    assert!(unset.contains("\"specialProxy\":\"\""), "{unset}");
+}
+
 #[test]
 fn test_metadata_internal_never_serializes() {
     // `internal` is an in-process usage-accounting marker, not a conn
@@ -513,6 +539,28 @@ fn test_error_from_io() {
 /// ADR-0011 footprint guard — `Metadata` is the per-connection hot type
 /// (M2 baseline 272 B). Fields must land in existing tail padding; a
 /// growth needs a measured justification in the commit body.
+///
+/// 272 → 280 B (issue #974): `flow_lookup: Arc<FlowLookup>` is one
+/// pointer the flow's process-lookup memo lives behind — `find-process-
+/// mode` shares it between this metadata and every clone the routing,
+/// UDP probe and tracking paths make, so it cannot be a plain field (a
+/// `Clone` would sever the memo) and a smaller non-owning type has
+/// nowhere to point.
+///
+/// 280 → 264 B: `special_proxy`/`special_rules` (2 × SmolStr, 48 B on
+/// every flow) collapsed into `special_route` — one pointer the named
+/// listener's route override lives behind, `None` for the
+/// default-listener majority and shared by every clone of a stamped
+/// flow. The payload is the same `InboundRouteOverride` the listener
+/// config holds, Arc'd once per stamped flow (wireguard/tproxy-UDP pass
+/// their listener Arc straight through — zero per-flow alloc there).
+///
+/// 264 → 272 B (issue #974): `rematch_name: Option<Arc<SmolStr>>` — the
+/// marker a `type: rematch` hop stamps, `None` on the ordinary flow and
+/// one pointer wide for it. It is per-clone state (each transition
+/// stamps its own copy), so it cannot fold into the clones-shared
+/// `flow_lookup` payload; an inline `Option<SmolStr>` would instead
+/// cost every flow 24 B for a field rematch flows alone carry.
 #[test]
 fn metadata_stays_272_bytes() {
     assert_eq!(std::mem::size_of::<meow_common::Metadata>(), 272);

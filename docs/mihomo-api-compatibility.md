@@ -11,6 +11,42 @@ Status meanings:
 - **Extension**: meow-rs API with no mihomo equivalent.
 - **Not implemented**: deliberately not registered; callers receive 404.
 
+## Listener transports
+
+Every route below serves identically over each configured controller
+endpoint — the plain `external-controller` TCP listener plus, like
+upstream, any of these coexisting listeners (issue #974, see
+[api-listener.md](specs/api-listener.md)):
+
+| Config key / CLI flag | Status | Notes |
+|---|---|---|
+| `external-controller-tls` / `--ext-ctl-tls` | Compatible | HTTPS via BoringSSL, ALPN `h2` then `http/1.1` (axum serves a real h2 on the `h2` ALPN). The endpoint is the `api-tls` build feature — `full`/`default` ship it, `minimal` parses the key but warns at startup that the HTTPS controller is not compiled into the build. Identity from `tls.certificate`/`tls.private-key` — both inline PEM or both home/`SAFE_PATHS`-contained file paths (a mixed pair is refused without embedding the inline material in errors); both unset serves an ephemeral self-signed RSA-2048 cert. Identity failures are endpoint-local like upstream: `-t`/load is shape-only, a bad pair just skips the TLS listener at bind. No PEM file watching. |
+| `external-controller-unix` / `--ext-ctl-unix` | Compatible | Unix socket, relative path under the daemon home. Deliberate divergences: refuses non-socket/other-user paths, reclaims only a verified stale socket, binds `0600` (not `0666`, and chmod failure fails the endpoint), keeps Bearer auth, and the cleanup guard unlinks only the exact socket it bound — re-verified by type and `(dev, ino)`. |
+| `external-controller-pipe` / `--ext-ctl-pipe` | Partial | Windows named pipe, byte mode, remote clients rejected, owner-only SDDL ACL on every instance; a failed next-instance creation still serves the already-connected client. Parsed but warn-ignored on non-Windows. |
+| `external-controller-cors` | Compatible | Always the configured `cors.New` wire shape: `allow-origins` (`*`/globs/echo, `[]` = allow-all), `allow-private-network` (default `true`), `Access-Control-Max-Age: 300`, `HEAD` never allowed (preflight or actual), request headers limited to `{content-type, authorization, origin}` — one bad name denies the preflight. An absent map resolves the `["*"]`/`true` defaults like upstream under a set/unset secret; upstream's permissive `AllowAll` fires only on `secret: ""`, and meow mounts no CORS layer without a secret at all, so it has no counterpart. |
+| `external-controller-routing-mark` | Not implemented | Parsed and warn-ignored; no controller-socket `SO_MARK`. |
+| `tls:` other members | Not implemented | `client-auth-type`, `client-auth-certificates`, `ech-key`, `custom-certifactes` (sic) parse and warn-ignore. |
+
+The listener surface is a startup snapshot: `PUT /configs` commits these
+keys to the document for the next boot and warns that a restart applies
+them — it never rebinds, reads PEMs or mutates CORS live. The plain TCP
+bind is the only startup-fatal endpoint; the new ones log-and-skip like
+upstream, and a config where every endpoint failed to bind logs that no
+controller is available.
+
+The same holds for named `listeners:` — including `type: anytls`: a PUT
+that changes the effective listener set (its own keys OR an inherited
+default like `max-connections`/`bind-address`/`sniffer:` resolving
+differently) is committed to the in-memory document and reported with a
+restart warning; running sockets, the authenticated user table and TLS
+material are untouched. The committed document is NOT written back to
+the backing config file — `PUT /configs` is a reload, not a save: keep
+the submitted YAML as the file the next boot reads (or run
+`PUT /configs` against the persisted path), otherwise the change is lost
+on restart. A `type: anytls` entry this build cannot serve (no
+`listener-anytls` feature) is rejected with 400 even under `?force=true`,
+so a persisted config can never strand the next boot.
+
 ## Panel runtime API
 
 | Route | Status | Notes |
@@ -36,15 +72,18 @@ Status meanings:
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe; members carry `provider-name`. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format (`YamlRule`, `TextRule` or `MrsRule`: what the payload parsed as), vehicle type, rule count, and RFC 3339 update time. |
-| `GET/PATCH /configs` | Partial | Mode, log level, `routing-mark` and `tun` are mutable. A `routing-mark` patch applies `SO_MARK` to outbound sockets opened after the commit (`0` clears); it is refused with 400 while meow's managed tproxy firewall holds an exemption for the current mark, and a refused patch leaves mode/log/tun untouched. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. `GET` reports `sniffing` (the resolved value — the deprecated `tproxy-sni` alias counts as enabled when no `sniffer:` block overrides it) and `skip-auth-prefixes`, but a `PATCH` of them is ignored: both are wired into the listeners at startup. Ports, `allow-lan`, `bind-address`, `ipv6`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
-| `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. `routing-mark` applies with the commit and is refused while a managed tproxy firewall pins the current mark (same gate as `PATCH`). A JSON config document is legal YAML 1.2 input, but map order then comes from the submitted text's literal order — meow-rs never re-sorts, so clients needing deterministic `nameserver-policy`/`hosts` order should submit YAML. |
+| `GET/PATCH /configs` | Partial | Mode, log level, `routing-mark`, `interface-name`, `global-ua` and `tun` are mutable. A `routing-mark` patch applies `SO_MARK` to outbound sockets opened after the commit (`0` clears); it is refused with 400 while meow's managed tproxy firewall holds an exemption for the current mark, and a refused patch leaves mode/log/tun untouched. An `interface-name` patch binds outbound sockets opened after the commit to that interface (`""` clears); it is never pin-refused the way `routing-mark` is — no managed firewall matches on an interface — and the name resolves to an index fresh per dial (no cache to invalidate), so an interface destroyed and recreated is followed while a missing one fails the dial closed; a node's own `interface-name` still wins, and loopback peers stay exempt. A `global-ua` patch installs the `User-Agent` internal HTTP fetches and latency probes send (`""` clears to `clash.meta/<version>`); a value carrying CR/LF/NUL/control bytes is refused with 400 and the live override is untouched. `GET` also reports the live `global-ua` and the committed `global-client-fingerprint`; the fingerprint is not patchable — adapters bake it at parse, so it changes through `PUT /configs`. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. When the TUN device is declared as a named `listeners:` `type: tun` entry instead (startup-only, one effective TUN), a `tun.enable` patch or PUT is refused with 400 while that device owns the slot, `GET` still reports `tun-enable`/`tun.enable` from the top-level section only, and `GET /listeners` lists the entry without a port; see docs/tun.md. `GET` reports `sniffing` (the resolved value — the deprecated `tproxy-sni` alias counts as enabled when no `sniffer:` block overrides it), `skip-auth-prefixes` and the live `interface-name`, but a `PATCH` of sniffing/skip-auth-prefixes is ignored: both are wired into the listeners at startup. `tcp-concurrent` is patchable: `false` switches new candidate selections to strictly sequential dials under a shared deadline, `true` (the meow-rs default — upstream's default is `false`) restores the race; `GET` reports the live policy and an in-flight dial run keeps the policy it started with. `find-process-mode` is patchable too: `always` looks up every eligible new inbound flow's owner before mode dispatch, `strict` (the default) only at the first reached process-demanding rule, `off` never — suppressing the traffic ledger's app lookup as well; `GET` reports the live mode. A `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive` patch merges the supplied fields over the committed values and re-installs the outbound keepalive policy for dials opened after the commit (bounds `0..=32767`, `0`/absent resolves to 15 s); `GET` reports the effective live values. `GET` also reports the effective `profile:` flags as `store-selected`/`store-fake-ip` (resolved over `dns.store-fake-ip`) and the resolved `ntp` object with `write-to-system: false`; `profile:` and `ntp:` keys in a patch are ignored. Ports, `allow-lan`, `bind-address`, `ipv6`, TUIC and the other dynamic listeners are unavailable. |
+| `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable; `lan-allowed-ips`/`lan-disallowed-ips` are validated (hard error on malformed CIDRs even with `?force=true`) and committed for the next boot, never re-applied to running accept loops, and `PATCH` does not model them. `routing-mark` applies with the commit and is refused while a managed tproxy firewall pins the current mark (same gate as `PATCH`); `interface-name` re-applies with the commit the same way, as do the committed `global-client-fingerprint` and `global-ua` (the UA installs process-wide, `""`/absent clears). `tcp-concurrent` and `find-process-mode` likewise re-apply at the swap — a document omitting them resets to the defaults (`true` for `tcp-concurrent`, `strict` for `find-process-mode`). `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`, `profile:` and `ntp:` resolve and validate with the committed document and install at commit (omission resets to defaults); an enabled `ntp.dialer-proxy` must name a built top-level proxy/group or `DIRECT`, and invalid `ntp:`/`keep-alive-*`/`profile:` semantics are rejected even under `?force=true`. The geo update schedule (`geo-auto-update`, `geo-update-interval`, `geodata.auto-update*`) persists through a committed document but stays a startup snapshot: a change warns that restart applies it. A JSON config document is legal YAML 1.2 input, but map order then comes from the submitted text's literal order — meow-rs never re-sorts, so clients needing deterministic `nameserver-policy`/`hosts` order should submit YAML. |
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |
 | `POST /cache/fakeip/flush` | Compatible | Clears fake-IP allocations. |
 
-Authentication matches mihomo: ordinary HTTP requires the exact
-`Authorization: Bearer <secret>` scheme, while WebSocket upgrades may instead
-use `?token=<secret>`. Authentication failures use
-`{"message":"Unauthorized"}`.
+With a controller secret, HTTP requires the exact `Authorization: Bearer <secret>`
+scheme, and WebSocket upgrades also accept `?token=<secret>`. Authentication
+failures use `{"message":"Unauthorized"}`.
+
+Without a controller secret, use an IP address or `localhost` to access the API.
+Browser API requests and WebSocket upgrades must come from the controller's own
+origin.
 
 ## Deliberate gaps
 
@@ -63,6 +102,18 @@ UDP connection entries are also intentionally omitted until their
 underlying tracking exists, and rule `missCount`/`missAt` stay zero/epoch
 by design (the compiled matcher short-circuits, so a rule that was never
 reached is not a "miss").
+
+One per-node dialer-option divergence is worth calling out here since it
+surfaces as a dial error an API client can observe: `mptcp: true` on a
+kernel without Multipath TCP (Linux <5.6, or built without
+`CONFIG_MPTCP`) fails the node's dial at `socket()` with
+`EPROTONOSUPPORT` — fail-closed like every other socket-option failure —
+where mihomo silently degrades to plain TCP. On kernels with MPTCP the
+kernel itself handles the protocol-level fallback to a non-MPTCP peer.
+Likewise `tfo`, `mptcp` and `routing-mark` on non-Linux platforms warn
+once and are skipped rather than failing, and `interface-name` fails
+closed with `Unsupported` on platforms that have no per-socket binding —
+a configured interface must never be silently ignored.
 
 ## Meow-rs extensions
 
@@ -84,7 +135,12 @@ The following routes are retained and do not collide with the mihomo surface:
   (`{"rule": "<line>"}`: one line after the config's rules; a line that
   fails to parse answers 400 naming it rather than a silent 204)
 - `GET /dns/results` and `POST /dns/query`
-- `GET /listeners`
+- `GET /listeners`: active listeners (`name`, `type`, `port`, `listen`);
+  tproxy entries also report `firewall`/`udp`/`udp-timeout`, and a
+  `type: anytls` entry with several `listen` addresses reports them all
+  under `addresses` (`port`/`listen` stay the first address). Credentials
+  — the `users` digests, certificate and private key — are never in the
+  output
 - `GET /statistics`: `uploadTotal` / `downloadTotal` (the `/traffic`
   totals) and `proxies`, the bytes each proxy carried since start, TCP and
   UDP: `{"DIRECT": {"upload": N, "download": N}, ...}`. A group's traffic

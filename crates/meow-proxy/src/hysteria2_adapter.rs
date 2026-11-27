@@ -53,9 +53,12 @@ pub struct Hy2Options {
     pub fingerprint: Option<String>,
     pub fast_open: bool,
     pub windows: crate::hysteria2::ReceiveWindows,
-    /// Parallel QUIC connections (`connections:`, meow extension); `0` is
-    /// automatic: one per CPU, at most 4.
-    pub connections: usize,
+    /// `quic-connections`: the K-way QUIC connection-pool width. `None`
+    /// resolves to [`crate::hysteria2::DEFAULT_QUIC_CONNECTIONS`]; any
+    /// value clamps to `1..=`[`crate::hysteria2::MAX_QUIC_CONNECTIONS`]
+    /// (the parser already warns past 4). Widens aggregate throughput
+    /// across flows — a single stream still rides one connection.
+    pub quic_connections: Option<usize>,
 }
 
 impl Hy2Options {
@@ -126,10 +129,10 @@ impl Hy2Options {
             pin_sha256: self.fingerprint.unwrap_or_default(),
             fast_open: self.fast_open,
             windows: self.windows,
-            connections: match self.connections {
-                0 => auto_connections(),
-                n => n,
-            },
+            connections: self
+                .quic_connections
+                .unwrap_or_else(auto_connections)
+                .clamp(1, crate::hysteria2::MAX_QUIC_CONNECTIONS),
         };
         Ok((addr, self.udp, cfg))
     }
@@ -151,7 +154,17 @@ pub struct Hy2Adapter {
 }
 
 impl Hy2Adapter {
-    pub fn new(options: Hy2Options) -> std::result::Result<Self, String> {
+    /// `dialer` is the injected `dialer-proxy` dialer, when one is
+    /// configured: `Some` only for a real chain (`is_proxy()`), and the
+    /// QUIC connection then rides the front's UDP association — a
+    /// `DirectDialer` keeps the raw bind path either way. Like the
+    /// WireGuard contract there is deliberately no `supports_udp` gate
+    /// here: that flag answers `false` for an unresolved group target,
+    /// and a UDP-less front simply fails `dial_udp_conn` at dial, closed.
+    pub fn new(
+        options: Hy2Options,
+        dialer: Option<Arc<dyn crate::dialer::TcpDialer>>,
+    ) -> std::result::Result<Self, String> {
         if options.up_bps > 0 {
             tracing::warn!(
                 "hysteria2 {}: `up` is ignored — meow runs BBRv2 (no Brutal in quiche)",
@@ -159,13 +172,23 @@ impl Hy2Adapter {
             );
         }
         let name = options.name.clone();
+        let quic_connections = options
+            .quic_connections
+            .unwrap_or_else(auto_connections)
+            .clamp(1, crate::hysteria2::MAX_QUIC_CONNECTIONS);
         let (addr, support_udp, cfg) = options.into_hysteria_config()?;
+        let client = match dialer.filter(|d| d.is_proxy()) {
+            Some(dialer) => {
+                crate::hysteria2::ReconnectableClient::with_dialer(cfg, dialer, quic_connections)
+            }
+            None => crate::hysteria2::ReconnectableClient::new(cfg, quic_connections),
+        };
         Ok(Self {
             name: SmolStr::from(name),
             addr,
             support_udp,
             health: ProxyHealth::new(),
-            client: Arc::new(crate::hysteria2::ReconnectableClient::new(cfg)),
+            client: Arc::new(client),
         })
     }
 }
@@ -397,6 +420,13 @@ impl ProxyAdapter for Hy2Adapter {
         self.support_udp
     }
 
+    /// Every flow's hop to the server travels as a QUIC datagram — TCP
+    /// streams included — so an injected `dialer-proxy` front always takes
+    /// the UDP association path (same whole-transport shape as WireGuard).
+    fn dialer_hop_network(&self, _flow: meow_common::Network) -> meow_common::Network {
+        meow_common::Network::Udp
+    }
+
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let target = target_from_metadata(metadata)?;
         debug!("Hysteria2 connecting to {} via {}", target, self.addr);
@@ -480,8 +510,8 @@ mod tests {
             hop_interval: None,
             fingerprint: None,
             fast_open: true,
-            connections: 1,
             windows: Default::default(),
+            quic_connections: None,
         }
     }
 
@@ -491,7 +521,7 @@ mod tests {
             password: String::new(),
             ..base_options()
         };
-        let Err(err) = Hy2Adapter::new(options) else {
+        let Err(err) = Hy2Adapter::new(options, None) else {
             panic!("must fail");
         };
         assert!(err.contains("password must not be empty"));
@@ -499,21 +529,24 @@ mod tests {
 
     #[test]
     fn adapter_constructor_builds_hysteria_config() {
-        let adapter = Hy2Adapter::new(Hy2Options {
-            server: "127.0.0.1".into(),
-            sni: Some("example.com".into()),
-            up_bps: 10,
-            down_bps: 20,
-            obfs: Some(Hy2Obfs::Salamander),
-            obfs_password: Some("obfs-secret".into()),
-            ports: Some("443,8443".into()),
-            hop_interval: Some(Hy2HopInterval {
-                min_secs: 15,
-                max_secs: 30,
-            }),
-            fingerprint: Some("00".repeat(32)),
-            ..base_options()
-        })
+        let adapter = Hy2Adapter::new(
+            Hy2Options {
+                server: "127.0.0.1".into(),
+                sni: Some("example.com".into()),
+                up_bps: 10,
+                down_bps: 20,
+                obfs: Some(Hy2Obfs::Salamander),
+                obfs_password: Some("obfs-secret".into()),
+                ports: Some("443,8443".into()),
+                hop_interval: Some(Hy2HopInterval {
+                    min_secs: 15,
+                    max_secs: 30,
+                }),
+                fingerprint: Some("00".repeat(32)),
+                ..base_options()
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(adapter.name(), "hy2");
         assert_eq!(adapter.addr(), "127.0.0.1:443");
@@ -557,11 +590,14 @@ mod tests {
                 max_packet_size: 0,
             },
         ] {
-            let Err(err) = Hy2Adapter::new(Hy2Options {
-                obfs: Some(obfs),
-                obfs_password: Some(String::new()),
-                ..base_options()
-            }) else {
+            let Err(err) = Hy2Adapter::new(
+                Hy2Options {
+                    obfs: Some(obfs),
+                    obfs_password: Some(String::new()),
+                    ..base_options()
+                },
+                None,
+            ) else {
                 panic!("{obfs:?} without a password must fail");
             };
             assert!(err.contains("missing obfs-password"), "{err}");
@@ -603,7 +639,7 @@ mod tests {
     /// the trait-default `connect_over` must keep returning NotSupported.
     #[tokio::test]
     async fn connect_over_is_not_supported() {
-        let adapter = Hy2Adapter::new(base_options()).unwrap();
+        let adapter = Hy2Adapter::new(base_options(), None).unwrap();
         // The error surfaces before any stream IO — a dead listener suffices.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
@@ -624,7 +660,7 @@ mod tests {
     /// review). The guard runs before `udp()`, so no session is needed.
     #[tokio::test]
     async fn dial_udp_refuses_oversized_domain_target() {
-        let adapter = Hy2Adapter::new(base_options()).unwrap();
+        let adapter = Hy2Adapter::new(base_options(), None).unwrap();
         let meta = Metadata {
             network: meow_common::Network::Udp,
             // 2048-byte bound on "host:port": this host alone exceeds it.

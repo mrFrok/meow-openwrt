@@ -191,6 +191,377 @@ pub async fn dns_via_proxy_dial_scope<F: std::future::Future>(fut: F) -> F::Outp
     IN_DNS_VIA_PROXY_DIAL.scope((), fut).await
 }
 
+// ─── Per-node dialer options (issue #974) ──────────────────────────────────
+//
+// mihomo's per-`proxies:`-entry dialer fields — `routing-mark`,
+// `interface-name`, `ip-version`, `tfo`, `mptcp` — plus the new top-level
+// `interface-name` global. The config layer parses each leaf's fields into
+// a [`crate::NodeDialerOpts`] carried by its `WrappedProxy`, which resolves
+// node-over-global at dial time and installs the result here as a
+// task-local scope around the adapter call. The socket helpers below —
+// `connect_tcp`, `bind_udp`/`bind_udp_for_peer`, `resolve_addrs` — read the
+// scope through [`dialer_opts`], so every socket a dial opens gets the
+// node's own options, including the WireGuard endpoint socket bound inside
+// `ensure_pump` (spec-delta: no WG carve-out).
+//
+// The scope REPLACES on nesting: a `dialer-proxy` front hop installs its
+// own options for the physical socket it opens, while the rear hop's
+// handshake rides the stream the front already built — matching mihomo,
+// where each hop's dialer options apply to the socket that hop opens.
+
+/// The address-family selection mihomo spells `ip-version` on a
+/// `proxies:` node (issue #974). Resolution-time only: an IP-literal
+/// `server:`/destination never reaches the filter because resolution
+/// short-circuits before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IpVersion {
+    /// Keep the resolver's order unchanged (`ip-version: dual`, default).
+    #[default]
+    Dual,
+    /// IPv4 candidates only; the dial fails when resolution yields none.
+    Ipv4,
+    /// IPv6 candidates only; the dial fails when resolution yields none.
+    Ipv6,
+    /// IPv4 candidates first, IPv6 kept as fallback — a stable reorder,
+    /// relative order inside each family preserved.
+    Ipv4Prefer,
+    /// IPv6 candidates first, IPv4 kept as fallback — likewise stable.
+    Ipv6Prefer,
+}
+
+impl std::fmt::Display for IpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dual => "dual",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Ipv4Prefer => "ipv4-prefer",
+            Self::Ipv6Prefer => "ipv6-prefer",
+        })
+    }
+}
+
+impl IpVersion {
+    /// The [`std::fmt::Display`] strings' inverse — `None` for anything outside the
+    /// five mihomo spellings (the parser turns that into a hard config
+    /// error, it does not silently default).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "dual" => Self::Dual,
+            "ipv4" => Self::Ipv4,
+            "ipv6" => Self::Ipv6,
+            "ipv4-prefer" => Self::Ipv4Prefer,
+            "ipv6-prefer" => Self::Ipv6Prefer,
+            _ => return None,
+        })
+    }
+}
+
+/// The top-level globals a node's options resolve over: `routing-mark`
+/// (the same `SO_MARK` [`set_routing_mark`] installs) and `interface-name`.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalDialerOpts {
+    /// The global `SO_MARK`; `0` normalizes to unset, as everywhere else.
+    pub routing_mark: Option<u32>,
+    /// The global interface binding. A node's own `interface-name` wins.
+    pub interface_name: Option<Arc<str>>,
+}
+
+/// The installed global dialer options — `routing-mark` reads `0` as
+/// unset (the same normalization the parser and [`set_routing_mark`]
+/// share), `interface-name` from [`set_global_interface_name`].
+pub fn global_dialer_opts() -> GlobalDialerOpts {
+    GlobalDialerOpts {
+        routing_mark: Some(routing_mark()).filter(|mark| *mark != 0),
+        interface_name: global_interface_name(),
+    }
+}
+
+/// The dial-time effective options: a node's [`crate::NodeDialerOpts`]
+/// resolved over [`GlobalDialerOpts`], every field concrete. A
+/// `WrappedProxy` computes this per dial and installs it via
+/// [`dialer_opts_scope`]; the socket helpers read [`dialer_opts`].
+#[derive(Debug, Clone, Default)]
+pub struct DialerOpts {
+    /// Effective `SO_MARK` — node mark when set, else the global mark.
+    /// Linux-only; skipped with a one-time warning elsewhere.
+    pub routing_mark: Option<u32>,
+    /// Effective interface binding — node > global > TUN owner binding.
+    /// Resolved name→index at dial time; loopback peers stay exempt.
+    pub interface_name: Option<Arc<str>>,
+    /// Resolution-time family selection applied inside `resolve_addrs`
+    /// (and to `DirectAdapter`'s own resolver output).
+    pub ip_version: IpVersion,
+    /// `TCP_FASTOPEN_CONNECT` on the node's TCP sockets. Linux-only.
+    pub tfo: bool,
+    /// Build the node's TCP sockets as MPTCP (`IPPROTO_MPTCP`). Linux-only.
+    pub mptcp: bool,
+}
+
+impl DialerOpts {
+    /// Node fields over the globals — the node value wins wherever it set
+    /// one, mihomo's per-node-over-`interface-name`/`routing-mark`
+    /// shadowing (issue #974).
+    pub fn resolve(node: &crate::adapter::NodeDialerOpts, global: &GlobalDialerOpts) -> Self {
+        Self {
+            routing_mark: node.routing_mark.or(global.routing_mark),
+            interface_name: node
+                .interface_name
+                .clone()
+                .or_else(|| global.interface_name.clone()),
+            ip_version: node.ip_version,
+            tfo: node.tfo,
+            mptcp: node.mptcp,
+        }
+    }
+
+    /// Whether the plain Tokio dial/bind paths must step aside for the
+    /// `socket2` path: any option the fast path cannot express on the
+    /// socket (`ip-version` never qualifies — it is resolution-time).
+    pub fn needs_socket2(&self) -> bool {
+        self.routing_mark.is_some() || self.interface_name.is_some() || self.tfo || self.mptcp
+    }
+
+    /// The global dialer fields with no node overlay — the scope meow's
+    /// own DNS plumbing resolves under (`resolve_via_hook`): a node's
+    /// `interface-name`/`routing-mark`/`tfo`/`mptcp` must not steer the
+    /// shared resolver's upstream sockets, and mihomo likewise resolves
+    /// through the central resolver without node fields (issue #974).
+    pub fn global_only() -> Self {
+        Self::resolve(
+            &crate::adapter::NodeDialerOpts::default(),
+            &global_dialer_opts(),
+        )
+    }
+
+    /// Fill still-unset fields from [`global_dialer_opts`], making an
+    /// unscoped read see the globals a scoped value already resolved:
+    /// provider fetches, DNS upstreams and the built-in DIRECT run no
+    /// scope, but the global `interface-name`/`routing-mark` applies to
+    /// them exactly as mihomo's does.
+    fn with_global_fallbacks(mut self) -> Self {
+        let global = global_dialer_opts();
+        if self.routing_mark.is_none() {
+            self.routing_mark = global.routing_mark;
+        }
+        if self.interface_name.is_none() {
+            self.interface_name = global.interface_name;
+        }
+        self
+    }
+}
+
+tokio::task_local! {
+    /// The resolved [`DialerOpts`] a `WrappedProxy` installs around one
+    /// adapter dial. Task-local so the front hop of a `dialer-proxy` chain
+    /// scoping *its* physical dial never bleeds into the rear's handshake —
+    /// and a nested scope replaces rather than merges (each hop resolves
+    /// its own node-over-global).
+    static DIALER_OPTS: DialerOpts;
+}
+
+/// The dial scope's resolved options, with the globals merged into any
+/// unset slot. No scope = defaults plus globals — so the live
+/// `routing-mark`/`interface-name` still reach every socket a scoped or
+/// unscoped caller opens.
+pub fn dialer_opts() -> DialerOpts {
+    DIALER_OPTS
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+        .with_global_fallbacks()
+}
+
+/// Run `fut` under `opts`, replacing any enclosing scope.
+pub async fn dialer_opts_scope<F: std::future::Future>(opts: DialerOpts, fut: F) -> F::Output {
+    DIALER_OPTS.scope(opts, fut).await
+}
+
+// ─── TCP Brutal carrier sockets (smux.brutal-opts, issue #974) ─────────────
+//
+// mihomo's `smux.brutal-opts` negotiates a TCP Brutal rate cap on the mux
+// carrier (sing-mux's `_BrutalBwExchange` control stream) and applies it to
+// the carrier's *physical* socket: `SetBrutalOptions` unwraps every
+// TLS/proxy wrapper down to the bottom `syscall.Conn` — under
+// `dialer-proxy` that is the *front hop's* socket. meow's socket helpers
+// already sit at that bottom: a mux session dial wrapped in
+// [`brutal_carrier_scope`] collects the `TcpStream` clone every
+// [`connect_tcp`] hands upward, and `apply_rate` sets the negotiated rate
+// on each stash. This deliberately is a *separate* task-local from
+// `DIALER_OPTS`: a `dialer-proxy` front hop REPLACES the dialer-opts scope
+// for its own physical dial, while the carrier cell must survive that
+// replacement so the front's socket is still the one captured.
+//
+// Resolver-internal sockets are excluded: `resolve_via_hook` and
+// `resolve_host_all_via` clear the cell for the lookup, so sockets a
+// DNS-via-proxy dial opens never land in a carrier's set.
+
+/// The kernel TCP sockets one brutal-enabled mux session dial opened,
+/// stashed by [`connect_tcp`] (Linux only — elsewhere the cell stays empty
+/// and [`apply_rate`](BrutalCarrier::apply_rate) is the upstream stub's
+/// behavior). The stash holds `dup`'d fd handles of the same kernel
+/// sockets — so the set stays referencable after the dial wraps each
+/// original in TLS/proxy layers, and closing a dropped clone can never
+/// disturb the live socket.
+#[derive(Debug, Default)]
+pub struct BrutalCarrier {
+    /// Stashed socket clones — Linux only; the field stays compiled out
+    /// elsewhere so the cell is provably empty on those builds.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    sockets: parking_lot::Mutex<Vec<std::net::TcpStream>>,
+}
+
+impl BrutalCarrier {
+    /// An empty carrier — one per new mux session dial (`create_session`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one dialled socket. The `dup`'d fd shares the kernel
+    /// socket, so `apply_rate`'s setsockopts land on the socket the dial
+    /// is using, not a copy of it.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn stash(&self, stream: std::net::TcpStream) {
+        self.sockets.lock().push(stream);
+    }
+
+    /// How many sockets the dial stashed (test observability).
+    #[cfg(all(test, target_os = "linux", not(target_env = "ohos")))]
+    fn stashed(&self) -> usize {
+        self.sockets.lock().len()
+    }
+
+    /// Apply the negotiated rate cap (bytes/s) to every stashed socket —
+    /// `TCP_CONGESTION "brutal"` then `TCP_BRUTAL_PARAMS{rate, cwnd_gain
+    /// 20}`, mirroring sing-mux `brutal_linux.go` (requires the apernet
+    /// tcp-brutal kernel module). Failures are `debug!`-only, never
+    /// fatal — upstream logs the same error at Debug and keeps the
+    /// carrier. Returns the count of sockets that took both setsockopts.
+    ///
+    /// Parallel `connect_tcp_candidates` may stash losing candidates; an
+    /// applied-then-closed loser wastes one setsockopt pair, which is
+    /// bounded and harmless.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    pub fn apply_rate(&self, rate_bps: u64) -> usize {
+        let sockets = self.sockets.lock();
+        if sockets.is_empty() {
+            // e.g. mux-over-mux: the carrier's bottom conn is another
+            // mux's stream, not a kernel socket — the same "cannot
+            // convert to syscall.Conn" outcome upstream debug-logs.
+            tracing::debug!("brutal: no kernel socket to apply TCP Brutal to");
+            return 0;
+        }
+        let mut applied = 0;
+        for stream in sockets.iter() {
+            match apply_brutal_rate(stream, rate_bps) {
+                Ok(()) => applied += 1,
+                Err(error) => tracing::debug!(
+                    %error,
+                    "brutal: failed to enable TCP Brutal at client \
+                     (the tcp-brutal kernel module may be missing)"
+                ),
+            }
+        }
+        applied
+    }
+
+    /// Non-Linux stub. The `_BrutalBwExchange` negotiation still ran — the
+    /// server applied its half of the rate — so this mirrors upstream's
+    /// `SetBrutalOptions` build-stub error, which sing-mux logs at Debug
+    /// and treats as non-fatal.
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    pub fn apply_rate(&self, _rate_bps: u64) -> usize {
+        tracing::debug!("brutal: TCP Brutal is only supported on Linux");
+        0
+    }
+}
+
+tokio::task_local! {
+    /// The [`BrutalCarrier`] collecting kernel sockets for the mux session
+    /// dial it wraps. `None` inside resolver internals (`resolve_via_hook`
+    /// / `resolve_host_all_via`): DNS plumbing sockets are meow's own, not
+    /// the dialing node's carrier egress.
+    static BRUTAL_CARRIER: Option<Arc<BrutalCarrier>>;
+}
+
+/// Run `fut` with the carrier cell set to `carrier`: `Some` collects every
+/// [`connect_tcp`] socket the dial opens (the scope a brutal-enabled mux
+/// client installs around its session dial); `None` shadows an outer cell
+/// so a *non-brutal* mux session's dial cannot feed a rear node's carrier
+/// under `dialer-proxy` mux-over-mux — Go's "nested multiplexing is not
+/// supported" verdict by construction (the rear's `apply_rate` then finds
+/// no kernel socket and debug-logs, matching upstream's cannot-convert).
+pub async fn brutal_carrier_scope<F: std::future::Future>(
+    carrier: Option<Arc<BrutalCarrier>>,
+    fut: F,
+) -> F::Output {
+    BRUTAL_CARRIER.scope(carrier, fut).await
+}
+
+/// The carrier whose dial scope the current task is inside, if any.
+/// Compiled for Linux (the stash path) and unix tests (scope assertions —
+/// `mod tests` is `cfg(unix)`, so `test` alone would be dead on Windows).
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), all(test, unix)))]
+fn brutal_carrier() -> Option<Arc<BrutalCarrier>> {
+    BRUTAL_CARRIER.try_with(Clone::clone).ok().flatten()
+}
+
+/// `TCP_BRUTAL_PARAMS` (23301) payload — apernet tcp-brutal's
+/// `TCPBrutalParams` as sing-mux writes it: rate in bytes/s plus the
+/// hysteria2-default cwnd_gain. 16 bytes; the tail padding is an explicit
+/// field so the option buffer is fully initialized.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[repr(C)]
+struct TcpBrutalParams {
+    rate: u64,
+    cwnd_gain: u32,
+    _pad: u32,
+}
+
+/// One socket's pair of setsockopts, sing-mux `brutal_linux.go` verbatim:
+/// pick the `brutal` congestion-control algorithm, then feed it the rate.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn apply_brutal_rate(stream: &std::net::TcpStream, rate_bps: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+    const CWND_GAIN: u32 = 20;
+    let fd = stream.as_raw_fd();
+    let congestion = b"brutal\0";
+    // SAFETY: `stream` owns the fd for the call; `congestion` is a valid
+    // NUL-terminated name buffer of the length passed.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            congestion.as_ptr().cast(),
+            congestion.len() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let params = TcpBrutalParams {
+        rate: rate_bps,
+        cwnd_gain: CWND_GAIN,
+        _pad: 0,
+    };
+    // SAFETY: `params` outlives the call and is the exact layout the
+    // tcp-brutal module reads at `size_of::<TcpBrutalParams>()` = 16.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_BRUTAL_PARAMS,
+            std::ptr::addr_of!(params).cast(),
+            std::mem::size_of::<TcpBrutalParams>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
 //
 // Backstop for the path that still hits libc `getaddrinfo` (no `HostResolver`
@@ -396,6 +767,108 @@ pub fn routing_mark() -> u32 {
     }
 }
 
+/// `listeners[].routing-mark` — `SO_MARK` stamped on the *listener's own*
+/// socket at bind (upstream `InboundOption.RoutingMark`, an ingress-side
+/// mark: a TCP listen socket's mark is inherited by every accepted
+/// socket, a UDP socket's datagrams carry it). Deliberately separate
+/// from the top-level `routing-mark` handled above, which marks OUTBOUND
+/// dials and feeds the TProxy firewall exemption — this one never
+/// touches `ROUTING_MARK`.
+///
+/// Linux only; callers warn and skip elsewhere. `CAP_NET_ADMIN` is
+/// required, same as the outbound mark.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub fn set_listener_socket_mark(fd: std::os::fd::RawFd, mark: u32) -> std::io::Result<()> {
+    // SAFETY: `fd` is owned by the caller for the call's duration and
+    // `mark` is a live `u32` of the size `SO_MARK` expects.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            std::ptr::addr_of!(mark).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// mihomo's top-level `interface-name` (issue #974): every outbound socket
+/// meow opens binds to this interface unless the node's own
+/// `interface-name` overrides it — and unless the socket's peer is
+/// loopback, which stays exempt like the TUN owner binding. The name is
+/// resolved to an index per dial (no cache), so a destroyed-and-recreated
+/// interface is followed. `None`/`""` = unset. The state compiles on every
+/// platform; the *binding* fails closed with `Unsupported` on platforms
+/// without per-socket binding (iOS, the BSDs), matching
+/// [`install_outbound_interface`]'s contract.
+static GLOBAL_INTERFACE_NAME: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// Install (or clear with `None`) the global `interface-name`. The name
+/// is normalized here so no caller can store a degenerate binding:
+/// trimmed, with an empty-after-trim or NUL-containing name meaning
+/// unset — a NUL byte would make Linux `SO_BINDTODEVICE` silently bind
+/// the truncated prefix's interface (the node parser rejects it first;
+/// `outbound_iface::bind_socket_to_name` errors on it last).
+pub fn set_global_interface_name(name: Option<&str>) {
+    *GLOBAL_INTERFACE_NAME.write() = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.contains('\0'))
+        .map(Arc::from);
+}
+
+/// The installed global `interface-name`, if any.
+pub fn global_interface_name() -> Option<Arc<str>> {
+    GLOBAL_INTERFACE_NAME.read().clone()
+}
+
+/// Default HTTP `User-Agent` sent by internal fetches and health checks
+/// when `global-ua` is unset or empty (`clash.meta/<pkg_version>`).
+pub const DEFAULT_USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
+
+/// mihomo's top-level `global-ua` (issue #974): overrides the `User-Agent`
+/// on the daemon's own HTTP requests (provider/subscription/geodata
+/// fetches, latency probes). Process-wide like `GLOBAL_INTERFACE_NAME` —
+/// the emitters live in meow-config and meow-proxy and share no config
+/// struct, and every config commit re-asserts it.
+static GLOBAL_UA: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// Whether `value` is a legal HTTP header field value (RFC 9110 §5.5 /
+/// Go `httpguts.ValidHeaderFieldValue`): HTAB, SP..='~', and obs-text
+/// 0x80..=0xFF. Rejects CR, LF, NUL, and all other control bytes — the
+/// emitters format the UA into a raw request head, so an unchecked
+/// newline would be header injection.
+#[inline]
+pub fn is_valid_http_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
+}
+
+/// Install (or clear with `None` / empty / whitespace-only) the global
+/// `User-Agent`. The value is trimmed; an invalid header value stores
+/// `None` as a backstop — the config parser rejects it upfront (Class A).
+pub fn set_global_ua(ua: Option<&str>) {
+    *GLOBAL_UA.write() = ua
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_valid_http_header_value(s))
+        .map(Arc::from);
+}
+
+/// The installed `global-ua` override, if any.
+pub fn global_ua() -> Option<Arc<str>> {
+    GLOBAL_UA.read().clone()
+}
+
+/// The effective `User-Agent` for internal HTTP requests and latency
+/// probes: `global-ua` when set, else [`DEFAULT_USER_AGENT`].
+pub fn effective_user_agent() -> Arc<str> {
+    global_ua().unwrap_or_else(|| Arc::from(DEFAULT_USER_AGENT))
+}
+
 /// Holders of firewall rules that exempt the current routing mark (meow's
 /// managed tproxy tables): while any is alive the mark cannot change at
 /// runtime, or meow's own traffic would stop matching the exemption.
@@ -423,33 +896,12 @@ pub fn routing_mark_pinned() -> bool {
     ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-#[cfg(all(
-    not(target_env = "ohos"),
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
-))]
-fn routing_mark_set() -> bool {
-    routing_mark() != 0
-}
-
-/// `SO_MARK` on a `socket2` socket per [`ROUTING_MARK`] (`0` = unset).
-/// Linux-only by definition — `set_mark` exists on no other cfg target —
-/// so callers wrap the call in `#[cfg(target_os = "linux")]`. OpenHarmony
-/// counts as `linux` but its only callers are `not(target_env = "ohos")`,
-/// so the fn is excluded there too.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
-    match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {}
-        mark => socket.set_mark(mark)?,
-    }
-    Ok(())
-}
-
 /// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
 /// Android, applies the installed `SocketProtector` (if any) to the
 /// socket fd before `connect()` so the connection bypasses the VPN.
-/// Desktop targets apply the installed outbound-interface policy, and on
-/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]).
+/// Desktop targets apply the installed outbound-interface policy, on
+/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]), and on
+/// all three the resolved per-node [`DialerOpts`] (issue #974).
 ///
 /// Callers that only have a hostname must use [`connect_tcp_host`] —
 /// passing a hostname here is a compile error by construction (the type
@@ -457,6 +909,50 @@ fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
+    // Snapshot the outbound keepalive policy before the socket is built —
+    // one read per dial, then one application on the connected stream so
+    // every terminal path below (Android/OHOS protected, socket2 with
+    // mark/iface/TFO/MPTCP, and the plain-Tokio fast path) gets the same
+    // posture exactly once. TLS/mux/logical hops wrap this stream and
+    // never re-apply it; reused connections keep what they dialled with.
+    let keepalive = crate::tcp_opts::outbound_tcp_keepalive();
+    let stream = connect_tcp_dial(addr).await?;
+    keepalive.apply(&stream);
+    // Inside a brutal mux session dial the physical socket is collected
+    // for the post-exchange rate cap — the `dup`'d fd (tokio's TcpStream
+    // has no `try_clone`; `try_clone_to_owned` is `F_DUPFD_CLOEXEC`)
+    // shares the same kernel socket so `apply_rate`'s setsockopts hit the
+    // fd the dial actually uses (and the front hop's socket under
+    // `dialer-proxy`, which is what the task-local outliving the front's
+    // `dialer_opts_scope` buys). A dup failure is debug-only, matching
+    // every other apply-side failure.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(carrier) = brutal_carrier() {
+        use std::os::fd::AsFd;
+        match stream.as_fd().try_clone_to_owned() {
+            Ok(owned) => carrier.stash(std::net::TcpStream::from(owned)),
+            Err(error) => {
+                tracing::debug!(%error, "brutal: failed to dup carrier socket");
+            }
+        }
+    }
+    Ok(stream)
+}
+
+/// [`connect_tcp`]'s dispatch across the platform dial paths; the wrapper
+/// owns the keepalive snapshot + application around it.
+async fn connect_tcp_dial(addr: SocketAddr) -> io::Result<TcpStream> {
+    // Platforms without the socket2 dial path — OpenHarmony included:
+    // an `interface-name` cannot be honored — fail closed rather than
+    // dial unbound, ahead of the protector early-return so even an
+    // Android- or OHOS-protected dial refuses to silently skip it; the
+    // Linux-only knobs degrade to a one-time warning like
+    // `set_routing_mark`'s.
+    #[cfg(any(
+        target_env = "ohos",
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
+    reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -470,17 +966,20 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     ));
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
-    // takes the physical route past the TUN default routes.
+    // takes the physical route past the TUN default routes. The resolved
+    // dialer opts (mark/interface/tfo/mptcp — the live mark already folds
+    // in through `dialer_opts()`) take the same socket2 path (issue #974).
     #[cfg(all(
         not(target_env = "ohos"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     {
-        if routing_mark_set()
+        let opts = dialer_opts();
+        if opts.needs_socket2()
             || (crate::outbound_iface::binds_peer(addr.ip())
                 && crate::outbound_iface::outbound_interface().is_some())
         {
-            return connect_tcp_iface_bound(addr).await;
+            return connect_tcp_with_opts(addr, &opts).await;
         }
     }
     #[cfg(not(target_env = "ohos"))]
@@ -489,28 +988,169 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     }
 }
 
-/// Dial with the socket bound to the installed outbound interface
-/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before `connect()`.
-/// Uses `tokio::net::TcpSocket` for the async connect so connection errors
-/// surface here, not on first I/O.
+/// `connect_tcp`'s socket2 path — the resolved [`DialerOpts`]
+/// (`routing-mark`, `interface-name`, `tfo`, `mptcp`; issue #974) applied
+/// before `connect()`, alongside the global mark and the TUN owner
+/// binding the fast-path check already routed through here.
+/// `ip-version` never reaches this far — it filtered the resolution
+/// upstream in `resolve_addrs`.
 // Unused on OpenHarmony, whose dials fail closed without a protector.
 #[cfg(all(
     not(target_env = "ohos"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+async fn connect_tcp_with_opts(addr: SocketAddr, opts: &DialerOpts) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // `opts.routing_mark` is the resolved mark — node mark when set, else
+    // the global — so `Some` is exactly "this socket carries a mark".
     #[cfg(target_os = "linux")]
-    apply_routing_mark(&socket)?;
-    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
+    let protocol = if opts.mptcp {
+        socket2::Protocol::MPTCP
+    } else {
+        socket2::Protocol::TCP
+    };
+    #[cfg(not(target_os = "linux"))]
+    let protocol = socket2::Protocol::TCP;
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(protocol))?;
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = opts.routing_mark {
+        socket.set_mark(mark)?;
+    }
+    #[cfg(target_os = "linux")]
+    if opts.tfo {
+        apply_tcp_fastopen_connect(&socket)?;
+    }
+    warn_linux_only_skipped(opts, true);
+    apply_interface_binding(&socket, domain, addr.ip(), opts)?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
     tokio_socket.connect(addr).await
+}
+
+/// Compatibility shim for [`connect_tcp_with_opts`] under the options in
+/// scope — the `outbound_iface` tests drive the bound path directly.
+/// The shim keeps that test module's `linux`/`macos` cfg: on Windows it
+/// would compile as dead code and trip `-D warnings`.
+#[cfg(all(
+    test,
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+    connect_tcp_with_opts(addr, &dialer_opts()).await
+}
+
+/// `TCP_FASTOPEN_CONNECT`: the `connect()` itself carries the TFO cookie
+/// request — the `sendmsg`-with-`MSG_FASTOPEN` shape is the alternative
+/// and stays an open question (see the issue's spec notes). Linux-only;
+/// a failure here fails the dial like the other socket options.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn apply_tcp_fastopen_connect(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let enable: libc::c_int = 1;
+    // SAFETY: `socket` keeps the fd alive for the call and `enable` is the
+    // int value `TCP_FASTOPEN_CONNECT` expects.
+    if unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN_CONNECT,
+            std::ptr::addr_of!(enable).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Off-Linux the three socket-level dialer options have no setsockopt to
+/// land on: mihomo skips them silently there, but a silent miss is harder
+/// to debug than one line — warn once per option instead. `tcp` gates
+/// `tfo`/`mptcp`: both are TCP-only, so the UDP path never warns on them.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "macos", target_os = "windows")
+))]
+fn warn_linux_only_skipped(opts: &DialerOpts, tcp: bool) {
+    use std::sync::Once;
+    static MARK: Once = Once::new();
+    static TFO: Once = Once::new();
+    static MPTCP: Once = Once::new();
+    if opts.routing_mark.is_some() {
+        MARK.call_once(|| {
+            tracing::warn!("routing-mark is Linux-only; the per-node mark is ignored");
+        });
+    }
+    if tcp && opts.tfo {
+        TFO.call_once(|| tracing::warn!("tfo is Linux-only; ignored on this platform"));
+    }
+    if tcp && opts.mptcp {
+        MPTCP.call_once(|| tracing::warn!("mptcp is Linux-only; ignored on this platform"));
+    }
+}
+
+/// On Linux every knob lands — nothing to warn about.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn warn_linux_only_skipped(_opts: &DialerOpts, _tcp: bool) {}
+
+/// Platforms with no socket2 dial path at all — OpenHarmony among them:
+/// its dials go through the protector, which knows nothing of the
+/// per-node fields, so a configured `interface-name` fails closed
+/// (`Unsupported`) rather than passing silently, matching
+/// [`install_outbound_interface`]'s posture; the Linux-only knobs warn
+/// once and are skipped, as on macOS/Windows.
+#[cfg(any(
+    target_env = "ohos",
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
+fn reject_unsupported_dialer_opts(opts: &DialerOpts) -> io::Result<()> {
+    if let Some(name) = &opts.interface_name {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("interface-name '{name}' is not supported on this platform"),
+        ));
+    }
+    if opts.routing_mark.is_some() || opts.tfo || opts.mptcp {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "per-node dialer options (routing-mark/tfo/mptcp) are not supported \
+                 on this platform; ignored"
+            );
+        });
+    }
+    Ok(())
+}
+
+/// Interface binding shared by the TCP/UDP socket2 paths. An explicit
+/// `interface-name` — node first, global otherwise — wins over the TUN
+/// owner binding; a loopback peer stays unbound either way, the same
+/// exemption `binds_peer` gives the TUN path (a socket scoped to a
+/// physical interface cannot reach a loopback peer, and localhost dials
+/// — external SIP003 plugin endpoints, test fixtures — must keep working).
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+fn apply_interface_binding(
+    socket: &socket2::Socket,
+    domain: socket2::Domain,
+    peer: IpAddr,
+    opts: &DialerOpts,
+) -> io::Result<()> {
+    match &opts.interface_name {
+        Some(name) if crate::outbound_iface::binds_peer(peer) => {
+            crate::outbound_iface::bind_socket_to_name(socket, domain, name)
+        }
+        Some(_) => Ok(()),
+        None => crate::outbound_iface::apply_outbound_interface_for_peer(socket, domain, peer),
+    }
 }
 
 /// Single resolution chokepoint shared by [`connect_tcp_host`],
@@ -534,33 +1174,84 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
 async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     // `metadata_ip_literal` folds bracketed IPv6 display forms (`[::1]`)
     // into the literal — a `server:`/`BND.ADDR` string may arrive in that
-    // shape and must not fall through to DNS (issue #701).
+    // shape and must not fall through to DNS (issue #701). The literal
+    // also bypasses `ip-version`: it is not resolution output.
     if let Some(ip) = crate::metadata_ip_literal(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    match host_resolver() {
+    // Every resolution path — hook, hook re-entry, system — converges here
+    // so the scope's `ip-version` filter applies once to them all
+    // (spec-delta for issue #974: the hook path must not escape it).
+    let addrs = match host_resolver() {
         Some(r) if in_host_resolver() => {
             // Re-entered: answer from what the hook already knows, and only
             // fall through to the system resolver when it knows nothing.
-            if let Some(ips) = r.resolve_all_local(host) {
-                if !ips.is_empty() {
-                    return Ok(ips
-                        .into_iter()
-                        .map(|ip| SocketAddr::new(ip, port))
-                        .collect());
+            match r.resolve_all_local(host).filter(|ips| !ips.is_empty()) {
+                Some(ips) => ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect(),
+                None => {
+                    tracing::debug!(
+                        host,
+                        "resolve: re-entrant host-resolver call (a DNS upstream dials through a \
+                         proxy) — using the system resolver for this hop to avoid a lookup cycle"
+                    );
+                    resolve_addrs_system(host, port).await?
                 }
             }
-            tracing::debug!(
-                host,
-                "resolve: re-entrant host-resolver call (a DNS upstream dials through a \
-                 proxy) — using the system resolver for this hop to avoid a lookup cycle"
-            );
         }
-        Some(r) => return resolve_via_hook(r.as_ref(), host, port).await,
-        None => {}
-    }
+        Some(r) => resolve_via_hook(r.as_ref(), host, port).await?,
+        None => resolve_addrs_system(host, port).await?,
+    };
 
+    // The `ip-version` constraint is per-name, not per-port — the wrap
+    // names the host only.
+    apply_ip_version_filter(addrs, dialer_opts().ip_version)
+        .map_err(|e| io::Error::new(e.kind(), format!("resolve {host}: {e}")))
+}
+
+/// Apply `version`'s family selection to resolved `addrs` (mihomo
+/// `ip-version`, issue #974): `dual` keeps resolver order; the exact
+/// modes keep one family and error when none remain; the `prefer` modes
+/// stable-sort that family first — relative order inside each family
+/// preserved, and an empty result is still an error. `to_canonical`
+/// classifies IPv4-mapped IPv6 addresses as IPv4, the same fold
+/// `bind_udp_for_peer`/`canonical_socket_addr` use downstream.
+///
+/// Public so `DirectAdapter::resolve_targets` applies the same filter to
+/// its own resolver view (the `type: direct` node's *target* hostname,
+/// where `ip-version` selects the egress family, not the server).
+pub fn apply_ip_version_filter(
+    addrs: Vec<SocketAddr>,
+    version: IpVersion,
+) -> io::Result<Vec<SocketAddr>> {
+    if version == IpVersion::Dual {
+        return Ok(addrs);
+    }
+    let v4 = matches!(version, IpVersion::Ipv4 | IpVersion::Ipv4Prefer);
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
+        .into_iter()
+        .partition(|addr| addr.ip().to_canonical().is_ipv4() == v4);
+    let filtered: Vec<SocketAddr> = match version {
+        IpVersion::Ipv4 | IpVersion::Ipv6 => primary,
+        _ => primary.into_iter().chain(secondary).collect(),
+    };
+    if filtered.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ip-version {version}: no matching address family"),
+        ));
+    }
+    Ok(filtered)
+}
+
+/// The system-resolver tail of [`resolve_addrs`]: warm single-flight cache,
+/// then `tokio::net::lookup_host` (OpenHarmony substitutes the bootstrap
+/// hook — libc's resolver sockets cannot be protected), then cache the
+/// answer. Never returns an empty `Vec`.
+async fn resolve_addrs_system(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     if let Some(cached) = sys_cache_get(host, port) {
         return Ok(cached);
     }
@@ -601,15 +1292,80 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
+/// `resolve_addrs` for a caller-supplied [`HostResolver`] rather than the
+/// installed global hook — e.g. an adapter carrying its own injected
+/// resolver (the WireGuard endpoint lookup). The lookup runs under the same
+/// `IN_HOST_RESOLVER` scope `resolve_via_hook` applies to the global
+/// hook: an *unscoped* `resolve_all` would let a `#PROXY`-tagged nameserver
+/// inside the hook re-enter this very dial and deadlock on the resolver's
+/// single-flight map (see `in_host_resolver`). A re-entrant call answers
+/// from `resolve_all_local` — what the hook already holds — then falls back
+/// to the system resolver, matching `resolve_addrs`'s re-entry arm. Literal
+/// hosts short-circuit before any hook, also as `resolve_addrs` does.
+pub async fn resolve_host_all_via(
+    r: &dyn HostResolver,
+    host: &str,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
+    if let Some(ip) = crate::metadata_ip_literal(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs = if in_host_resolver() {
+        match r.resolve_all_local(host).filter(|ips| !ips.is_empty()) {
+            Some(ips) => ips
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+            None => {
+                tracing::debug!(
+                    host,
+                    "resolve: re-entrant resolver call — using the system resolver for this \
+                     hop to avoid a lookup cycle"
+                );
+                resolve_addrs_system(host, port).await?
+            }
+        }
+    } else {
+        // `resolve_via_hook` clears the carrier cell for the lookup —
+        // the exclusion covers this caller-supplied-resolver path too.
+        resolve_via_hook(r, host, port).await?
+    };
+    // The injected-resolver path resolves the same node-level names
+    // `resolve_addrs` does (the WireGuard endpoint), so the dial scope's
+    // `ip-version` filters it identically (issue #974).
+    apply_ip_version_filter(addrs, dialer_opts().ip_version)
+        .map_err(|e| io::Error::new(e.kind(), format!("resolve {host}: {e}")))
+}
+
 /// Run one [`HostResolver`] lookup with [`IN_HOST_RESOLVER`] set, so a dial
 /// made while answering it takes the system-resolver path instead of
 /// re-entering the hook.
+///
+/// The lookup itself runs under [`DialerOpts::global_only`]: the hook's
+/// upstream sockets — a DNS exchange's UDP/TCP dials, the pooled DoH H2
+/// conn — are meow's own plumbing, not the dialing node's egress, so a
+/// node `interface-name`/`routing-mark` must not steer them (a node bound
+/// to an interface the DNS upstream is unreachable over would break its
+/// own resolution; mihomo resolves through the central resolver without
+/// node fields, issue #974). The node's `ip-version` is unaffected: it
+/// filters this call's *result* in `resolve_addrs`, on this side of the
+/// scope — and a `#PROXY` upstream's `WrappedProxy` still installs the
+/// carrying node's own scope over this one.
 async fn resolve_via_hook(
     r: &dyn HostResolver,
     host: &str,
     port: u16,
 ) -> io::Result<Vec<SocketAddr>> {
-    let ips = IN_HOST_RESOLVER.scope((), r.resolve_all(host)).await?;
+    // `BRUTAL_CARRIER.scope(None, …)` excludes the hook's upstream sockets
+    // from a carrier cell: a `#PROXY` DNS exchange dialing through a
+    // brutal-mux node opens *its own* session (and carrier cell), while a
+    // non-mux upstream's sockets are DNS plumbing — never the dialing
+    // node's egress, exactly like the `global_only` dialer opts.
+    let ips = dialer_opts_scope(
+        DialerOpts::global_only(),
+        BRUTAL_CARRIER.scope(None, IN_HOST_RESOLVER.scope((), r.resolve_all(host))),
+    )
+    .await?;
     if ips.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -648,15 +1404,86 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
 /// retain their socket protection/binding and configured per-connect timeout —
 /// under a deadline that per-connect timeout is a ceiling the fairness window
 /// may tighten, so no candidate is guaranteed its full configured slice.
+///
+/// `tcp-concurrent: false` (the [`crate::dial::tcp_concurrent`] live policy)
+/// switches this to a strictly sequential walk of `addrs` — same order, one
+/// live connect at a time, no family interleave — while keeping the shared
+/// deadline's fair-share ceiling per non-final candidate. The policy is read
+/// once here; a running selection keeps the snapshot it started with.
 pub async fn connect_tcp_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
 where
     F: Fn(SocketAddr) -> Fut + Sync,
     Fut: std::future::Future<Output = io::Result<T>>,
 {
-    match crate::dial::dial_deadline() {
-        Some(deadline) => connect_candidates_before(addrs, deadline, dial).await,
-        None => connect_resolved_candidates(addrs, dial).await,
+    dispatch_tcp_candidates(addrs, dial, crate::dial::tcp_concurrent()).await
+}
+
+/// The scheduling decision [`connect_tcp_candidates`] makes, with the policy
+/// explicit so tests drive it without touching the process-global.
+async fn dispatch_tcp_candidates<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    dial: F,
+    concurrent: bool,
+) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    match (crate::dial::dial_deadline(), concurrent) {
+        (Some(deadline), true) => connect_candidates_before(addrs, deadline, dial).await,
+        (Some(deadline), false) => connect_candidates_sequential(addrs, deadline, dial).await,
+        (None, true) => connect_resolved_candidates(addrs, dial).await,
+        // The plain serial loop already walks the list in order, one live
+        // connect at a time — `tcp-concurrent: false` with no caller deadline.
+        (None, false) => connect_address_family(addrs, &dial).await,
     }
+}
+
+/// Sequential candidate dial under a shared deadline (`tcp-concurrent:
+/// false`): the already filtered and ordered list is walked in order with at
+/// most one live connect. A non-final candidate gets
+/// `min(remaining / remaining_candidates, 10 s)` — the same fairness idea
+/// [`connect_candidates_before`] staggers by, minus the overlap — and the
+/// last candidate gets whatever budget remains. A timed-out candidate's
+/// future is dropped before the next dial starts.
+async fn connect_candidates_sequential<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    deadline: tokio::time::Instant,
+    dial: F,
+) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    use tokio::time::{timeout_at, Duration, Instant};
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let total = addrs.len();
+    let mut last_err = None;
+    for (tried, addr) in addrs.into_iter().enumerate() {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into()));
+        };
+        let left = total - tried;
+        let ceiling = if left == 1 {
+            remaining
+        } else {
+            (remaining / left as u32).min(ATTEMPT_TIMEOUT)
+        };
+        let attempt = dial(addr);
+        tokio::pin!(attempt);
+        last_err = match timeout_at(now + ceiling, &mut attempt).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => crate::MeowError::prefer_errno_io(last_err, error),
+            Err(_) => crate::MeowError::prefer_errno_io(
+                last_err,
+                io::Error::new(io::ErrorKind::TimedOut, "TCP candidate timed out"),
+            ),
+        };
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "no TCP candidate addresses")
+    }))
 }
 
 async fn connect_candidates_before<T, F, Fut>(
@@ -672,11 +1499,15 @@ where
     use tokio::time::{sleep_until, timeout_at, Duration, Instant};
     const STAGGER: Duration = Duration::from_millis(250);
     const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
-    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    // `to_canonical` so an IPv4-mapped candidate races with the family the
+    // `ip-version` filter classified it into, not the v6 literal family.
+    let first_v6 = addrs
+        .first()
+        .is_some_and(|addr| addr.ip().to_canonical().is_ipv6());
     let (mut first, mut other): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
         addrs
             .into_iter()
-            .partition(|addr| addr.is_ipv6() == first_v6);
+            .partition(|addr| addr.ip().to_canonical().is_ipv6() == first_v6);
     let mut ordered = std::collections::VecDeque::new();
     while !first.is_empty() || !other.is_empty() {
         if let Some(addr) = first.pop_front() {
@@ -752,10 +1583,14 @@ where
     F: Fn(SocketAddr) -> Fut + Sync,
     Fut: std::future::Future<Output = io::Result<T>>,
 {
-    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    // `to_canonical`, the same classification `apply_ip_version_filter`
+    // uses — a mapped `::ffff:x` candidate races as IPv4 either way.
+    let first_v6 = addrs
+        .first()
+        .is_some_and(|addr| addr.ip().to_canonical().is_ipv6());
     let (preferred, fallback): (Vec<_>, Vec<_>) = addrs
         .into_iter()
-        .partition(|addr| addr.is_ipv6() == first_v6);
+        .partition(|addr| addr.ip().to_canonical().is_ipv6() == first_v6);
     if fallback.is_empty() {
         return connect_address_family(preferred, &dial).await;
     }
@@ -876,6 +1711,84 @@ pub fn canonical_socket_addr(mut addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+/// The receive buffer quic-go asks for. The OS default (about 208 KiB on
+/// Linux) overflows whenever a reader falls a few milliseconds behind a
+/// fast download, and each dropped datagram is a loss the sender must
+/// detect and resend.
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+))]
+const UDP_RECV_BUFFER_BYTES: usize = 7 << 20;
+
+/// Grow a UDP socket's receive buffer, best effort — for QUIC endpoint
+/// sockets and the UDP associations that carry them: every datagram the
+/// kernel drops at a full receive buffer is a loss the transport must
+/// detect and resend, so the association's kernel queue gets the same
+/// headroom as the raw path's. Linux caps the request at
+/// `net.core.rmem_max`, so a privileged meow forces it past the cap as
+/// quic-go does; macOS rejects a size above `kern.ipc.maxsockbuf`, so the
+/// request halves until one is taken. The send buffer keeps the OS
+/// default: the driver does not pace, and a full send buffer is what holds
+/// its bursts back from the interface queue.
+///
+/// Gated to the targets `Cargo.toml` gives the socket2 dep
+/// (Android/Linux/macOS/Windows) — iOS/tvOS and the BSDs keep the OS
+/// default buffer via the stub below.
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+))]
+pub fn enlarge_udp_recv_buffer(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let mut size = UDP_RECV_BUFFER_BYTES;
+    while size >= 1 << 20 && sock.set_recv_buffer_size(size).is_err() {
+        size /= 2;
+    }
+    // getsockopt reports twice the size taken on Linux.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if sock
+        .recv_buffer_size()
+        .is_ok_and(|got| got < 2 * UDP_RECV_BUFFER_BYTES)
+    {
+        force_recv_buffer(socket);
+    }
+    tracing::debug!(size = ?sock.recv_buffer_size(), "udp socket receive buffer");
+}
+
+/// No-socket2 stub for the remaining targets — the enlargement is
+/// best-effort headroom, never correctness.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+)))]
+pub fn enlarge_udp_recv_buffer(_socket: &UdpSocket) {}
+
+/// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
+/// for an unprivileged meow.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn force_recv_buffer(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let size = UDP_RECV_BUFFER_BYTES as libc::c_int;
+    // SAFETY: the socket stays open for the call, and the option value is a
+    // c_int of the size passed.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            std::ptr::addr_of!(size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 async fn bind_udp_with_peer<A: ToSocketAddrs>(
     local: A,
     peer: Option<IpAddr>,
@@ -886,6 +1799,14 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     )))]
     let _ = peer;
+    // Ahead of the protector early-return for the same reason as
+    // `connect_tcp` — OpenHarmony included: an `interface-name` the
+    // platform cannot honor must fail closed, not dial unbound.
+    #[cfg(any(
+        target_env = "ohos",
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
+    reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -906,19 +1827,22 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
+    // The resolved dialer opts (mark/interface; issue #974 — `tfo`/`mptcp`
+    // are TCP-only) take the same socket2 path.
     #[cfg(all(
         not(target_env = "ohos"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     {
-        if routing_mark_set() || crate::outbound_iface::outbound_interface().is_some() {
+        let opts = dialer_opts();
+        if opts.needs_socket2() || crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
                 .await?
                 .next()
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "bind_udp: no address resolved")
                 })?;
-            return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
+            return bind_udp_with_opts(resolved, peer.unwrap_or(resolved.ip()), &opts);
         }
     }
     #[cfg(not(target_env = "ohos"))]
@@ -927,17 +1851,18 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     }
 }
 
-/// Bind a UDP socket to the installed outbound interface
-/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
-/// The destination determines whether the interface binding is required.
-/// A socket pinned to a loopback `local` address is left unbound where the
-/// platform's binding would break it (see `outbound_iface::binds_peer`).
+/// `bind_udp_with_peer`'s socket2 path — the resolved [`DialerOpts`]
+/// (`routing-mark`, `interface-name`; issue #974) applied before the
+/// local-address bind, alongside the TUN owner binding the fast-path check
+/// already routed here. `peer` decides the loopback exemption, exactly as
+/// the installed-binding path's does. `tfo`/`mptcp` are TCP-only — they
+/// never apply (nor warn) on a datagram socket.
 // Unused on OpenHarmony, whose dials fail closed without a protector.
 #[cfg(all(
     not(target_env = "ohos"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
+fn bind_udp_with_opts(local: SocketAddr, peer: IpAddr, opts: &DialerOpts) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -945,12 +1870,39 @@ pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Resul
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     #[cfg(target_os = "linux")]
-    apply_routing_mark(&socket)?;
-    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
+    if let Some(mark) = opts.routing_mark {
+        socket.set_mark(mark)?;
+    }
+    warn_linux_only_skipped(opts, false);
+    apply_interface_binding(&socket, domain, peer, opts)?;
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
 }
+
+/// Compatibility shim for [`bind_udp_with_opts`] under the options in
+/// scope — the `outbound_iface` tests drive the bound path directly.
+/// Same `linux`/`macos` cfg as `connect_tcp_iface_bound` (the only
+/// caller): Windows `-D warnings` would flag it as dead code.
+#[cfg(all(
+    test,
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos")
+))]
+pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
+    bind_udp_with_opts(local, peer, &dialer_opts())
+}
+
+/// Serialise tests that mutate process-global dialer state —
+/// `SocketProtector`, `HostResolver`, `GLOBAL_INTERFACE_NAME`: the async
+/// tests in this module and `outbound_iface`'s registry test run in the
+/// same binary and would otherwise race — a global `interface-name`
+/// installed mid-test would steer `connect_tcp_with_opts`/
+/// `bind_udp_with_opts` onto the wrong interface and flake the
+/// bound-socket assertions. `tokio::sync` (not `parking_lot`) so the
+/// guard can be held across `.await`.
+#[cfg(all(test, unix))]
+pub(crate) static TEST_DIAL_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -1085,10 +2037,11 @@ mod tests {
         }
     }
 
-    /// Serialise tests that touch the process-global protector — they would
-    /// otherwise race each other and corrupt count assertions. `tokio::sync`
-    /// (not `parking_lot`) so the guard can be held across `.await`.
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Serialise tests that touch process-global state (protector,
+    /// resolver, `GLOBAL_INTERFACE_NAME`) — they would otherwise race
+    /// each other and `outbound_iface`'s bound-path assertions. Shared
+    /// with that module under `TEST_DIAL_STATE_LOCK`.
+    use super::TEST_DIAL_STATE_LOCK as LOCK;
 
     // ─── connect_tcp ─────────────────────────────────────────────────────────
 
@@ -1254,6 +2207,93 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
         let _stream = connect_tcp_host("127.0.0.1", port).await.expect("connect");
         let _ = accept.await.unwrap();
+    }
+
+    // ─── outbound keepalive policy (issue #974) ────────────────────────
+
+    /// The installed `OutboundTcpKeepalive` lands on the dialed stream —
+    /// SO_KEEPALIVE plus the configured timing — and the disabled posture
+    /// clears it instead. Serialized under LOCK: the policy is a
+    /// process-global. Gated to the targets `OutboundTcpKeepalive::apply`
+    /// performs setsockopts on (the BSD stub would leave SO_KEEPALIVE
+    /// unset and fail the assertion).
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "windows"
+    ))]
+    #[tokio::test]
+    async fn connect_tcp_applies_installed_keepalive_policy() {
+        use crate::tcp_opts::{
+            outbound_tcp_keepalive, set_outbound_tcp_keepalive, OutboundTcpKeepalive,
+        };
+
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        clear_host_resolver();
+        let prior = outbound_tcp_keepalive();
+
+        let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let port = listener.local_addr().unwrap().port();
+
+        let enabled_policy = OutboundTcpKeepalive {
+            enabled: true,
+            idle: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(5),
+            probes: 9,
+        };
+        set_outbound_tcp_keepalive(enabled_policy);
+        let accept = tokio::spawn({
+            let listener = Arc::clone(&listener);
+            async move { listener.accept().await.unwrap() }
+        });
+        let stream = connect_tcp(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        assert!(
+            sock.keepalive().unwrap(),
+            "enabled policy must set SO_KEEPALIVE"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                sock.keepalive_time().unwrap(),
+                std::time::Duration::from_secs(60)
+            );
+            assert_eq!(
+                sock.keepalive_interval().unwrap(),
+                std::time::Duration::from_secs(5)
+            );
+            assert_eq!(sock.keepalive_retries().unwrap(), 9);
+        }
+        drop(stream);
+
+        // The disabled posture clears SO_KEEPALIVE rather than leaving
+        // the kernel default.
+        set_outbound_tcp_keepalive(OutboundTcpKeepalive {
+            enabled: false,
+            ..enabled_policy
+        });
+        let accept = tokio::spawn({
+            let listener = Arc::clone(&listener);
+            async move { listener.accept().await.unwrap() }
+        });
+        let stream = connect_tcp(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+        assert!(
+            !socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "disabled policy must clear SO_KEEPALIVE"
+        );
+        drop(stream);
+
+        set_outbound_tcp_keepalive(prior);
     }
 
     // ─── bind_udp ────────────────────────────────────────────────────────────
@@ -1564,6 +2604,664 @@ mod tests {
 
         clear_host_resolver();
     }
+
+    #[tokio::test]
+    async fn injected_resolver_lookup_is_scoped_outside_a_hook() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let r = FixedResolver::new(IpAddr::from([203, 0, 113, 9]));
+        let addrs = resolve_host_all_via(r.as_ref(), "wg.example", 51820)
+            .await
+            .expect("caller-supplied resolver answers");
+        assert_eq!(addrs, vec![SocketAddr::from(([203, 0, 113, 9], 51820))]);
+        assert_eq!(r.count(), 1);
+    }
+
+    /// An adapter resolving its endpoint *inside* a global-hook call —
+    /// e.g. the nameserver answering the query is `#PROXY`-tagged through
+    /// this very adapter — must hit the same re-entry fence as the
+    /// installed hook: answer from the system resolver, never call the
+    /// injected hook again (the real resolver's single-flight map would
+    /// deadlock the pair).
+    #[tokio::test]
+    async fn injected_resolver_inside_a_hook_scope_uses_the_system_resolver() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+
+        struct Outer {
+            inner: parking_lot::Mutex<Option<io::Result<Vec<SocketAddr>>>>,
+            via: Arc<FixedResolver>,
+        }
+        #[async_trait]
+        impl HostResolver for Outer {
+            async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+                self.resolve_all(host).await.map(|ips| ips[0])
+            }
+            async fn resolve_all(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+                *self.inner.lock() =
+                    Some(resolve_host_all_via(self.via.as_ref(), "localhost", 51820).await);
+                Ok(vec![IpAddr::from([203, 0, 113, 7])])
+            }
+        }
+
+        let injected = FixedResolver::new(IpAddr::from([203, 0, 113, 9]));
+        let outer = Arc::new(Outer {
+            inner: parking_lot::Mutex::new(None),
+            via: Arc::clone(&injected),
+        });
+        set_host_resolver(Arc::clone(&outer) as Arc<dyn HostResolver>);
+
+        resolve_host_all("proxy.example", 443).await.unwrap();
+
+        let inner = outer.inner.lock().take().expect("nested lookup ran");
+        let inner = inner.expect("system resolver answered the re-entrant lookup");
+        assert!(
+            inner.iter().all(|a| a.ip().is_loopback()),
+            "re-entrant injected lookup must use the system resolver, got {inner:?}"
+        );
+        assert_eq!(
+            injected.count(),
+            0,
+            "the re-entrant call must not reach the injected resolver"
+        );
+
+        clear_host_resolver();
+    }
+
+    // ─── per-node dialer opts (issue #974) ─────────────────────────────────
+
+    #[test]
+    fn ip_version_names_roundtrip_and_reject_unknown() {
+        for (name, want) in [
+            ("dual", IpVersion::Dual),
+            ("ipv4", IpVersion::Ipv4),
+            ("ipv6", IpVersion::Ipv6),
+            ("ipv4-prefer", IpVersion::Ipv4Prefer),
+            ("ipv6-prefer", IpVersion::Ipv6Prefer),
+        ] {
+            assert_eq!(IpVersion::from_name(name), Some(want), "{name}");
+            assert_eq!(want.to_string(), name, "{name}");
+        }
+        for bad in ["", "ipv4prefer", "v4", "IPV4", "dual-stack"] {
+            assert_eq!(IpVersion::from_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn resolve_fills_node_over_global() {
+        let node = crate::NodeDialerOpts {
+            routing_mark: Some(7),
+            ..Default::default()
+        };
+        let global = GlobalDialerOpts {
+            routing_mark: Some(3),
+            interface_name: Some(Arc::from("en0")),
+        };
+        let resolved = DialerOpts::resolve(&node, &global);
+        // Set node fields win; unset ones inherit the global.
+        assert_eq!(resolved.routing_mark, Some(7));
+        assert_eq!(resolved.interface_name.as_deref(), Some("en0"));
+        // A node interface-name shadows the global.
+        let node = crate::NodeDialerOpts {
+            interface_name: Some(Arc::from("utun3")),
+            ..Default::default()
+        };
+        let resolved = DialerOpts::resolve(&node, &global);
+        assert_eq!(resolved.routing_mark, Some(3));
+        assert_eq!(resolved.interface_name.as_deref(), Some("utun3"));
+    }
+
+    #[test]
+    fn needs_socket2_only_for_socket_options() {
+        assert!(!DialerOpts::default().needs_socket2());
+        // `ip-version` is resolution-time — never enough by itself.
+        assert!(!DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            routing_mark: Some(1),
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            interface_name: Some(Arc::from("en0")),
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            tfo: true,
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            mptcp: true,
+            ..Default::default()
+        }
+        .needs_socket2());
+    }
+
+    #[tokio::test]
+    async fn scope_replaces_nested_and_reads_globals_outside() {
+        let _g = LOCK.lock().await;
+        set_global_interface_name(Some("en0"));
+        let outer = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            tfo: true,
+            ..Default::default()
+        };
+        let inner = DialerOpts {
+            ip_version: IpVersion::Ipv4,
+            ..Default::default()
+        };
+        dialer_opts_scope(outer, async {
+            let opts = dialer_opts();
+            assert_eq!(opts.ip_version, IpVersion::Ipv6);
+            assert!(opts.tfo);
+            // An unset slot still inherits the global.
+            assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+            dialer_opts_scope(inner, async {
+                // Nesting REPLACES — the front hop's own options, never a
+                // merge of the rear's.
+                let opts = dialer_opts();
+                assert_eq!(opts.ip_version, IpVersion::Ipv4);
+                assert!(!opts.tfo);
+            })
+            .await;
+            // The enclosing scope is restored on the way out.
+            assert_eq!(dialer_opts().ip_version, IpVersion::Ipv6);
+        })
+        .await;
+        // Outside any scope: defaults plus globals.
+        let opts = dialer_opts();
+        assert_eq!(opts.ip_version, IpVersion::Dual);
+        assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+        set_global_interface_name(None);
+        assert!(dialer_opts().interface_name.is_none());
+    }
+
+    #[test]
+    fn ip_version_filter_modes_stable_order_and_canonical() {
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v4b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let mixed = vec![v4a, v6a, v4b, v6b];
+
+        // `dual` is the identity — resolver order untouched.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Dual).unwrap(),
+            mixed
+        );
+        // Exact modes keep one family, in resolver order.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv4).unwrap(),
+            vec![v4a, v4b]
+        );
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv6).unwrap(),
+            vec![v6a, v6b]
+        );
+        // Prefer modes stable-reorder: family first, order inside each
+        // family preserved.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv4Prefer).unwrap(),
+            vec![v4a, v4b, v6a, v6b]
+        );
+        assert_eq!(
+            apply_ip_version_filter(mixed, IpVersion::Ipv6Prefer).unwrap(),
+            vec![v6a, v6b, v4a, v4b]
+        );
+        // An empty family errors for the exact modes…
+        let v4_only = vec![v4a, v4b];
+        assert!(apply_ip_version_filter(v4_only.clone(), IpVersion::Ipv6).is_err());
+        // …but a prefer mode over one family still returns it.
+        assert_eq!(
+            apply_ip_version_filter(v4_only.clone(), IpVersion::Ipv4Prefer).unwrap(),
+            v4_only
+        );
+        // An IPv4-mapped IPv6 address classifies as IPv4 (`to_canonical`),
+        // the same fold the egress checks downstream apply.
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:443".parse().unwrap();
+        assert_eq!(
+            apply_ip_version_filter(vec![v6a, mapped], IpVersion::Ipv4).unwrap(),
+            vec![mapped]
+        );
+        // Empty input errors rather than passing through silently.
+        assert!(apply_ip_version_filter(Vec::new(), IpVersion::Dual)
+            .unwrap()
+            .is_empty());
+        assert!(apply_ip_version_filter(Vec::new(), IpVersion::Ipv4).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_addrs_literal_bypasses_filter_and_resolver() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        set_host_resolver(Arc::new(FailingResolver) as Arc<dyn HostResolver>);
+        // Even under an `ipv6` scope a literal returns verbatim — it is
+        // not resolution output (bracketed forms fold the same way).
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        };
+        let literal: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        assert_eq!(
+            dialer_opts_scope(scoped.clone(), resolve_addrs("127.0.0.1", 53))
+                .await
+                .unwrap(),
+            vec![literal]
+        );
+        let v6_literal: SocketAddr = "[::1]:53".parse().unwrap();
+        assert_eq!(
+            dialer_opts_scope(scoped, resolve_addrs("[::1]", 53))
+                .await
+                .unwrap(),
+            vec![v6_literal]
+        );
+        clear_host_resolver();
+    }
+
+    #[tokio::test]
+    async fn resolve_addrs_filters_all_resolution_paths() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let v4: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:53".parse().unwrap();
+        let resolver =
+            FixedResolver::new_all(vec![v6.ip(), v4.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        set_host_resolver(Arc::clone(&resolver) as Arc<dyn HostResolver>);
+        let scoped = |ip_version| DialerOpts {
+            ip_version,
+            ..Default::default()
+        };
+        // The installed-hook path filters like the system path would.
+        let got = dialer_opts_scope(scoped(IpVersion::Ipv4), resolve_addrs("h.test", 53))
+            .await
+            .unwrap();
+        assert_eq!(got, vec![v4], "ipv4 keeps only the v4 candidate");
+        let got = dialer_opts_scope(scoped(IpVersion::Ipv6Prefer), resolve_addrs("h.test", 53))
+            .await
+            .unwrap();
+        assert_eq!(got.first(), Some(&v6), "prefer reorders, keeps both");
+        assert_eq!(got.len(), 3);
+        // A filtered-out family is a resolution failure with context.
+        let resolver_v6 = FixedResolver::new_all(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        set_host_resolver(Arc::clone(&resolver_v6) as Arc<dyn HostResolver>);
+        let err = dialer_opts_scope(scoped(IpVersion::Ipv4), resolve_addrs("h.test", 53))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("h.test"), "{err}");
+        assert!(err.to_string().contains("ipv4"), "{err}");
+        // The wrap is per-name — the port is not part of the constraint.
+        assert!(!err.to_string().contains(":53"), "{err}");
+        clear_host_resolver();
+    }
+
+    #[tokio::test]
+    async fn resolve_host_all_via_filters_under_scope() {
+        let _g = LOCK.lock().await;
+        let v4 = IpAddr::from([192, 0, 2, 1]);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let resolver = FixedResolver::new_all(vec![v4, v6]);
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        };
+        // The injected-resolver path (WireGuard's endpoint lookup) takes
+        // the same filter — it must not escape `ip-version`.
+        let got = dialer_opts_scope(
+            scoped,
+            resolve_host_all_via(resolver.as_ref(), "ep.test", 51820),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![SocketAddr::new(v6, 51820)]);
+    }
+
+    #[tokio::test]
+    async fn global_interface_name_round_trip() {
+        let _g = LOCK.lock().await;
+        assert!(global_interface_name().is_none());
+        set_global_interface_name(Some("en0"));
+        assert_eq!(global_interface_name().as_deref(), Some("en0"));
+        // The global reaches the resolved dialer opts of an unscoped read.
+        assert_eq!(
+            dialer_opts().interface_name.as_deref(),
+            Some("en0"),
+            "unscoped callers still see the global"
+        );
+        // …and of a scoped read whose node set nothing.
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv4,
+            ..Default::default()
+        };
+        dialer_opts_scope(scoped, async {
+            assert_eq!(dialer_opts().interface_name.as_deref(), Some("en0"));
+        })
+        .await;
+        set_global_interface_name(None);
+        assert!(global_interface_name().is_none());
+        assert!(dialer_opts().interface_name.is_none());
+    }
+
+    /// The setter normalizes rather than trusting its input (issue #974
+    /// review): a whitespace-padded name stores trimmed, an empty or
+    /// NUL-bearing name stores as unset — a NUL would otherwise make
+    /// Linux `SO_BINDTODEVICE` silently bind the truncated prefix.
+    #[tokio::test]
+    async fn set_global_interface_name_normalizes() {
+        let _g = LOCK.lock().await;
+        set_global_interface_name(Some("  en0  "));
+        assert_eq!(global_interface_name().as_deref(), Some("en0"));
+        set_global_interface_name(Some("   "));
+        assert!(global_interface_name().is_none());
+        set_global_interface_name(Some("en0\0x"));
+        assert!(global_interface_name().is_none());
+        set_global_interface_name(None);
+    }
+
+    /// A node's `interface-name` must not strand loopback peers on the
+    /// named interface — the same `binds_peer` exemption the TUN/global
+    /// binding gets (spec §1.2). The bogus name proves no bind ran:
+    /// reaching `bind_socket_to_name` would error instead of connecting.
+    /// The second half proves the binding path itself is armed, so the
+    /// exemption — not a skipped option — is what let the dial through.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn loopback_peer_is_exempt_from_node_interface_name() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        // Short enough for `IFNAMSIZ` — the point is a missing
+        // interface, not an over-long name.
+        let scoped = || DialerOpts {
+            interface_name: Some(Arc::from("no-such0")),
+            ..Default::default()
+        };
+        let stream = dialer_opts_scope(scoped(), connect_tcp(addr))
+            .await
+            .expect("loopback peer bypasses the interface binding");
+        let _ = accept.await.unwrap();
+        drop(stream);
+        let err = dialer_opts_scope(scoped(), connect_tcp("192.0.2.1:9".parse().unwrap()))
+            .await
+            .expect_err("a nonexistent interface must fail closed");
+        #[cfg(target_os = "macos")]
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        #[cfg(target_os = "linux")]
+        assert_eq!(err.raw_os_error(), Some(libc::ENODEV), "{err}");
+    }
+
+    /// Inside the resolver hook the scope is global-only — DNS upstream
+    /// sockets are meow plumbing, not the node's egress — while the
+    /// node's `ip-version` still filters the lookup's *result* on this
+    /// side of the scope (issue #974 review).
+    struct ScopeCapturingResolver {
+        ips: Vec<IpAddr>,
+        seen: parking_lot::Mutex<Option<DialerOpts>>,
+    }
+    #[async_trait]
+    impl HostResolver for ScopeCapturingResolver {
+        async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+        async fn resolve_all(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+            *self.seen.lock() = Some(dialer_opts());
+            Ok(self.ips.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_hook_runs_under_global_only_scope() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        set_global_interface_name(Some("en0"));
+        let resolver = Arc::new(ScopeCapturingResolver {
+            ips: vec![IpAddr::from([203, 0, 113, 8])],
+            seen: parking_lot::Mutex::new(None),
+        });
+        set_host_resolver(Arc::clone(&resolver) as Arc<dyn HostResolver>);
+
+        let node = DialerOpts {
+            interface_name: Some(Arc::from("utun9")),
+            ip_version: IpVersion::Ipv4,
+            tfo: true,
+            ..Default::default()
+        };
+        let addrs = dialer_opts_scope(node, resolve_addrs("node.example", 443))
+            .await
+            .expect("the hook resolves under the global-only scope");
+        assert_eq!(addrs, vec![SocketAddr::from(([203, 0, 113, 8], 443))]);
+        {
+            let seen = resolver.seen.lock();
+            let opts = seen.as_ref().expect("the hook ran");
+            // The node's fields never reach the hook; the global does.
+            assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+            assert!(!opts.tfo);
+            assert_eq!(opts.ip_version, IpVersion::Dual);
+        }
+        // …while the node's `ip-version` still filters the hook's answer.
+        let node = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        };
+        let err = dialer_opts_scope(node, resolve_addrs("node.example", 443))
+            .await
+            .expect_err("an ipv4-only answer fails the ipv6 filter");
+        assert!(err.to_string().contains("ipv6"), "{err}");
+
+        set_global_interface_name(None);
+        clear_host_resolver();
+    }
+
+    /// Off-Linux the TCP-only knobs warn once and skip — they never fail
+    /// a dial (spec §1.4/§1.5). Linux lands them on the socket instead,
+    /// where the outcome depends on the running kernel, so only the
+    /// non-Linux leg asserts success.
+    #[tokio::test]
+    async fn tfo_and_mptcp_skip_off_linux() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let scoped = DialerOpts {
+            tfo: true,
+            mptcp: true,
+            ..Default::default()
+        };
+        // Linux lands the options on the socket — the outcome depends
+        // on the running kernel (MPTCP needs ≥5.6), so an `Err` just
+        // ends the test early; off-Linux the warn-and-skip path must
+        // never fail the dial.
+        #[cfg(target_os = "linux")]
+        let Ok(stream) = dialer_opts_scope(scoped, connect_tcp(addr)).await
+        else {
+            return;
+        };
+        #[cfg(not(target_os = "linux"))]
+        let stream = dialer_opts_scope(scoped, connect_tcp(addr))
+            .await
+            .expect("tfo/mptcp warn-and-skip must not fail the dial");
+        let _ = accept.await.unwrap();
+        drop(stream);
+    }
+
+    // ─── TCP Brutal carrier scope (smux.brutal-opts, issue #974) ────────
+
+    /// The cell is visible to `connect_tcp` inside
+    /// `brutal_carrier_scope` — across a nested `dialer_opts_scope`
+    /// replacement, which is what a `dialer-proxy` front hop installs —
+    /// and gone again on unwind. On Linux the loopback socket must land
+    /// in the stash.
+    #[tokio::test]
+    async fn carrier_scope_collects_sockets_across_opts_replacement() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let carrier = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        assert!(brutal_carrier().is_none(), "no cell outside a scope");
+        let stream = brutal_carrier_scope(Some(Arc::clone(&carrier)), async {
+            assert!(brutal_carrier().is_some());
+            let stream = connect_tcp(addr).await.expect("connect");
+            dialer_opts_scope(DialerOpts::default(), async {
+                assert!(
+                    brutal_carrier().is_some(),
+                    "a front hop's dialer-opts replacement must not hide the cell"
+                );
+            })
+            .await;
+            stream
+        })
+        .await;
+        let _ = accept.await.unwrap();
+        drop(stream);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        assert_eq!(
+            carrier.stashed(),
+            1,
+            "the loopback dial must stash its socket"
+        );
+        assert!(brutal_carrier().is_none(), "the scope must unwind");
+    }
+
+    /// The resolver hook must see `None` — sockets a DNS-via-proxy
+    /// upstream dials inside the lookup are plumbing, not carrier egress.
+    struct CarrierCapturingResolver {
+        seen: parking_lot::Mutex<Option<bool>>,
+    }
+    #[async_trait]
+    impl HostResolver for CarrierCapturingResolver {
+        async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+        async fn resolve_all(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+            *self.seen.lock() = Some(brutal_carrier().is_some());
+            Ok(vec![IpAddr::from([203, 0, 113, 9])])
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_via_hook_and_host_all_via_clear_the_carrier_cell() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let carrier = Arc::new(BrutalCarrier::new());
+
+        // The installed-hook path (`resolve_addrs` → `resolve_via_hook`).
+        let hooked = Arc::new(CarrierCapturingResolver {
+            seen: parking_lot::Mutex::new(None),
+        });
+        set_host_resolver(Arc::clone(&hooked) as Arc<dyn HostResolver>);
+        let got = brutal_carrier_scope(
+            Some(Arc::clone(&carrier)),
+            resolve_addrs("node.example", 443),
+        )
+        .await
+        .expect("hook answers");
+        assert_eq!(got, vec![SocketAddr::from(([203, 0, 113, 9], 443))]);
+        assert_eq!(
+            *hooked.seen.lock(),
+            Some(false),
+            "the hook must observe the cleared cell"
+        );
+        clear_host_resolver();
+
+        // The caller-supplied-resolver path (`resolve_host_all_via`,
+        // WireGuard's endpoint lookup) — its hook call goes through the
+        // same `resolve_via_hook`, so it must see the same `None`.
+        let injected = Arc::new(CarrierCapturingResolver {
+            seen: parking_lot::Mutex::new(None),
+        });
+        let got = brutal_carrier_scope(
+            Some(carrier),
+            resolve_host_all_via(injected.as_ref(), "ep.example", 51820),
+        )
+        .await
+        .expect("injected resolver answers");
+        assert_eq!(got, vec![SocketAddr::from(([203, 0, 113, 9], 51820))]);
+        assert_eq!(
+            *injected.seen.lock(),
+            Some(false),
+            "the injected-resolver call must observe the cleared cell"
+        );
+    }
+
+    /// `apply_rate` on a real stashed socket: on Linux the pair either
+    /// lands (tcp-brutal module loaded) or debug-logs ENOPROTOOPT, and
+    /// off-Linux the upstream stub arm returns 0 — never fatal.
+    #[tokio::test]
+    async fn apply_rate_on_a_stashed_socket_is_never_fatal() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let carrier = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = brutal_carrier_scope(Some(Arc::clone(&carrier)), connect_tcp(addr))
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            let applied = carrier.apply_rate(1_000_000);
+            assert!(
+                applied <= carrier.stashed(),
+                "apply count {applied} cannot exceed the stash"
+            );
+        }
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        assert_eq!(
+            carrier.apply_rate(1_000_000),
+            0,
+            "the non-Linux stub applies nothing"
+        );
+        drop(stream);
+    }
+
+    /// `scope(None)` shadows an outer cell — the mechanism a non-brutal
+    /// mux session's `create_session` uses so its kernel sockets can never
+    /// feed a rear node's carrier under mux-over-mux `dialer-proxy`.
+    #[tokio::test]
+    async fn none_scope_shadows_an_outer_carrier() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let outer = Arc::new(BrutalCarrier::new());
+        let inner = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+            let _ = listener.accept().await.unwrap();
+        });
+
+        brutal_carrier_scope(Some(Arc::clone(&outer)), async {
+            // The shadowed dial — a non-brutal front's session dial under
+            // a rear node's carrier scope.
+            let _shadowed = brutal_carrier_scope(None, connect_tcp(addr))
+                .await
+                .expect("shadowed connect");
+            // A nested brutal cell still collects its own sockets.
+            let _nested = brutal_carrier_scope(Some(Arc::clone(&inner)), connect_tcp(addr))
+                .await
+                .expect("nested connect");
+        })
+        .await;
+        accept.await.unwrap();
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            assert_eq!(outer.stashed(), 0, "the shadowed dial fed no socket");
+            assert_eq!(inner.stashed(), 1, "the nested cell kept its own");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1744,6 +3442,10 @@ mod same_family_progress {
     use std::time::Duration;
     #[tokio::test(start_paused = true)]
     async fn surviving_candidate_reclaims_budget_after_others_fail() {
+        // `connect_tcp_candidates` reads the `tcp-concurrent` process-global
+        // — serialize against the `tcp_concurrent_policy` test that flips
+        // it, or this run would take the sequential walk (issue #974).
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addrs = (1..=3)
             .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
             .collect();
@@ -1765,6 +3467,7 @@ mod same_family_progress {
     }
     #[tokio::test(start_paused = true)]
     async fn stalled_same_family_addresses_do_not_starve_later_candidates() {
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addresses = (1..=3)
             .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
             .collect();
@@ -1784,6 +3487,7 @@ mod same_family_progress {
     }
     #[tokio::test(start_paused = true)]
     async fn no_caller_deadline_does_not_introduce_five_second_limit() {
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addr = SocketAddr::from(([192, 0, 2, 1], 1));
         let start = tokio::time::Instant::now();
         let result = connect_tcp_candidates(vec![addr], |address| async move {
@@ -1799,6 +3503,7 @@ mod same_family_progress {
     #[tokio::test(start_paused = true)]
     async fn shared_deadline_race_bounds_and_drops_pending_attempts() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         struct Live(Arc<AtomicUsize>);
         impl Drop for Live {
             fn drop(&mut self) {
@@ -1824,5 +3529,459 @@ mod same_family_progress {
             .await
             .is_err());
         assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod tcp_concurrent_policy {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Mixed-family list: `connect_candidates_before` interleaves
+    /// families — under `false` the call order must be the *resolver*
+    /// order instead (the deliberate divergence documented on
+    /// `connect_tcp_candidates`).
+    const MIXED: [&str; 4] = [
+        "[2001:db8::1]:443",
+        "192.0.2.1:443",
+        "[2001:db8::2]:443",
+        "192.0.2.2:443",
+    ];
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    struct LiveCount(Arc<AtomicUsize>);
+    impl Drop for LiveCount {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Sequential under a shared deadline walks the list strictly in
+    /// order — no family interleave, at most one live connect even past
+    /// the 250 ms the racer would have staggered by.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_preserves_list_order_without_overlap() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED);
+        let result = crate::dial::with_dial_timeout("seq order", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let calls = &calls;
+                    let live = &live;
+                    let win = addrs[2];
+                    async move {
+                        assert_eq!(
+                            live.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "a second connect must never overlap"
+                        );
+                        calls.lock().unwrap().push(addr);
+                        // Past the 250 ms stagger the race would have used.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        if addr == win {
+                            Ok(addr)
+                        } else {
+                            Err(io::ErrorKind::ConnectionRefused.into())
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        assert_eq!(*calls.lock().unwrap(), addrs[..3]);
+    }
+
+    /// A black-holed first candidate gets only its fair share — every
+    /// later candidate still runs (the primary regression risk).
+    #[tokio::test(start_paused = true)]
+    async fn sequential_stalled_candidate_gets_only_its_share() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let started = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..3]);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("seq stall", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let started = &started;
+                    let live = &live;
+                    let win = addrs[2];
+                    async move {
+                        assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
+                        let _guard = LiveCount(Arc::clone(live));
+                        started.lock().unwrap().push(addr);
+                        if addr == win {
+                            return Ok(addr);
+                        }
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        assert_eq!(*started.lock().unwrap(), addrs);
+        // c1: 5s/3 = ~1667ms; c2: (5s − ~1667ms)/2 = ~1667ms → c3 at ~3333ms.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < crate::dial::DIAL_TIMEOUT,
+            "later candidates must run before the shared deadline: {elapsed:?}"
+        );
+    }
+
+    /// The budget share recomputes after each attempt: an instant failure
+    /// hands the next candidate the larger remaining slice.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_recomputes_share_after_fast_failures() {
+        let addrs = addrs(&MIXED[..3]);
+        let start = tokio::time::Instant::now();
+        let stalls = Mutex::new(Vec::<SocketAddr>::new());
+        let result = crate::dial::with_dial_timeout("seq recompute", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let stalls = &stalls;
+                    let first = addrs[0];
+                    let second = addrs[1];
+                    async move {
+                        if addr == first {
+                            return Err(io::ErrorKind::ConnectionRefused.into());
+                        }
+                        if addr == second {
+                            stalls.lock().unwrap().push(addr);
+                            std::future::pending::<io::Result<SocketAddr>>().await
+                        } else {
+                            Ok(addr)
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        // c2 stalled on a recomputed ~2.5s share ((5s − ~0)/2), not 5/3.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed > Duration::from_secs(2),
+            "c2 must get the recomputed larger share, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "c2 must still be dropped in time for c3, elapsed {elapsed:?}"
+        );
+        assert_eq!(*stalls.lock().unwrap(), vec![addrs[1]]);
+    }
+
+    /// Every candidate pending: the deadline splits fairly — all of them
+    /// get an attempt before the shared budget expires.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_all_stalled_still_attempts_every_candidate() {
+        let started = AtomicUsize::new(0);
+        let addrs = addrs(&MIXED);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout::<_, SocketAddr>("seq all stall", async {
+            dispatch_tcp_candidates(
+                addrs,
+                |_| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<io::Result<SocketAddr>>()
+                },
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            4,
+            "each candidate deserves its share before the deadline"
+        );
+        assert_eq!(start.elapsed(), crate::dial::DIAL_TIMEOUT);
+    }
+
+    /// Immediate failure then success, in order, with no delay.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_fast_fail_then_success() {
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..2]);
+        let start = tokio::time::Instant::now();
+        let winner = crate::dial::with_dial_timeout("seq fail-ok", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    calls.lock().unwrap().push(addr);
+                    let first = addrs[0];
+                    async move {
+                        if addr == first {
+                            Err(io::ErrorKind::ConnectionRefused.into())
+                        } else {
+                            Ok(addr)
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner, addrs[1]);
+        assert_eq!(*calls.lock().unwrap(), addrs);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// An errno-backed error outranks later context-only failures —
+    /// including the synthesized per-candidate timeout.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_errno_preference_survives_timeout_tail() {
+        let addrs = addrs(&MIXED[..3]);
+        let err = crate::dial::with_dial_timeout::<_, SocketAddr>("seq errno", async {
+            dispatch_tcp_candidates(
+                addrs,
+                |addr| async move {
+                    if addr.port() == 443 && addr.ip().is_ipv6() {
+                        Err(io::Error::from_raw_os_error(61))
+                    } else if addr.ip().is_ipv4() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Err(io::Error::other("context only"))
+                    }
+                },
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.raw_os_error(), Some(61));
+    }
+
+    /// Empty input fails immediately; a singleton runs under the same
+    /// rules and a stalled singleton burns the whole remaining budget —
+    /// it IS the final candidate.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_empty_and_singleton() {
+        let err = crate::dial::with_dial_timeout::<_, ()>("seq empty", async {
+            dispatch_tcp_candidates(Vec::new(), |_| async { Ok(()) }, false)
+                .await
+                .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let addr = addrs(&["192.0.2.7:443"])[0];
+        let winner = crate::dial::with_dial_timeout("seq singleton", async {
+            Ok(dispatch_tcp_candidates(vec![addr], |a| async move { Ok(a) }, false).await?)
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner, addr);
+
+        let start = tokio::time::Instant::now();
+        let err = crate::dial::with_dial_timeout::<_, SocketAddr>("seq singleton stall", async {
+            dispatch_tcp_candidates(
+                vec![addr],
+                |_| std::future::pending::<io::Result<SocketAddr>>(),
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            start.elapsed(),
+            crate::dial::DIAL_TIMEOUT,
+            "the final candidate owns the remaining budget"
+        );
+    }
+
+    /// Without a caller deadline the plain serial loop runs — same order,
+    /// no injected timeout, no family stagger.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_without_deadline_uses_plain_serial_loop() {
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..3]);
+        let winner = dispatch_tcp_candidates(
+            addrs.clone(),
+            |addr| {
+                let calls = &calls;
+                let win = addrs[1];
+                async move {
+                    calls.lock().unwrap().push(addr);
+                    if addr == win {
+                        // Well past the 250 ms family stagger; nothing races.
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        Ok(addr)
+                    } else {
+                        Err(io::ErrorKind::ConnectionRefused.into())
+                    }
+                }
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, addrs[1]);
+        assert_eq!(*calls.lock().unwrap(), addrs[..2]);
+    }
+
+    /// `true` keeps both deadline and deadline-free race behaviour: the
+    /// fallback candidate wins on the 250 ms stagger while the stalled
+    /// preferred candidate is still live.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_true_keeps_the_race() {
+        for deadline in [true, false] {
+            let live = Arc::new(AtomicUsize::new(0));
+            let max_live = Arc::new(AtomicUsize::new(0));
+            let addrs = addrs(&["[2001:db8::1]:443", "192.0.2.1:443"]);
+            let start = tokio::time::Instant::now();
+            let dial = |addr: SocketAddr| {
+                let live = Arc::clone(&live);
+                let max_live = Arc::clone(&max_live);
+                async move {
+                    let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_live.fetch_max(n, Ordering::SeqCst);
+                    let _guard = LiveCount(live);
+                    if addr.is_ipv6() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Ok(addr)
+                    }
+                }
+            };
+            let run = dispatch_tcp_candidates(addrs, dial, true);
+            let winner = if deadline {
+                crate::dial::with_dial_timeout("race", async { Ok(run.await?) })
+                    .await
+                    .unwrap()
+            } else {
+                run.await.unwrap()
+            };
+            assert!(winner.is_ipv4());
+            assert_eq!(max_live.load(Ordering::SeqCst), 2, "the race must overlap");
+            assert_eq!(start.elapsed(), Duration::from_millis(250));
+        }
+    }
+
+    /// Dropping the selector future mid-attempt cancels the in-flight
+    /// connect — the candidate's guard unwinds.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_selector_cancels_inflight_attempt() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = addrs(&["192.0.2.1:443"]);
+        let counter = Arc::clone(&live);
+        let handle = tokio::spawn(crate::dial::with_dial_timeout("seq cancel", async move {
+            let _ = dispatch_tcp_candidates(
+                addrs,
+                move |_| {
+                    let live = Arc::clone(&counter);
+                    async move {
+                        live.fetch_add(1, Ordering::SeqCst);
+                        let _guard = LiveCount(live);
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    }
+                },
+                false,
+            )
+            .await;
+            Ok::<(), crate::MeowError>(())
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    /// The shared selector honours the process-global: `connect_tcp_host`
+    /// and `DirectAdapter::dial_tcp` both delegate to
+    /// `connect_tcp_candidates` — the function driven here — so one
+    /// toggle proves the policy reaches both production paths. The flag
+    /// is restored on drop even through a panic; `false` can only ever
+    /// make a sibling test's selector call *more* conservative, so the
+    /// brief window cannot flip another test's expectation.
+    #[tokio::test(start_paused = true)]
+    async fn selector_reads_the_live_global_once() {
+        // Mutating the process-global must not leak into a sibling's
+        // `connect_tcp_candidates` walk — the serial excludes them.
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::dial::set_tcp_concurrent(true);
+            }
+        }
+        let _reset = Reset;
+        crate::dial::set_tcp_concurrent(false);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = addrs(&["[2001:db8::1]:443", "192.0.2.1:443"]);
+        let start = tokio::time::Instant::now();
+        let winner = crate::dial::with_dial_timeout("selector", async {
+            Ok(connect_tcp_candidates(addrs.clone(), |addr| {
+                let live = &live;
+                async move {
+                    assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
+                    let _guard = LiveCount(Arc::clone(live));
+                    if addr.is_ipv6() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Ok(addr)
+                    }
+                }
+            })
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv4());
+        // Sequential: v6 burned its 5s/2 share before v4 ran.
+        assert_eq!(start.elapsed(), Duration::from_millis(2500));
+
+        crate::dial::set_tcp_concurrent(true);
+        let winner = crate::dial::with_dial_timeout("selector", async {
+            Ok(connect_tcp_candidates(addrs, |addr| async move {
+                if addr.is_ipv6() {
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                } else {
+                    Ok(addr)
+                }
+            })
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv4());
+        assert_eq!(start.elapsed(), Duration::from_millis(2750));
     }
 }

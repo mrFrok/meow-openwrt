@@ -468,6 +468,171 @@ Consequences:
   (`--group-features`), keeping the meow-proxy depth-4 leg count at 1788
   instead of 3676.
 
+## Addendum (2026-11-12): WireGuard (Phase-1) — §6 amendment
+
+**Feature**: `wireguard` (meow-proxy, meow-wireguard)
+
+**Measurement plan**: After the feature PR merges, measure stripped aarch64-linux-musl
+release binary with and without `--features wireguard` using:
+```
+cargo build --release --target aarch64-unknown-linux-musl --features full
+strip target/.../meow && wc -c meow
+```
+Compare to the last recorded `default`/`full` baseline in this document.
+
+**Expected delta**: ~400–600 KiB for smoltcp + meow-wireguard (no ring; RustCrypto
+crates already counted in the baseline via SS/snell/hysteria2 deps).
+
+**Budget posture**: If the delta breaches the `full`-profile cap, the amendment
+shall raise the cap by the measured delta rounded up to the nearest 512 KiB, with
+a note that the cap reflects WireGuard's smoltcp stack.
+
+**Minimal posture**: The `minimal` build must remain below its cap. Verified by
+the CI step "minimal build size check" gating on the unchanged minimal cap.
+
+## Addendum (2026-11-21): `simple-obfs`/`obfs` + `v2ray-plugin` leave `minimal` — `ss` carries no plugins
+
+The 2026-10-29 addendum kept `simple-obfs`/`obfs` and `v2ray-plugin` inside
+plain `ss`, on the §1 rationale that SS + v2ray-plugin + TLS + ws is the
+dominant router deployment. Incremental growth on this branch then tipped
+the aarch64-musl `minimal` binary 10.6 KB over the 8 MiB hard cap
+(8,399,176 B vs 8,388,608 B measured on the reference host), and the two
+plugin surfaces contribute ~18.7 KB of symbols (`simple_obfs` 13.4 KB +
+`v2ray_plugin` 5.3 KB). Pruning them restores the budget; per §6 the cap
+itself is not amended — the bundle contract is what changed.
+
+`ss` now carries *no* built-in plugin transport. Two opt-in features
+restore them — `ss-obfs` (implies `ss` + `meow-transport/simple-obfs`) and
+`ss-v2ray-plugin` (implies `ss`) — symmetric across `meow-proxy`,
+`meow-config` and `meow-app`, and re-bundled into `default`/`full`, so
+release binaries are unchanged. A `plugin: obfs`/`simple-obfs`/
+`v2ray-plugin` node under a build without the feature binds the same dead
+placeholder the 2026-10-29 mechanism provides, with the dial reason naming
+`ss-obfs`/`ss-v2ray-plugin`.
+
+One name is special-cased: `obfs-local` is the SIP003 *binary* spelling,
+not a built-in, so it stays off `is_builtin_sip003_plugin`. With `ss-obfs`
+compiled in it keeps its external-subprocess semantics (spawn suppressed
+under `-t`, still gated by provider `allow-external-plugin`); compiled out
+it joins `FEATURE_GATED_PLUGINS` — the adapter reports the missing
+`ss-obfs` feature before `Plugin::start`, and the dry-run/policy/provider
+classification stops treating the name as spawnable. An `ss`-only build
+therefore cannot be tricked into spawning an obfs binary the operator
+deliberately pruned.
+
+Consequences:
+
+- `minimal` (`ss` + `trojan` + `dns-server` + `listener-mixed`) drops
+  ~19 KB back under the 8 MiB cap; `full`/`default` keep both plugins.
+- Generic `plugin:`/`plugin-opts:` parsing and SIP003 opts serialization
+  stay unconditional — that plumbing is shared by every plugin, built-in
+  or external.
+- `snell` and `listener-shadowsocks` keep their own
+  `meow-transport/simple-obfs` activation — their obfs is a server/snell
+  concern, not the SS plugin surface this prunes.
+
+## Addendum (2026-11-21): C-dep unwind tables + zstd default features — two mechanism-level trims
+
+Two independent size reductions measured and landed on the same
+`aarch64-musl minimal` leg this ADR gates (zigbuild, `lto=fat,
+strip=true, codegen-units=1, panic=abort, opt-level="z"`):
+
+- `zstd` workspace dep → `default-features = false`. zstd 0.14
+  default-enables `legacy` (the v0.1–v0.7 frame decoders), `arrays` and
+  `zdict_builder`; `ZSTD_decompress` keeps a dispatch slot for the
+  legacy decoders so they survive LTO even though meow only ever
+  produces/consumes current-version frames via `zstd::encode_all` and
+  `zstd::stream::Decoder`. **−125,632 B** in-tree (measured on top of
+  the unwind-flags build; earlier isolated A/B measured −130,752 B).
+  `Cargo.lock` unchanged — features are not recorded there.
+- `.cargo/config.toml` `[env]` sets target-qualified
+  `CFLAGS_<triple>`/`CXXFLAGS_<triple>` to
+  `-fno-unwind-tables -fno-asynchronous-unwind-tables` (+ `-fno-exceptions`
+  for CXX) for `aarch64_unknown_linux_musl` and
+  `x86_64_unknown_linux_musl`. panic=abort already keeps rustc from
+  emitting unwind tables for workspace crates, but every C dep compiles
+  with toolchain defaults. Both C-build frontends honour the env vars —
+  the cc crate reads them directly, and cmake-rs merges them into its
+  `-DCMAKE_C_FLAGS`/`-DCMAKE_CXX_FLAGS` args — so boring-sys, zstd-sys,
+  libmimalloc-sys, ring and blake3 all compile table-free with no
+  wrapper scripts or vendored patches (`flags.make` and per-object
+  section scans verified). Measured: **−163,272 B on aarch64-musl**
+  (8,290,952 → 8,127,680; per section: .eh_frame −117.6 KB,
+  .eh_frame_hdr −25.2 KB, .gcc_except_table −12.4 KB, plus ~7.8 KB of
+  dead landing-pad `.text`), **−170,312 B on x86_64-musl**
+  (10,054,968 → 9,884,656; .eh_frame −126.6 KB, .eh_frame_hdr
+  −25.7 KB, .gcc_except_table −11.5 KB).
+
+Dropping `legacy` is a deliberate rejection boundary whose blast radius
+is narrower than the version list suggests. A legacy frame could only
+ever decompress on the streaming paths — an `MRS!`-wrapped payload, or
+a whole-file upstream `.mrs` opened by `UpstreamRuleSetReader`
+(convert-ruleset) — and `ZSTD_decompressLegacyStream` accepts just
+v0.4–v0.7, answering v0.1–v0.3 with `version_unsupported`; every other
+entry point (rule_set's `ZSTD_MAGIC` dispatch, geosite's `MRS!`/`.dat`
+split) refused the bytes before any decode. What the follow-up changes
+is the diagnosis: `mrs_parser::legacy_zstd_version` sniffs the first
+frame's magic ahead of the decoder at every entry point (`FD 2F B5 1E`
+for v0.1, which wrote the word big-endian; `NN B5 2F FD` for
+v0.2–v0.7), so all seven versions report "unsupported legacy zstd
+frame (v0.N, pre-1.0 format); regenerate the file with a current zstd
+version" instead of a bare "unknown frame descriptor" or a
+format-mismatch — a legacy frame later in a concatenated stream still
+takes the generic error. No public mrs/geosite feed ships pre-0.8
+frames, so the reachable surface stays private/archived rulesets.
+Failure handling is unchanged per surface: an HTTP provider's payload
+defect — including the on-disk cache offline `-t` parses without
+fetching, so a green `-t` proves nothing about the remote body —
+registers the provider empty in both modes (recorded in the logbook);
+a local `file:`/`inline:` payload defect is a config defect, rejected
+under `strict` and dropping the provider under lenient; a geosite DB
+logs an error and loads as absent. Nothing crashes and nothing
+degrades silently.
+
+The combined head-of-branch result is 8,002,048 B — the aarch64
+`minimal` cap is unchanged and now has ~377 KiB of headroom.
+
+Residual unwind data (~1.1 MiB on aarch64: .eh_frame 893 KB +
+.eh_frame_hdr 276 KB + .gcc_except_table 9 KB) is **not** C-side and
+these flags cannot reach it: prebuilt std-family rlib objects ship
+.eh_frame (locally compiled workspace rlibs emit none — panic=abort is
+already effective there), and zig's bundled musl objects keep theirs.
+Removing that needs `-Zbuild-std` (nightly — the workspace pins stable)
+or upstream zig changes; post-link `objcopy --remove-section` is not a
+workaround because the payload lives inside `PT_LOAD` segments (the
+file shrank by only 232 B in a direct experiment). `RUSTFLAGS=
+-Cforce-unwind-tables=no` was also verified a no-op here — the Rust
+side already emits nothing.
+
+One debugging trade-off is accepted with the flag trim: musl C objects
+ship no unwind tables, so a crash inside boringssl/zstd/ring/blake3
+cannot be walked by DWARF unwind — a debugger may still reconstruct a
+partial backtrace via frame-pointer/prologue heuristics, but a complete
+trace needs a rebuild that keeps the unwind tables and debug symbols
+(e.g. via the packager opt-out in `docs/benchmarks/binary-size.md`).
+
+## Addendum (2026-11-22): `ss-obfs` returns to `minimal`
+
+The 2026-11-21 addendum pruned both `ss-obfs` and `ss-v2ray-plugin` out of
+`minimal` to restore the 8 MiB cap; the C-dep unwind-table + zstd trims
+that landed the same day bought back ~289 KB. Operator demand for the
+dominant SIP003 transport makes `obfs` worth that headroom, so `minimal`
+now carries `ss-obfs` (`ss + meow-transport/simple-obfs`) again while
+`ss-v2ray-plugin` and the heavier plugins stay out.
+
+Measured on the reference host (zigbuild, same release profile):
+**8,213,192 B** — 175,416 B under the 8,388,608 B cap; per §6 the cap is
+unchanged, only the bundle contents moved.
+
+Consequences:
+
+- `minimal` (`ss` + `ss-obfs` + `trojan` + `dns-server` +
+  `listener-mixed`) accepts `plugin: obfs`/`simple-obfs`/`obfs-local`
+  nodes again; `plugin: v2ray-plugin` keeps the dead-placeholder +
+  feature-named dial error (`--features ss-v2ray-plugin`).
+- `full`/`default` are unchanged — both features were already bundled
+  there.
+
 ## References
 
 - `docs/roadmap.md` §M2 items 3 + 5 — pinned by this ADR.

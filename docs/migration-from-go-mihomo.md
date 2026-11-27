@@ -46,9 +46,16 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `mode: rule / global / direct` | ✓ | Fully supported. |
 | `log-level` | ✓ | Fully supported. |
 | `external-controller` | ✓ | REST API on same port. |
-| `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). |
+| `external-controller-tls` | ✓ | Additional HTTPS controller listener (BoringSSL, ALPN `h2`/`http/1.1`), coexisting with the plain one. A build feature: `api-tls` (in `full`/`default`, not `minimal` — there the key parses and startup warns it is not compiled in). Identity from nested `tls.certificate`/`tls.private-key` (inline PEM or home/`SAFE_PATHS`-contained file pair — never mixed); both unset generates an ephemeral self-signed RSA-2048 cert at bind. Like upstream, every identity failure — one-sided pair, malformed inline PEM, unreadable path — defers to endpoint bind and logs/skips only that listener (`-t` stays shape-only). Bare `:port` binds the dual-stack wildcard. See [api-listener.md](specs/api-listener.md). |
+| `external-controller-unix` | ✓ | HTTP over a Unix socket, relative path resolved under the daemon home, coexisting listeners. **Divergences (deliberate):** refuses non-socket/other-user paths, reclaims only a verified stale same-owner socket (`ECONNREFUSED` probe), binds `0600` not `0666` (chmod failure fails the endpoint), keeps Bearer auth on, and the cleanup guard unlinks only the exact socket it bound — re-verified by type and `(dev, ino)`. |
+| `external-controller-pipe` | ~ | Parsed on every platform; served on Windows only (byte mode, remote clients rejected, owner-only SDDL ACL on every instance). Warn-ignored elsewhere. |
+| `external-controller-cors` | ✓ | Controller CORS policy — the configured `cors.New` wire shape (`allow-origins` globs/echo — `[]` is allow-all — `allow-private-network` default `true`, max-age 300, method allowlist sans `HEAD`, request-header allowlist `{content-type, authorization, origin}`). Upstream gates its permissive `AllowAll` on `secret: ""` only; an absent map under a set/unset secret resolves `["*"]`/`true` defaults, and meow mounts no CORS layer without a secret at all. |
+| `tls:` (top-level) | ~ | Only `certificate`/`private-key` apply (the `external-controller-tls` identity — never start a listener alone, warn without it). `client-auth-type`, `client-auth-certificates`, `ech-key`, `custom-certifactes` (sic) parse and warn-ignore. Top-level `certificate`/`private-key` warn as *misplaced* — mihomo reads them nested only. |
+| `external-controller-routing-mark` | — | Parsed, warn-ignored (controller listener `SO_MARK` not implemented). |
+| `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). Applies to every controller transport — plain, TLS, Unix socket and pipe alike (upstream's unix socket is unauthenticated). |
 | `authentication` + `skip-auth-prefixes` | ✓ | Inbound proxy auth (M1.F-3). |
-| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). |
+| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). `type: tun` declares a flat-form TUN device (`listeners:`-tuned defaults: `mtu` 9000, `udp-timeout` 300, `auto-route` off; presence is the enabled state — `enable`/nested `tun:`/`port`/`listen` are hard errors; one effective TUN — a named entry plus `tun.enable: true`, or two named entries, fails to parse). Starts at boot only and a failed spawn is fatal; `PUT`/`PATCH` `tun.enable` is refused while a named device runs. Same `listener-tun` feature; see [tun.md](tun.md#named-listeners-type-tun-entries). |
+| `lan-allowed-ips`, `lan-disallowed-ips` | ✓ | CIDR admission on the mixed/HTTP/SOCKS TCP accept loops only — rejected peers drop silently at `accept` before auth or sniffing. Omitted allow list admits all; explicit `[]` admits none. Top-level keys only; nested under `listeners:` they are a hard parse error. Startup-only like the listeners themselves: `PUT /configs` validates and stores for the next boot. |
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
 | `proxies:` — Direct, Reject | ✓ | Fully supported. |
@@ -59,7 +66,10 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
 | `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
-| `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
+| `proxies:` — WireGuard | ✓ | Userspace WG client (vendored boringtun + smoltcp): standard WG + Cloudflare WARP `reserved`. In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. Phase-1: `dns` is ignored and `amnezia-wg-option` is a hard error; `dialer-proxy` is supported (UDP-capable fronts only — a TCP-only front fails the bind at dial time) — see [wireguard.md](wireguard.md). |
+| `proxies:` — TUIC / SSH | ✗ | Not implemented. |
+| `proxies:` — rematch | ✓ | Control outbound (upstream `C.Rematch`): carries no address and never dials — a rule that selects it stamps `Metadata.rematchName` (`target-rematch-name`) and/or switches the active rule list (`target-sub-rule`) and re-enters the scan iteratively. At least one `target-*` field required; `""` is the explicit clear form (clears the marker / returns to the top-level rules), `null`/omitted leaves the field unchanged. No `server`/`port`; `udp:` is ignored (the transition precedes the capability check) and `dialer-proxy` is a hard error. Re-visiting an adapter or exceeding 32 transitions rejects the flow — no slide to a later rule. |
+| `proxies:` — dns | ✓ | Resolver leaf (upstream `C.Dns`): consumes the flow's raw DNS payload through meow's own resolver — the nominal destination is never contacted, `DST-PORT,53,dns-out` is routing syntax only. No endpoint keys; `server`/`port`/`udp`/transport keys are ignored with warnings (any shape, even ill-typed) and `dialer-proxy` is ignored. Works on `proxies:` entries and inside `proxy-providers:`. See [specs/dns-outbound.md](specs/dns-outbound.md). |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
 | `proxy-groups:` — load-balance | ✓ | round-robin + consistent-hashing (M1.C-1). |
 | `proxy-groups:` — relay | ✓ | Chain multiple outbounds (M1.C-2). |
@@ -68,9 +78,13 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — GEOIP | ✓ | MaxMind MMDB. |
 | `rules:` — GEOSITE | ✓ | mrs format only — see §Rules. |
 | `rules:` — RULE-SET | ✓ | M1.D-5, mrs + yaml formats. |
-| `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. |
+| `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. `find-process-mode` selects when it runs (below). |
+| `rules:` — PROCESS-PATH | ✓ | Same lookup as PROCESS-NAME; plus a `/`-prefix directory match and `*` glob (meow-rs extensions over upstream's filename match). |
+| `rules:` — PROCESS-NAME-REGEX, PROCESS-PATH-REGEX | ✓ | Case-insensitive search semantics; comma-protected payloads like DOMAIN-REGEX. |
+| `rules:` — PROCESS-NAME-WILDCARD, PROCESS-PATH-WILDCARD | ✓ | Whole-field `*`/`?` glob (`,`-unprotected fixed fields; a fourth field is parsed as upstream params and ignored). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
-| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
+| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. Condition leaves accept every rule type except `MATCH`/`SUB-RULE` — upstream's logic-leg exclusion set. **Extensions:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!` (upstream parses only the prefix `AND`/`OR`/`NOT` forms). |
+| `rules:` — REMATCH-NAME | ✓ | Exact, case-sensitive compare against `Metadata.rematchName` — the marker a `type: rematch` node stamps on the flow. `/` separates alternatives (each token trimmed); an unset marker never matches, and `*`/`|` are literal bytes. Works standalone, inside `AND`/`OR`/`NOT` legs and `SUB-RULE` conditions, and through rule providers. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |
@@ -91,8 +105,13 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `tproxy-port` | ✓ | Linux nftables / macOS pf. Managed-REDIRECT semantic (TCP, host `output` chain) — mihomo's real-TPROXY shorthand maps to `listeners:` `type: tproxy transparent: true` instead. **meow-openwrt:** the shorthand is mihomo's real TPROXY (TCP + IPv4 UDP, deployer-owned rules, bound per `bind-address`); the managed mode is the `listeners:` form. |
 | `redir-port` | ✓ | Deployer-REDIRECT listener, meow owns no rules. Same as `listeners:` `type: redir`. |
 | `routing-mark` | ✓ | Linux only. `SO_MARK` on every outbound socket; the deployer's rules exempt meow's own traffic. |
+| `global-client-fingerprint` | ✓ | Default uTLS ClientHello profile (`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`random`, etc.) for `proxies:`/`proxy-providers:` nodes omitting `client-fingerprint`. Node value wins, an omitted or `""` value inherits the global, and an explicit `none` opts out (under VLESS+REALITY the literal `none` passes through to the warn-and-Chrome fallback, as upstream), an unsupported name warns and degrades to backend defaults. Baked at parse — changes ride a full config load, not a `PATCH`. |
+| `global-ua` | ✓ | `User-Agent` override on internal HTTP fetches (providers, subscriptions, geodata, external-ui) and latency probes; `""`/unset = `clash.meta/<version>`. A request-supplied `User-Agent` still wins; values with CR/LF/NUL/control bytes are rejected at admission. `PATCH /configs` applies it live. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
 | `geodata:` | ✓ | Path overrides, auto-update, interval, and download URL overrides. |
+| `geo-auto-update`, `geo-update-interval` (flat) | ✓ | Aliases of `geodata.auto-update` / `geodata.auto-update-interval`; the nested keys win when both are set. The schedule is a startup snapshot — a committed `PUT /configs` change warns that a restart applies it. `geodata-mode`, `geodata-loader`, `geosite-matcher` are accepted and warned on (unsupported selectors), even under `strict: true`. |
+| `find-process-mode` | ✓ | `always` looks up every eligible new inbound flow's owner before mode dispatch (and shows it in `/connections`); `strict` (the default) runs the lookup once, only when the first reached rule predicate needs it; `off` never looks up — process rules still evaluate whatever identity the inbound supplied. `PATCH /configs` flips it live; `GET` reports the running mode. |
+| `tcp-concurrent` | ✓ | `false` dials each destination's filtered, ordered candidate list strictly sequentially under one shared deadline; `true` keeps the candidate race. **Divergence:** unset defaults to `true` — meow-rs keeps its historical race where upstream defaults `false`. `PATCH /configs` flips it live; a race already in progress keeps its policy. |
 | `/metrics` Prometheus endpoint | ✓ | meow-rs enhancement (no Go upstream equiv). |
 
 ---
@@ -127,10 +146,18 @@ These fields parse without error but behave differently from Go mihomo:
 | `PUT /configs` in-flight connections | Graceful handover | Cold reload, connections dropped + logged | A |
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |
 | `GET /configs` response includes null Option fields | Full struct with nulls | Only non-null fields returned | B |
-| `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
-| `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
+| `geodata-mode`, `geodata-loader`, `geoip-matcher`, `geosite-matcher` (flat or nested) | Valid fields | Accepted and merged onto the `geodata:` machinery; the unsupported selectors warn-once (nested wins over flat), even under `strict: true` | B |
+| `tcp-concurrent` unset | Upstream default `false` (sequential dials) | meow-rs default `true` — the existing candidate race is preserved unless the operator opts out | B |
+| `find-process-mode` | `always`/`strict`/`off` | Same modes; `strict` scans only at the first *reached* process-demanding rule (never for a flow an earlier rule already decided, never per packet on established UDP flows). `off` also suppresses the traffic ledger's app lookup | — |
+| `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind). The *new* `external-controller-{tls,unix,pipe}` endpoints keep upstream's log-and-skip tolerance — only the plain bind is fatal | A |
+| `external-controller*` / `external-controller-cors` / `tls:` in `PUT /configs` | Live-rebinds the controller listeners | Committed to the document for the next boot; listeners/CORS are startup snapshots, so a change warns that a restart applies it. The PUT never binds, unlinks, reads PEMs or touches the running listeners | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
-| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Honored on the outbound half only — applied once per physical upstream dial (`0`/absent → 15 s, `0..=32767` hard bounds, `disable-keep-alive` turns it off). The inbound half keeps its own `tcp-keepalive*` family — different defaults (300 s) and different scope; see "Two keepalive families" below | B |
+| `profile.store-selected` | `select`-group choices persist to `cache.db` (BoltDB) | Same semantics — restore on load, write on successful selection — but persisted as JSON next to the config; see "Selection persistence" below | B |
+| `profile.store-fake-ip` | Persists fake-IP mappings when `true` | Resolution is `profile.store-fake-ip` > `dns.store-fake-ip` > `false`; a disagreement between the two spellings warns once per admission | B |
+| `ntp:` | Polls SNTP and (optionally) writes the OS clock | Bounded poll feeding protocol timestamps only — never the OS clock; see "NTP scope" below | A |
+| `smux.statistic` | Tracks mux carrier statistics | Parsed and warn-ignored: physical carrier tracking is unavailable; use `/connections`/`/traffic` for per-flow accounting | B |
+| `smux.brutal-opts` | TCP Brutal rate cap negotiated per mux carrier (sing-mux `_BrutalBwExchange`) | Implemented: parse leniency mirrored (`up`/`down` weak-decode numbers to text, unparseable → 0, eager shape errors), the exchange runs on every platform and pins the pool to one carrier, `protocol: muxcool` is rejected. The carrier-socket rate cap itself applies only on Linux (tcp-brutal module); non-Linux still negotiates and warns | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -151,9 +178,37 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 | `.dat` geosite file in discovery path | Loads (protobuf) | Hard error + conversion hint (`convert-geo`) |
 | `sub-rules:` cycle | May panic or loop | Hard parse error |
 | `sub-rules:` reference to undefined block | Runtime no-match | Hard parse error |
+| `listeners[].rule` naming an undefined `sub-rules:` block | Runtime no-match → DIRECT | Hard parse error naming the listener and block |
+| `listeners[].rule` block missing after a config swap | Falls back to the top-level `rules:` scan | Rejects the flow closed — a vanished override must not silently change egress policy |
+| `listeners[].proxy` naming an absent proxy | Rejects | Rejects (same); resolved live per flow, so groups and `PUT /configs` membership changes are honoured |
+| `lan-allowed-ips` / `lan-disallowed-ips` under `listeners[]` | Accepted as an unknown key, silently inert | Hard parse error pointing at the top level |
+| `lan-allowed-ips` entries | Bare IPs and CIDRs | CIDRs only — `10.0.0.1` is a hard error, `10.0.0.1/32` is the intent |
+| `listeners[].routing-mark` on non-Linux | Warns/ignored | Warns and is ignored (ingress `SO_MARK` on the listener socket — unrelated to the top-level outbound `routing-mark`) |
 | `nameserver-policy` entry with zero valid nameservers | Runtime panic at first query | Hard parse error at load |
 | `IN-TYPE` with unknown protocol name | Silently no-matches all traffic of that type | Hard parse error |
 | Base64 payload with URL-safe alphabet (`-`, `_`) | Accepted in some dashboard versions | 400 with decode-error message |
+
+### Named-listener route overrides
+
+`listeners[].proxy` and `listeners[].rule` are the upstream `specialProxy`
+/`specialRules` inbound options:
+
+- `proxy:` pins every flow of the inbound to that proxy or group,
+  resolved per flow against the live route table before mode dispatch
+  and `find-process-mode` — it wins over `rule:`, `mode: global` and
+  `mode: direct` too. `DIRECT` is unconditional. A name missing from the
+  table, or a UDP flow pinned at a UDP-incapable target, rejects; there
+  is no slide back into the rule scan. Hits account under the
+  `ListenerProxy` bucket, never a fictitious rule hit.
+- `rule:` selects a `sub-rules:` block *of the same document* by name
+  (it is not a `RULE-SET` provider and not an `IN-NAME` rule). In rule
+  mode the block replaces the top-level `rules:` scan for that inbound;
+  exhausting the block — or an empty block — answers DIRECT without
+  consulting the main list. Block matches carry no per-rule hit counters
+  and cannot be disabled through `/rules`.
+- `routing-mark:` sets `SO_MARK` on the listener's own socket at bind
+  (Linux only) — an ingress mark for policy routing, unrelated to the
+  top-level `routing-mark` key that marks outbound sockets.
 
 ---
 
@@ -174,15 +229,18 @@ UDP relay via UDP-over-TCP). External SIP003 plugin binaries are
 supported via `plugin:` on `ss` nodes and `allow-external-plugin` on
 providers.
 
-Feature prerequisites: `obfs`/`simple-obfs` and `v2ray-plugin` are
-bundled with `ss` itself (so they are in `minimal`); `gost-plugin`,
-`shadow-tls`, `restls` and `jls` each sit behind a same-named Cargo
-feature, all re-bundled into `default`/`full` but absent from `minimal`
-— a `plugin:` line naming a compiled-out built-in keeps the node bound
-as an unavailable placeholder whose dials fail with a "not compiled
-into this build" error (it is never handed to the external-plugin spawn
-path). `kcptun` and `ech-tls-tunnel` were already separate features and
-behave the same way.
+Feature prerequisites: plain `ss` carries no built-in plugin transport —
+`obfs`/`simple-obfs` sit behind `ss-obfs` and `v2ray-plugin` behind
+`ss-v2ray-plugin`, while `gost-plugin`, `shadow-tls`, `restls` and `jls`
+each sit behind a same-named Cargo feature. All are re-bundled into
+`default`/`full`; `minimal` ships `ss-obfs` only — a `plugin:` line naming a
+compiled-out built-in keeps the node bound as an unavailable placeholder
+whose dials fail with a "not compiled into this build" error (it is never
+handed to the external-plugin spawn path). `kcptun` and `ech-tls-tunnel`
+were already separate features and behave the same way. The SIP003 binary
+name `obfs-local` follows `ss-obfs` too: with the feature on it keeps its
+external-subprocess semantics; without it the node fails naming
+`ss-obfs` rather than spawning a pruned binary.
 
 ### Trojan
 
@@ -295,6 +353,39 @@ proxies:
 an `atyp 0x03` (domain) request. IP-only dial is used only when no hostname is
 available. This preserves domain for SNI and logging on the destination server.
 
+### WireGuard
+
+Supported behind the `wireguard` Cargo feature — part of the `full` bundle, so
+the published release binaries carry it; `minimal` builds leave it out
+(ADR-0007 binary-size caps). The client is a userspace stack: a vendored
+boringtun 0.7.1 noise layer (ring replaced by RustCrypto) over smoltcp. Full
+field reference, compatibility table and Phase-1 scope:
+[wireguard.md](wireguard.md).
+
+```yaml
+proxies:
+  - name: warp
+    type: wireguard
+    server: engage.cloudflareclient.com
+    port: 2408
+    ip: 172.16.0.2
+    private-key: eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=
+    public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+    udp: true
+```
+
+**Divergences from Go mihomo:**
+
+| Field / behaviour | Go mihomo | meow-rs |
+|-------------------|-----------|-------------|
+| `amnezia-wg-option` | AmneziaWG obfuscation fields | Hard parse error — Phase-1 is standard WireGuard only (Phase-3 planned). |
+| `dialer-proxy` on the node | Field accepted by the outbound schema | Supported — the endpoint's UDP transport rides the front's UDP association (UDP-capable fronts only; a TCP-only front fails the bind at dial time — closed, never a silent direct egress). |
+| `dns` | Per-node tunnel DNS list | Accepted but ignored, warn-once — `remote-dns-resolve` covers tunnel-side resolution (per-node DNS is Phase-2). |
+| `ip-stack: system` | Kernel WG stack | Warn-once, then runs smoltcp anyway — no kernel WG mode in Phase-1. |
+| `mtu` | No bound enforced (default `1408`) | Enforced range 640–9000, default `1420` — the smoltcp inner MTU (`mtu − 64` WG overhead) must stay ≥ 576. |
+| `udp` / `remote-dns-resolve` | Default `false` | Default `true` — UDP relay and tunnel-side DNS resolution are on unless disabled. |
+| `type: wireguard` without the feature | n/a | Parse error naming the `wireguard` feature — same contract as `anytls`. |
+
 ### Not supported in the default app build
 
 The following protocols are not available in the default app build. Using them
@@ -302,8 +393,11 @@ in `proxies:` will produce a hard parse error unless a feature note says
 otherwise:
 
 - **TUIC** — not implemented.
-- **WireGuard** — niche; deferred.
 - **SSH** — niche; deferred.
+- **WireGuard** — supported behind the `wireguard` Cargo feature. Part of the
+  `full` bundle, so the published release binaries carry it; `minimal` builds
+  leave it out and a `type: wireguard` node there fails to parse with an error
+  naming the feature (ADR-0007 binary-size caps).
 - **AnyTLS** — supported. Part of the `full` bundle, so the published release
   binaries carry it; `minimal` builds leave it out (ADR-0007 binary-size caps).
 
@@ -425,7 +519,8 @@ used at dial time. This matches upstream.
 TLS/WS/obfs stack to its own server, then the protocol handshake — over the
 preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `direct`, `reject`, `http`, `socks5`, `snell`, `vless`, `vmess`, `trojan`,
-`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
+`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included —
+`ss-obfs`, `ss-v2ray-plugin`, `ech-tls-tunnel` features respectively) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
 only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` (when those
@@ -643,10 +738,63 @@ using them will produce a clear error at startup.
 
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
-| TUIC, WireGuard, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
-| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section with the `listener-tun` Cargo feature |
+| TUIC, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
+| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section or a named `listeners:` `type: tun` entry (flat form, one effective TUN), with the `listener-tun` Cargo feature |
 
 ---
+
+## Top-level knobs (`profile:`, `ntp:`, `keep-alive-*`)
+
+Three sections Go mihomo users already have in their configs resolve to
+slightly different machinery in meow-rs.
+
+**Selection persistence.** `profile.store-selected` (default `true`,
+matching upstream) restores `select`-group choices at load and records
+successful `PUT /proxies/{name}` selections — but meow-rs stores the map
+as JSON next to the config file, while mihomo uses BoltDB `cache.db`.
+The files are not interchangeable: migrating means keeping the directory
+contents and letting meow write its own store (nothing crashes; the old
+`cache.db` is simply never read). `store-selected: false` disables both
+restoration and writes, like upstream, and does not delete an existing
+cache file. Configs loaded via `--config-string` have no backing path
+and persist nothing.
+
+**Fake-IP persistence.** `profile.store-fake-ip` outranks
+`dns.store-fake-ip`, which outranks `false` — declare both with
+different values and one warns which spelling won. The flag only takes
+effect for fake-IP DNS modes.
+
+**NTP scope.** The `ntp:` section polls the configured server (default
+`time.apple.com:123`, every `interval` minutes, at most three attempts
+per poll, ±24 h offset cap) and feeds the offset into exactly two
+protocol fields: VMess auth-ID timestamps and the REALITY client
+timestamp. Before the first successful sample — and after the section
+is disabled — those fields use wall time. Everything else keeps the OS
+clock: **TLS/QUIC certificate verification is unchanged**, so a host
+whose clock is badly skewed still fails certificate checks until the OS
+time is fixed (the NTP offset only ever *adds* skew-tolerance to the two
+protocol fields it owns; it cannot repair TLS). `write-to-system: true`
+is parsed for config compatibility and warn-ignored — meow-rs never
+invokes a clock-setting syscall, even under root. `dialer-proxy` names
+an existing top-level proxy/group (or `DIRECT`) the poll dials through;
+the name must exist whenever the section is enabled.
+
+**Two keepalive families.** mihomo's flat `keep-alive-*` keys tune both
+accept-side and dial-side sockets; meow-rs splits them. `tcp-keepalive`,
+`tcp-keepalive-idle`, `-interval`, `-probes` stay the *inbound* family
+(defaults 300 s/30 s/5, listener-startup scope, applied to accepted
+sockets). `keep-alive-idle`, `keep-alive-interval`,
+`disable-keep-alive` are now honored on the *outbound* family — applied
+once per physical upstream connect on every dial path (defaults 15 s,
+bounds `0..=32767`, probes fixed at 9). Setting only the flat keys no
+longer silently does nothing; wanting the old inbound tuning still means
+`tcp-keepalive*`.
+
+**Mux `statistic`.** The flag parses and, when `true`, warns that
+physical carrier tracking is unavailable — the mux pool has no
+per-carrier surface; per-flow accounting lives in `/connections` and
+`/traffic`. `0/0/0` pool sizing keeps warning it disables sharing; the
+shipped defaults are `4/4/4` from a single source (`MuxOptions::default`).
 
 ## meow-rs-only features
 
@@ -679,6 +827,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Full app bundle | `meow-app/full` | on |
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
+| WireGuard outbound | `meow-proxy/wireguard` (in `full`, not in `minimal`) | on |
 | Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
 | Traffic ledger (SQLite + public-suffix list) | `meow-app/traffic-ledger` (in `full`, not in `minimal`) | on |
 | Shadowsocks inbound (`listeners:` `type: shadowsocks`) | `meow-app/listener-shadowsocks` (in `full`, not in `minimal`) | on |
@@ -697,10 +846,11 @@ cargo build --release --no-default-features -p meow-dns
 
 Most common format from public providers. Typical issues:
 
-1. **Unsupported proxy types** — TUIC, WireGuard, SSH, ShadowsocksR, and other
-   niche upstream protocols still need replacement or removal. AnyTLS works
-   out of the box in the release binaries; a `minimal` build needs
-   `--features anytls`.
+1. **Unsupported proxy types** — TUIC, SSH, ShadowsocksR, and other niche
+   upstream protocols still need replacement or removal. AnyTLS and WireGuard
+   work out of the box in the release binaries (the `full` bundle); a
+   `minimal` build needs `--features anytls` for AnyTLS and the `wireguard`
+   feature for WireGuard.
 2. **`enhanced-mode: fake-ip`** — supported. Migration from a prior
    meow-rs release that warned-and-fell-back to `normal` is automatic;
    no config change required.
@@ -812,9 +962,9 @@ These have been tested against a real subscription and confirmed working:
 The following are unsupported or intentionally rejected:
 
 - **`quic://` nameservers** — hard error; replace with `tls://` or `https://`.
-- **TUIC / WireGuard / SSH / ShadowsocksR proxies** — hard error; no default-build adapter.
-- **AnyTLS proxies in a `minimal` build** — hard error; the `full` bundle and
-  the release binaries support them.
+- **TUIC / SSH / ShadowsocksR proxies** — hard error; no adapter.
+- **AnyTLS or WireGuard proxies in a `minimal` build** — hard error; the
+  `full` bundle and the release binaries support them.
 - **Snell v1/v2** — hard error; use Snell v3/v4/v5/v6.
 - **`vless` with `flow: xtls-rprx-direct`** — hard error; use `xtls-rprx-vision`.
 - **External dashboard auto-download** (`external-ui-url`) — not performed.

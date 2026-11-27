@@ -154,8 +154,36 @@ impl TunnelInner {
             },
             _ => None,
         };
-        let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(metadata)).await?;
-        let Some(leaf) = counted else {
+        let (dial, pick) = meow_proxy::group::watch_dial_pick(with_dial_timeout(
+            proxy.name(),
+            proxy.dial_udp(metadata),
+        ))
+        .await;
+        let conn = dial?;
+        // The peeks behind `counted`/`via` guessed the leaf the dial would
+        // take; the dial commits its own picks — a concurrent dial moves a
+        // round-robin group past the member the peek named, and a leaf
+        // that was a rematch at peek time can have been swapped for a real
+        // member, which the `counted` gate would leave uncounted.
+        // Attribute the member the dial went through when a conn-path
+        // group committed one. When nothing reported — a node, or a front
+        // the pick channel does not reach — keep the original peek: a
+        // post-dial read would only name the *current* selection, which is
+        // not evidence of what the dial spent (issue #974 review).
+        let counted = match pick {
+            Some(pick) => {
+                let leaf = crate::tcp::leaf_proxy(pick.as_ref(), metadata).unwrap_or(pick);
+                udp_counted(leaf.adapter_type()).then(|| {
+                    let via = match &counted {
+                        Some(Some(peeked)) if Arc::ptr_eq(peeked, &leaf) => via,
+                        _ => None,
+                    };
+                    (Some(leaf), via)
+                })
+            }
+            None => counted.map(|leaf| (leaf, via)),
+        };
+        let Some((leaf, via)) = counted else {
             return Ok(conn);
         };
         let leaf = leaf.as_deref().map_or(proxy.name(), |leaf| leaf.name());
@@ -169,7 +197,9 @@ impl TunnelInner {
 
 /// The leaf a UDP flow through `adapter` ends at ([`crate::tcp::leaf_proxy`],
 /// `None` inside for `adapter` itself), or `None` when that leaf sends
-/// nothing.
+/// nothing — a rematch control outbound included (issue #974): the flow
+/// re-enters routing before any of these dials, and a leaf that still
+/// ends here fails closed without a counter.
 fn udp_leaf(
     adapter: &dyn ProxyAdapter,
     metadata: &Metadata,
@@ -179,13 +209,21 @@ fn udp_leaf(
         adapter.adapter_type(),
         meow_common::ProxyAdapter::adapter_type,
     );
-    match kind {
+    udp_counted(kind).then_some(leaf)
+}
+
+/// Whether a resolved leaf's adapter kind carries a counted UDP flow —
+/// shared by the pre-dial peek and the post-dial attribution of the
+/// member a conn-path group's dial actually committed.
+fn udp_counted(kind: AdapterType) -> bool {
+    !matches!(
+        kind,
         AdapterType::Reject
-        | AdapterType::RejectDrop
-        | AdapterType::Pass
-        | AdapterType::PassRule => None,
-        _ => Some(leaf),
-    }
+            | AdapterType::RejectDrop
+            | AdapterType::Pass
+            | AdapterType::PassRule
+            | AdapterType::Rematch
+    )
 }
 
 /// One UDP flow's handle on the tunnel's flush signal (issue #695).
@@ -288,16 +326,38 @@ pub async fn handle_udp(
         return;
     }
 
+    // An established session forwards before anything that can demand the
+    // flow's owner: per-packet metadata carries a fresh lookup memo, so
+    // the NAT hit must precede `resolve_udp_dst`'s route probe and the
+    // slow path's `resolve_proxy_flow`, or an established flow could pay
+    // a socket-table walk per datagram (issue #974). Only possible when
+    // the caller already resolved `dst_ip`; a hostname waits for the
+    // key-forming resolution below.
+    if let Some(dst_ip) = metadata.dst_ip {
+        if forward_nat_hit(
+            tunnel,
+            (src, SocketAddr::new(dst_ip, metadata.dst_port)),
+            data,
+        )
+        .await
+        {
+            return;
+        }
+    }
+
     // Pre-resolve metadata (host -> real IP if rules need it). UDP keeps
-    // the eager pre_resolve + resolve_proxy pair (no lazy enrichment): the
-    // NAT session key below requires a resolved dst_ip regardless of what
-    // the rules demand.
+    // the eager pre_resolve + resolve_proxy_flow pair (no lazy
+    // enrichment): the NAT session key below requires a resolved dst_ip
+    // regardless of what the rules demand.
     tunnel.pre_resolve(&mut metadata).await;
 
     // Rule-demand gating is only an optimization. UDP still requires a real
     // address for its NAT key and outbound packet API, including after a
     // fake-IP was rewritten back to a hostname under domain-only rules.
-    tunnel.resolve_udp_dst(&mut metadata).await;
+    // When the direct-nameserver probe ran it already produced the flow's
+    // committed decision — use it verbatim; re-scanning after its dst_ip
+    // fill could match a slot the probe legitimately skipped (issue #974).
+    let probed = tunnel.resolve_udp_dst(&mut metadata).await;
 
     // Build destination SocketAddr for the NAT key.
     // pre_resolve() populates dst_ip for any hostname; if it is still None
@@ -314,49 +374,25 @@ pub async fn handle_udp(
     let key = (src, dst_addr);
 
     // Fast path: existing session — forward and return.
-    //
-    // Clone the `Arc<UdpSession>` out and DROP the DashMap guard before the
-    // `.await` below. `nat_table.get()` returns a `Ref` that holds a *read*
-    // lock on the key's shard for as long as it is alive. Two ways the old
-    // `if let Some(session) = nat_table.get(&key)` form deadlocked:
-    //   1. The guard was held across `write_packet().await`, so while this task
-    //      parked on the upstream round-trip the shard read-lock stayed held,
-    //      blocking every same-shard `insert`/`remove`/sweep.
-    //   2. On a write error it called `nat_table.remove(&key)` — a *write* lock
-    //      on the very shard whose read-lock the `session` guard still held.
-    //      A read+write on the same shard from one thread self-deadlocks the
-    //      shard's RwLock, parking the worker forever; on the 2-worker iOS
-    //      runtime both workers then wedge → total packet stall + dead control
-    //      API. Fires whenever an established session's upstream has died and
-    //      the app sends another datagram (common for QUIC / long-lived UDP).
-    // Holding only the cloned `Arc` keeps the session alive with no lock held.
-    let existing = tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value()));
-    if let Some(session) = existing {
-        if let Err(e) = session.conn.write_packet(data, &dst_addr).await {
-            debug!("UDP write error for {} -> {}: {}", src, dst_addr, e);
-            // Compare-and-remove: evict only the session that actually failed.
-            // While this write was parked a concurrent slow path may have
-            // replaced the entry with a fresh healthy session; an
-            // unconditional `remove()` would tear that replacement down and
-            // force the next packet to redial (issue #432).
-            tunnel
-                .nat_table
-                .remove_if(&key, |_, s| Arc::ptr_eq(s, &session));
-        } else {
-            session.touch();
-        }
+    if forward_nat_hit(tunnel, key, data).await {
         return;
     }
 
     // Slow path: all client UDP, including port 53, follows routing policy.
     // `_route` pins this generation's dialer registry across the dial
-    // (issue #533 review).
+    // (issue #533 review). The mutable flow entry point shares this
+    // metadata's lookup memo with the `resolve_udp_dst` probe above —
+    // one socket-table scan per flow at most (issue #974).
+    let resolved = match probed {
+        Some(target) => Some(target),
+        None => tunnel.resolve_proxy_flow(&mut metadata).await,
+    };
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = tunnel.resolve_proxy(&metadata).await
+    }) = resolved
     else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;
@@ -429,6 +465,48 @@ pub async fn handle_udp(
             warn!("UDP dial error for {} -> {}: {}", src, dst_addr, e);
         }
     }
+}
+
+/// Write `data` into the NAT session `key` names, if one is live: `true`
+/// on a hit (forwarded or the dead session evicted), `false` on a miss —
+/// the caller then takes the dial slow path.
+///
+/// Clone the `Arc<UdpSession>` out and DROP the DashMap guard before the
+/// `.await` below. `nat_table.get()` returns a `Ref` that holds a *read*
+/// lock on the key's shard for as long as it is alive. Two ways the old
+/// `if let Some(session) = nat_table.get(&key)` form deadlocked:
+///   1. The guard was held across `write_packet().await`, so while this task
+///      parked on the upstream round-trip the shard read-lock stayed held,
+///      blocking every same-shard `insert`/`remove`/sweep.
+///   2. On a write error it called `nat_table.remove(&key)` — a *write* lock
+///      on the very shard whose read-lock the `session` guard still held.
+///      A read+write on the same shard from one thread self-deadlocks the
+///      shard's RwLock, parking the worker forever; on the 2-worker iOS
+///      runtime both workers then wedge → total packet stall + dead control
+///      API. Fires whenever an established session's upstream has died and
+///      the app sends another datagram (common for QUIC / long-lived UDP).
+///
+/// Holding only the cloned `Arc` keeps the session alive with no lock held.
+async fn forward_nat_hit(tunnel: &TunnelInner, key: (SocketAddr, SocketAddr), data: &[u8]) -> bool {
+    let (src, dst_addr) = key;
+    let existing = tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value()));
+    let Some(session) = existing else {
+        return false;
+    };
+    if let Err(e) = session.conn.write_packet(data, &dst_addr).await {
+        debug!("UDP write error for {} -> {}: {}", src, dst_addr, e);
+        // Compare-and-remove: evict only the session that actually failed.
+        // While this write was parked a concurrent slow path may have
+        // replaced the entry with a fresh healthy session; an
+        // unconditional `remove()` would tear that replacement down and
+        // force the next packet to redial (issue #432).
+        tunnel
+            .nat_table
+            .remove_if(&key, |_, s| Arc::ptr_eq(s, &session));
+    } else {
+        session.touch();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -540,6 +618,7 @@ mod tests {
             proxies.clone(),
             vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
             Default::default(),
+            Default::default(),
         );
         let stats = tunnel.statistics();
 
@@ -565,6 +644,311 @@ mod tests {
         assert!(tunnel.inner().nat_table.contains_key(&(src, dst)));
         assert_eq!(stats.snapshot(), (4, 6));
         assert_eq!(stats.proxy_traffic(), by_proxy);
+    }
+
+    /// An instant-dial UDP leaf for traffic-attribution tests.
+    struct UdpStubProxy {
+        name: &'static str,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for UdpStubProxy {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            Ok(Box::new(NoopPacketConn))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for UdpStubProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    fn rematch_member(name: &str) -> Arc<dyn Proxy> {
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(&format!(
+            "proxies:\n  - {{name: {name}, type: rematch, target-rematch-name: stage1}}\n"
+        ))
+        .unwrap();
+        Arc::clone(&meow_config::rebuild_from_raw(&raw).unwrap().proxies[name])
+    }
+
+    /// A front that peeks like `inner` but whose dial lets a racing flow
+    /// take the counter's current member first — the interleaving
+    /// `watch_dial_pick`'s doc describes. The racing dial commits the
+    /// rematch leaf, which fails closed, and this dial commits the next
+    /// member.
+    struct RacedDial {
+        inner: meow_proxy::LoadBalanceGroup,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for RacedDial {
+        fn name(&self) -> &str {
+            "raced"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::LoadBalance
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            let _ = self.inner.dial_udp(metadata).await;
+            self.inner.dial_udp(metadata).await
+        }
+        fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+            self.inner.unwrap_proxy(metadata, touch)
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    /// A group whose selection changed between the flow's peek and its own
+    /// dial, modelled on a selector over `[rematch, transport]` (a real
+    /// selector does not `note_dial_pick`): the peek reads the rematch
+    /// leaf, the dial commits the transport.
+    struct FlippedPick {
+        leaves: [Arc<dyn Proxy>; 2],
+        flipped: AtomicBool,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for FlippedPick {
+        fn name(&self) -> &str {
+            "flipped"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Selector
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            self.flipped.store(true, Ordering::SeqCst);
+            self.leaves[1].dial_udp(metadata).await
+        }
+        fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+            Some(Arc::clone(
+                &self.leaves[self.flipped.load(Ordering::SeqCst) as usize],
+            ))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    /// The pre-dial `udp_leaf` peek saw the round-robin slot a racing dial
+    /// then committed — a rematch leaf — while this dial went through the
+    /// next member. The conn must count toward the member it actually
+    /// went through, not be dropped uncounted on the peeked leaf (issue
+    /// #974: a rematch peek never means "no transport").
+    #[tokio::test]
+    async fn dial_udp_attributes_the_pick_the_dial_committed() {
+        let tunnel = mk_tunnel();
+        let rematch = rematch_member("inspect");
+        let transport: Arc<dyn Proxy> = Arc::new(UdpStubProxy {
+            name: "transport",
+            health: ProxyHealth::default(),
+        });
+        let front = RacedDial {
+            inner: meow_proxy::LoadBalanceGroup::new(
+                "lb",
+                vec![rematch, transport],
+                meow_proxy::LbStrategy::RoundRobin,
+            ),
+            health: ProxyHealth::default(),
+        };
+        let src: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let conn = tunnel
+            .inner()
+            .dial_udp(&front, &mk_metadata(src, dst))
+            .await
+            .expect("the committed member is a real transport");
+        let n = conn.write_packet(b"ping", &dst).await.unwrap();
+        assert_eq!(n, 4);
+        let by_proxy = tunnel.statistics().proxy_traffic();
+        assert_eq!(
+            by_proxy.iter().collect::<Vec<_>>(),
+            vec![(&Arc::from("transport"), &(4, 0))],
+            "counted under the committed member, nothing under the peeked rematch"
+        );
+    }
+
+    /// The same flip behind a front the pick channel cannot reach keeps
+    /// the peek's verdict: a rematch leaf at peek time means no transport
+    /// attribution — a post-dial re-read would only name the selection
+    /// *now*, which says nothing about the member the dial spent (issue
+    /// #974 review). Nothing is guessed, so nothing is counted.
+    #[tokio::test]
+    async fn dial_udp_unreported_flip_counts_nothing() {
+        let tunnel = mk_tunnel();
+        let front = FlippedPick {
+            leaves: [
+                rematch_member("inspect"),
+                Arc::new(UdpStubProxy {
+                    name: "transport",
+                    health: ProxyHealth::default(),
+                }),
+            ],
+            flipped: AtomicBool::new(false),
+            health: ProxyHealth::default(),
+        };
+        let src: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let conn = tunnel
+            .inner()
+            .dial_udp(&front, &mk_metadata(src, dst))
+            .await
+            .expect("the committed member is a real transport");
+        conn.write_packet(b"ping", &dst).await.unwrap();
+        let by_proxy = tunnel.statistics().proxy_traffic();
+        assert!(by_proxy.is_empty());
+    }
+
+    /// A selector member whose own dial flips the group's selection — the
+    /// mid-dial window the in-band pick report closes: post-dial the
+    /// group's `unwrap_proxy` names `other`; only the pick recorded at
+    /// the member-dial point knows the conn went through `flip`.
+    struct FlipOnDial {
+        sel: std::sync::OnceLock<Arc<meow_proxy::SelectorGroup>>,
+        inner: UdpStubProxy,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for FlipOnDial {
+        fn name(&self) -> &str {
+            self.inner.name
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            assert!(
+                self.sel.get().unwrap().select("other"),
+                "member flips the group's selection mid-dial"
+            );
+            self.inner.dial_udp(metadata).await
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for FlipOnDial {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A selector's dial reports the member it committed, so the mid-dial
+    /// flip above cannot rename the flow: `sel` dialled `flip`, `flip`'s
+    /// own dial re-selected `other`, and the stats land on `flip` — what
+    /// the conn went through — not `other`, what a post-dial peek reads.
+    #[tokio::test]
+    async fn dial_udp_attributes_the_member_the_selector_dialled() {
+        let tunnel = mk_tunnel();
+        let flip = Arc::new(FlipOnDial {
+            sel: std::sync::OnceLock::new(),
+            inner: UdpStubProxy {
+                name: "flip",
+                health: ProxyHealth::default(),
+            },
+            health: ProxyHealth::default(),
+        });
+        let sel = Arc::new(meow_proxy::SelectorGroup::new(
+            "sel",
+            vec![
+                Arc::clone(&flip) as Arc<dyn Proxy>,
+                Arc::new(UdpStubProxy {
+                    name: "other",
+                    health: ProxyHealth::default(),
+                }),
+            ],
+        ));
+        assert!(flip.sel.set(Arc::clone(&sel)).is_ok());
+        let src: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let conn = tunnel
+            .inner()
+            .dial_udp(sel.as_ref(), &mk_metadata(src, dst))
+            .await
+            .expect("the committed member is a real transport");
+        conn.write_packet(b"ping", &dst).await.unwrap();
+        let by_proxy = tunnel.statistics().proxy_traffic();
+        assert_eq!(
+            by_proxy.iter().collect::<Vec<_>>(),
+            vec![(&Arc::from("flip"), &(4, 0))],
+            "counted under the member the dial went through, not the post-dial selection"
+        );
     }
 
     struct NoopPacketConn;
@@ -1125,5 +1509,110 @@ mod tests {
         let conns = proxy.conns.lock().unwrap();
         assert!(!conns[1].1.load(Ordering::SeqCst));
         assert_eq!(conns[1].0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A write-counting packet conn for the established-session fixture.
+    struct RecordingConn {
+        writes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for RecordingConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            Ok((0, "0.0.0.0:0".parse().unwrap()))
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok("0.0.0.0:0".parse().unwrap())
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+    }
+
+    /// An established NAT session must forward before anything that can
+    /// demand the flow's owner: per-packet metadata carries a fresh
+    /// lookup memo, so reaching a `strict` process slot on an established
+    /// flow would scan once per datagram (issue #974).
+    #[tokio::test]
+    async fn nat_hit_skips_process_demand_for_established_flows() {
+        use meow_common::{Rule, RuleMatchHelper, RuleType};
+
+        // Deterministic process demand on every OS — the same stub shape
+        // tunnel.rs's `DemandProcess` uses.
+        struct DemandProcess;
+        impl Rule for DemandProcess {
+            fn rule_type(&self) -> RuleType {
+                RuleType::ProcessName
+            }
+            fn match_metadata(&self, _: &Metadata, _: &RuleMatchHelper) -> bool {
+                false
+            }
+            fn adapter(&self) -> &str {
+                "DIRECT"
+            }
+            fn payload(&self) -> &str {
+                ""
+            }
+            fn should_find_process(&self) -> bool {
+                true
+            }
+        }
+
+        let tunnel = mk_tunnel();
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.update_routing(
+            res.proxies,
+            vec![
+                Box::new(DemandProcess),
+                Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+            res.dialer_registry,
+        );
+        tunnel.set_mode(TunnelMode::Rule);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        tunnel.set_process_lookup_hook(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+
+        let src: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+        // Not 198.51.100.9: the ledger tests query that host and this
+        // flow's counters would land in their install when they run
+        // alongside this test.
+        let dst: SocketAddr = "198.51.100.99:443".parse().unwrap();
+        let key = (src, dst);
+        let writes = Arc::new(AtomicUsize::new(0));
+        tunnel.inner().nat_table.insert(
+            key,
+            Arc::new(UdpSession::new(
+                Box::new(RecordingConn {
+                    writes: Arc::clone(&writes),
+                }),
+                Arc::from("DIRECT"),
+            )),
+        );
+
+        // Two datagrams on the established session: each carries a fresh
+        // memo, so a single scan would prove per-packet owner work.
+        for _ in 0..2 {
+            handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 2, "the session forwards");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an established flow must never scan"
+        );
+
+        // A brand-new flow still pays the reached slot's one scan.
+        let new_src: SocketAddr = "127.0.0.1:45679".parse().unwrap();
+        handle_udp(tunnel.inner(), b"ping", new_src, mk_metadata(new_src, dst)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a new flow scans once");
     }
 }
